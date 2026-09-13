@@ -41,11 +41,12 @@ use rt_storage::{
 use rt_utp::UtpEndpoint;
 
 use crate::command::{
-    ActiveTorrentPeers, CmdResult, EngineCategory, EngineCmd, EngineGlobalLimits, EngineJob,
-    EngineNetworkFeatures, EnginePeerSnapshot, EnginePieceState, EngineStats, EngineStorageRoot,
-    EngineSubsystemHealth, EngineTorrentFile, EngineTorrentLimits, EngineTorrentMetadata,
-    EngineTrackerHealth, EngineTrackerSnapshot, EngineWebseedSnapshot, PreparedTorrentTaskData,
-    QueueMove, TorrentDiagnostic, TorrentLiveStats, TorrentPromotionAction,
+    try_acquire_engine_add_task, ActiveTorrentPeers, CmdResult, EngineAddTaskGuard, EngineCategory,
+    EngineCmd, EngineGlobalLimits, EngineJob, EngineNetworkFeatures, EnginePeerSnapshot,
+    EnginePieceState, EngineStats, EngineStorageRoot, EngineSubsystemHealth, EngineTorrentFile,
+    EngineTorrentLimits, EngineTorrentMetadata, EngineTrackerHealth, EngineTrackerSnapshot,
+    EngineWebseedSnapshot, PreparedTorrentTaskData, QueueMove, TorrentDiagnostic, TorrentLiveStats,
+    TorrentPromotionAction,
 };
 use crate::db_worker::DbExecutor;
 #[cfg(not(test))]
@@ -1591,6 +1592,16 @@ struct PureV2RecheckCompletion {
     error: Option<String>,
 }
 
+struct TorrentAddRequest {
+    meta: TorrentMeta,
+    save_path: Option<PathBuf>,
+    paused: bool,
+    category: Option<String>,
+    tags: Vec<String>,
+    reply: oneshot::Sender<CmdResult<String>>,
+    add_guard: Option<EngineAddTaskGuard>,
+}
+
 /// Inputs captured by the actor before a stats refresh is detached. The
 /// resulting collector never borrows actor state; it reads only cloned
 /// channels and shared read models, then posts one immutable result back.
@@ -2111,8 +2122,16 @@ impl Engine {
                 tags,
                 reply,
             } => {
-                self.begin_torrent_add(*meta, save_path, paused, category, tags, reply)
-                    .await;
+                self.begin_torrent_add(TorrentAddRequest {
+                    meta: *meta,
+                    save_path,
+                    paused,
+                    category,
+                    tags,
+                    reply,
+                    add_guard: None,
+                })
+                .await;
             }
             EngineCmd::AddTorrentRaw {
                 raw,
@@ -2125,6 +2144,7 @@ impl Engine {
                 self.start_torrent_add_from_raw(raw, save_path, paused, category, tags, reply);
             }
             EngineCmd::PreparedTorrentMeta {
+                add_guard,
                 prepared,
                 save_path,
                 paused,
@@ -2133,14 +2153,24 @@ impl Engine {
                 reply,
             } => match prepared {
                 Ok(meta) => {
-                    self.begin_torrent_add(*meta, save_path, paused, category, tags, reply)
-                        .await;
+                    self.begin_torrent_add(TorrentAddRequest {
+                        meta: *meta,
+                        save_path,
+                        paused,
+                        category,
+                        tags,
+                        reply,
+                        add_guard: Some(add_guard),
+                    })
+                    .await;
                 }
                 Err(error) => {
+                    drop(add_guard);
                     let _ = reply.send(Err(error));
                 }
             },
             EngineCmd::PreparedTorrentAdd {
+                add_guard,
                 meta,
                 staged_blob,
                 save_path,
@@ -2149,6 +2179,7 @@ impl Engine {
                 tags,
                 reply,
             } => {
+                let _add_guard = add_guard;
                 let info_hash = meta_info_hash_hex(&meta);
                 let owns_pending_add = self.runtime.pending_torrent_adds.remove(&info_hash);
                 let result = match staged_blob {
@@ -3602,36 +3633,39 @@ impl Engine {
         true
     }
 
-    async fn begin_torrent_add(
-        &mut self,
-        meta: TorrentMeta,
-        save_path: Option<PathBuf>,
-        paused: bool,
-        category: Option<String>,
-        tags: Vec<String>,
-        reply: oneshot::Sender<CmdResult<String>>,
-    ) {
-        let info_hash = meta_info_hash_hex(&meta);
+    async fn begin_torrent_add(&mut self, request: TorrentAddRequest) {
+        let info_hash = meta_info_hash_hex(&request.meta);
         if self.runtime.torrent_chans.contains_key(&info_hash)
             || self.runtime.pending_torrent_adds.contains(&info_hash)
             || self.registry.read().await.get(&info_hash).is_some()
         {
-            let _ = reply.send(Err(format!("torrent {info_hash} already added")));
+            let _ = request
+                .reply
+                .send(Err(format!("torrent {info_hash} already added")));
             return;
         }
-        self.runtime.pending_torrent_adds.insert(info_hash);
-        self.start_torrent_add_from_meta(meta, save_path, paused, category, tags, reply);
+        self.runtime.pending_torrent_adds.insert(info_hash.clone());
+        if !self.start_torrent_add_from_meta(request) {
+            self.runtime.pending_torrent_adds.remove(&info_hash);
+        }
     }
 
-    fn start_torrent_add_from_meta(
-        &self,
-        meta: TorrentMeta,
-        save_path: Option<PathBuf>,
-        paused: bool,
-        category: Option<String>,
-        tags: Vec<String>,
-        reply: oneshot::Sender<CmdResult<String>>,
-    ) {
+    fn start_torrent_add_from_meta(&self, request: TorrentAddRequest) -> bool {
+        let Some(add_guard) = request.add_guard.or_else(try_acquire_engine_add_task) else {
+            let _ = request
+                .reply
+                .send(Err("torrent add preparation capacity exhausted".to_owned()));
+            return false;
+        };
+        let TorrentAddRequest {
+            meta,
+            save_path,
+            paused,
+            category,
+            tags,
+            reply,
+            add_guard: _,
+        } = request;
         let info_hash = meta_info_hash_hex(&meta);
         let raw = meta_raw(&meta).to_vec();
         let config = Arc::clone(&self.config);
@@ -3650,6 +3684,7 @@ impl Engine {
             let delivered = send_engine_command_until_delivered(
                 cmd_tx,
                 EngineCmd::PreparedTorrentAdd {
+                    add_guard,
                     meta: Box::new(meta),
                     staged_blob: blob_result,
                     save_path,
@@ -3667,6 +3702,7 @@ impl Engine {
                 }
             }
         });
+        true
     }
 
     fn start_torrent_add_from_raw(
@@ -3678,6 +3714,10 @@ impl Engine {
         tags: Vec<String>,
         reply: oneshot::Sender<CmdResult<String>>,
     ) {
+        let Some(add_guard) = try_acquire_engine_add_task() else {
+            let _ = reply.send(Err("torrent add preparation capacity exhausted".to_owned()));
+            return;
+        };
         let cmd_tx = self.cmd_tx.clone();
         tokio::spawn(async move {
             let prepared = match tokio::task::spawn_blocking(move || {
@@ -3692,6 +3732,7 @@ impl Engine {
             send_engine_command_until_delivered(
                 cmd_tx,
                 EngineCmd::PreparedTorrentMeta {
+                    add_guard,
                     prepared,
                     save_path,
                     paused,

@@ -1641,6 +1641,13 @@ pub async fn torrents_add(
         values
     };
     let mut added_hashes = Vec::new();
+    let save_path = if save_path.trim().is_empty() {
+        None
+    } else {
+        Some(std::path::PathBuf::from(save_path))
+    };
+    let start_paused = paused || stopped;
+
     for url in url_values {
         if url
             .get(.."magnet:".len())
@@ -1661,16 +1668,11 @@ pub async fn torrents_add(
                     return (StatusCode::BAD_REQUEST, "Fails.").into_response();
                 }
             };
-            let save_path = if save_path.trim().is_empty() {
-                None
-            } else {
-                Some(std::path::PathBuf::from(save_path.clone()))
-            };
             let hash = match engine
                 .add_magnet_with_labels(
                     magnet,
-                    save_path,
-                    paused || stopped,
+                    save_path.clone(),
+                    start_paused,
                     Some(category.clone()),
                     tags.clone(),
                 )
@@ -1742,13 +1744,6 @@ pub async fn torrents_add(
         }
         return (StatusCode::BAD_REQUEST, "Fails.").into_response();
     }
-
-    let save_path = if save_path.trim().is_empty() {
-        None
-    } else {
-        Some(std::path::PathBuf::from(save_path))
-    };
-    let start_paused = paused || stopped;
 
     for raw in torrent_blobs {
         let hash = match engine
@@ -4568,7 +4563,7 @@ async fn required_resolved_hashes(
     keys: &[&str],
 ) -> Result<Vec<String>, StatusCode> {
     let requested = required_hashes(params, keys)?;
-    Ok(resolve_hashes(state, requested).await)
+    resolve_hashes(state, requested).await
 }
 
 fn strict_hashes_from_str(raw: &str) -> Option<Vec<String>> {
@@ -4760,7 +4755,15 @@ async fn torrent_limit_map(
             }
         },
     };
-    let hashes = resolve_hashes(state, requested).await;
+    let hashes = match resolve_hashes(state, requested).await {
+        Ok(hashes) => hashes,
+        Err(status) => {
+            return (
+                status,
+                Json(serde_json::Value::Object(serde_json::Map::new())),
+            );
+        }
+    };
     let reg = state.registry.read().await;
     let entries = reg
         .iter()
@@ -5856,12 +5859,15 @@ async fn fetch_torrent_url(
     Ok(body)
 }
 
-async fn resolve_hashes(state: &AppState, hashes: Vec<String>) -> Vec<String> {
+async fn resolve_hashes(state: &AppState, hashes: Vec<String>) -> Result<Vec<String>, StatusCode> {
     if hashes.len() == 1 && hashes[0] == "all" {
         let reg = state.registry.read().await;
-        reg.iter().map(|entry| entry.info_hash.clone()).collect()
+        if reg.len() > MAX_QBIT_MUTATION_ITEMS {
+            return Err(StatusCode::BAD_REQUEST);
+        }
+        Ok(reg.iter().map(|entry| entry.info_hash.clone()).collect())
     } else {
-        hashes
+        Ok(hashes)
     }
 }
 
@@ -5921,6 +5927,28 @@ mod tests {
             .unwrap();
         }
         state
+    }
+
+    #[tokio::test]
+    async fn qbit_all_hash_resolution_rejects_an_oversized_registry() {
+        let state = AppState::new();
+        {
+            let mut registry = state.registry.write().await;
+            for index in 0..=MAX_QBIT_MUTATION_ITEMS {
+                registry
+                    .add(TorrentEntry::new(
+                        format!("{index:040x}"),
+                        "bounded".to_owned(),
+                        "/data".to_owned(),
+                    ))
+                    .unwrap();
+            }
+        }
+
+        assert_eq!(
+            resolve_hashes(&state, vec!["all".to_owned()]).await,
+            Err(StatusCode::BAD_REQUEST)
+        );
     }
 
     fn qbit_info(hash: &str, tracker: &str, trackers_count: u32) -> QbTorrentInfo {

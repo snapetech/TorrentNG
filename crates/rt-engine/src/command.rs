@@ -1,5 +1,9 @@
 /// Commands sent from the API layer down to the engine or individual torrent tasks.
-use std::{net::SocketAddr, path::PathBuf};
+use std::{
+    net::SocketAddr,
+    path::PathBuf,
+    sync::atomic::{AtomicUsize, Ordering},
+};
 
 use tokio::sync::{mpsc, oneshot};
 
@@ -12,6 +16,40 @@ use crate::torrent_task::TorrentCmd;
 use crate::TorrentActivityTier;
 
 pub type CmdResult<T> = Result<T, String>;
+
+// Raw/parsed metainfo can be retained across a blocking parse, blob staging,
+// and the bounded engine command mailbox. Keep that whole preparation chain
+// bounded so many large add requests cannot accumulate several copies of one
+// torrent while the actor is busy with unrelated work.
+const MAX_ENGINE_ADD_TASKS: usize = 8;
+static ENGINE_ADD_TASKS: AtomicUsize = AtomicUsize::new(0);
+
+#[derive(Debug)]
+pub(crate) struct EngineAddTaskGuard;
+
+impl Drop for EngineAddTaskGuard {
+    fn drop(&mut self) {
+        ENGINE_ADD_TASKS.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+pub(crate) fn try_acquire_engine_add_task() -> Option<EngineAddTaskGuard> {
+    let mut current = ENGINE_ADD_TASKS.load(Ordering::Acquire);
+    loop {
+        if current >= MAX_ENGINE_ADD_TASKS {
+            return None;
+        }
+        match ENGINE_ADD_TASKS.compare_exchange_weak(
+            current,
+            current + 1,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => return Some(EngineAddTaskGuard),
+            Err(observed) => current = observed,
+        }
+    }
+}
 
 /// Work that should be applied after a dormant torrent has been reconstructed
 /// by the blocking promotion worker. Keeping the reply sender in the action
@@ -818,7 +856,7 @@ pub struct TorrentDiagnostic {
 
 /// Engine-level commands (handled by the top-level EngineHandle).
 #[derive(Debug)]
-pub enum EngineCmd {
+pub(crate) enum EngineCmd {
     /// Add a torrent from parsed metainfo. save_path overrides config default.
     AddTorrent {
         meta: Box<TorrentMeta>,
@@ -851,6 +889,7 @@ pub enum EngineCmd {
     /// Internal completion after raw metainfo parsing. The actor performs a
     /// duplicate check/reservation before starting blob persistence.
     PreparedTorrentMeta {
+        add_guard: EngineAddTaskGuard,
         prepared: CmdResult<Box<TorrentMeta>>,
         save_path: Option<PathBuf>,
         paused: bool,
@@ -861,6 +900,7 @@ pub enum EngineCmd {
     /// Internal completion after detached torrent-blob staging. The actor
     /// publishes the staged file only after it still owns the pending add.
     PreparedTorrentAdd {
+        add_guard: EngineAddTaskGuard,
         meta: Box<TorrentMeta>,
         staged_blob: CmdResult<PathBuf>,
         save_path: Option<PathBuf>,

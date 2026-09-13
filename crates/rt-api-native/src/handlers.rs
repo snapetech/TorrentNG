@@ -3102,10 +3102,19 @@ pub async fn bulk_action(
         )
             .into_response();
     }
-    let hashes = if dry_run {
+    let hashes = match if dry_run {
         preview_hashes(&state, &req.hashes).await
     } else {
         resolve_hashes(&state, &req.hashes).await
+    } {
+        Ok(hashes) => hashes,
+        Err(error) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::to_value(ApiError::bad_request(error)).unwrap()),
+            )
+                .into_response();
+        }
     };
     let mut errors = Vec::new();
     if hashes.is_empty() {
@@ -3151,7 +3160,16 @@ pub async fn cross_seed(
         return response;
     }
     let dry_run = req.dry_run.unwrap_or(true);
-    let hashes = resolve_hashes(&state, &req.hashes).await;
+    let hashes = match resolve_hashes(&state, &req.hashes).await {
+        Ok(hashes) => hashes,
+        Err(error) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::to_value(ApiError::bad_request(error)).unwrap()),
+            )
+                .into_response();
+        }
+    };
     let mut errors = Vec::new();
     if hashes.is_empty() {
         errors.push("hashes is required".to_owned());
@@ -6617,10 +6635,15 @@ fn latency_histogram_by_device(
     }
 }
 
-async fn resolve_hashes(state: &AppState, hashes: &[String]) -> Vec<String> {
+async fn resolve_hashes(state: &AppState, hashes: &[String]) -> Result<Vec<String>, String> {
     let reg = state.registry.read().await;
     if hashes.len() == 1 && hashes[0].trim().eq_ignore_ascii_case("all") {
-        return reg.iter().map(|entry| entry.info_hash.clone()).collect();
+        if reg.len() > MAX_NATIVE_MUTATION_ITEMS {
+            return Err(format!(
+                "all torrent selection exceeds the maximum of {MAX_NATIVE_MUTATION_ITEMS} items"
+            ));
+        }
+        return Ok(reg.iter().map(|entry| entry.info_hash.clone()).collect());
     }
     let canonical = reg
         .iter()
@@ -6631,7 +6654,7 @@ async fn resolve_hashes(state: &AppState, hashes: &[String]) -> Vec<String> {
             )
         })
         .collect::<HashMap<_, _>>();
-    hashes
+    Ok(hashes
         .iter()
         .map(|hash| hash.trim())
         .filter(|hash| !hash.is_empty())
@@ -6641,25 +6664,28 @@ async fn resolve_hashes(state: &AppState, hashes: &[String]) -> Vec<String> {
                 .cloned()
                 .unwrap_or_else(|| hash.to_ascii_lowercase())
         })
-        .collect()
+        .collect())
 }
 
-async fn preview_hashes(state: &AppState, hashes: &[String]) -> Vec<String> {
+async fn preview_hashes(state: &AppState, hashes: &[String]) -> Result<Vec<String>, String> {
     if hashes.len() == 1 && hashes[0].trim().eq_ignore_ascii_case("all") {
-        return state
-            .registry
-            .read()
-            .await
+        let registry = state.registry.read().await;
+        if registry.len() > MAX_NATIVE_MUTATION_ITEMS {
+            return Err(format!(
+                "all torrent selection exceeds the maximum of {MAX_NATIVE_MUTATION_ITEMS} items"
+            ));
+        }
+        return Ok(registry
             .iter()
             .map(|entry| entry.info_hash.clone())
-            .collect();
+            .collect());
     }
-    hashes
+    Ok(hashes
         .iter()
         .map(|hash| hash.trim())
         .filter(|hash| !hash.is_empty())
         .map(ToOwned::to_owned)
-        .collect()
+        .collect())
 }
 
 async fn matching_hashes_for_json_rule(
@@ -9605,7 +9631,29 @@ mod tests {
                 .unwrap();
         }
 
-        let resolved = resolve_hashes(&state, &[known.to_ascii_uppercase(), "b".repeat(40)]).await;
+        let resolved = resolve_hashes(&state, &[known.to_ascii_uppercase(), "b".repeat(40)])
+            .await
+            .unwrap();
         assert_eq!(resolved, vec![known, "b".repeat(40)]);
+    }
+
+    #[tokio::test]
+    async fn torrentng_all_hash_resolution_rejects_an_oversized_registry() {
+        let state = AppState::new();
+        {
+            let mut registry = state.registry.write().await;
+            for index in 0..=MAX_NATIVE_MUTATION_ITEMS {
+                registry
+                    .add(TorrentEntry::new(
+                        format!("{index:040x}"),
+                        "bounded".to_owned(),
+                        "/data".to_owned(),
+                    ))
+                    .unwrap();
+            }
+        }
+
+        assert!(resolve_hashes(&state, &["all".to_owned()]).await.is_err());
+        assert!(preview_hashes(&state, &["all".to_owned()]).await.is_err());
     }
 }
