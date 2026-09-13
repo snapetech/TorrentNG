@@ -14282,10 +14282,11 @@ fn persisted_global_tags(conn: &Connection) -> CmdResult<Vec<String>> {
 }
 
 fn normalize_tags(tags: Vec<String>) -> Vec<String> {
+    let mut seen = HashSet::new();
     let mut out = Vec::new();
     for tag in tags {
         let tag = tag.trim().to_owned();
-        if !tag.is_empty() && !out.contains(&tag) {
+        if !tag.is_empty() && seen.insert(tag.clone()) {
             out.push(tag);
         }
     }
@@ -14293,10 +14294,11 @@ fn normalize_tags(tags: Vec<String>) -> Vec<String> {
 }
 
 fn normalize_tracker_urls(trackers: Vec<String>) -> Vec<String> {
+    let mut seen = HashSet::new();
     let mut out = Vec::new();
     for tracker in trackers {
         let tracker = tracker.trim().to_owned();
-        if !tracker.is_empty() && !out.contains(&tracker) {
+        if !tracker.is_empty() && seen.insert(tracker.clone()) {
             out.push(tracker);
         }
     }

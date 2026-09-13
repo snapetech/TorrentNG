@@ -5554,10 +5554,11 @@ fn strict_tracker_values(values: &str) -> Result<Vec<String>, ()> {
 }
 
 fn normalize_tracker_values(values: Vec<String>) -> Vec<String> {
+    let mut seen = HashSet::new();
     let mut out = Vec::new();
     for value in values {
         let value = value.trim().to_owned();
-        if !value.is_empty() && !out.contains(&value) {
+        if !value.is_empty() && seen.insert(value.clone()) {
             out.push(value);
         }
     }

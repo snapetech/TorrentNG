@@ -167,6 +167,7 @@ impl PieceBitmap {
         }
     }
 
+    #[cfg(test)]
     fn from_bools(bits: &[bool]) -> Self {
         let mut bitmap = Self::new(bits.len());
         for (index, value) in bits.iter().copied().enumerate() {
@@ -456,6 +457,22 @@ fn reserve_peer_bitfield_bytes(
     resources
         .try_acquire(MemoryClass::PeerBuffer, bytes)
         .ok_or_else(|| anyhow::anyhow!("peer bitfield allocation of {bytes} bytes denied"))
+}
+
+fn reserve_peer_bitfield_wire_bytes(
+    resources: &ResourceGovernor,
+    pieces: &PieceBitmap,
+) -> anyhow::Result<MemoryLease> {
+    let bitfield_bytes = u64::try_from(pieces.len().div_ceil(8))
+        .map_err(|_| anyhow::anyhow!("peer bitfield wire allocation does not fit in u64"))?;
+    // The payload is held by Message, Message::encode creates a second
+    // length-prefixed copy, and TCP's framed writer can retain a third copy
+    // until the send flushes. Reserve the peak rather than letting a large
+    // torrent's piece count bypass the peer-buffer governor.
+    let bytes = bitfield_bytes.saturating_mul(3).saturating_add(5);
+    resources
+        .try_acquire(MemoryClass::PeerBuffer, bytes)
+        .ok_or_else(|| anyhow::anyhow!("peer bitfield wire allocation of {bytes} bytes denied"))
 }
 
 fn reserve_peer_event_bytes(
@@ -2367,11 +2384,17 @@ impl TorrentTask {
     }
 
     fn upload_context(&self, peer_addr: SocketAddr) -> Option<UploadContext> {
-        let have_pieces = self.picker.have_pieces();
+        let piece_count = self.picker.piece_count();
         let have_pieces = if self.super_seeding && self.picker.is_complete() {
-            super_seed_visible_pieces(&have_pieces, peer_addr)
+            super_seed_visible_pieces(&self.picker, piece_count, peer_addr)
         } else {
-            PieceBitmap::from_bools(&have_pieces)
+            let mut have_pieces = PieceBitmap::new(piece_count);
+            for piece in 0..piece_count {
+                if self.picker.have_piece(piece) {
+                    have_pieces.set(piece, true);
+                }
+            }
+            have_pieces
         };
         let bitmap_memory_lease = self
             .resources
@@ -5100,12 +5123,9 @@ impl TorrentTask {
             self.meta.pieces.len() as u32,
             ImportPolicy::RequireVerification,
         );
-        state.pieces = self
-            .picker
-            .have_pieces()
-            .into_iter()
-            .map(|have| {
-                if have {
+        state.pieces = (0..self.picker.piece_count())
+            .map(|piece| {
+                if self.picker.have_piece(piece) {
                     PieceState::Valid
                 } else {
                     PieceState::Unknown
@@ -5873,7 +5893,7 @@ async fn run_outgoing_peer(
         remote_supports_extension,
     )
     .await?;
-    send_have_state(&mut peer_io, &upload.have_pieces).await?;
+    send_have_state(&mut peer_io, &upload.have_pieces, &upload.resources).await?;
     peer_io.send(Message::Interested).await?;
 
     Ok(run_peer_loop(
@@ -5950,7 +5970,7 @@ async fn run_established_utp_peer(
         remote_supports_extension,
     )
     .await?;
-    send_have_state(&mut peer_io, &upload.have_pieces).await?;
+    send_have_state(&mut peer_io, &upload.have_pieces, &upload.resources).await?;
     peer_io.send(Message::Interested).await?;
 
     Ok(run_peer_loop(
@@ -6003,7 +6023,7 @@ async fn run_incoming_peer(
         remote_supports_extension,
     )
     .await?;
-    send_have_state(&mut peer_io, &upload.have_pieces).await?;
+    send_have_state(&mut peer_io, &upload.have_pieces, &upload.resources).await?;
     peer_io.send(Message::Interested).await?;
     Ok(run_peer_loop(
         addr,
@@ -6049,7 +6069,7 @@ async fn run_incoming_utp_peer(
         remote_supports_extension,
     )
     .await?;
-    send_have_state(&mut peer_io, &upload.have_pieces).await?;
+    send_have_state(&mut peer_io, &upload.have_pieces, &upload.resources).await?;
     peer_io.send(Message::Interested).await?;
     Ok(run_peer_loop(
         addr,
@@ -6831,11 +6851,17 @@ impl OutstandingRequest {
     }
 }
 
-async fn send_have_state(peer_io: &mut PeerIo, have_pieces: &PieceBitmap) -> anyhow::Result<()> {
-    let bitfield = have_pieces.to_bitfield();
-    if bitfield.iter().any(|byte| *byte != 0) {
-        peer_io.send(Message::Bitfield(bitfield)).await?;
+async fn send_have_state(
+    peer_io: &mut PeerIo,
+    have_pieces: &PieceBitmap,
+    resources: &ResourceGovernor,
+) -> anyhow::Result<()> {
+    if have_pieces.count_ones() == 0 {
+        return Ok(());
     }
+    let _wire_memory_lease = reserve_peer_bitfield_wire_bytes(resources, have_pieces)?;
+    let bitfield = have_pieces.to_bitfield();
+    peer_io.send(Message::Bitfield(bitfield)).await?;
     Ok(())
 }
 
@@ -7010,9 +7036,15 @@ fn pieces_to_bitfield(pieces: &[bool]) -> Vec<u8> {
     bits
 }
 
-fn super_seed_visible_pieces(have_pieces: &[bool], peer_addr: SocketAddr) -> PieceBitmap {
-    let available_count = have_pieces.iter().filter(|have| **have).count();
-    let mut visible = PieceBitmap::new(have_pieces.len());
+fn super_seed_visible_pieces<A: PieceAvailability + ?Sized>(
+    have_pieces: &A,
+    piece_count: usize,
+    peer_addr: SocketAddr,
+) -> PieceBitmap {
+    let available_count = (0..piece_count)
+        .filter(|piece| have_pieces.has_piece(*piece))
+        .count();
+    let mut visible = PieceBitmap::new(piece_count);
     if available_count == 0 {
         return visible;
     }
@@ -7020,12 +7052,9 @@ fn super_seed_visible_pieces(have_pieces: &[bool], peer_addr: SocketAddr) -> Pie
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     peer_addr.hash(&mut hasher);
     let target = (hasher.finish() as usize) % available_count;
-    if let Some(selected) = have_pieces
-        .iter()
-        .enumerate()
-        .filter(|(_, have)| **have)
+    if let Some(selected) = (0..piece_count)
+        .filter(|piece| have_pieces.has_piece(*piece))
         .nth(target)
-        .map(|(index, _)| index)
     {
         visible.set(selected, true);
     }
@@ -8423,6 +8452,29 @@ mod tests {
     }
 
     #[test]
+    fn peer_bitfield_wire_reservation_covers_transient_copies() {
+        let pieces = PieceBitmap::from_bools(&[true; 65]);
+        let wire_bytes = 3 * pieces.len().div_ceil(8) as u64 + 5;
+        let mut class_caps_bytes = [0; rt_metrics::MEMORY_CLASS_COUNT];
+        class_caps_bytes[MemoryClass::PeerBuffer as usize] = wire_bytes;
+        let governor = ResourceGovernor::new(rt_metrics::ResourceGovernorConfig {
+            total_cap_bytes: wire_bytes,
+            class_caps_bytes,
+            pressure_constrained_pct: 75,
+            pressure_critical_pct: 90,
+        });
+
+        let lease = reserve_peer_bitfield_wire_bytes(&governor, &pieces).unwrap();
+        assert_eq!(lease.bytes(), wire_bytes);
+        assert!(reserve_peer_bitfield_wire_bytes(&governor, &pieces).is_err());
+        drop(lease);
+        assert_eq!(
+            governor.snapshot().classes[MemoryClass::PeerBuffer as usize].used_bytes,
+            0
+        );
+    }
+
+    #[test]
     fn piece_assembly_reservation_is_owned_until_assembly_drop() {
         let bytes = 4 * 1024usize;
         let mut class_caps_bytes = [0; rt_metrics::MEMORY_CLASS_COUNT];
@@ -8537,7 +8589,7 @@ mod tests {
     #[test]
     fn super_seed_visible_pieces_reveals_one_available_piece() {
         let addr = "127.0.0.1:6881".parse().unwrap();
-        let visible = super_seed_visible_pieces(&[true, true, false, true], addr);
+        let visible = super_seed_visible_pieces(&[true, true, false, true], 4, addr);
 
         assert_eq!(visible.count_ones(), 1);
         assert_eq!(visible.get(2), Some(false));
@@ -8548,7 +8600,7 @@ mod tests {
         let addr = "127.0.0.1:6881".parse().unwrap();
 
         assert_eq!(
-            super_seed_visible_pieces(&[false, false, false], addr),
+            super_seed_visible_pieces(&[false, false, false], 3, addr),
             PieceBitmap::new(3)
         );
     }

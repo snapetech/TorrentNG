@@ -233,73 +233,75 @@ impl PiecePicker {
         self.sequential
     }
 
+    pub fn piece_count(&self) -> usize {
+        self.piece_count
+    }
+
+    pub fn have_piece(&self, piece: usize) -> bool {
+        self.wanted.get(piece).is_some_and(|wanted| !*wanted)
+    }
+
     /// Pick the next block to request from a peer with given bitfield.
     ///
     /// Returns `None` if nothing is available from this peer right now.
     pub fn pick<A: PieceAvailability + ?Sized>(&mut self, peer_has: &A) -> Option<BlockRequest> {
         // Priority pieces first.
-        for &p in &self.priority.clone() {
-            if self.wanted[p] && self.enabled[p] && peer_has.has_piece(p) {
-                if let Some(req) = self.pick_block_from(p) {
-                    return Some(req);
-                }
-            }
+        if let Some(piece) = self
+            .priority
+            .iter()
+            .copied()
+            .find(|&piece| self.piece_is_requestable(piece) && peer_has.has_piece(piece))
+        {
+            return self.pick_block_from(piece);
         }
 
         if self.sequential {
-            for p in self.sequential_order() {
-                if self.wanted[p] && self.enabled[p] && peer_has.has_piece(p) {
-                    if let Some(req) = self.pick_block_from(p) {
-                        return Some(req);
-                    }
-                }
+            let start = self
+                .sequential_start_piece
+                .min(self.piece_count.saturating_sub(1));
+            if let Some(piece) = (start..self.piece_count)
+                .chain(0..start)
+                .find(|&piece| self.piece_is_requestable(piece) && peer_has.has_piece(piece))
+            {
+                return self.pick_block_from(piece);
             }
             return None;
         }
 
-        // Rarest-first among wanted pieces the peer has.
-        let wanted_enabled: Vec<bool> = self
-            .wanted
-            .iter()
-            .zip(self.enabled.iter())
-            .map(|(wanted, enabled)| *wanted && *enabled)
-            .collect();
-        let ordered = self.availability.rarest_first(&wanted_enabled);
-        for p in ordered {
-            if peer_has.has_piece(p) {
-                if let Some(req) = self.pick_block_from(p) {
-                    return Some(req);
-                }
-            }
-        }
-        None
+        // Rarest-first among wanted pieces the peer has. Scan for the
+        // smallest (availability, piece index) pair instead of materializing
+        // an order vector proportional to the torrent's total piece count on
+        // every request.
+        let piece = self.rarest_requestable_piece(peer_has)?;
+        self.pick_block_from(piece)
     }
 
     /// Pick from a source that is known to have every piece but is not counted
     /// in peer availability, such as a BEP19 webseed.
     pub fn pick_from_seed(&mut self) -> Option<BlockRequest> {
-        for &p in &self.priority.clone() {
-            if self.wanted[p] && self.enabled[p] {
-                if let Some(req) = self.pick_block_from(p) {
-                    return Some(req);
-                }
-            }
+        if let Some(piece) = self
+            .priority
+            .iter()
+            .copied()
+            .find(|&piece| self.piece_is_requestable(piece))
+        {
+            return self.pick_block_from(piece);
         }
         if self.sequential {
-            for p in self.sequential_order() {
-                if self.wanted[p] && self.enabled[p] {
-                    if let Some(req) = self.pick_block_from(p) {
-                        return Some(req);
-                    }
-                }
+            let start = self
+                .sequential_start_piece
+                .min(self.piece_count.saturating_sub(1));
+            if let Some(piece) = (start..self.piece_count)
+                .chain(0..start)
+                .find(|&piece| self.piece_is_requestable(piece))
+            {
+                return self.pick_block_from(piece);
             }
             return None;
         }
         for p in 0..self.piece_count {
-            if self.wanted[p] && self.enabled[p] {
-                if let Some(req) = self.pick_block_from(p) {
-                    return Some(req);
-                }
+            if self.piece_is_requestable(p) {
+                return self.pick_block_from(p);
             }
         }
         None
@@ -319,23 +321,94 @@ impl PiecePicker {
             return None;
         }
 
-        for piece in self.pieces_in_pick_order() {
-            if !self.wanted[piece] || !self.enabled[piece] || !peer_has.has_piece(piece) {
+        let piece = self.next_endgame_piece(peer_has, already_requested_by_peer)?;
+        let state = self.in_progress.get_mut(&piece)?;
+        let block_idx = state.next_requested_not_received(already_requested_by_peer, piece)?;
+        state.mark_requested(block_idx);
+        Some(state.block_request_for(piece, block_idx))
+    }
+
+    fn piece_is_requestable(&self, piece: usize) -> bool {
+        piece < self.piece_count
+            && self.wanted[piece]
+            && self.enabled[piece]
+            && self
+                .in_progress
+                .get(&piece)
+                .is_none_or(|state| state.next_unrequested().is_some())
+    }
+
+    fn rarest_requestable_piece<A: PieceAvailability + ?Sized>(
+        &self,
+        peer_has: &A,
+    ) -> Option<usize> {
+        let mut best = None;
+        for piece in 0..self.piece_count {
+            if !self.piece_is_requestable(piece) || !peer_has.has_piece(piece) {
                 continue;
             }
-
-            let Some(state) = self.in_progress.get_mut(&piece) else {
+            let candidate = (self.availability.count(piece), piece);
+            if candidate.0 == 0 {
                 continue;
-            };
-            let Some(block_idx) =
-                state.next_requested_not_received(already_requested_by_peer, piece)
-            else {
-                continue;
-            };
-            state.mark_requested(block_idx);
-            return Some(state.block_request_for(piece, block_idx));
+            }
+            if best.map(|current| candidate < current).unwrap_or(true) {
+                best = Some(candidate);
+            }
         }
-        None
+        best.map(|(_, piece)| piece)
+    }
+
+    fn next_endgame_piece<A: PieceAvailability + ?Sized>(
+        &self,
+        peer_has: &A,
+        already_requested_by_peer: &[BlockRequest],
+    ) -> Option<usize> {
+        let is_candidate = |piece: usize| {
+            piece < self.piece_count
+                && self.wanted[piece]
+                && self.enabled[piece]
+                && peer_has.has_piece(piece)
+                && self.in_progress.get(&piece).is_some_and(|state| {
+                    state
+                        .next_requested_not_received(already_requested_by_peer, piece)
+                        .is_some()
+                })
+        };
+
+        // Preserve the old order's priority-first behavior without cloning
+        // the complete priority vector.
+        if let Some(piece) = self
+            .priority
+            .iter()
+            .copied()
+            .find(|&piece| is_candidate(piece))
+        {
+            return Some(piece);
+        }
+
+        if self.sequential {
+            let start = self
+                .sequential_start_piece
+                .min(self.piece_count.saturating_sub(1));
+            return (start..self.piece_count)
+                .chain(0..start)
+                .find(|&piece| is_candidate(piece) && !self.priority.contains(&piece));
+        }
+
+        let mut best = None;
+        for piece in 0..self.piece_count {
+            if self.priority.contains(&piece) || !is_candidate(piece) {
+                continue;
+            }
+            let candidate = (self.availability.count(piece), piece);
+            if candidate.0 == 0 {
+                continue;
+            }
+            if best.map(|current| candidate < current).unwrap_or(true) {
+                best = Some(candidate);
+            }
+        }
+        best.map(|(_, piece)| piece)
     }
 
     fn endgame_active(&self) -> bool {
@@ -357,41 +430,6 @@ impl PiecePicker {
                         .and_then(PieceState::next_unrequested)
                         .is_none()
                 })
-    }
-
-    fn pieces_in_pick_order(&self) -> Vec<usize> {
-        let mut ordered = Vec::new();
-        for piece in self.priority.iter().copied() {
-            if !ordered.contains(&piece) {
-                ordered.push(piece);
-            }
-        }
-
-        let remaining = if self.sequential {
-            self.sequential_order()
-        } else {
-            let wanted_enabled: Vec<bool> = self
-                .wanted
-                .iter()
-                .zip(self.enabled.iter())
-                .map(|(wanted, enabled)| *wanted && *enabled)
-                .collect();
-            self.availability.rarest_first(&wanted_enabled)
-        };
-        for piece in remaining {
-            if !ordered.contains(&piece) {
-                ordered.push(piece);
-            }
-        }
-        ordered
-    }
-
-    fn sequential_order(&self) -> Vec<usize> {
-        if self.piece_count == 0 {
-            return Vec::new();
-        }
-        let start = self.sequential_start_piece.min(self.piece_count - 1);
-        (start..self.piece_count).chain(0..start).collect()
     }
 
     fn piece_length_for(&self, piece: usize) -> u32 {
@@ -528,6 +566,12 @@ impl PiecePicker {
             .collect();
         partials.sort_by_key(|(piece, _)| *piece);
         partials
+    }
+}
+
+impl PieceAvailability for PiecePicker {
+    fn has_piece(&self, piece: usize) -> bool {
+        self.have_piece(piece)
     }
 }
 

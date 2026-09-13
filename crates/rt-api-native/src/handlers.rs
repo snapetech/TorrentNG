@@ -1754,10 +1754,11 @@ pub async fn remove_torrent_tags(
 }
 
 fn normalize_tags(tags: Vec<String>) -> Vec<String> {
+    let mut seen = HashSet::new();
     let mut normalized = Vec::new();
     for tag in tags {
         let tag = tag.trim().to_owned();
-        if !tag.is_empty() && !normalized.contains(&tag) {
+        if !tag.is_empty() && seen.insert(tag.clone()) {
             normalized.push(tag);
         }
     }
