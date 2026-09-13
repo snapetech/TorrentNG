@@ -30,7 +30,7 @@ use crate::command::EngineCmd;
 use crate::egress_policy::{OutboundEgressPolicy, OutboundTargetKind};
 use crate::network_budget::GlobalNetworkBudget;
 use crate::torrent_task::TorrentCmd;
-use crate::tracker_runtime::{bounded_response_body, is_udp_tracker_url, protocol_numwant};
+use crate::tracker_runtime::{is_udp_tracker_url, protocol_numwant};
 
 const METADATA_PIECE_SIZE: usize = 16 * 1024;
 const MAX_METADATA_SIZE: u32 = 16 * 1024 * 1024;
@@ -225,6 +225,7 @@ pub async fn run_metadata_task(
                                 udp_timeout,
                                 TrackerEvent::Stopped,
                                 &egress_policy,
+                                &resources,
                             )
                             .await;
                         }
@@ -242,6 +243,7 @@ pub async fn run_metadata_task(
                                 udp_timeout,
                                 TrackerEvent::Stopped,
                                 &egress_policy,
+                                &resources,
                             )
                             .await;
                         }
@@ -332,6 +334,7 @@ pub async fn run_metadata_task(
                     udp_timeout,
                     tracker_event,
                     &egress_policy,
+                    &resources,
                 ).await;
                 if tracker_event == TrackerEvent::Started {
                     tracker_event = TrackerEvent::Empty;
@@ -365,6 +368,7 @@ pub async fn run_metadata_task(
                         udp_timeout,
                         TrackerEvent::Stopped,
                         &egress_policy,
+                        &resources,
                     )
                     .await;
                 }
@@ -667,6 +671,7 @@ async fn announce_trackers(
     udp_timeout: Duration,
     event: TrackerEvent,
     egress_policy: &OutboundEgressPolicy,
+    resources: &ResourceGovernor,
 ) -> Vec<SocketAddr> {
     let mut peers = Vec::new();
     let mut seen = HashSet::new();
@@ -681,6 +686,7 @@ async fn announce_trackers(
             udp_timeout,
             event,
             egress_policy,
+            resources,
         )
         .await
         {
@@ -724,6 +730,7 @@ async fn announce_tracker(
     udp_timeout: Duration,
     event: TrackerEvent,
     egress_policy: &OutboundEgressPolicy,
+    resources: &ResourceGovernor,
 ) -> Result<AnnounceResponse, TrackerError> {
     if is_udp_tracker_url(tracker_url) {
         announce_udp(
@@ -734,6 +741,7 @@ async fn announce_tracker(
             udp_timeout,
             event,
             egress_policy,
+            resources,
         )
         .await
     } else {
@@ -745,11 +753,13 @@ async fn announce_tracker(
             http_timeout,
             event,
             egress_policy,
+            resources,
         )
         .await
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn announce_http(
     tracker_url: &str,
     info_hash: [u8; 20],
@@ -758,6 +768,7 @@ async fn announce_http(
     http_timeout: Duration,
     event: TrackerEvent,
     egress_policy: &OutboundEgressPolicy,
+    resources: &ResourceGovernor,
 ) -> Result<AnnounceResponse, TrackerError> {
     let tracker =
         Url::parse(tracker_url).map_err(|error| TrackerError::InvalidUrl(error.to_string()))?;
@@ -785,10 +796,16 @@ async fn announce_http(
             status: response.status().as_u16(),
         });
     }
-    let bytes = bounded_response_body(response, 4 * 1024 * 1024).await?;
-    AnnounceResponse::parse_with_peer_limit(&bytes, max_peers)
+    let body = crate::tracker_runtime::bounded_response_body_with_memory(
+        response,
+        4 * 1024 * 1024,
+        resources,
+    )
+    .await?;
+    AnnounceResponse::parse_with_peer_limit(&body.bytes, max_peers)
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn announce_udp(
     tracker_url: &str,
     info_hash: [u8; 20],
@@ -797,6 +814,7 @@ async fn announce_udp(
     udp_timeout: Duration,
     event: TrackerEvent,
     egress_policy: &OutboundEgressPolicy,
+    resources: &ResourceGovernor,
 ) -> Result<AnnounceResponse, TrackerError> {
     let url = Url::parse(tracker_url).map_err(|e| TrackerError::InvalidUrl(e.to_string()))?;
     let mut addrs = egress_policy
@@ -827,7 +845,11 @@ async fn announce_udp(
         .await
         .map_err(|e| TrackerError::Network(e.to_string()))?;
 
-    let mut buf = vec![0u8; 64 * 1024];
+    let _response_lease = crate::tracker_runtime::reserve_tracker_response_bytes(
+        resources,
+        crate::tracker_runtime::MAX_TRACKER_UDP_RESPONSE_BYTES,
+    )?;
+    let mut buf = vec![0u8; crate::tracker_runtime::MAX_TRACKER_UDP_RESPONSE_BYTES];
     let n = tokio::time::timeout(udp_timeout, socket.recv(&mut buf))
         .await
         .map_err(|_| TrackerError::Timeout)?

@@ -135,7 +135,7 @@ Required policy:
 
 Current good sign:
 
-- Private torrent inbound filtering exists via `allowed_private_peers` and `peer_source_allowed` style logic.
+- Private torrent inbound filtering exists via the bounded tracker-peer cache and `peer_source_allowed` style logic.
 - DHT registration path checks private metadata before registering torrents.
 
 Remaining concern:

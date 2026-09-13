@@ -8,6 +8,7 @@
 use std::collections::HashMap;
 use std::time::Duration;
 
+use rt_metrics::{MemoryClass, MemoryLease, ResourceGovernor};
 use rt_tracker::{
     to_http_scrape_url,
     udp::{UdpAnnounceRequest, UdpAnnounceResponse, UdpConnectRequest, UdpConnectResponse},
@@ -21,6 +22,7 @@ use url::Url;
 use crate::egress_policy::{OutboundEgressPolicy, OutboundTargetKind};
 
 const MAX_TRACKER_RESPONSE_BYTES: usize = 4 * 1024 * 1024;
+pub(crate) const MAX_TRACKER_UDP_RESPONSE_BYTES: usize = 64 * 1024;
 pub(crate) const MAX_TRACKER_ANNOUNCES_IN_FLIGHT: usize = 8;
 pub(crate) const STOPPED_TRACKER_ANNOUNCE_DEADLINE: Duration = Duration::from_secs(10);
 
@@ -52,6 +54,7 @@ pub(crate) struct TrackerAnnounceContext {
     pub(crate) udp_timeout: Duration,
     pub(crate) numwant: u32,
     pub(crate) egress_policy: OutboundEgressPolicy,
+    pub(crate) resources: ResourceGovernor,
 }
 
 pub(crate) struct TrackerAnnounceSpec {
@@ -256,8 +259,10 @@ async fn announce_http(
             status: response.status().as_u16(),
         });
     }
-    let bytes = bounded_response_body(response, MAX_TRACKER_RESPONSE_BYTES).await?;
-    AnnounceResponse::parse_with_peer_limit(&bytes, context.numwant as usize)
+    let body =
+        bounded_response_body_with_memory(response, MAX_TRACKER_RESPONSE_BYTES, &context.resources)
+            .await?;
+    AnnounceResponse::parse_with_peer_limit(&body.bytes, context.numwant as usize)
 }
 
 async fn announce_udp(
@@ -295,7 +300,9 @@ async fn announce_udp(
         .await
         .map_err(|e| TrackerError::Network(e.to_string()))?;
 
-    let mut buf = vec![0u8; 64 * 1024];
+    let _response_lease =
+        reserve_tracker_response_bytes(&context.resources, MAX_TRACKER_UDP_RESPONSE_BYTES)?;
+    let mut buf = vec![0u8; MAX_TRACKER_UDP_RESPONSE_BYTES];
     let n = tokio::time::timeout(context.udp_timeout, socket.recv(&mut buf))
         .await
         .map_err(|_| TrackerError::Timeout)?
@@ -373,8 +380,52 @@ async fn scrape_tracker(
             status: status.as_u16(),
         });
     }
-    let body = bounded_response_body(resp, MAX_TRACKER_RESPONSE_BYTES).await?;
-    ScrapeStats::parse(&body, &context.info_hash)
+    let body =
+        bounded_response_body_with_memory(resp, MAX_TRACKER_RESPONSE_BYTES, &context.resources)
+            .await?;
+    ScrapeStats::parse(&body.bytes, &context.info_hash)
+}
+
+pub(crate) struct LeasedResponseBody {
+    pub(crate) bytes: Vec<u8>,
+    pub(crate) _lease: MemoryLease,
+}
+
+pub(crate) fn reserve_tracker_response_bytes(
+    resources: &ResourceGovernor,
+    bytes: usize,
+) -> Result<MemoryLease, TrackerError> {
+    resources
+        .try_acquire(
+            MemoryClass::TrackerPeers,
+            u64::try_from(bytes).unwrap_or(u64::MAX),
+        )
+        .ok_or_else(|| TrackerError::Network("tracker response memory budget exhausted".to_owned()))
+}
+
+pub(crate) async fn bounded_response_body_with_memory(
+    response: reqwest::Response,
+    max_bytes: usize,
+    resources: &ResourceGovernor,
+) -> Result<LeasedResponseBody, TrackerError> {
+    if response
+        .content_length()
+        .is_some_and(|length| length > max_bytes as u64)
+    {
+        return Err(TrackerError::ParseError(format!(
+            "response exceeds {max_bytes} byte limit"
+        )));
+    }
+    // Reserve the full allowed body size, not merely Content-Length. A peer
+    // can omit or misstate that header, while the streaming reader still
+    // permits any body up to `max_bytes`; the lease must cover that worst
+    // case so the governor cannot be bypassed by an inconsistent response.
+    let lease = reserve_tracker_response_bytes(resources, max_bytes)?;
+    let bytes = bounded_response_body(response, max_bytes).await?;
+    Ok(LeasedResponseBody {
+        bytes,
+        _lease: lease,
+    })
 }
 
 /// Read an HTTP response with a hard byte ceiling before parsing it.
@@ -414,8 +465,10 @@ pub(crate) async fn bounded_response_body(
 #[cfg(test)]
 mod tests {
     use super::{
-        is_udp_tracker_url, protocol_numwant, TrackerWorkers, MAX_TRACKER_ANNOUNCES_IN_FLIGHT,
+        is_udp_tracker_url, protocol_numwant, reserve_tracker_response_bytes, TrackerWorkers,
+        MAX_TRACKER_ANNOUNCES_IN_FLIGHT,
     };
+    use rt_metrics::{MemoryClass, ResourceGovernor, ResourceGovernorConfig, MEMORY_CLASS_COUNT};
 
     #[test]
     fn tracker_scheme_dispatch_is_case_insensitive() {
@@ -439,5 +492,22 @@ mod tests {
     fn protocol_peer_limit_does_not_wrap() {
         assert_eq!(protocol_numwant(200), 200);
         assert_eq!(protocol_numwant(usize::MAX), u32::MAX);
+    }
+
+    #[test]
+    fn tracker_response_buffer_reservation_is_shared_and_released() {
+        let mut class_caps_bytes = [0; MEMORY_CLASS_COUNT];
+        class_caps_bytes[MemoryClass::TrackerPeers as usize] = 64;
+        let governor = ResourceGovernor::new(ResourceGovernorConfig {
+            total_cap_bytes: 64,
+            class_caps_bytes,
+            pressure_constrained_pct: 75,
+            pressure_critical_pct: 90,
+        });
+
+        let lease = reserve_tracker_response_bytes(&governor, 64).unwrap();
+        assert!(reserve_tracker_response_bytes(&governor, 1).is_err());
+        drop(lease);
+        assert!(reserve_tracker_response_bytes(&governor, 64).is_ok());
     }
 }

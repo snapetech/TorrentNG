@@ -21,9 +21,18 @@ const DHT_ANNOUNCED_PEERS_GLOBAL_CAP: usize = 16_384;
 const DHT_TRACKED_TORRENTS_CAP: usize = 16_384;
 const DHT_COMMAND_GENERATION_CAP: usize = DHT_TRACKED_TORRENTS_CAP.saturating_mul(2);
 const DHT_QUERIED_NODES_PER_INFO_HASH_CAP: usize = 256;
+// Keep the aggregate queried-node history bounded across all tracked
+// torrents. The old per-info-hash limit alone allowed 16,384 torrents to
+// retain more than four million socket addresses before any admission path
+// noticed the growth.
+const DHT_QUERIED_NODES_GLOBAL_CAP: usize = 262_144;
 const DHT_OUTSTANDING_QUERY_CAP: usize = 8_192;
 const DHT_PENDING_FORWARD_TORRENT_CAP: usize = 1_024;
 const DHT_PENDING_FORWARD_PEERS_PER_TORRENT_CAP: usize = 512;
+// Bound the aggregate peer addresses retained while torrent mailboxes are
+// full. The per-torrent cap alone allowed 1,024 stalled torrents to retain
+// more than half a million SocketAddr values.
+const DHT_PENDING_FORWARD_PEERS_GLOBAL_CAP: usize = 65_536;
 const DHT_INGRESS_GLOBAL_PACKETS_PER_SECOND: u32 = 2_048;
 const DHT_INGRESS_PACKETS_PER_IP_PER_SECOND: u32 = 64;
 const DHT_INGRESS_IP_STATE_CAP: usize = 4_096;
@@ -799,13 +808,33 @@ impl DhtTask {
     }
 
     async fn search_torrents(&mut self) {
+        let mut query_budget = DHT_QUERIED_NODES_GLOBAL_CAP;
         for info_hash in self.torrents.keys().copied().collect::<Vec<_>>() {
-            self.search_torrent(info_hash, false).await;
+            if query_budget == 0 {
+                break;
+            }
+            query_budget = self
+                .search_torrent_with_budget(info_hash, false, query_budget)
+                .await;
         }
     }
 
     async fn search_torrent(&mut self, info_hash: [u8; 20], force_restart: bool) {
+        self.search_torrent_with_budget(info_hash, force_restart, DHT_QUERIED_NODES_GLOBAL_CAP)
+            .await;
+    }
+
+    async fn search_torrent_with_budget(
+        &mut self,
+        info_hash: [u8; 20],
+        force_restart: bool,
+        mut query_budget: usize,
+    ) -> usize {
         self.maybe_restart_lookup(info_hash, force_restart);
+        query_budget = self
+            .remaining_queried_node_budget()
+            .min(query_budget)
+            .min(DHT_QUERIED_NODES_GLOBAL_CAP);
         let target = NodeId::from_bytes(info_hash);
         let nodes: Vec<_> = self
             .table
@@ -815,11 +844,17 @@ impl DhtTask {
             .collect();
         if nodes.is_empty() {
             self.bootstrap().await;
-            return;
+            return query_budget;
         }
         for addr in nodes {
-            self.send_get_peers(info_hash, addr).await;
+            if query_budget == 0 {
+                break;
+            }
+            if self.send_get_peers(info_hash, addr, query_budget).await {
+                query_budget -= 1;
+            }
         }
+        query_budget
     }
 
     fn maybe_restart_lookup(&mut self, info_hash: [u8; 20], force_restart: bool) {
@@ -841,6 +876,9 @@ impl DhtTask {
         if !self.torrents.contains_key(&info_hash) {
             return;
         }
+        let mut query_budget = self
+            .remaining_queried_node_budget()
+            .min(DHT_QUERIED_NODES_GLOBAL_CAP);
         let target = NodeId::from_bytes(info_hash);
         let addrs: Vec<_> = self
             .table
@@ -861,26 +899,47 @@ impl DhtTask {
                 .collect();
 
         for addr in addrs.into_iter().take(K) {
-            self.send_get_peers(info_hash, addr).await;
+            if query_budget == 0 {
+                break;
+            }
+            if self.send_get_peers(info_hash, addr, query_budget).await {
+                query_budget -= 1;
+            }
         }
     }
 
-    async fn send_get_peers(&mut self, info_hash: [u8; 20], addr: SocketAddr) {
+    fn remaining_queried_node_budget(&self) -> usize {
+        let used = self
+            .queried_nodes
+            .values()
+            .fold(0usize, |total, nodes| total.saturating_add(nodes.len()));
+        DHT_QUERIED_NODES_GLOBAL_CAP.saturating_sub(used)
+    }
+
+    async fn send_get_peers(
+        &mut self,
+        info_hash: [u8; 20],
+        addr: SocketAddr,
+        query_budget: usize,
+    ) -> bool {
         let SocketAddr::V4(v4) = addr else {
-            return;
+            return false;
         };
+        if query_budget == 0 {
+            return false;
+        }
         if self.outstanding.len() >= DHT_OUTSTANDING_QUERY_CAP {
-            return;
+            return false;
         }
         if self
             .queried_nodes
             .get(&info_hash)
             .is_some_and(|nodes| nodes.len() >= DHT_QUERIED_NODES_PER_INFO_HASH_CAP)
         {
-            return;
+            return false;
         }
         if !self.queried_nodes.entry(info_hash).or_default().insert(v4) {
-            return;
+            return false;
         }
         let tx = self.transaction_id();
         let msg = KrpcMessage::Query {
@@ -907,7 +966,7 @@ impl DhtTask {
             if empty {
                 self.queried_nodes.remove(&info_hash);
             }
-            return;
+            return false;
         }
         if let Err(e) = self.socket.send_to(&msg.encode(), addr).await {
             self.outstanding.remove(&tx);
@@ -928,7 +987,9 @@ impl DhtTask {
                 error = %e,
                 "DHT get_peers send failed"
             );
+            return false;
         }
+        true
     }
 
     async fn announce_peer_to_node(
@@ -1018,6 +1079,24 @@ impl DhtTask {
         cmd_tx: mpsc::Sender<TorrentCmd>,
         peers: Vec<SocketAddr>,
     ) {
+        let mut pending_peer_count = self
+            .pending_peer_forwards
+            .values()
+            .fold(0usize, |total, pending| {
+                total.saturating_add(pending.peers.len())
+            });
+        if !self.pending_peer_forwards.contains_key(&info_hash)
+            && pending_peer_count >= DHT_PENDING_FORWARD_PEERS_GLOBAL_CAP
+        {
+            debug!(
+                component = "dht",
+                operation = "forward_peers",
+                result = "pending_peer_global_cap_exceeded",
+                cap = DHT_PENDING_FORWARD_PEERS_GLOBAL_CAP,
+                "dropping DHT peers because the global pending-forward peer cap is full"
+            );
+            return;
+        }
         if !self.pending_peer_forwards.contains_key(&info_hash)
             && self.pending_peer_forwards.len() >= DHT_PENDING_FORWARD_TORRENT_CAP
         {
@@ -1052,7 +1131,18 @@ impl DhtTask {
                 );
                 break;
             }
+            if pending_peer_count >= DHT_PENDING_FORWARD_PEERS_GLOBAL_CAP {
+                debug!(
+                    component = "dht",
+                    operation = "forward_peers",
+                    result = "pending_peer_global_cap_exceeded",
+                    cap = DHT_PENDING_FORWARD_PEERS_GLOBAL_CAP,
+                    "dropping excess DHT peers because the global pending-forward peer cap is full"
+                );
+                break;
+            }
             pending.peers.push(peer);
+            pending_peer_count = pending_peer_count.saturating_add(1);
         }
     }
 
@@ -1626,6 +1716,81 @@ mod tests {
             peers.values().map(Vec::len).sum::<usize>(),
             DHT_ANNOUNCED_PEERS_GLOBAL_CAP
         );
+    }
+
+    #[tokio::test]
+    async fn pending_peer_forward_global_cap_bounds_retained_addresses() {
+        let socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        socket.set_nonblocking(true).unwrap();
+        let socket = UdpSocket::from_std(socket).unwrap();
+        let local_id = NodeId::from_bytes([1; 20]);
+        let first_hash = [1; 20];
+        let second_hash = [2; 20];
+        let third_hash = [3; 20];
+        let (cmd_tx, _cmd_rx) = mpsc::channel(1);
+        let half = DHT_PENDING_FORWARD_PEERS_GLOBAL_CAP / 2;
+        let first_peers = (0..half)
+            .map(|port| SocketAddr::from(([198, 51, 100, 1], port as u16)))
+            .collect();
+        let second_peers = (0..half)
+            .map(|port| SocketAddr::from(([198, 51, 100, 2], port as u16)))
+            .collect();
+        let mut task = DhtTask {
+            local_id,
+            table: RoutingTable::new(local_id),
+            socket,
+            listen_port: 6881,
+            bootstrap_nodes: Vec::new(),
+            next_tx: 1,
+            outstanding: HashMap::new(),
+            queried_nodes: HashMap::new(),
+            torrents: HashMap::new(),
+            announced_peers: HashMap::new(),
+            last_full_lookup: HashMap::new(),
+            pending_peer_forwards: HashMap::from([
+                (
+                    first_hash,
+                    PendingPeerForward {
+                        cmd_tx: cmd_tx.clone(),
+                        peers: first_peers,
+                    },
+                ),
+                (
+                    second_hash,
+                    PendingPeerForward {
+                        cmd_tx: cmd_tx.clone(),
+                        peers: second_peers,
+                    },
+                ),
+            ]),
+            generations: HashMap::new(),
+        };
+
+        assert_eq!(
+            task.pending_peer_forwards
+                .values()
+                .map(|pending| pending.peers.len())
+                .sum::<usize>(),
+            DHT_PENDING_FORWARD_PEERS_GLOBAL_CAP
+        );
+
+        task.queue_pending_peer_forward(
+            first_hash,
+            cmd_tx.clone(),
+            vec![SocketAddr::from(([198, 51, 100, 1], 60_000))],
+        );
+        assert_eq!(
+            task.pending_peer_forwards[&first_hash].peers.len(),
+            half,
+            "an existing pending torrent must not bypass the global peer cap"
+        );
+
+        task.queue_pending_peer_forward(
+            third_hash,
+            cmd_tx,
+            vec![SocketAddr::from(([198, 51, 100, 3], 60_000))],
+        );
+        assert!(!task.pending_peer_forwards.contains_key(&third_hash));
     }
 
     #[tokio::test]

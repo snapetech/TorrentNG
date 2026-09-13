@@ -2001,6 +2001,7 @@ impl TorrentTask {
             udp_timeout: self.udp_timeout,
             numwant: protocol_numwant(self.peer_capacity()),
             egress_policy: self.egress_policy,
+            resources: self.resources.clone(),
         }
     }
 

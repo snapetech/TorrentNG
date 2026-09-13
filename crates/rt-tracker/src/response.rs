@@ -1,11 +1,24 @@
 use std::net::{IpAddr, SocketAddr};
 
-use rt_bencode::{decode, BValue};
+use rt_bencode::{BValue, Decoder};
 
 use crate::{
     error::TrackerError,
     peer::{parse_compact_peers_v4_with_limit, parse_compact_peers_v6_with_limit, Peer},
 };
+
+// Tracker response bodies are byte-bounded by the engine, but a bencoded
+// response can still spend far more heap than its bytes when it contains a
+// large number of tiny nested lists/dictionaries. Keep parser allocations
+// bounded independently of the peer-vector limit.
+const MAX_TRACKER_RESPONSE_NODES: usize = 16 * 1024;
+
+fn decode_tracker_response(bytes: &[u8]) -> Result<BValue<'_>, TrackerError> {
+    Decoder::new(bytes)
+        .with_max_nodes(MAX_TRACKER_RESPONSE_NODES)
+        .decode()
+        .map_err(|error| TrackerError::ParseError(error.to_string()))
+}
 
 /// Current status of a tracker.
 #[derive(Debug, Clone)]
@@ -57,7 +70,7 @@ pub struct ScrapeStats {
 
 impl ScrapeStats {
     pub fn parse(bytes: &[u8], info_hash: &[u8]) -> Result<Self, TrackerError> {
-        let val = decode(bytes).map_err(|e| TrackerError::ParseError(e.to_string()))?;
+        let val = decode_tracker_response(bytes)?;
         if let Some(reason) = val.get(b"failure reason") {
             let msg = reason
                 .as_bytes()
@@ -111,7 +124,7 @@ impl AnnounceResponse {
     /// know their connection capacity should use this method so a tracker
     /// cannot force an unnecessarily large temporary peer vector.
     pub fn parse_with_peer_limit(bytes: &[u8], max_peers: usize) -> Result<Self, TrackerError> {
-        let val = decode(bytes).map_err(|e| TrackerError::ParseError(e.to_string()))?;
+        let val = decode_tracker_response(bytes)?;
 
         // Check for failure reason first
         if let Some(reason) = val.get(b"failure reason") {
@@ -328,6 +341,20 @@ mod tests {
         let raw = make_response(3600, Some(&[]), None);
         let resp = AnnounceResponse::parse(&raw).unwrap();
         assert!(resp.peers.is_empty());
+    }
+
+    #[test]
+    fn response_parser_rejects_excessive_node_count() {
+        let mut raw = b"d4:rootl".to_vec();
+        for _ in 0..MAX_TRACKER_RESPONSE_NODES {
+            raw.extend_from_slice(b"le");
+        }
+        raw.push(b'e');
+
+        assert!(matches!(
+            decode_tracker_response(&raw),
+            Err(TrackerError::ParseError(message)) if message.contains("node limit")
+        ));
     }
 
     #[test]
