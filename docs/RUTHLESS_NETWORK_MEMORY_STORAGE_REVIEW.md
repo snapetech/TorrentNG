@@ -208,9 +208,9 @@ Concerns:
 
 Required patch direction:
 
-- Replace peer piece availability Vec<bool> with bitset/bitmap storage.
+- Keep packed peer bitmap storage and add coverage for cap rejection and large-piece-count profiles.
 - Add per-torrent configurable event channel capacity.
-- Charge peer availability maps and outstanding request storage to `MemoryClass::PeerBuffer` or a new peer-state class.
+- Charge any remaining variable peer request/command storage to `MemoryClass::PeerBuffer` or a new peer-state class if measurement shows the current capacity estimate is insufficient.
 - Make request pipeline adapt to total ResourceGovernor pressure, not only piece assembly bytes.
 
 ## P1: database actor instead of sync mutex inside async engine

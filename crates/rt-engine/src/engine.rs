@@ -10125,7 +10125,9 @@ impl Engine {
         resources.classes[storage_frame].used_bytes = storage.in_use_bytes();
         resources.classes[storage_frame].denied_allocations = storage.denied_allocations();
         let piece_assembly = MemoryClass::PieceAssembly as usize;
-        resources.classes[piece_assembly].used_bytes = stats.piece_assembly_bytes;
+        resources.classes[piece_assembly].used_bytes = resources.classes[piece_assembly]
+            .used_bytes
+            .max(stats.piece_assembly_bytes);
         let peer_buffer = MemoryClass::PeerBuffer as usize;
         let governor_peer_buffer_bytes = resources.classes[peer_buffer].used_bytes;
         resources.classes[peer_buffer].used_bytes = governor_peer_buffer_bytes
@@ -12839,7 +12841,13 @@ fn finalize_engine_stats_resources(
     resources.classes[storage_frame].used_bytes = storage.in_use_bytes();
     resources.classes[storage_frame].denied_allocations = storage.denied_allocations();
     let piece_assembly = MemoryClass::PieceAssembly as usize;
-    resources.classes[piece_assembly].used_bytes = stats.piece_assembly_bytes;
+    // Live piece assemblies now own governor leases. Keep the larger of the
+    // live lease total and the collected actor gauge so a slow/stale stats
+    // query cannot hide allocations, while avoiding double-counting the
+    // same bytes in both sources.
+    resources.classes[piece_assembly].used_bytes = resources.classes[piece_assembly]
+        .used_bytes
+        .max(stats.piece_assembly_bytes);
     let peer_buffer = MemoryClass::PeerBuffer as usize;
     let governor_peer_buffer_bytes = resources.classes[peer_buffer].used_bytes;
     resources.classes[peer_buffer].used_bytes = governor_peer_buffer_bytes
@@ -21307,6 +21315,27 @@ mod tests {
         assert_eq!(
             resources.classes[MemoryClass::PeerBuffer as usize].used_bytes,
             64 + 1 + 2 + 3
+        );
+        drop(lease);
+    }
+
+    #[test]
+    fn engine_stats_preserve_live_piece_assembly_leases_without_double_counting() {
+        let governor = test_resource_governor();
+        let lease = governor
+            .try_acquire(MemoryClass::PieceAssembly, 64)
+            .expect("test piece-assembly lease should fit");
+        let mut stats = EngineStats {
+            piece_assembly_bytes: 64,
+            ..Default::default()
+        };
+
+        finalize_engine_stats_resources(&mut stats, governor.snapshot(), 75, 90);
+
+        let resources = stats.resources.expect("resource snapshot");
+        assert_eq!(
+            resources.classes[MemoryClass::PieceAssembly as usize].used_bytes,
+            64
         );
         drop(lease);
     }

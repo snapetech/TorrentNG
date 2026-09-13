@@ -449,6 +449,28 @@ fn reserve_peer_bitfield_bytes(
         .ok_or_else(|| anyhow::anyhow!("peer bitfield allocation of {bytes} bytes denied"))
 }
 
+fn reserve_peer_event_bytes(
+    resources: &ResourceGovernor,
+    bytes: usize,
+) -> anyhow::Result<MemoryLease> {
+    let bytes = u64::try_from(bytes)
+        .map_err(|_| anyhow::anyhow!("peer event allocation does not fit in u64"))?;
+    resources
+        .try_acquire(MemoryClass::PeerBuffer, bytes)
+        .ok_or_else(|| anyhow::anyhow!("peer event allocation of {bytes} bytes denied"))
+}
+
+fn reserve_piece_assembly_bytes(
+    resources: &ResourceGovernor,
+    bytes: usize,
+) -> anyhow::Result<MemoryLease> {
+    let bytes = u64::try_from(bytes)
+        .map_err(|_| anyhow::anyhow!("piece assembly allocation does not fit in u64"))?;
+    resources
+        .try_acquire(MemoryClass::PieceAssembly, bytes)
+        .ok_or_else(|| anyhow::anyhow!("piece assembly allocation of {bytes} bytes denied"))
+}
+
 fn remember_tracker_peers_bounded(
     known: &mut HashSet<SocketAddr>,
     allowed_private: &mut HashSet<SocketAddr>,
@@ -489,14 +511,29 @@ struct PieceAssembly {
     data: Vec<u8>,
     received: Vec<bool>,
     last_used: Instant,
+    /// The data allocation is part of the process-wide piece-assembly
+    /// budget for as long as this assembly remains live. Tests that exercise
+    /// the standalone value constructor may omit the lease; production
+    /// insertion always uses `with_memory_lease`.
+    _memory_lease: Option<MemoryLease>,
 }
 
 impl PieceAssembly {
+    #[cfg(test)]
     fn new(len: usize) -> Self {
+        Self::new_with_lease(len, None)
+    }
+
+    fn with_memory_lease(len: usize, memory_lease: MemoryLease) -> Self {
+        Self::new_with_lease(len, Some(memory_lease))
+    }
+
+    fn new_with_lease(len: usize, memory_lease: Option<MemoryLease>) -> Self {
         Self {
             data: vec![0; len],
             received: vec![false; len.div_ceil(MAX_BLOCK_SIZE as usize)],
             last_used: Instant::now(),
+            _memory_lease: memory_lease,
         }
     }
 
@@ -620,6 +657,7 @@ enum PeerEvent {
         peer: SocketAddr,
         id: PeerId,
         block: BlockEvent,
+        _memory_lease: Option<MemoryLease>,
     },
     Uploaded {
         peer: SocketAddr,
@@ -648,6 +686,7 @@ enum PeerEvent {
         id: PeerId,
         peers: Vec<SocketAddr>,
         dropped: Vec<SocketAddr>,
+        _memory_lease: MemoryLease,
     },
 }
 
@@ -2794,7 +2833,12 @@ impl TorrentTask {
                     handle.interested = false;
                 }
             }
-            PeerEvent::Piece { peer, block, .. } => {
+            PeerEvent::Piece {
+                peer,
+                block,
+                _memory_lease,
+                ..
+            } => {
                 // A peer task can race shutdown and leave one final block in
                 // the bounded event channel. Once its handle is gone, that
                 // block is stale and must not be written after a recheck or a
@@ -3199,9 +3243,12 @@ impl TorrentTask {
         let inserted = if self.piece_assemblies.contains_key(&block.piece) {
             false
         } else {
+            let memory_lease = reserve_piece_assembly_bytes(&self.resources, len)?;
             self.piece_assembly_bytes = self.piece_assembly_bytes.saturating_add(len);
-            self.piece_assemblies
-                .insert(block.piece, PieceAssembly::new(len));
+            self.piece_assemblies.insert(
+                block.piece,
+                PieceAssembly::with_memory_lease(len, memory_lease),
+            );
             true
         };
 
@@ -6172,7 +6219,23 @@ async fn run_peer_loop(
                     }
                     Message::Piece { piece, begin, data } => {
                         let data_len = data.len() as u32;
+                        let memory_lease = match reserve_peer_event_bytes(&upload.resources, data.len())
+                        {
+                            Ok(lease) => lease,
+                            Err(error) => {
+                                debug!(
+                                    component = "peer",
+                                    operation = "reserve_piece_event_memory",
+                                    peer = %addr,
+                                    result = "denied",
+                                    error = %error,
+                                    "disconnecting peer because its received block exceeds the memory budget"
+                                );
+                                break;
+                            }
+                        };
                         if !take_matching_outstanding(&mut outstanding, piece, begin, data_len) {
+                            drop(memory_lease);
                             warn!(
                                 peer = %addr,
                                 piece,
@@ -6196,6 +6259,7 @@ async fn run_peer_loop(
                                     offset: begin,
                                     data: bytes::Bytes::from(data),
                                 },
+                                _memory_lease: Some(memory_lease),
                             },
                         )
                         .await
@@ -6406,6 +6470,28 @@ async fn run_peer_loop(
                         }
                         match parse_ut_pex_peers(&payload) {
                             Ok(pex) if !pex.added.is_empty() || !pex.dropped.is_empty() => {
+                                let memory_bytes = pex
+                                    .added
+                                    .capacity()
+                                    .saturating_add(pex.dropped.capacity())
+                                    .saturating_mul(std::mem::size_of::<SocketAddr>());
+                                let memory_lease = match reserve_peer_event_bytes(
+                                    &upload.resources,
+                                    memory_bytes,
+                                ) {
+                                    Ok(lease) => lease,
+                                    Err(error) => {
+                                        debug!(
+                                            component = "peer",
+                                            operation = "reserve_pex_event_memory",
+                                            peer = %addr,
+                                            result = "denied",
+                                            error = %error,
+                                            "disconnecting peer because its peer-exchange payload exceeds the memory budget"
+                                        );
+                                        break;
+                                    }
+                                };
                                 if !send_peer_event(
                                     &peer_event_tx,
                                     PeerEvent::PeerExchange {
@@ -6413,6 +6499,7 @@ async fn run_peer_loop(
                                         id: peer_id,
                                         peers: pex.added,
                                         dropped: pex.dropped,
+                                        _memory_lease: memory_lease,
                                     },
                                 )
                                 .await
@@ -8228,6 +8315,32 @@ mod tests {
     }
 
     #[test]
+    fn piece_assembly_reservation_is_owned_until_assembly_drop() {
+        let bytes = 4 * 1024usize;
+        let mut class_caps_bytes = [0; rt_metrics::MEMORY_CLASS_COUNT];
+        class_caps_bytes[MemoryClass::PieceAssembly as usize] = bytes as u64;
+        let governor = ResourceGovernor::new(rt_metrics::ResourceGovernorConfig {
+            total_cap_bytes: bytes as u64,
+            class_caps_bytes,
+            pressure_constrained_pct: 75,
+            pressure_critical_pct: 90,
+        });
+
+        let lease = reserve_piece_assembly_bytes(&governor, bytes).unwrap();
+        let assembly = PieceAssembly::with_memory_lease(bytes, lease);
+        assert_eq!(
+            governor.snapshot().classes[MemoryClass::PieceAssembly as usize].used_bytes,
+            bytes as u64
+        );
+        assert!(reserve_piece_assembly_bytes(&governor, 1).is_err());
+        drop(assembly);
+        assert_eq!(
+            governor.snapshot().classes[MemoryClass::PieceAssembly as usize].used_bytes,
+            0
+        );
+    }
+
+    #[test]
     fn encodes_piece_flags_to_peer_wire_bitfield_msb_first() {
         assert_eq!(
             pieces_to_bitfield(&[true, false, true, false, false, false, false, false, true]),
@@ -9964,6 +10077,7 @@ mod tests {
                 offset: 0,
                 data: bytes::Bytes::from_static(b"late"),
             },
+            _memory_lease: None,
         };
 
         assert!(peer_event_if_active(false, active_event).is_some());

@@ -627,7 +627,7 @@ sync-loop counters because it polls the selected client adapter.
 | `torrentng_storage_peer_read_elevator_*` | gauge/counter | Peer-read elevator enablement, queue state, queue-full backpressure, backend batches, and coalesced requests |
 | `torrentng_storage_page_cache_advise_*` | counter | Page-cache advice calls (`SEQUENTIAL`, `WILLNEED`, `DONTNEED`) and failures from the storage scheduler |
 | `torrentng_storage_sparse_*` | counter | Sparse recheck data extents, skipped hole bytes, and seek fallback count |
-| `torrentng_piece_assembly_*` | gauge/counter | In-memory completed-piece assembly buffers, bytes, and budget evictions |
+| `torrentng_piece_assembly_*` | gauge/counter | In-memory completed-piece assembly buffers, bytes, governor-denied allocations, and budget evictions |
 | `torrentng_peer_request_window_reductions_total` | counter | Peer request refills reduced because memory pressure limited in-flight piece data |
 | `torrentng_peer_{rx,tx}_buffer_bytes` | gauge | Process-owned peer buffer pressure from outstanding receive requests and upload buffers; upload block assembly and queued peer bitfields are also charged to the `peer_buffer` memory class while in flight |
 | `torrentng_peer_command_queue_*` | gauge/counter | Active peer command queue capacity, depth, and full-send backpressure events |
