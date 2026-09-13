@@ -5,7 +5,8 @@
 //! complete torrents resume seeding without a full recheck. The source client
 //! state is never modified.
 
-use std::io::{self, BufRead, Write};
+use std::fs::File;
+use std::io::{self, BufRead, Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -20,6 +21,8 @@ use rt_migrate::{
     MigrationPlan, MigrationSource, MigrationTorrent, PathRemap, ResumeConfidence,
 };
 use serde::Serialize;
+
+const MAX_TORRENT_BLOB_BYTES: u64 = 64 * 1024 * 1024;
 
 const USAGE: &str = "\
 torrentngd migrate — import existing client state into the TorrentNG client
@@ -303,6 +306,54 @@ pub(crate) fn confirm<R: BufRead, W: Write>(
     ))
 }
 
+fn read_torrent_blob(path: &Path) -> anyhow::Result<Vec<u8>> {
+    let file =
+        File::open(path).with_context(|| format!("opening .torrent source {}", path.display()))?;
+    if file.metadata()?.len() > MAX_TORRENT_BLOB_BYTES {
+        bail!(
+            ".torrent source {} exceeds {} bytes",
+            path.display(),
+            MAX_TORRENT_BLOB_BYTES
+        );
+    }
+    let mut raw = Vec::new();
+    file.take(MAX_TORRENT_BLOB_BYTES.saturating_add(1))
+        .read_to_end(&mut raw)
+        .with_context(|| format!("reading .torrent source {}", path.display()))?;
+    if raw.len() as u64 > MAX_TORRENT_BLOB_BYTES {
+        bail!(
+            ".torrent source {} grew beyond {} bytes while it was being read",
+            path.display(),
+            MAX_TORRENT_BLOB_BYTES
+        );
+    }
+    Ok(raw)
+}
+
+fn persist_torrent_blobs(plan: &MigrationPlan, blob_dir: &Path) -> anyhow::Result<usize> {
+    rt_storage::create_dir_all_no_follow(blob_dir)
+        .with_context(|| format!("creating {}", blob_dir.display()))?;
+    let mut blobs = 0usize;
+    for torrent in &plan.torrents {
+        let raw = read_torrent_blob(&torrent.torrent_path)?;
+        let destination = blob_dir.join(format!("{}.torrent", torrent.info_hash));
+        rt_storage::write_file_no_follow_sync(&destination, &raw).with_context(|| {
+            format!(
+                "writing imported .torrent blob {} from {}",
+                destination.display(),
+                torrent.torrent_path.display()
+            )
+        })?;
+        blobs += 1;
+    }
+    if blobs > 0 {
+        rt_storage::sync_dir_no_follow(blob_dir).with_context(|| {
+            format!("syncing imported .torrent blobs in {}", blob_dir.display())
+        })?;
+    }
+    Ok(blobs)
+}
+
 /// Entry point for `torrentngd migrate <args>`.
 pub fn run(args: &[String]) -> anyhow::Result<()> {
     let command = match parse_args(args) {
@@ -406,23 +457,16 @@ pub fn run(args: &[String]) -> anyhow::Result<()> {
         .with_context(|| format!("opening database {}", db_path.display()))?;
     rt_db::migrate(&conn).context("migrating database schema")?;
 
+    // Blob persistence must succeed before any import row is committed. A
+    // missing blob makes the row unusable on restart, so reporting a
+    // successful DB/fast-resume import while silently dropping the blob is
+    // worse than failing the apply operation.
+    let blob_dir = config.daemon.session_dir.join("torrents");
+    let blobs = persist_torrent_blobs(&plan, &blob_dir)?;
+
     let result = plan
         .apply_native_import(&mut conn, &fastresume_dir, &options, args.policy)
         .map_err(|e| anyhow!("TorrentNG-client import failed: {e}"))?;
-
-    // Persist the .torrent metainfo into the engine blob dir so the TorrentNG
-    // state is complete: the daemon can load it, and `torrentngd export` can
-    // project it back out without first running the daemon.
-    let blob_dir = config.daemon.session_dir.join("torrents");
-    std::fs::create_dir_all(&blob_dir)
-        .with_context(|| format!("creating {}", blob_dir.display()))?;
-    let mut blobs = 0usize;
-    for torrent in &plan.torrents {
-        let dest = blob_dir.join(format!("{}.torrent", torrent.info_hash));
-        if std::fs::copy(&torrent.torrent_path, &dest).is_ok() {
-            blobs += 1;
-        }
-    }
 
     println!(
         "\nImported {} torrent(s), {} file(s), {} tracker(s); {blobs} .torrent blob(s) persisted.",
@@ -549,6 +593,52 @@ mod tests {
         assert!(!confirm(io::Cursor::new(b"no\n"), &mut io::sink(), p).unwrap());
         assert!(!confirm(io::Cursor::new(b""), &mut io::sink(), p).unwrap());
         assert!(String::from_utf8(out).unwrap().contains("Type 'yes'"));
+    }
+
+    #[test]
+    fn blob_persistence_reports_source_errors_before_import() {
+        let target = tempfile::tempdir().unwrap();
+        let source = target.path().join("missing.torrent");
+        let info_hash = "a".repeat(40);
+        let plan = MigrationPlan {
+            source: MigrationSource::Generic,
+            root: target.path().to_path_buf(),
+            torrents: vec![MigrationTorrent {
+                info_hash: info_hash.clone(),
+                name: "missing".to_owned(),
+                total_length: 1,
+                piece_length: 1,
+                piece_count: 1,
+                is_private: false,
+                files: Vec::new(),
+                torrent_path: source,
+                resume_path: None,
+                save_path: None,
+                category: None,
+                tags: Vec::new(),
+                uploaded: None,
+                downloaded: None,
+                completed: None,
+                added_at: None,
+                completed_at: None,
+                paused: None,
+                tracker_activity: rt_migrate::TrackerActivity::default(),
+                resume_confidence: ResumeConfidence::None,
+                fastresume: None,
+                trackers: Vec::new(),
+                warnings: Vec::new(),
+            }],
+            auxiliary_artifacts: Vec::new(),
+            skipped: Vec::new(),
+        };
+
+        let error = persist_torrent_blobs(&plan, &target.path().join("torrents")).unwrap_err();
+        assert!(error.to_string().contains("opening .torrent source"));
+        assert!(!target
+            .path()
+            .join("torrents")
+            .join(format!("{info_hash}.torrent"))
+            .exists());
     }
 
     #[test]

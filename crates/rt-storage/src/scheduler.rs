@@ -1,8 +1,8 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::fs::File;
 use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, Mutex, Weak};
 use std::time::{Duration, Instant};
 
@@ -469,6 +469,24 @@ impl FilePool {
 type BlockingJob = Box<dyn FnOnce() + Send + 'static>;
 
 #[derive(Debug)]
+struct BlockingJobCancelGuard(Arc<AtomicU8>);
+
+impl Drop for BlockingJobCancelGuard {
+    fn drop(&mut self) {
+        let _ = self.0.compare_exchange(
+            BLOCKING_JOB_QUEUED,
+            BLOCKING_JOB_CANCELLED,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        );
+    }
+}
+
+const BLOCKING_JOB_QUEUED: u8 = 0;
+const BLOCKING_JOB_STARTED: u8 = 1;
+const BLOCKING_JOB_CANCELLED: u8 = 2;
+
+#[derive(Debug)]
 struct BlockingPool {
     queue_name: &'static str,
     sender: mpsc::SyncSender<BlockingJob>,
@@ -514,10 +532,24 @@ impl BlockingPool {
         F: FnOnce() -> Result<T, StorageError> + Send + 'static,
     {
         let (tx, rx) = oneshot::channel();
+        let job_state = Arc::new(AtomicU8::new(BLOCKING_JOB_QUEUED));
+        let worker_job_state = job_state.clone();
+        let _cancel_guard = BlockingJobCancelGuard(job_state);
         self.queued.fetch_add(1, Ordering::Relaxed);
         if self
             .sender
             .try_send(Box::new(move || {
+                if worker_job_state
+                    .compare_exchange(
+                        BLOCKING_JOB_QUEUED,
+                        BLOCKING_JOB_STARTED,
+                        Ordering::AcqRel,
+                        Ordering::Acquire,
+                    )
+                    .is_err()
+                {
+                    return;
+                }
                 let _ = tx.send(f());
             }))
             .is_err()
@@ -535,6 +567,121 @@ impl BlockingPool {
     }
 }
 
+/// The bounded resources shared by path-backed schedulers in one process.
+///
+/// Scheduling policy remains per mount/torrent, but the expensive workers and
+/// descriptor cache do not need to be duplicated for every torrent. Keeping
+/// this seam separate from `MountScheduler` also means each scheduler retains
+/// its own class permits, dirty generations, read cache, counters, and device
+/// queue identity.
+#[derive(Debug)]
+struct SharedSchedulerResources {
+    file_pool: Arc<FilePool>,
+    io_pool: Arc<BlockingPool>,
+    disk_backend: Arc<SelectedDiskBackend>,
+    hash_pool: Arc<BlockingPool>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct SharedSchedulerKey {
+    file_pool_size: usize,
+    idle_file_ttl_secs: u64,
+    io_worker_threads: usize,
+    io_queue_depth: usize,
+    hash_worker_threads: usize,
+    hash_queue_depth: usize,
+    backend_request: BackendRequest,
+}
+
+static SHARED_SCHEDULER_RESOURCES: Lazy<
+    Mutex<HashMap<SharedSchedulerKey, Weak<SharedSchedulerResources>>>,
+> = Lazy::new(|| Mutex::new(HashMap::new()));
+
+fn backend_request_from_env() -> BackendRequest {
+    std::env::var("TNG_STORAGE_BACKEND")
+        .ok()
+        .map(|value| BackendRequest::parse(&value))
+        .unwrap_or(BackendRequest::Auto)
+}
+
+fn shared_scheduler_key(io_config: &StorageIoConfig) -> SharedSchedulerKey {
+    SharedSchedulerKey {
+        file_pool_size: clamp_file_pool_size(io_config.file_pool_size),
+        idle_file_ttl_secs: io_config.idle_file_ttl_secs,
+        io_worker_threads: io_config.io_worker_threads.max(1),
+        io_queue_depth: io_config.io_queue_depth.max(1),
+        hash_worker_threads: io_config.hash_worker_threads.max(1),
+        hash_queue_depth: io_config.hash_queue_depth.max(1),
+        backend_request: backend_request_from_env(),
+    }
+}
+
+fn create_scheduler_resources(key: SharedSchedulerKey) -> Arc<SharedSchedulerResources> {
+    Arc::new(SharedSchedulerResources {
+        file_pool: Arc::new(FilePool::new(
+            key.file_pool_size,
+            Duration::from_secs(key.idle_file_ttl_secs),
+        )),
+        io_pool: Arc::new(BlockingPool::new(
+            "rt-storage-io",
+            key.io_worker_threads,
+            key.io_queue_depth,
+        )),
+        disk_backend: Arc::new(SelectedDiskBackend::select_with_queue_depth(
+            key.backend_request,
+            key.io_worker_threads,
+            key.io_queue_depth,
+        )),
+        hash_pool: Arc::new(BlockingPool::new(
+            "rt-storage-hash",
+            key.hash_worker_threads,
+            key.hash_queue_depth,
+        )),
+    })
+}
+
+fn shared_scheduler_resources(io_config: &StorageIoConfig) -> Arc<SharedSchedulerResources> {
+    let key = shared_scheduler_key(io_config);
+    let mut resources = SHARED_SCHEDULER_RESOURCES
+        .lock()
+        .expect("shared scheduler resources mutex poisoned");
+    if let Some(existing) = resources.get(&key).and_then(Weak::upgrade) {
+        return existing;
+    }
+    resources.retain(|_, resource| resource.strong_count() > 0);
+
+    // Construct while holding the registry lock so concurrent torrent
+    // promotions cannot briefly create duplicate worker pools for one key.
+    let shared = create_scheduler_resources(key);
+    resources.insert(key, Arc::downgrade(&shared));
+    shared
+}
+
+fn local_scheduler_resources(io_config: &StorageIoConfig) -> Arc<SharedSchedulerResources> {
+    create_scheduler_resources(shared_scheduler_key(io_config))
+}
+
+fn mark_dirty_path(
+    dirty_paths: &Mutex<HashMap<PathBuf, u64>>,
+    dirty_path_generation: &AtomicU64,
+    path: PathBuf,
+) {
+    let mut dirty = dirty_paths.lock().expect("dirty path mutex poisoned");
+    let generation = dirty_path_generation.fetch_add(1, Ordering::Relaxed);
+    dirty.insert(path, generation);
+}
+
+fn clear_dirty_path_if_generation(
+    dirty_paths: &Mutex<HashMap<PathBuf, u64>>,
+    path: &Path,
+    expected_generation: u64,
+) {
+    let mut dirty = dirty_paths.lock().expect("dirty path mutex poisoned");
+    if dirty.get(path).copied() == Some(expected_generation) {
+        dirty.remove(path);
+    }
+}
+
 /// Per-mount I/O scheduler.
 #[derive(Debug, Clone)]
 pub struct MountScheduler {
@@ -549,14 +696,20 @@ pub struct MountScheduler {
     device_queue_sem: Arc<Semaphore>,
     device_queue_capacity: usize,
     io_config: StorageIoConfig,
+    _shared_resources: Arc<SharedSchedulerResources>,
     file_pool: Arc<FilePool>,
     io_pool: Arc<BlockingPool>,
     disk_backend: Arc<SelectedDiskBackend>,
     hash_pool: Arc<BlockingPool>,
-    dirty_paths: Arc<Mutex<HashSet<PathBuf>>>,
+    /// Dirty paths carry a write generation, not just membership. A sync
+    /// operation may overlap a later write; only the generation observed by
+    /// that sync may be cleared when its fdatasync completes.
+    dirty_paths: Arc<Mutex<HashMap<PathBuf, u64>>>,
+    dirty_path_generation: Arc<AtomicU64>,
     peer_read_cache: Arc<Mutex<HashMap<PathBuf, PeerReadCacheEntry>>>,
     peer_read_cache_epoch: Arc<AtomicU64>,
     peer_read_elevator: Arc<Mutex<Option<PeerReadElevator>>>,
+    peer_read_limit: usize,
     peer_read_elevator_enabled: bool,
     peer_read_elevator_queue_depth: usize,
     device_id: Option<String>,
@@ -823,6 +976,7 @@ impl PeerReadElevator {
     fn spawn(
         storage_root: StorageRootId,
         queue_depth: usize,
+        inflight_limit: usize,
         budget: Duration,
         file_pool: Arc<FilePool>,
         io_pool: Arc<BlockingPool>,
@@ -836,6 +990,7 @@ impl PeerReadElevator {
         tokio::spawn(peer_read_elevator_worker(
             storage_root,
             receiver,
+            inflight_limit,
             budget,
             file_pool,
             io_pool,
@@ -908,6 +1063,7 @@ impl PeerReadElevator {
 async fn peer_read_elevator_worker(
     _storage_root: StorageRootId,
     mut receiver: tokio_mpsc::Receiver<PeerReadRequest>,
+    inflight_limit: usize,
     budget: Duration,
     file_pool: Arc<FilePool>,
     io_pool: Arc<BlockingPool>,
@@ -916,10 +1072,15 @@ async fn peer_read_elevator_worker(
     device_queue_sem: Arc<Semaphore>,
     counters: Arc<StorageCounters>,
 ) {
+    let inflight = Arc::new(Semaphore::new(inflight_limit.max(1)));
     while let Some(first) = receiver.recv().await {
         let requests = collect_peer_read_batch(&mut receiver, first, budget).await;
         let batches = peer_read_batches(requests);
         for batch in batches {
+            let permit = match inflight.clone().acquire_owned().await {
+                Ok(permit) => permit,
+                Err(_) => return,
+            };
             let file_pool = file_pool.clone();
             let io_pool = io_pool.clone();
             let disk_backend = disk_backend.clone();
@@ -927,6 +1088,7 @@ async fn peer_read_elevator_worker(
             let device_queue_sem = device_queue_sem.clone();
             let counters = counters.clone();
             tokio::spawn(async move {
+                let _permit = permit;
                 let results = dispatch_peer_read_batch(
                     batch,
                     file_pool,
@@ -1008,7 +1170,7 @@ fn peer_read_batches(mut requests: Vec<PeerReadRequest>) -> Vec<PeerReadBatch> {
 }
 
 async fn dispatch_peer_read_batch(
-    batch: PeerReadBatch,
+    mut batch: PeerReadBatch,
     file_pool: Arc<FilePool>,
     io_pool: Arc<BlockingPool>,
     disk_backend: Arc<SelectedDiskBackend>,
@@ -1019,6 +1181,14 @@ async fn dispatch_peer_read_batch(
     oneshot::Sender<Result<bytes::Bytes, StorageError>>,
     Result<bytes::Bytes, StorageError>,
 )> {
+    // A caller can drop the read future while its request is still waiting in
+    // the elevator. Do not acquire queue permits or perform filesystem work
+    // for a result nobody can receive.
+    batch.requests.retain(|request| !request.tx.is_closed());
+    if batch.requests.is_empty() {
+        return Vec::new();
+    }
+
     let _queue = match queue_sem.acquire_owned().await {
         Ok(permit) => permit,
         Err(_) => {
@@ -1039,6 +1209,11 @@ async fn dispatch_peer_read_batch(
                 .collect();
         }
     };
+
+    batch.requests.retain(|request| !request.tx.is_closed());
+    if batch.requests.is_empty() {
+        return Vec::new();
+    }
 
     let path = batch.path.clone();
     let offset = batch.offset;
@@ -1106,9 +1281,29 @@ async fn dispatch_peer_read_batch(
                 .requests
                 .into_iter()
                 .map(|request| {
-                    let relative = request.offset.saturating_sub(batch.offset) as usize;
-                    let end = relative.saturating_add(request.len);
-                    (request.tx, Ok(bytes.slice(relative..end)))
+                    let relative = request
+                        .offset
+                        .checked_sub(batch.offset)
+                        .and_then(|relative| usize::try_from(relative).ok());
+                    let end = relative.and_then(|relative| relative.checked_add(request.len));
+                    match (relative, end) {
+                        (Some(relative), Some(end)) if end <= bytes.len() => {
+                            (request.tx, Ok(bytes.slice(relative..end)))
+                        }
+                        _ => {
+                            let actual = relative
+                                .map(|relative| bytes.len().saturating_sub(relative))
+                                .unwrap_or(0);
+                            (
+                                request.tx,
+                                Err(StorageError::ShortIo {
+                                    path: request.path.to_string_lossy().into_owned(),
+                                    expected: request.len,
+                                    actual,
+                                }),
+                            )
+                        }
+                    }
                 })
                 .collect()
         }
@@ -1148,12 +1343,13 @@ impl MountScheduler {
             StorageProfile::Unknown => topology.profile.clone(),
             profile => profile.clone(),
         };
-        Self::new_with_profile_and_io_config(
+        Self::new_with_profile_and_io_config_and_resources(
             storage_root,
             config,
             profile,
             effective_io_config_for_topology(&config.storage_io, Some(&topology)),
             Some(topology),
+            Some(shared_scheduler_resources(&config.storage_io)),
         )
     }
 
@@ -1163,6 +1359,25 @@ impl MountScheduler {
         profile: StorageProfile,
         io_config: StorageIoConfig,
         topology: Option<StorageTopology>,
+    ) -> Self {
+        let local_resources = local_scheduler_resources(&io_config);
+        Self::new_with_profile_and_io_config_and_resources(
+            storage_root,
+            config,
+            profile,
+            io_config,
+            topology,
+            Some(local_resources),
+        )
+    }
+
+    fn new_with_profile_and_io_config_and_resources(
+        storage_root: StorageRootId,
+        config: &SchedulerConfig,
+        profile: StorageProfile,
+        io_config: StorageIoConfig,
+        topology: Option<StorageTopology>,
+        shared_resources: Option<Arc<SharedSchedulerResources>>,
     ) -> Self {
         let ssd = matches!(profile, StorageProfile::Ssd | StorageProfile::Nvme);
         let recheck_limit = if config.recheck_concurrency > 0 {
@@ -1199,24 +1414,12 @@ impl MountScheduler {
         } else {
             IoClass::Metadata.hdd_concurrency()
         };
-        let file_pool = Arc::new(FilePool::new(
-            clamp_file_pool_size(io_config.file_pool_size),
-            Duration::from_secs(io_config.idle_file_ttl_secs),
-        ));
-        let io_pool = Arc::new(BlockingPool::new(
-            "rt-storage-io",
-            io_config.io_worker_threads,
-            io_config.io_queue_depth,
-        ));
-        let backend_request = std::env::var("TNG_STORAGE_BACKEND")
-            .ok()
-            .map(|value| BackendRequest::parse(&value))
-            .unwrap_or(BackendRequest::Auto);
-        let disk_backend = Arc::new(SelectedDiskBackend::select_with_queue_depth(
-            backend_request,
-            io_config.io_worker_threads,
-            io_config.io_queue_depth,
-        ));
+        let shared_resources =
+            shared_resources.unwrap_or_else(|| local_scheduler_resources(&io_config));
+        let file_pool = shared_resources.file_pool.clone();
+        let io_pool = shared_resources.io_pool.clone();
+        let disk_backend = shared_resources.disk_backend.clone();
+        let hash_pool = shared_resources.hash_pool.clone();
         let queue_sem = Arc::new(Semaphore::new(
             config.max_queue.min(io_config.io_queue_depth).max(1),
         ));
@@ -1239,6 +1442,7 @@ impl MountScheduler {
                 Some(PeerReadElevator::spawn(
                     storage_root,
                     peer_read_elevator_queue_depth,
+                    peer_read_limit,
                     Duration::from_millis(io_config.peer_read_elevator_budget_ms),
                     file_pool.clone(),
                     io_pool.clone(),
@@ -1267,15 +1471,14 @@ impl MountScheduler {
             file_pool,
             io_pool,
             disk_backend,
-            hash_pool: Arc::new(BlockingPool::new(
-                "rt-storage-hash",
-                io_config.hash_worker_threads,
-                io_config.hash_queue_depth,
-            )),
-            dirty_paths: Arc::new(Mutex::new(HashSet::new())),
+            _shared_resources: shared_resources,
+            hash_pool,
+            dirty_paths: Arc::new(Mutex::new(HashMap::new())),
+            dirty_path_generation: Arc::new(AtomicU64::new(0)),
             peer_read_cache: Arc::new(Mutex::new(HashMap::new())),
             peer_read_cache_epoch: Arc::new(AtomicU64::new(0)),
             peer_read_elevator,
+            peer_read_limit,
             peer_read_elevator_enabled,
             peer_read_elevator_queue_depth,
             device_id,
@@ -1516,6 +1719,7 @@ impl MountScheduler {
             *elevator = Some(PeerReadElevator::spawn(
                 self.storage_root,
                 self.peer_read_elevator_queue_depth,
+                self.peer_read_limit,
                 Duration::from_millis(self.io_config.peer_read_elevator_budget_ms),
                 self.file_pool.clone(),
                 self.io_pool.clone(),
@@ -1765,6 +1969,7 @@ impl MountScheduler {
         let pool = self.file_pool.clone();
         let disk_backend = self.disk_backend.clone();
         let dirty_paths = self.dirty_paths.clone();
+        let dirty_path_generation = self.dirty_path_generation.clone();
         let peer_read_cache = self.peer_read_cache.clone();
         let peer_read_cache_epoch = self.peer_read_cache_epoch.clone();
         let counters = self.counters.clone();
@@ -1819,8 +2024,7 @@ impl MountScheduler {
             }
             record_sync_completion(&counters, sync_started);
         } else {
-            let mut dirty = dirty_paths.lock().expect("dirty path mutex poisoned");
-            dirty.insert(key);
+            mark_dirty_path(&dirty_paths, &dirty_path_generation, key);
         }
         counters.write_ops_by_class[class_index(class)].fetch_add(1, Ordering::Relaxed);
         counters.bytes_written_by_class[class_index(class)]
@@ -1841,6 +2045,7 @@ impl MountScheduler {
     ) -> Result<(), StorageError> {
         let pool = self.file_pool.clone();
         let dirty_paths = self.dirty_paths.clone();
+        let dirty_path_generation = self.dirty_path_generation.clone();
         let counters = self.counters.clone();
         let path = path.to_path_buf();
         self.run_queued_blocking(0, move || {
@@ -1908,8 +2113,7 @@ impl MountScheduler {
                 }
             }
             if mode != PreallocationMode::Off {
-                let mut dirty = dirty_paths.lock().expect("dirty path mutex poisoned");
-                dirty.insert(key);
+                mark_dirty_path(&dirty_paths, &dirty_path_generation, key);
             }
             Ok(())
         })
@@ -1925,6 +2129,11 @@ impl MountScheduler {
         let started = Instant::now();
         let submission = self.reserve_submission(0)?;
         let key = normalized_key(&path);
+        let expected_generation = dirty_paths
+            .lock()
+            .expect("dirty path mutex poisoned")
+            .get(&key)
+            .copied();
         let file = match self
             .io_pool
             .run({
@@ -1950,8 +2159,9 @@ impl MountScheduler {
             return Err(error);
         }
         record_sync_completion(&counters, started);
-        let mut dirty = dirty_paths.lock().expect("dirty path mutex poisoned");
-        dirty.remove(&key);
+        if let Some(expected_generation) = expected_generation {
+            clear_dirty_path_if_generation(&dirty_paths, &key, expected_generation);
+        }
         drop(submission);
         Ok(())
     }
@@ -1963,15 +2173,22 @@ impl MountScheduler {
         let counters = self.counters.clone();
         let started = Instant::now();
         let submission = self.reserve_submission(0)?;
-        let paths: Vec<PathBuf> = {
+        let paths: Vec<(PathBuf, u64)> = {
             let dirty = dirty_paths.lock().expect("dirty path mutex poisoned");
-            dirty.iter().cloned().collect()
+            dirty
+                .iter()
+                .map(|(path, generation)| (path.clone(), *generation))
+                .collect()
         };
+        let paths_for_open = paths
+            .iter()
+            .map(|(path, _)| path.clone())
+            .collect::<Vec<_>>();
         let files = match self
             .io_pool
             .run({
                 let pool = pool.clone();
-                let paths = paths.clone();
+                let paths = paths_for_open;
                 move || {
                     let mut files = pool.write_handles();
                     for path in paths {
@@ -2004,8 +2221,10 @@ impl MountScheduler {
             }
         }
         let mut dirty = dirty_paths.lock().expect("dirty path mutex poisoned");
-        for path in paths {
-            dirty.remove(&path);
+        for (path, expected_generation) in paths {
+            if dirty.get(&path).copied() == Some(expected_generation) {
+                dirty.remove(&path);
+            }
         }
         record_sync_completion(&counters, started);
         drop(submission);
@@ -2456,6 +2675,8 @@ fn full_preallocate(file: &File, len: u64) -> Result<(), StorageError> {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::AtomicBool;
+
     use super::*;
     use crate::elevator::DeviceId;
     use rt_path::StorageRootId;
@@ -2550,6 +2771,62 @@ mod tests {
             Err(StorageError::QueueFull { mount }) if mount == "test-blocking-pool"
         ));
         assert_eq!(pool.queued(), 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancelled_queued_blocking_job_is_skipped() {
+        let pool = Arc::new(BlockingPool::new("test-cancelled-blocking-pool", 1, 1));
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let first = tokio::spawn({
+            let pool = pool.clone();
+            async move {
+                pool.run(move || {
+                    started_tx.send(()).unwrap();
+                    release_rx.recv().unwrap();
+                    Ok::<_, StorageError>(())
+                })
+                .await
+            }
+        });
+
+        started_rx.recv().unwrap();
+
+        let ran = Arc::new(AtomicBool::new(false));
+        let second = tokio::spawn({
+            let pool = pool.clone();
+            let ran = ran.clone();
+            async move {
+                pool.run(move || {
+                    ran.store(true, Ordering::SeqCst);
+                    Ok::<_, StorageError>(())
+                })
+                .await
+            }
+        });
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while pool.queued() != 1 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("second job was not queued");
+
+        second.abort();
+        assert!(second.await.unwrap_err().is_cancelled());
+
+        release_tx.send(()).unwrap();
+        first.await.unwrap().unwrap();
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while pool.queued() != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("cancelled job was not drained");
+        assert!(!ran.load(Ordering::SeqCst));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -2733,6 +3010,30 @@ mod tests {
         assert_eq!(stats.queue_full, 1);
         assert_eq!(stats.device_queue_capacity, 1);
         assert_eq!(stats.device_queue_available, 0);
+    }
+
+    #[tokio::test]
+    async fn path_schedulers_share_bounded_worker_resources() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = SchedulerConfig {
+            profile: StorageProfile::Ssd,
+            storage_io: StorageIoConfig {
+                file_pool_size: 3,
+                io_worker_threads: 2,
+                io_queue_depth: 7,
+                hash_worker_threads: 1,
+                hash_queue_depth: 5,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let first = MountScheduler::new_for_path(StorageRootId::new(), dir.path(), &config);
+        let second = MountScheduler::new_for_path(StorageRootId::new(), dir.path(), &config);
+
+        assert!(Arc::ptr_eq(&first.file_pool, &second.file_pool));
+        assert!(Arc::ptr_eq(&first.io_pool, &second.io_pool));
+        assert!(Arc::ptr_eq(&first.disk_backend, &second.disk_backend));
+        assert!(Arc::ptr_eq(&first.hash_pool, &second.hash_pool));
     }
 
     #[test]
@@ -3147,6 +3448,24 @@ mod tests {
         assert_eq!(after_sync.sync_ops, 1);
     }
 
+    #[test]
+    fn dirty_sync_does_not_clear_a_newer_write_generation() {
+        let dirty_paths = Mutex::new(HashMap::new());
+        let dirty_path_generation = AtomicU64::new(0);
+        let path = PathBuf::from("payload.bin");
+
+        mark_dirty_path(&dirty_paths, &dirty_path_generation, path.clone());
+        let first_generation = dirty_paths.lock().unwrap().get(&path).copied().unwrap();
+        mark_dirty_path(&dirty_paths, &dirty_path_generation, path.clone());
+
+        clear_dirty_path_if_generation(&dirty_paths, &path, first_generation);
+        assert_eq!(dirty_paths.lock().unwrap().len(), 1);
+
+        let second_generation = dirty_paths.lock().unwrap().get(&path).copied().unwrap();
+        clear_dirty_path_if_generation(&dirty_paths, &path, second_generation);
+        assert!(dirty_paths.lock().unwrap().is_empty());
+    }
+
     #[tokio::test]
     async fn strict_write_sync_is_counted_and_not_left_dirty() {
         let dir = tempfile::tempdir().unwrap();
@@ -3459,5 +3778,98 @@ mod tests {
                 .load(Ordering::Relaxed),
             1
         );
+    }
+
+    #[tokio::test]
+    async fn canceled_queued_peer_read_is_not_dispatched() {
+        // Regression: dropping a peer read while it is queued in the HDD
+        // elevator must not still open the file and consume an I/O slot.
+        let sched = hdd_scheduler();
+        let (tx, rx) = oneshot::channel();
+        drop(rx);
+        let request = PeerReadRequest {
+            path: PathBuf::from("canceled-peer-read.bin"),
+            offset: 0,
+            len: 1024,
+            _queued_bytes: QueuedDiskBytes::reserve(
+                sched.counters.clone(),
+                None,
+                1024,
+                "peer-read-elevator",
+            )
+            .unwrap(),
+            tx,
+        };
+        let batch = PeerReadBatch {
+            path: request.path.clone(),
+            offset: request.offset,
+            len: request.len,
+            requests: vec![request],
+        };
+
+        let results = dispatch_peer_read_batch(
+            batch,
+            sched.file_pool.clone(),
+            sched.io_pool.clone(),
+            sched.disk_backend.clone(),
+            sched.queue_sem.clone(),
+            sched.device_queue_sem.clone(),
+            sched.counters.clone(),
+        )
+        .await;
+
+        assert!(results.is_empty());
+        assert_eq!(sched.stats().file_pool.misses, 0);
+        assert_eq!(sched.stats().queued_disk_bytes, 0);
+    }
+
+    #[tokio::test]
+    async fn malformed_peer_read_batch_returns_short_io_instead_of_panicking() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("malformed-peer-read.bin");
+        std::fs::write(&path, b"data").unwrap();
+        let sched = hdd_scheduler();
+        let (tx, rx) = oneshot::channel();
+        let request = PeerReadRequest {
+            path: path.clone(),
+            offset: 8,
+            len: 4,
+            _queued_bytes: QueuedDiskBytes::reserve(
+                sched.counters.clone(),
+                None,
+                4,
+                "peer-read-elevator",
+            )
+            .unwrap(),
+            tx,
+        };
+        let batch = PeerReadBatch {
+            path,
+            offset: 0,
+            len: 4,
+            requests: vec![request],
+        };
+
+        let results = dispatch_peer_read_batch(
+            batch,
+            sched.file_pool.clone(),
+            sched.io_pool.clone(),
+            sched.disk_backend.clone(),
+            sched.queue_sem.clone(),
+            sched.device_queue_sem.clone(),
+            sched.counters.clone(),
+        )
+        .await;
+
+        let (reply, result) = results.into_iter().next().expect("request should complete");
+        reply.send(result).expect("caller should still be waiting");
+        assert!(matches!(
+            rx.await.unwrap(),
+            Err(StorageError::ShortIo {
+                expected: 4,
+                actual: 0,
+                ..
+            })
+        ));
     }
 }

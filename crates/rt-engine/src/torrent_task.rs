@@ -11,14 +11,15 @@ use std::sync::Mutex;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use futures::{SinkExt, StreamExt};
-use reqwest::header::RANGE;
+use reqwest::header::{CONTENT_RANGE, RANGE};
+use reqwest::StatusCode;
 use rt_bencode::{decode, BValue};
 use rusqlite::Connection;
 #[cfg(test)]
 use tokio::net::TcpListener;
 use tokio::net::TcpStream;
 use tokio::sync::{mpsc, oneshot, OwnedSemaphorePermit, RwLock};
-use tokio::time::{interval, sleep, timeout, Sleep};
+use tokio::time::{interval, sleep, timeout, Instant as TokioInstant, Sleep};
 use tokio_util::codec::Framed;
 use tracing::{debug, info, warn};
 use url::Url;
@@ -56,8 +57,8 @@ use crate::db_worker::DbExecutor;
 use crate::egress_policy::{OutboundEgressPolicy, OutboundTargetKind};
 use crate::network_budget::{GlobalNetworkBudget, SharedRateLimiter};
 use crate::tracker_runtime::{
-    announce_tracker, bounded_response_body, TrackerAnnounceContext, TrackerAnnounceResult,
-    TrackerAnnounceSpec, TrackerWorkers, MAX_TRACKER_ANNOUNCES_IN_FLIGHT,
+    announce_tracker, bounded_response_body, protocol_numwant, TrackerAnnounceContext,
+    TrackerAnnounceResult, TrackerAnnounceSpec, TrackerWorkers, MAX_TRACKER_ANNOUNCES_IN_FLIGHT,
     STOPPED_TRACKER_ANNOUNCE_DEADLINE,
 };
 use crate::{EnginePeerSnapshot, EngineTorrentLimits, EngineWebseedSnapshot, TorrentRuntimeStats};
@@ -84,9 +85,23 @@ const PEER_EVENT_SEND_TIMEOUT: Duration = Duration::from_millis(500);
 const WEBSEED_RETRY_BASE: Duration = Duration::from_secs(1);
 const WEBSEED_RETRY_MAX: Duration = Duration::from_secs(300);
 const MAX_UT_PEX_PEERS: usize = 2_048;
+const DOWNLOAD_BUCKET_MIN_CAPACITY: u64 = MAX_BLOCK_SIZE as u64;
 
 fn peer_event_channel_capacity(max_peers: usize) -> usize {
     max_peers.clamp(64, 512)
+}
+
+fn download_bucket_capacity(limit: u64) -> u64 {
+    limit.max(DOWNLOAD_BUCKET_MIN_CAPACITY)
+}
+
+fn consume_download_tokens(tokens: &mut u64, limit: u64, bytes: u64) -> bool {
+    if *tokens < bytes {
+        return false;
+    }
+    *tokens -= bytes;
+    *tokens = (*tokens).min(download_bucket_capacity(limit));
+    true
 }
 
 fn db_i64(value: u64) -> i64 {
@@ -252,6 +267,13 @@ pub enum TorrentCmd {
         limits: EngineTorrentLimits,
         reply: Option<oneshot::Sender<Result<(), String>>>,
     },
+    /// Replace the persisted tracker override and apply it to the live task.
+    /// A reply is used for API mutations; internal task-control paths may
+    /// leave it absent.
+    UpdateTrackers {
+        trackers: Vec<String>,
+        reply: Option<oneshot::Sender<Result<(), String>>>,
+    },
     UpdatePeerExchange(bool),
     /// TNG-002: stops network activity, disconnects every peer, and drains
     /// any already-buffered peer events so no further disk write can reach
@@ -310,7 +332,7 @@ pub enum TorrentCmd {
     },
     /// An inbound uTP peer whose handshake already matched this torrent.
     AcceptUtpPeer {
-        stream: UtpStream,
+        stream: Box<UtpStream>,
         peer_addr: SocketAddr,
         handshake: Handshake,
         peer_permit: OwnedSemaphorePermit,
@@ -349,7 +371,10 @@ fn effective_piece_assembly_soft_cap(configured_bytes: usize) -> usize {
 
 fn memory_aware_request_pipeline(piece_assembly_bytes: usize, soft_cap_bytes: usize) -> usize {
     if soft_cap_bytes == 0 {
-        return 0;
+        // A zero assembly cap disables aggregation, not downloading. Blocks
+        // take the direct-write path in this mode, so keep the peer pipeline
+        // open instead of permanently starving the torrent.
+        return PEER_REQUEST_PIPELINE_NORMAL;
     }
     if piece_assembly_bytes.saturating_mul(4) >= soft_cap_bytes.saturating_mul(3) {
         PEER_REQUEST_PIPELINE_CONSTRAINED
@@ -475,6 +500,28 @@ impl PieceAssembly {
         self.received.iter().all(|received| *received)
     }
 
+    fn received_blocks(&self) -> Vec<(u32, bytes::Bytes)> {
+        self.received
+            .iter()
+            .enumerate()
+            .filter_map(|(block_idx, received)| {
+                if !received {
+                    return None;
+                }
+                let start = block_idx.saturating_mul(MAX_BLOCK_SIZE as usize);
+                let end = start
+                    .saturating_add(MAX_BLOCK_SIZE as usize)
+                    .min(self.data.len());
+                (start < end).then(|| {
+                    (
+                        start as u32,
+                        bytes::Bytes::copy_from_slice(&self.data[start..end]),
+                    )
+                })
+            })
+            .collect()
+    }
+
     fn len(&self) -> usize {
         self.data.len()
     }
@@ -486,8 +533,8 @@ fn evict_piece_assemblies_to_budget(
     current_piece: u32,
     max_assemblies: usize,
     max_bytes: usize,
-) -> u64 {
-    let mut evictions = 0u64;
+) -> Vec<u32> {
+    let mut evictions = Vec::new();
     while assemblies.len() > max_assemblies || *assembly_bytes > max_bytes {
         let Some(evict_piece) = assemblies
             .iter()
@@ -500,7 +547,7 @@ fn evict_piece_assemblies_to_budget(
 
         if let Some(assembly) = assemblies.remove(&evict_piece) {
             *assembly_bytes = assembly_bytes.saturating_sub(assembly.len());
-            evictions = evictions.saturating_add(1);
+            evictions.push(evict_piece);
         }
     }
     evictions
@@ -670,6 +717,35 @@ struct UploadRequest {
 
 type UploadReadResult = (UploadRequest, anyhow::Result<LeasedUploadBlock>);
 
+/// Own the join handles for detached upload reads and abort them if the peer
+/// loop is cancelled. Dropping a `JoinHandle` detaches its child task, so a
+/// peer eviction or torrent shutdown could otherwise leave a read holding a
+/// `MemoryLease` and scheduler work until its timeout.
+#[derive(Default)]
+struct UploadReadTasks(
+    futures::stream::FuturesUnordered<tokio::task::JoinHandle<UploadReadResult>>,
+);
+
+impl std::ops::Deref for UploadReadTasks {
+    type Target = futures::stream::FuturesUnordered<tokio::task::JoinHandle<UploadReadResult>>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl std::ops::DerefMut for UploadReadTasks {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
+
+impl Drop for UploadReadTasks {
+    fn drop(&mut self) {
+        abort_upload_reads(&self.0);
+    }
+}
+
 pub struct TorrentTask {
     info_hash_hex: String,
     meta: TorrentMetaV1,
@@ -716,6 +792,12 @@ pub struct TorrentTask {
     last_progress_persist: Option<Instant>,
     transfer_stats_dirty: bool,
     piece_assemblies: HashMap<u32, PieceAssembly>,
+    /// Partial pieces restored from fastresume already have their received
+    /// bytes on disk, but their contents are not hydrated into an in-memory
+    /// assembly. Keep those pieces on the direct-write path until they either
+    /// verify or are rejected; otherwise a new block would be combined with
+    /// zero-filled bytes and the completed piece would fail verification.
+    restored_partial_pieces: HashSet<u32>,
     piece_assembly_bytes: usize,
     piece_assembly_soft_cap_bytes: usize,
     piece_assembly_evictions: u64,
@@ -831,17 +913,38 @@ impl TorrentTask {
                 ..Default::default()
             },
         );
+        let metainfo_trackers = meta.all_trackers();
         let mut tracker_tiers = tracker_tiers_from_meta(&meta);
-        let tracker_rows = db
+        let tracker_restore = db
             .run("restore_tracker_state", {
                 let info_hash = info_hash_hex.clone();
                 move |db| {
-                    rt_db::list_torrent_trackers(db, &info_hash).map_err(|error| error.to_string())
+                    let rows = rt_db::list_torrent_trackers(db, &info_hash)
+                        .map_err(|error| error.to_string())?;
+                    let persisted_trackers = match rt_db::get(db, &info_hash) {
+                        Ok(row) => Some(row.trackers),
+                        Err(rt_db::DbError::NotFound(_)) => None,
+                        Err(error) => return Err(error.to_string()),
+                    };
+                    Ok((rows, persisted_trackers))
                 }
             })
             .await;
-        match tracker_rows {
-            Ok(rows) => restore_tracker_state_from_rows(&mut tracker_tiers, &rows),
+        match tracker_restore {
+            Ok((rows, persisted_trackers)) => {
+                // `torrents.trackers` is the durable client override. Keep
+                // the metainfo's BEP-12 tiers for untouched torrents, but
+                // treat a changed value (including an explicit empty list)
+                // as authoritative after an actor restart.
+                if persisted_trackers
+                    .as_ref()
+                    .is_some_and(|trackers| trackers.as_slice() != metainfo_trackers.as_slice())
+                {
+                    tracker_tiers =
+                        tracker_tiers_from_urls(persisted_trackers.as_deref().unwrap_or_default());
+                }
+                restore_tracker_state_from_rows(&mut tracker_tiers, &rows);
+            }
             Err(error) => {
                 warn!(
                     component = "db",
@@ -895,6 +998,7 @@ impl TorrentTask {
             last_progress_persist: None,
             transfer_stats_dirty: false,
             piece_assemblies: HashMap::new(),
+            restored_partial_pieces: HashSet::new(),
             piece_assembly_bytes: 0,
             piece_assembly_soft_cap_bytes: effective_piece_assembly_soft_cap(
                 piece_assembly_cap_bytes,
@@ -969,7 +1073,13 @@ impl TorrentTask {
                 );
                 return;
             }
-        } else if !restored {
+        } else if self.initial_state == TorrentState::Checking || !restored {
+            // `Checking` is a durable promise that the previous process had
+            // not completed verification. A fastresume file may still exist
+            // from before that scan, so it must never be allowed to turn the
+            // task directly into Downloading/Seeding on restore. The engine
+            // also recovers a queued recheck job after tasks are loaded; the
+            // scan below can adopt that job id when its command arrives.
             match self.run_recheck(None).await {
                 RecheckOutcome::Shutdown => return,
                 RecheckOutcome::Failed(error) => {
@@ -1039,19 +1149,19 @@ impl TorrentTask {
                             result = "command_channel_closed",
                             "torrent command channel closed; shutting down"
                         );
+                        self.cancel_tracker_announces();
                         self.announce_stopped().await;
                         self.persist_progress().await;
                         self.save_fastresume(false).await;
-                        self.cancel_tracker_announces();
                         self.shutdown_peers().await;
                         break;
                     };
                     match cmd {
                         TorrentCmd::Shutdown => {
+                            self.cancel_tracker_announces();
                             self.announce_stopped().await;
                             self.persist_progress().await;
                             self.save_fastresume(false).await;
-                            self.cancel_tracker_announces();
                             self.shutdown_peers().await;
                             break;
                         }
@@ -1273,7 +1383,7 @@ impl TorrentTask {
                             peer_permit,
                         } => {
                             if !self.paused {
-                                self.accept_utp_peer(stream, peer_addr, handshake, peer_permit)
+                                self.accept_utp_peer(*stream, peer_addr, handshake, peer_permit)
                                     .await;
                             }
                         }
@@ -1330,6 +1440,22 @@ impl TorrentTask {
                                     result = "error",
                                     error = %error,
                                     "failed to apply persisted torrent limits"
+                                );
+                            }
+                            if let Some(reply) = reply {
+                                let _ = reply.send(result);
+                            }
+                        }
+                        TorrentCmd::UpdateTrackers { trackers, reply } => {
+                            let result = self.apply_tracker_urls(trackers).await;
+                            if let Err(error) = &result {
+                                warn!(
+                                    component = "torrent",
+                                    operation = "update_trackers",
+                                    torrent = %self.info_hash_hex,
+                                    result = "error",
+                                    error = %error,
+                                    "failed to apply updated tracker URLs"
                                 );
                             }
                             if let Some(reply) = reply {
@@ -1475,7 +1601,7 @@ impl TorrentTask {
                 self.meta.private,
             );
             let peer_task = tokio::spawn(async move {
-                let result = run_outgoing_peer_with_policy(
+                let (result, outstanding) = match run_outgoing_peer_with_policy(
                     addr,
                     peer_id,
                     info_hash,
@@ -1484,7 +1610,11 @@ impl TorrentTask {
                     upload,
                     transport_policy,
                 )
-                .await;
+                .await
+                {
+                    Ok(exit) => (exit.result, exit.outstanding),
+                    Err(error) => (Err(error), Vec::new()),
+                };
                 if let Err(e) = result {
                     debug!(
                         component = "peer",
@@ -1495,12 +1625,12 @@ impl TorrentTask {
                         "peer ended"
                     );
                 }
-                let _ = send_peer_event(
+                let _ = send_peer_disconnect_event(
                     &peer_disconnect_tx,
                     PeerEvent::Disconnected {
                         peer: addr,
                         id: peer_id,
-                        outstanding: Vec::new(),
+                        outstanding,
                     },
                 )
                 .await;
@@ -1627,16 +1757,11 @@ impl TorrentTask {
         match result.response {
             Ok(resp) => {
                 let peers: Vec<SocketAddr> = resp.peers.iter().map(|peer| peer.addr).collect();
-                tracker.on_success(&resp);
+                tracker.on_success_with_min_interval(&resp, self.min_announce_interval);
                 if let Some(scrape) = result.scrape {
                     tracker.scrape_complete = Some(scrape.complete);
                     tracker.scrape_incomplete = Some(scrape.incomplete);
                     tracker.scrape_downloaded = Some(scrape.downloaded);
-                }
-                if let Some(min_interval) = self.min_announce_interval {
-                    if tracker.interval < min_interval {
-                        tracker.interval = min_interval;
-                    }
                 }
                 self.persist_tracker_state().await;
                 self.tracker_event = tracker_event_after_success(self.tracker_event, result.event);
@@ -1677,7 +1802,7 @@ impl TorrentTask {
             listen_port: self.listen_port,
             http_timeout: self.http_timeout,
             udp_timeout: self.udp_timeout,
-            numwant: self.peer_capacity() as u32,
+            numwant: protocol_numwant(self.peer_capacity()),
             egress_policy: self.egress_policy,
         }
     }
@@ -1782,7 +1907,7 @@ impl TorrentTask {
                 continue;
             };
             match result {
-                Ok(resp) => tracker.on_success(&resp),
+                Ok(resp) => tracker.on_success_with_min_interval(&resp, self.min_announce_interval),
                 Err(err) => {
                     warn!(
                         component = "tracker",
@@ -1806,6 +1931,11 @@ impl TorrentTask {
         self.cancel_tracker_announces();
         self.tracker_event = TrackerEvent::Started;
         self.stopped_announced = false;
+        // A stopped announce records the tracker's ordinary next interval.
+        // Resuming is a new tracker session, so that old deadline must not
+        // delay the Started event until the previous session's interval has
+        // elapsed.
+        self.schedule_trackers_now();
     }
 
     fn cancel_tracker_announces(&mut self) {
@@ -1862,7 +1992,7 @@ impl TorrentTask {
         let peer_disconnect_tx = self.peer_disconnect_tx.clone();
         let upload = self.upload_context(peer_addr);
         let peer_task = tokio::spawn(async move {
-            if let Err(e) = run_incoming_peer(
+            let (result, outstanding) = match run_incoming_peer(
                 stream,
                 peer_addr,
                 peer_id,
@@ -1874,6 +2004,10 @@ impl TorrentTask {
             )
             .await
             {
+                Ok(exit) => (exit.result, exit.outstanding),
+                Err(error) => (Err(error), Vec::new()),
+            };
+            if let Err(e) = result {
                 debug!(
                     component = "peer",
                     operation = "run_incoming",
@@ -1883,12 +2017,12 @@ impl TorrentTask {
                     "incoming peer ended"
                 );
             }
-            let _ = send_peer_event(
+            let _ = send_peer_disconnect_event(
                 &peer_disconnect_tx,
                 PeerEvent::Disconnected {
                     peer: peer_addr,
                     id: peer_id,
-                    outstanding: Vec::new(),
+                    outstanding,
                 },
             )
             .await;
@@ -1946,7 +2080,7 @@ impl TorrentTask {
         let peer_disconnect_tx = self.peer_disconnect_tx.clone();
         let upload = self.upload_context(peer_addr);
         let peer_task = tokio::spawn(async move {
-            if let Err(e) = run_incoming_utp_peer(
+            let (result, outstanding) = match run_incoming_utp_peer(
                 stream,
                 peer_addr,
                 peer_id,
@@ -1958,6 +2092,10 @@ impl TorrentTask {
             )
             .await
             {
+                Ok(exit) => (exit.result, exit.outstanding),
+                Err(error) => (Err(error), Vec::new()),
+            };
+            if let Err(e) = result {
                 debug!(
                     component = "peer",
                     operation = "run_incoming_utp",
@@ -1967,12 +2105,12 @@ impl TorrentTask {
                     "incoming uTP peer ended"
                 );
             }
-            let _ = send_peer_event(
+            let _ = send_peer_disconnect_event(
                 &peer_disconnect_tx,
                 PeerEvent::Disconnected {
                     peer: peer_addr,
                     id: peer_id,
-                    outstanding: Vec::new(),
+                    outstanding,
                 },
             )
             .await;
@@ -2402,9 +2540,7 @@ impl TorrentTask {
             .header(RANGE, format!("bytes={start}-{end}"))
             .send()
             .await?;
-        if !response.status().is_success() {
-            anyhow::bail!("HTTP {}", response.status());
-        }
+        validate_webseed_range_response(response.status(), response.headers(), start, end)?;
         let bytes = bounded_response_body(response, req.length as usize)
             .await
             .map_err(|error| anyhow::anyhow!(error))?;
@@ -2488,11 +2624,14 @@ impl TorrentTask {
             PeerEvent::Choked {
                 peer, outstanding, ..
             } => {
-                if let Some(handle) = self.active_peers.get_mut(&peer) {
+                let outstanding = if let Some(handle) = self.active_peers.get_mut(&peer) {
                     handle.choked = true;
                     handle.outstanding = 0;
-                    handle.requested.clear();
-                }
+                    let requested = std::mem::take(&mut handle.requested);
+                    Self::merge_unique_block_requests(requested, outstanding)
+                } else {
+                    outstanding
+                };
                 for req in outstanding {
                     self.picker.cancel_request(req.piece as usize, req.begin);
                 }
@@ -2530,15 +2669,13 @@ impl TorrentTask {
             PeerEvent::Disconnected {
                 peer, outstanding, ..
             } => {
-                // The dedicated terminal channel normally carries an empty
-                // request list. Recover the requests tracked by the engine
-                // in that case; otherwise a saturated ordinary event queue
-                // would strand picker reservations forever.
-                let outstanding = if outstanding.is_empty() {
-                    self.active_peers
-                        .get(&peer)
-                        .map(|handle| handle.requested.clone())
-                        .unwrap_or_default()
+                // The peer loop's view can omit commands still queued in its
+                // mailbox. Union it with the engine's view so a disconnect
+                // cannot strand picker reservations, while deduplicating the
+                // same coordinate reported by both sides.
+                let outstanding = if let Some(handle) = self.active_peers.get_mut(&peer) {
+                    let requested = std::mem::take(&mut handle.requested);
+                    Self::merge_unique_block_requests(requested, outstanding)
                 } else {
                     outstanding
                 };
@@ -2726,21 +2863,49 @@ impl TorrentTask {
 
     async fn handle_block(&mut self, block: BlockEvent) {
         let piece = block.piece;
-        let aggregate_piece_write = self.can_aggregate_piece_write(piece);
-        if let Err(e) = self.record_piece_block(&block) {
-            warn!(
+        if !self.picker.is_piece_in_progress(piece as usize) {
+            debug!(
                 component = "torrent",
-                operation = "assemble_piece",
+                operation = "receive_block",
                 torrent = %self.info_hash_hex,
                 piece,
                 offset = block.offset,
-                result = "error",
-                error = %e,
-                "failed to assemble in-memory piece for verification"
+                result = "ignored",
+                reason = "piece_not_in_progress",
+                "dropping a late block after the piece request state was released"
             );
-            self.remove_piece_assembly(piece);
-            self.picker.reject_piece(piece as usize);
             return;
+        }
+        if self.picker.is_block_received(piece as usize, block.offset) {
+            debug!(
+                component = "torrent",
+                operation = "receive_block",
+                torrent = %self.info_hash_hex,
+                piece,
+                offset = block.offset,
+                result = "ignored",
+                reason = "duplicate_block",
+                "dropping a duplicate block already accepted for this piece"
+            );
+            return;
+        }
+        let aggregate_piece_write = self.can_aggregate_piece_write(piece);
+        if aggregate_piece_write {
+            if let Err(e) = self.record_piece_block(&block) {
+                warn!(
+                    component = "torrent",
+                    operation = "assemble_piece",
+                    torrent = %self.info_hash_hex,
+                    piece,
+                    offset = block.offset,
+                    result = "error",
+                    error = %e,
+                    "failed to assemble in-memory piece for verification"
+                );
+                self.remove_piece_assembly(piece);
+                self.picker.reject_piece(piece as usize);
+                return;
+            }
         }
         if !aggregate_piece_write {
             if let Err(e) = self.write_block(&block).await {
@@ -2793,6 +2958,7 @@ impl TorrentTask {
                             return;
                         }
                     }
+                    self.restored_partial_pieces.remove(&block.piece);
                     self.remove_piece_assembly(block.piece);
                     self.dirty_pieces_since_barrier.insert(block.piece);
                     info!(
@@ -2848,6 +3014,7 @@ impl TorrentTask {
                         "piece verification failed"
                     );
                     self.picker.reject_piece(block.piece as usize);
+                    self.restored_partial_pieces.remove(&block.piece);
                     self.remove_piece_assembly(block.piece);
                 }
                 VerifyResult::Missing { file_index, reason } => {
@@ -2859,6 +3026,7 @@ impl TorrentTask {
                         "piece verification could not read data"
                     );
                     self.picker.reject_piece(block.piece as usize);
+                    self.restored_partial_pieces.remove(&block.piece);
                     self.remove_piece_assembly(block.piece);
                 }
             }
@@ -2867,7 +3035,10 @@ impl TorrentTask {
 
     fn can_aggregate_piece_write(&self, piece: u32) -> bool {
         self.piece_length(piece)
-            .map(|len| len as usize <= self.piece_assembly_soft_cap_bytes)
+            .map(|len| {
+                len as usize <= self.piece_assembly_soft_cap_bytes
+                    && !self.restored_partial_pieces.contains(&piece)
+            })
             .unwrap_or(false)
     }
 
@@ -2906,8 +3077,17 @@ impl TorrentTask {
     }
 
     fn clear_piece_assemblies(&mut self) {
+        let discarded_pieces = self.piece_assemblies.keys().copied().collect::<Vec<_>>();
         self.piece_assemblies.clear();
         self.piece_assembly_bytes = 0;
+        // In-memory assemblies contain the only copy of partial blocks when
+        // aggregation is enabled. Any clear that is not preceded by a
+        // successful fastresume flush must also release the picker's partial
+        // reservations, otherwise a later peer can be asked only for the
+        // missing suffix while the discarded prefix is no longer available.
+        for piece in discarded_pieces {
+            self.picker.reject_piece(piece as usize);
+        }
     }
 
     fn enforce_piece_assembly_budget(&mut self, current_piece: u32) {
@@ -2918,7 +3098,17 @@ impl TorrentTask {
             MAX_IN_MEMORY_PIECE_ASSEMBLIES,
             self.piece_assembly_soft_cap_bytes,
         );
-        self.piece_assembly_evictions = self.piece_assembly_evictions.saturating_add(evictions);
+        self.piece_assembly_evictions = self
+            .piece_assembly_evictions
+            .saturating_add(evictions.len() as u64);
+        // The assembly is the only copy of these bytes until a complete piece
+        // is written. Dropping it while leaving the picker's received-bit
+        // state intact would make the next block recreate an incomplete
+        // zero-filled assembly and then fail completion. Reject the affected
+        // pieces so their already-received blocks are requested again.
+        for piece in evictions {
+            self.picker.reject_piece(piece as usize);
+        }
     }
 
     async fn send_have_to_peers(&mut self, piece: u32) {
@@ -2980,18 +3170,28 @@ impl TorrentTask {
         }
     }
 
+    fn merge_unique_block_requests(
+        mut requests: Vec<BlockRequest>,
+        additional: Vec<BlockRequest>,
+    ) -> Vec<BlockRequest> {
+        let mut seen = requests
+            .iter()
+            .map(|request| (request.piece, request.begin))
+            .collect::<HashSet<_>>();
+        for request in additional {
+            if seen.insert((request.piece, request.begin)) {
+                requests.push(request);
+            }
+        }
+        requests
+    }
+
     fn try_consume_download_tokens(&mut self, bytes: u32) -> bool {
         self.refill_download_tokens();
         let Some(limit) = self.download_limit_bytes_per_sec else {
             return true;
         };
-        let bytes = u64::from(bytes);
-        if self.download_tokens < bytes {
-            return false;
-        }
-        self.download_tokens = self.download_tokens.saturating_sub(bytes);
-        self.download_tokens = self.download_tokens.min(limit);
-        true
+        consume_download_tokens(&mut self.download_tokens, limit, u64::from(bytes))
     }
 
     fn refill_download_tokens(&mut self) {
@@ -3004,7 +3204,10 @@ impl TorrentTask {
         let elapsed = now.saturating_duration_since(self.download_tokens_updated);
         self.download_tokens_updated = now;
         let refill = (elapsed.as_secs_f64() * limit as f64).floor() as u64;
-        self.download_tokens = self.download_tokens.saturating_add(refill).min(limit);
+        self.download_tokens = self
+            .download_tokens
+            .saturating_add(refill)
+            .min(download_bucket_capacity(limit));
     }
 
     async fn shutdown_peers(&mut self) {
@@ -3094,6 +3297,7 @@ impl TorrentTask {
         let previous_recheck_restore_state = self.recheck_restore_state;
         self.paused = true;
         self.recheck_restore_state = Some(TorrentState::Paused);
+        self.cancel_tracker_announces();
         self.announce_stopped().await;
         self.shutdown_peers().await;
         self.save_fastresume(false).await;
@@ -3212,6 +3416,20 @@ impl TorrentTask {
         }
     }
 
+    async fn apply_tracker_urls(&mut self, trackers: Vec<String>) -> Result<(), String> {
+        self.cancel_tracker_announces();
+        self.tracker_tiers = tracker_tiers_from_urls(&trackers);
+        self.active_tracker_tier = 0;
+        self.tracker_event = TrackerEvent::Empty;
+        self.schedule_trackers_now();
+
+        let mut registry = self.registry.write().await;
+        if let Some(mut entry) = registry.get_mut(&self.info_hash_hex) {
+            entry.tracker_message = None;
+        }
+        Ok(())
+    }
+
     fn schedule_active_tracker_tier_now(&mut self) {
         if self.tracker_tiers.is_empty() {
             return;
@@ -3267,6 +3485,10 @@ impl TorrentTask {
                 ));
             }
         }
+
+        crate::engine::validate_file_path_projection(
+            effective_files.iter().map(|file| file.path.as_display()),
+        )?;
 
         let paths_changed = self.meta.files.len() != effective_files.len()
             || self
@@ -3433,7 +3655,10 @@ impl TorrentTask {
         // torrent and make the configured limit unusably strict at scale.
         self.download_limit_bytes_per_sec = self.torrent_download_limit_bytes_per_sec;
         self.download_tokens_updated = Instant::now();
-        self.download_tokens = self.download_limit_bytes_per_sec.unwrap_or(u64::MAX);
+        self.download_tokens = self
+            .download_limit_bytes_per_sec
+            .map(download_bucket_capacity)
+            .unwrap_or(u64::MAX);
     }
 
     fn set_torrent_upload_limit(&mut self, limit: Option<i64>) {
@@ -3523,9 +3748,10 @@ impl TorrentTask {
         Ok(())
     }
 
-    async fn run_recheck(&mut self, job_id: Option<String>) -> RecheckOutcome {
+    async fn run_recheck(&mut self, mut job_id: Option<String>) -> RecheckOutcome {
         let mut valid = 0usize;
         let mut invalid = 0usize;
+        let mut verified_bytes = 0_u64;
         let mut invalid_pieces = Vec::new();
         let mut verified_pieces = Vec::with_capacity(self.piece_map.piece_count as usize);
         // A recheck supersedes any announce already in flight. Without a
@@ -3534,6 +3760,12 @@ impl TorrentTask {
         // the recheck is supposed to have frozen.
         self.cancel_tracker_announces();
         self.shutdown_peers().await;
+        // Do not checkpoint the old fastresume bitmap while this scan is in
+        // progress. Publish each piece below only after its current bytes
+        // have been hashed, so a crash cannot restore stale-valid pieces.
+        for piece in 0..self.piece_map.piece_count {
+            self.picker.reject_piece(piece as usize);
+        }
         if let Err(error) = self.set_state_checked(TorrentState::Checking).await {
             self.paused = true;
             self.cancel_tracker_announces();
@@ -3542,7 +3774,7 @@ impl TorrentTask {
                 self.persist_recheck_job_progress(
                     job_id,
                     0,
-                    valid,
+                    verified_bytes,
                     &invalid_pieces,
                     JOB_STATE_FAILED,
                     Some("failed to persist torrent checking state"),
@@ -3555,7 +3787,7 @@ impl TorrentTask {
         }
 
         for piece in 0..self.piece_map.piece_count {
-            match self.pending_recheck_control().await {
+            match self.pending_recheck_control(&mut job_id).await {
                 Some(RecheckOutcome::Paused {
                     reply,
                     previous_paused,
@@ -3599,7 +3831,7 @@ impl TorrentTask {
                         self.persist_recheck_job_progress(
                             job_id,
                             piece,
-                            valid,
+                            verified_bytes,
                             &invalid_pieces,
                             if result.is_ok() {
                                 JOB_STATE_PAUSED
@@ -3644,7 +3876,7 @@ impl TorrentTask {
                         self.persist_recheck_job_progress(
                             job_id,
                             piece,
-                            valid,
+                            verified_bytes,
                             &invalid_pieces,
                             JOB_STATE_CANCELLED,
                             Some("recheck cancelled"),
@@ -3669,7 +3901,7 @@ impl TorrentTask {
                         self.persist_recheck_job_progress(
                             job_id,
                             piece,
-                            valid,
+                            verified_bytes,
                             &invalid_pieces,
                             JOB_STATE_PAUSED,
                             Some("recheck interrupted by shutdown"),
@@ -3696,16 +3928,22 @@ impl TorrentTask {
                 VerifyResult::Valid => {
                     verified_pieces.push((piece, true));
                     valid += 1;
+                    verified_bytes = verified_bytes.saturating_add(
+                        self.piece_length(piece).map(u64::from).unwrap_or_default(),
+                    );
+                    self.picker.mark_have(piece as usize);
                 }
                 VerifyResult::Invalid => {
                     verified_pieces.push((piece, false));
                     invalid_pieces.push(piece as i64);
                     invalid += 1;
+                    self.picker.reject_piece(piece as usize);
                 }
                 VerifyResult::Missing { .. } => {
                     verified_pieces.push((piece, false));
                     invalid_pieces.push(piece as i64);
                     invalid += 1;
+                    self.picker.reject_piece(piece as usize);
                 }
             }
 
@@ -3715,7 +3953,7 @@ impl TorrentTask {
                     self.persist_recheck_job_progress(
                         job_id,
                         piece + 1,
-                        valid,
+                        verified_bytes,
                         &invalid_pieces,
                         JOB_STATE_RUNNING,
                         Some("recheck progress"),
@@ -3763,6 +4001,12 @@ impl TorrentTask {
             self.schedule_trackers_now();
             TorrentState::Seeding
         } else {
+            self.tracker_event = tracker_event_after_incomplete_recheck(self.tracker_event);
+            // Rechecking cancelled any announce from the previous state. The
+            // tracker needs a fresh left/count snapshot when the torrent is
+            // found incomplete, even if the old session deadline was still in
+            // the future.
+            self.schedule_trackers_now();
             self.persist_progress().await;
             TorrentState::Downloading
         };
@@ -3776,7 +4020,7 @@ impl TorrentTask {
                 self.persist_recheck_job_progress(
                     job_id,
                     self.piece_map.piece_count,
-                    valid,
+                    verified_bytes,
                     &invalid_pieces,
                     JOB_STATE_FAILED,
                     Some("failed to persist torrent state after recheck"),
@@ -3791,7 +4035,7 @@ impl TorrentTask {
             self.persist_recheck_job_progress(
                 job_id,
                 self.piece_map.piece_count,
-                valid,
+                verified_bytes,
                 &invalid_pieces,
                 JOB_STATE_COMPLETED,
                 Some("recheck completed"),
@@ -3811,7 +4055,10 @@ impl TorrentTask {
         }
     }
 
-    async fn pending_recheck_control(&mut self) -> Option<RecheckOutcome> {
+    async fn pending_recheck_control(
+        &mut self,
+        active_job_id: &mut Option<String>,
+    ) -> Option<RecheckOutcome> {
         loop {
             match self.cmd_rx.try_recv() {
                 Ok(TorrentCmd::Pause { reply }) => {
@@ -3885,11 +4132,54 @@ impl TorrentTask {
                         let _ = reply.send(result);
                     }
                 }
+                Ok(TorrentCmd::UpdateTrackers { trackers, reply }) => {
+                    let result = self.apply_tracker_urls(trackers).await;
+                    if let Err(error) = &result {
+                        warn!(
+                            component = "torrent",
+                            operation = "update_trackers",
+                            torrent = %self.info_hash_hex,
+                            result = "error",
+                            error = %error,
+                            "failed to apply updated tracker URLs during recheck"
+                        );
+                    }
+                    if let Some(reply) = reply {
+                        let _ = reply.send(result);
+                    }
+                }
                 Ok(TorrentCmd::UpdatePeerExchange(enabled)) => {
                     self.pex_enabled = enabled;
                 }
-                Ok(TorrentCmd::Recheck { .. }) => {}
+                Ok(TorrentCmd::Recheck { job_id }) => {
+                    if let Some(job_id) = job_id {
+                        if active_job_id.is_none() {
+                            // Startup/resume rechecks normally have no durable
+                            // job. If an explicit recheck is queued while one
+                            // of those scans is still running, adopt its job
+                            // identity so the scan completes the job instead
+                            // of silently discarding the command.
+                            *active_job_id = Some(job_id);
+                        } else if active_job_id.as_deref() != Some(job_id.as_str()) {
+                            debug!(
+                                torrent = %self.info_hash_hex,
+                                active_job_id = ?active_job_id,
+                                queued_job_id = %job_id,
+                                "ignoring recheck command for a different active job"
+                            );
+                        }
+                    }
+                }
                 Ok(TorrentCmd::CancelJob { job_id }) => {
+                    if active_job_id.as_deref() != Some(job_id.as_str()) {
+                        debug!(
+                            torrent = %self.info_hash_hex,
+                            job_id,
+                            active_job_id = ?active_job_id,
+                            "ignoring cancellation for an inactive recheck job"
+                        );
+                        continue;
+                    }
                     debug!(
                         torrent = %self.info_hash_hex,
                         job_id,
@@ -4052,6 +4342,14 @@ impl TorrentTask {
         for partial in &state.partial_pieces {
             self.picker
                 .restore_partial_piece(partial.piece as usize, &partial.received_blocks);
+            if self
+                .picker
+                .partial_pieces()
+                .iter()
+                .any(|(piece, _)| *piece == partial.piece)
+            {
+                self.restored_partial_pieces.insert(partial.piece);
+            }
         }
 
         {
@@ -4408,7 +4706,7 @@ impl TorrentTask {
         &self,
         job_id: &str,
         next_piece: u32,
-        valid_pieces: usize,
+        verified_bytes: u64,
         invalid_pieces: &[i64],
         state: &str,
         message: Option<&str>,
@@ -4416,7 +4714,7 @@ impl TorrentTask {
         let now = unix_now();
         let done = i64::from(next_piece.min(self.piece_map.piece_count));
         let byte_offset = self.verified_byte_offset(next_piece);
-        let verified_bytes = db_i64((valid_pieces as u64).saturating_mul(self.meta.piece_length));
+        let verified_bytes = db_i64(verified_bytes);
         let job_id = job_id.to_owned();
         let state = state.to_owned();
         let message = message.map(str::to_owned);
@@ -4498,6 +4796,7 @@ impl TorrentTask {
     }
 
     async fn save_fastresume(&mut self, full_verify: bool) {
+        let durable_assembly_pieces = self.flush_piece_assemblies_to_disk().await;
         let (uploaded, downloaded) = self.transfer_snapshot().await;
         let mut state = FastresumeState::new_empty(
             &self.meta.info_hash,
@@ -4520,6 +4819,10 @@ impl TorrentTask {
             .picker
             .partial_pieces()
             .into_iter()
+            .filter(|(piece, _)| {
+                !self.piece_assemblies.contains_key(piece)
+                    || durable_assembly_pieces.contains(piece)
+            })
             .map(|(piece, received_blocks)| PartialPieceState {
                 piece,
                 received_blocks,
@@ -4574,6 +4877,49 @@ impl TorrentTask {
                 }
             }
         }
+    }
+
+    /// Make partial in-memory assemblies durable before advertising their
+    /// received block indexes in fastresume. A clean fastresume record that
+    /// points at bytes which only existed in RAM would make the next process
+    /// trust a partial piece that the disk does not contain.
+    async fn flush_piece_assemblies_to_disk(&self) -> HashSet<u32> {
+        let assemblies = self
+            .piece_assemblies
+            .iter()
+            .map(|(piece, assembly)| (*piece, assembly.received_blocks()))
+            .collect::<Vec<_>>();
+        let mut durable = HashSet::new();
+        for (piece, blocks) in assemblies {
+            let mut success = true;
+            for (offset, data) in blocks {
+                if let Err(error) = self
+                    .write_block(&BlockEvent {
+                        piece,
+                        offset,
+                        data,
+                    })
+                    .await
+                {
+                    warn!(
+                        component = "fastresume",
+                        operation = "flush_piece_assembly",
+                        torrent = %self.info_hash_hex,
+                        piece,
+                        offset,
+                        result = "error",
+                        error = %error,
+                        "could not flush an in-memory partial piece before fastresume save"
+                    );
+                    success = false;
+                    break;
+                }
+            }
+            if success {
+                durable.insert(piece);
+            }
+        }
+        durable
     }
 }
 
@@ -4721,6 +5067,25 @@ fn tracker_tiers_from_meta(meta: &TorrentMetaV1) -> Vec<Vec<TrackerState>> {
     tiers
 }
 
+fn tracker_tiers_from_urls(urls: &[String]) -> Vec<Vec<TrackerState>> {
+    let mut seen = HashSet::new();
+    let trackers = urls
+        .iter()
+        .filter_map(|url| {
+            if url.is_empty() || !seen.insert(url.clone()) {
+                None
+            } else {
+                Some(TrackerState::new(url.clone()))
+            }
+        })
+        .collect::<Vec<_>>();
+    if trackers.is_empty() {
+        Vec::new()
+    } else {
+        vec![trackers]
+    }
+}
+
 /// Restore the small amount of tracker session state that must survive an
 /// actor restart. Tracker IDs are opaque BEP 3 bytes and cannot be recovered
 /// from the metainfo; losing them makes the next HTTP announce a new tracker
@@ -4855,6 +5220,45 @@ fn webseed_block_url(meta: &TorrentMetaV1, webseed: &str) -> Option<Url> {
     }
 }
 
+fn validate_webseed_range_response(
+    status: StatusCode,
+    headers: &reqwest::header::HeaderMap,
+    expected_start: u64,
+    expected_end: u64,
+) -> anyhow::Result<()> {
+    if status != StatusCode::PARTIAL_CONTENT {
+        // A 200 response may contain the complete file from byte zero even
+        // though the server ignored our Range header. Accepting and
+        // truncating that body would write the wrong bytes for every
+        // non-zero block.
+        anyhow::bail!("webseed did not honor byte range: HTTP {status}");
+    }
+    let content_range = headers
+        .get(CONTENT_RANGE)
+        .ok_or_else(|| anyhow::anyhow!("webseed 206 response is missing Content-Range"))?
+        .to_str()
+        .map_err(|_| anyhow::anyhow!("webseed Content-Range is not valid ASCII"))?;
+    let range = content_range
+        .strip_prefix("bytes ")
+        .and_then(|value| value.split_once('/'))
+        .and_then(|(range, _total)| range.split_once('-'));
+    let Some((start, end)) = range else {
+        anyhow::bail!("webseed returned malformed Content-Range: {content_range}");
+    };
+    let start = start.parse::<u64>().map_err(|_| {
+        anyhow::anyhow!("webseed returned malformed Content-Range: {content_range}")
+    })?;
+    let end = end.parse::<u64>().map_err(|_| {
+        anyhow::anyhow!("webseed returned malformed Content-Range: {content_range}")
+    })?;
+    if start != expected_start || end != expected_end {
+        anyhow::bail!(
+            "webseed returned byte range {start}-{end}, expected {expected_start}-{expected_end}"
+        );
+    }
+    Ok(())
+}
+
 #[derive(Debug, Default, PartialEq, Eq)]
 struct UtPexPeers {
     added: Vec<SocketAddr>,
@@ -4944,10 +5348,27 @@ fn reconcile_peer_availability<A: PieceAvailability + ?Sized>(
 }
 
 fn tracker_event_after_success(current: TrackerEvent, sent: TrackerEvent) -> TrackerEvent {
-    if matches!(sent, TrackerEvent::Started | TrackerEvent::Completed) {
+    // A newer lifecycle event may have been queued while this request was in
+    // flight (for example, the torrent can finish while its Started announce
+    // is waiting on the tracker). Only consume the event represented by the
+    // response; otherwise a successful Started response can erase a pending
+    // Completed notification.
+    if current == sent && matches!(sent, TrackerEvent::Started | TrackerEvent::Completed) {
         TrackerEvent::Empty
     } else {
         current
+    }
+}
+
+fn tracker_event_after_incomplete_recheck(current: TrackerEvent) -> TrackerEvent {
+    // A Started event may still be pending for a newly resumed session. A
+    // Completed or Stopped event, however, no longer describes an active
+    // incomplete torrent after the recheck and must not be sent later.
+    match current {
+        TrackerEvent::Started => TrackerEvent::Started,
+        TrackerEvent::Empty | TrackerEvent::Completed | TrackerEvent::Stopped => {
+            TrackerEvent::Empty
+        }
     }
 }
 
@@ -5014,6 +5435,44 @@ async fn send_peer_event(peer_event_tx: &mpsc::Sender<PeerEvent>, event: PeerEve
     )
 }
 
+async fn send_choke_event(
+    peer_event_tx: &mpsc::Sender<PeerEvent>,
+    peer: SocketAddr,
+    id: PeerId,
+    choked_requests: Vec<BlockRequest>,
+    outstanding: &mut Vec<OutstandingRequest>,
+) -> bool {
+    if send_peer_event(
+        peer_event_tx,
+        PeerEvent::Choked {
+            peer,
+            id,
+            outstanding: choked_requests.clone(),
+        },
+    )
+    .await
+    {
+        true
+    } else {
+        // The actor still owns these reservations because the Choked event
+        // was not delivered. Keep them for the terminal disconnect fallback.
+        outstanding.extend(choked_requests.into_iter().map(OutstandingRequest::new));
+        false
+    }
+}
+
+/// Terminal peer events must eventually reach the actor while its channel is
+/// still open. Dropping a disconnect because the dedicated queue is full
+/// strands the active peer entry, its picker reservations, and its global
+/// peer permit. The peer task is owned by the torrent actor, so shutdown can
+/// abort this wait if the actor itself is no longer making progress.
+async fn send_peer_disconnect_event(
+    peer_event_tx: &mpsc::Sender<PeerEvent>,
+    event: PeerEvent,
+) -> bool {
+    peer_event_tx.send(event).await.is_ok()
+}
+
 /// Open a TCP connection, complete BEP 3 handshake, receive Piece messages.
 async fn run_outgoing_peer_with_policy(
     addr: SocketAddr,
@@ -5023,7 +5482,7 @@ async fn run_outgoing_peer_with_policy(
     peer_cmd_rx: mpsc::Receiver<PeerCommand>,
     upload: UploadContext,
     policy: OutgoingTransportPolicy,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<PeerLoopExit> {
     match policy {
         OutgoingTransportPolicy::Auto => {
             run_outgoing_peer(addr, peer_id, info_hash, peer_event_tx, peer_cmd_rx, upload).await
@@ -5071,7 +5530,7 @@ async fn run_outgoing_peer(
     peer_event_tx: mpsc::Sender<PeerEvent>,
     peer_cmd_rx: mpsc::Receiver<PeerCommand>,
     upload: UploadContext,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<PeerLoopExit> {
     let stream = tokio::time::timeout(Duration::from_secs(10), TcpStream::connect(addr)).await??;
     stream.set_nodelay(true)?;
 
@@ -5121,7 +5580,16 @@ async fn run_outgoing_peer(
     send_have_state(&mut peer_io, &upload.have_pieces).await?;
     peer_io.send(Message::Interested).await?;
 
-    run_peer_loop(addr, peer_id, peer_io, peer_event_tx, peer_cmd_rx, upload).await
+    Ok(run_peer_loop(
+        addr,
+        peer_id,
+        peer_io,
+        peer_event_tx,
+        peer_cmd_rx,
+        upload,
+        false,
+    )
+    .await)
 }
 
 async fn run_outgoing_utp_peer(
@@ -5131,7 +5599,7 @@ async fn run_outgoing_utp_peer(
     peer_event_tx: mpsc::Sender<PeerEvent>,
     peer_cmd_rx: mpsc::Receiver<PeerCommand>,
     upload: UploadContext,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<PeerLoopExit> {
     let stream = UtpStream::connect(addr).await?;
     run_established_utp_peer(
         addr,
@@ -5153,7 +5621,7 @@ async fn run_established_utp_peer(
     peer_cmd_rx: mpsc::Receiver<PeerCommand>,
     upload: UploadContext,
     mut stream: UtpStream,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<PeerLoopExit> {
     let our_hs = Handshake {
         info_hash,
         peer_id: crate::peer_id::our_peer_id(),
@@ -5177,7 +5645,7 @@ async fn run_established_utp_peer(
     }
     let remote_supports_extension = remote_hs.reserved.supports_extension_protocol();
 
-    let mut peer_io = PeerIo::Utp(UtpPeerIo { stream });
+    let mut peer_io = PeerIo::Utp(Box::new(UtpPeerIo { stream }));
     send_extension_handshake(
         &mut peer_io,
         upload.metadata.as_ref(),
@@ -5189,7 +5657,16 @@ async fn run_established_utp_peer(
     send_have_state(&mut peer_io, &upload.have_pieces).await?;
     peer_io.send(Message::Interested).await?;
 
-    run_peer_loop(addr, peer_id, peer_io, peer_event_tx, peer_cmd_rx, upload).await
+    Ok(run_peer_loop(
+        addr,
+        peer_id,
+        peer_io,
+        peer_event_tx,
+        peer_cmd_rx,
+        upload,
+        false,
+    )
+    .await)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -5202,7 +5679,7 @@ async fn run_incoming_peer(
     peer_cmd_rx: mpsc::Receiver<PeerCommand>,
     upload: UploadContext,
     remote_supports_extension: bool,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<PeerLoopExit> {
     stream.set_nodelay(true)?;
     let mut framed = Framed::new(stream, PeerCodec);
 
@@ -5232,7 +5709,16 @@ async fn run_incoming_peer(
     .await?;
     send_have_state(&mut peer_io, &upload.have_pieces).await?;
     peer_io.send(Message::Interested).await?;
-    run_peer_loop(addr, peer_id, peer_io, peer_event_tx, peer_cmd_rx, upload).await
+    Ok(run_peer_loop(
+        addr,
+        peer_id,
+        peer_io,
+        peer_event_tx,
+        peer_cmd_rx,
+        upload,
+        false,
+    )
+    .await)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -5245,7 +5731,7 @@ async fn run_incoming_utp_peer(
     peer_cmd_rx: mpsc::Receiver<PeerCommand>,
     upload: UploadContext,
     remote_supports_extension: bool,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<PeerLoopExit> {
     let our_hs = Handshake {
         info_hash,
         peer_id: crate::peer_id::our_peer_id(),
@@ -5258,7 +5744,7 @@ async fn run_incoming_utp_peer(
     .await
     .map_err(|_| anyhow::anyhow!("peer handshake write timed out"))??;
 
-    let mut peer_io = PeerIo::Utp(UtpPeerIo { stream });
+    let mut peer_io = PeerIo::Utp(Box::new(UtpPeerIo { stream }));
     send_extension_handshake(
         &mut peer_io,
         upload.metadata.as_ref(),
@@ -5269,12 +5755,21 @@ async fn run_incoming_utp_peer(
     .await?;
     send_have_state(&mut peer_io, &upload.have_pieces).await?;
     peer_io.send(Message::Interested).await?;
-    run_peer_loop(addr, peer_id, peer_io, peer_event_tx, peer_cmd_rx, upload).await
+    Ok(run_peer_loop(
+        addr,
+        peer_id,
+        peer_io,
+        peer_event_tx,
+        peer_cmd_rx,
+        upload,
+        false,
+    )
+    .await)
 }
 
 enum PeerIo {
     Tcp(Framed<TcpStream, PeerCodec>),
-    Utp(UtpPeerIo),
+    Utp(Box<UtpPeerIo>),
 }
 
 struct UtpPeerIo {
@@ -5329,6 +5824,16 @@ impl UtpPeerIo {
     }
 }
 
+#[derive(Debug)]
+struct PeerLoopExit {
+    result: anyhow::Result<()>,
+    /// Requests that were accepted by the torrent actor but had not yet
+    /// produced a Piece event when the peer loop ended. The production
+    /// wrapper forwards these to the actor's dedicated terminal channel so
+    /// picker reservations are released even on a socket/error path.
+    outstanding: Vec<BlockRequest>,
+}
+
 async fn run_peer_loop(
     addr: SocketAddr,
     peer_id: PeerId,
@@ -5336,12 +5841,21 @@ async fn run_peer_loop(
     peer_event_tx: mpsc::Sender<PeerEvent>,
     mut peer_cmd_rx: mpsc::Receiver<PeerCommand>,
     mut upload: UploadContext,
-) -> anyhow::Result<()> {
+    // Production wrappers use the dedicated terminal channel after this
+    // loop returns. The direct loop path can opt into the ordinary event
+    // channel when it owns no separate terminal delivery path.
+    send_terminal_event_on_peer_channel: bool,
+) -> PeerLoopExit {
     let mut outstanding = Vec::<OutstandingRequest>::new();
+    // BEP 10 extension ids are negotiated per peer. The id in our outgoing
+    // handshake is the id this loop receives from the peer; responses must
+    // use the peer's advertised id rather than our local id.
+    let mut remote_ut_metadata_id = None;
+    let mut download_choked = true;
     let mut upload_choked = true;
     let mut upload_limit_bytes_per_sec = upload.upload_limit_bytes_per_sec;
     let mut upload_tokens = upload_limit_bytes_per_sec.unwrap_or(u64::MAX);
-    let mut upload_tokens_updated = Instant::now();
+    let mut upload_tokens_updated = TokioInstant::now();
     let mut timeout_tick = interval(Duration::from_secs(5));
     let mut last_activity = Instant::now();
     let mut request_window_started = Instant::now();
@@ -5350,7 +5864,7 @@ async fn run_peer_loop(
     // peer loop must not await one read inline: a slow device otherwise
     // prevents it from processing choke/shutdown/input messages. The loop
     // owns the socket; detached read futures only return a leased block.
-    let mut upload_reads = futures::stream::FuturesUnordered::new();
+    let mut upload_reads = UploadReadTasks::default();
     // A peer is allowed to pipeline more requests than the detached read
     // budget. Queue only a small bounded tail and let completed reads refill
     // the worker set; saturating this queue drops the newest request instead
@@ -5371,11 +5885,29 @@ async fn run_peer_loop(
                 last_activity = Instant::now();
                 match cmd {
                     PeerCommand::Request(req) => {
-                        peer_io.send(Message::Request {
+                        if download_choked {
+                            // The engine may have queued a request just
+                            // before the remote choke event reached it. Do
+                            // not put that request on the wire; the engine's
+                            // Choked event releases its reservation.
+                            continue;
+                        }
+                        if let Err(error) = peer_io
+                            .send(Message::Request {
                             piece: req.piece,
                             begin: req.begin,
                             length: req.length,
-                        }).await?;
+                        })
+                        .await
+                        {
+                            // The torrent actor reserved this block before
+                            // enqueueing the command. Preserve it for the
+                            // terminal disconnect event when the socket
+                            // rejects the write, otherwise the picker can
+                            // strand the block as permanently requested.
+                            outstanding.push(OutstandingRequest::new(req));
+                            return Err(error);
+                        }
                         outstanding.push(OutstandingRequest::new(req));
                     }
                     PeerCommand::Have(piece) => {
@@ -5385,6 +5917,11 @@ async fn run_peer_loop(
                     PeerCommand::Choke => {
                         upload_choked = true;
                         pending_upload_requests.clear();
+                        // A local choke invalidates reads that were admitted
+                        // under the previous upload state. Abort them now so
+                        // a slow disk cannot retain peer memory until the
+                        // per-read timeout.
+                        abort_upload_reads(&upload_reads);
                         peer_io.send(Message::Choke).await?;
                     }
                     PeerCommand::Unchoke => {
@@ -5400,7 +5937,7 @@ async fn run_peer_loop(
                     PeerCommand::UpdateUploadLimit(limit) => {
                         upload_limit_bytes_per_sec = limit;
                         upload_tokens = upload_limit_bytes_per_sec.unwrap_or(u64::MAX);
-                        upload_tokens_updated = Instant::now();
+                        upload_tokens_updated = TokioInstant::now();
                     }
                     PeerCommand::Shutdown => {
                         pending_upload_requests.clear();
@@ -5498,10 +6035,21 @@ async fn run_peer_loop(
                         )
                         .await
                         {
+                            // The actor still owns this reservation because
+                            // the Piece event was not delivered. Put the
+                            // coordinate back so the terminal disconnect
+                            // event releases it even when other requests are
+                            // still in flight.
+                            outstanding.push(OutstandingRequest::new(BlockRequest {
+                                piece,
+                                begin,
+                                length: data_len,
+                            }));
                             break; // torrent task gone
                         }
                     }
                     Message::Unchoke => {
+                        download_choked = false;
                         if !send_peer_event(
                             &peer_event_tx,
                             PeerEvent::Unchoked {
@@ -5597,14 +6145,14 @@ async fn run_peer_loop(
                         );
                     }
                     Message::Choke => {
+                        download_choked = true;
                         let choked_requests = drain_outstanding(&mut outstanding);
-                        if !send_peer_event(
+                        if !send_choke_event(
                             &peer_event_tx,
-                            PeerEvent::Choked {
-                                peer: addr,
-                                id: peer_id,
-                                outstanding: choked_requests,
-                            },
+                            addr,
+                            peer_id,
+                            choked_requests,
+                            &mut outstanding,
                         )
                         .await
                         {
@@ -5622,6 +6170,7 @@ async fn run_peer_loop(
                     Message::Extended { ext_id: EXT_HANDSHAKE_ID, payload } => {
                         match ExtensionHandshake::parse(&payload) {
                             Ok(handshake) => {
+                                remote_ut_metadata_id = handshake.ut_metadata_id();
                                 if !send_peer_event(
                                     &peer_event_tx,
                                     PeerEvent::ExtendedHandshake {
@@ -5652,13 +6201,24 @@ async fn run_peer_loop(
                     Message::Extended { ext_id: LOCAL_UT_METADATA_ID, payload } => {
                         match UtMetadataMessage::parse(&payload) {
                             Ok(UtMetadataMessage::Request { piece }) => {
+                                let Some(remote_ut_metadata_id) = remote_ut_metadata_id else {
+                                    debug!(
+                                        component = "peer",
+                                        operation = "send_ut_metadata",
+                                        peer = %addr,
+                                        result = "ignored",
+                                        reason = "remote_extension_id_unknown",
+                                        "ignoring metadata request before peer extension negotiation"
+                                    );
+                                    continue;
+                                };
                                 let response = upload
                                     .metadata
                                     .as_ref()
                                     .map(|metadata| metadata_response(piece, metadata))
                                     .unwrap_or(UtMetadataMessage::Reject { piece });
                                 peer_io.send(Message::Extended {
-                                    ext_id: LOCAL_UT_METADATA_ID,
+                                    ext_id: remote_ut_metadata_id,
                                     payload: response.encode(),
                                 }).await?;
                             }
@@ -5803,33 +6363,43 @@ async fn run_peer_loop(
                         PeerEvent::RequestTimedOut {
                             peer: addr,
                             id: peer_id,
-                            timed_out,
+                            timed_out: timed_out.clone(),
                         },
                     )
                     .await
                 {
+                    outstanding.extend(timed_out.into_iter().map(OutstandingRequest::new));
                     break;
                 }
             }
         }
         }
-        for read in upload_reads {
-            read.abort();
-        }
         Ok(())
     }
     .await;
 
-    let _ = send_peer_event(
-        &peer_event_tx,
-        PeerEvent::Disconnected {
-            peer: addr,
-            id: peer_id,
-            outstanding: drain_outstanding(&mut outstanding),
-        },
-    )
-    .await;
-    result
+    // Keep this outside the result-producing block: socket, framing, and
+    // event-delivery errors can leave that block through `?`, bypassing the
+    // normal loop break. Dropping a JoinHandle detaches its task, so every
+    // in-flight upload read must be explicitly aborted on every exit path.
+    abort_upload_reads(&upload_reads);
+
+    let outstanding = drain_outstanding(&mut outstanding);
+    if send_terminal_event_on_peer_channel {
+        let _ = send_peer_event(
+            &peer_event_tx,
+            PeerEvent::Disconnected {
+                peer: addr,
+                id: peer_id,
+                outstanding: outstanding.clone(),
+            },
+        )
+        .await;
+    }
+    PeerLoopExit {
+        result,
+        outstanding,
+    }
 }
 
 async fn send_extension_handshake(
@@ -5994,29 +6564,41 @@ fn start_upload_reads(
     }
 }
 
+fn abort_upload_reads(
+    upload_reads: &futures::stream::FuturesUnordered<tokio::task::JoinHandle<UploadReadResult>>,
+) {
+    for read in upload_reads.iter() {
+        read.abort();
+    }
+}
+
 async fn wait_for_upload_budget(
     limit: Option<u64>,
     tokens: &mut u64,
-    tokens_updated: &mut Instant,
+    tokens_updated: &mut TokioInstant,
     bytes: u64,
 ) {
     let Some(limit) = limit.filter(|limit| *limit > 0) else {
         *tokens = u64::MAX;
-        *tokens_updated = Instant::now();
+        *tokens_updated = TokioInstant::now();
         return;
     };
-    loop {
-        let now = Instant::now();
+    let mut remaining = bytes;
+    while remaining > 0 {
+        let now = TokioInstant::now();
         let elapsed = now.saturating_duration_since(*tokens_updated);
         *tokens_updated = now;
         let refill = (elapsed.as_secs_f64() * limit as f64).floor() as u64;
         *tokens = tokens.saturating_add(refill).min(limit);
-        if *tokens >= bytes {
-            *tokens = tokens.saturating_sub(bytes);
-            return;
+        let requested = remaining.min(limit);
+        if *tokens >= requested {
+            *tokens -= requested;
+            remaining -= requested;
+            continue;
         }
-        let missing = bytes.saturating_sub(*tokens);
-        sleep(Duration::from_secs_f64(missing as f64 / limit as f64)).await;
+        let missing = requested.saturating_sub(*tokens);
+        sleep(Duration::from_secs_f64(missing as f64 / limit as f64).max(Duration::from_millis(1)))
+            .await;
     }
 }
 
@@ -6134,6 +6716,8 @@ fn webseed_retry_delay(failures: u8) -> Duration {
 
 #[cfg(test)]
 mod tests {
+    use sha1::{Digest, Sha1};
+
     use super::*;
 
     fn persist_task_row(conn: &Connection, entry: &rt_session::TorrentEntry, meta: &TorrentMetaV1) {
@@ -6157,6 +6741,34 @@ mod tests {
             TorrentTask::try_apply_choke_decision(&tx, false, ChokeDecision::Choke);
         assert!(state);
         assert!(!failed);
+    }
+
+    #[test]
+    fn merged_peer_request_views_are_deduplicated() {
+        let requests = vec![BlockRequest {
+            piece: 2,
+            begin: 0,
+            length: MAX_BLOCK_SIZE,
+        }];
+        let merged = TorrentTask::merge_unique_block_requests(
+            requests,
+            vec![
+                BlockRequest {
+                    piece: 2,
+                    begin: 0,
+                    length: MAX_BLOCK_SIZE,
+                },
+                BlockRequest {
+                    piece: 3,
+                    begin: 0,
+                    length: MAX_BLOCK_SIZE,
+                },
+            ],
+        );
+
+        assert_eq!(merged.len(), 2);
+        assert_eq!(merged[0].piece, 2);
+        assert_eq!(merged[1].piece, 3);
     }
 
     #[test]
@@ -6731,9 +7343,34 @@ mod tests {
         entry.amount_left = 4;
         entry.transition(TorrentState::Paused).unwrap();
         persist_task_row(&conn, &entry, &meta);
+        let job_id = "queued-recheck".to_owned();
+        rt_db::upsert_job(
+            &conn,
+            &rt_db::JobRow {
+                job_id: job_id.clone(),
+                kind: "recheck_torrent".to_owned(),
+                state: JOB_STATE_RUNNING.to_owned(),
+                dry_run: false,
+                affected_torrents: vec![info_hash.clone()],
+                total: 1,
+                done: 0,
+                checkpoint: 0,
+                file_index: Some(0),
+                piece_index: Some(0),
+                byte_offset: Some(0),
+                verified_bytes: 0,
+                invalid_pieces: Vec::new(),
+                error: None,
+                created_at: 1,
+                started_at: Some(1),
+                updated_at: 1,
+                finished_at: None,
+            },
+        )
+        .unwrap();
         registry.write().await.add(entry).unwrap();
         let db = Arc::new(Mutex::new(conn));
-        let (_cmd_tx, cmd_rx) = mpsc::channel(1);
+        let (cmd_tx, cmd_rx) = mpsc::channel(4);
         let mut task = TorrentTask::new(
             meta,
             temp.path().to_path_buf(),
@@ -6758,6 +7395,23 @@ mod tests {
         )
         .await;
 
+        // The task is already doing its implicit paused-torrent scan. The
+        // explicit command must attach the durable job to that scan rather
+        // than being discarded, and an unrelated stale cancellation must not
+        // stop it.
+        cmd_tx
+            .send(TorrentCmd::Recheck {
+                job_id: Some(job_id.clone()),
+            })
+            .await
+            .unwrap();
+        cmd_tx
+            .send(TorrentCmd::CancelJob {
+                job_id: "stale-recheck".to_owned(),
+            })
+            .await
+            .unwrap();
+
         assert!(matches!(
             task.run_recheck(None).await,
             RecheckOutcome::Complete
@@ -6770,6 +7424,10 @@ mod tests {
         assert_eq!(
             rt_db::get(&db.lock().unwrap(), &info_hash).unwrap().state,
             TorrentState::Paused.as_str()
+        );
+        assert_eq!(
+            rt_db::get_job(&db.lock().unwrap(), &job_id).unwrap().state,
+            JOB_STATE_COMPLETED
         );
     }
 
@@ -6941,7 +7599,7 @@ mod tests {
             .unwrap();
 
         assert!(matches!(
-            task.run_recheck(None).await,
+            task.run_recheck(Some("stopped-recheck".to_owned())).await,
             RecheckOutcome::Cancelled
         ));
         assert!(task.paused);
@@ -7148,6 +7806,114 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn checking_restore_rechecks_even_when_fastresume_claims_complete() {
+        let temp = tempfile::tempdir().unwrap();
+        let conn = Connection::open_in_memory().unwrap();
+        rt_db::migrate(&conn).unwrap();
+        let meta = TorrentMetaV1 {
+            info_hash: [23; 20],
+            announce: None,
+            announce_list: Vec::new(),
+            webseeds: Vec::new(),
+            comment: None,
+            created_by: None,
+            creation_date: None,
+            name: "checking-restore.bin".into(),
+            piece_length: 4,
+            pieces: vec![[0; 20]],
+            files: vec![rt_metainfo::TorrentFileV1 {
+                index: 0,
+                length: 4,
+                path: rt_path::SafeRelPath::from_name("checking-restore.bin", false).unwrap(),
+                offset: 0,
+                pad: false,
+            }],
+            private: false,
+            raw: Vec::new(),
+        };
+        let info_hash = hex::encode(meta.info_hash);
+        let mut fastresume =
+            FastresumeState::new_empty(&meta.info_hash, 1, ImportPolicy::RequireVerification);
+        fastresume.clean_shutdown = true;
+        fastresume.pieces = vec![PieceState::Valid];
+        FastresumeStore::new(temp.path().join("fastresume"))
+            .save(&fastresume)
+            .unwrap();
+
+        let registry = Arc::new(RwLock::new(SessionRegistry::new()));
+        let mut entry = rt_session::TorrentEntry::new(
+            info_hash.clone(),
+            meta.name.clone(),
+            temp.path().to_string_lossy().into_owned(),
+        );
+        entry.total_length = 4;
+        entry.amount_left = 0;
+        // This is the state persisted when a process stops after admitting a
+        // recheck job but before the scan completes. It must take precedence
+        // over an older fastresume bitmap.
+        entry.state = TorrentState::Checking;
+        persist_task_row(&conn, &entry, &meta);
+        registry.write().await.add(entry).unwrap();
+
+        let db = Arc::new(Mutex::new(conn));
+        let (cmd_tx, cmd_rx) = mpsc::channel(4);
+        let task = TorrentTask::new(
+            meta,
+            temp.path().to_path_buf(),
+            false,
+            TorrentState::Checking,
+            Arc::clone(&registry),
+            DbExecutor::direct(Arc::clone(&db)),
+            ResourceGovernor::new(rt_metrics::ResourceGovernorConfig::default()),
+            cmd_rx,
+            temp.path().join("fastresume"),
+            8,
+            6881,
+            10,
+            10,
+            60,
+            1024 * 1024,
+            StorageIoConfig::default(),
+            false,
+            OutboundEgressPolicy::default(),
+            GlobalNetworkBudget::unlimited(),
+            10_000,
+        )
+        .await;
+        let handle = tokio::spawn(task.run());
+
+        timeout(Duration::from_secs(2), async {
+            loop {
+                let state = db
+                    .lock()
+                    .unwrap()
+                    .query_row(
+                        "SELECT state FROM torrents WHERE info_hash = ?1",
+                        [&info_hash],
+                        |row| row.get::<_, String>(0),
+                    )
+                    .ok();
+                if state.as_deref() == Some(TorrentState::Downloading.as_str()) {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("checking restore did not verify the current payload");
+        assert_eq!(
+            registry.read().await.get(&info_hash).unwrap().state,
+            TorrentState::Downloading
+        );
+
+        cmd_tx.send(TorrentCmd::Shutdown).await.unwrap();
+        timeout(Duration::from_secs(1), handle)
+            .await
+            .expect("checking restore task did not shut down")
+            .unwrap();
+    }
+
+    #[tokio::test]
     async fn error_dormant_promotion_accepts_resume_before_recovery() {
         let temp = tempfile::tempdir().unwrap();
         let conn = Connection::open_in_memory().unwrap();
@@ -7269,6 +8035,19 @@ mod tests {
         assert_eq!(stricter_limit(Some(30), None), Some(30));
         assert_eq!(stricter_limit(None, Some(40)), Some(40));
         assert_eq!(stricter_limit(None, None), None);
+    }
+
+    #[test]
+    fn download_budget_accepts_a_protocol_block_below_the_rate_limit() {
+        let limit = 1_000;
+        let mut tokens = download_bucket_capacity(limit);
+
+        assert!(consume_download_tokens(
+            &mut tokens,
+            limit,
+            u64::from(MAX_BLOCK_SIZE)
+        ));
+        assert_eq!(tokens, 0);
     }
 
     #[test]
@@ -7415,6 +8194,37 @@ mod tests {
                 .unwrap()
                 .as_str(),
             "https://mirror.example/payload-dir/payload.bin"
+        );
+    }
+
+    #[test]
+    fn webseed_range_response_rejects_server_that_ignores_range() {
+        let headers = reqwest::header::HeaderMap::new();
+
+        let error =
+            validate_webseed_range_response(StatusCode::OK, &headers, 16_384, 32_767).unwrap_err();
+
+        assert!(error.to_string().contains("did not honor byte range"));
+    }
+
+    #[test]
+    fn webseed_range_response_requires_the_requested_content_range() {
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert(
+            CONTENT_RANGE,
+            reqwest::header::HeaderValue::from_static("bytes 16384-32767/65536"),
+        );
+
+        assert!(validate_webseed_range_response(
+            StatusCode::PARTIAL_CONTENT,
+            &headers,
+            16_384,
+            32_767,
+        )
+        .is_ok());
+        assert!(
+            validate_webseed_range_response(StatusCode::PARTIAL_CONTENT, &headers, 0, 16_383,)
+                .is_err()
         );
     }
 
@@ -7681,6 +8491,12 @@ mod tests {
         let mut assembly = PieceAssembly::new((MAX_BLOCK_SIZE * 2) as usize);
         assembly.insert(0, &[1; MAX_BLOCK_SIZE as usize]).unwrap();
         assert!(!assembly.is_complete());
+        assert_eq!(assembly.received_blocks().len(), 1);
+        assert_eq!(assembly.received_blocks()[0].0, 0);
+        assert_eq!(
+            assembly.received_blocks()[0].1.len(),
+            MAX_BLOCK_SIZE as usize
+        );
         assembly
             .insert(MAX_BLOCK_SIZE, &[2; MAX_BLOCK_SIZE as usize])
             .unwrap();
@@ -7706,6 +8522,211 @@ mod tests {
             .insert(0, &[2; MAX_BLOCK_SIZE as usize])
             .unwrap_err();
         assert!(err.to_string().contains("conflicting duplicate block"));
+    }
+
+    #[tokio::test]
+    async fn fastresume_flushes_partial_in_memory_assembly_to_disk() {
+        let temp = tempfile::tempdir().unwrap();
+        let conn = Connection::open_in_memory().unwrap();
+        rt_db::migrate(&conn).unwrap();
+        let piece_length = u64::from(MAX_BLOCK_SIZE) * 2;
+        let meta = TorrentMetaV1 {
+            info_hash: [21; 20],
+            announce: None,
+            announce_list: Vec::new(),
+            webseeds: Vec::new(),
+            comment: None,
+            created_by: None,
+            creation_date: None,
+            name: "partial.bin".into(),
+            piece_length,
+            pieces: vec![[0; 20]],
+            files: vec![rt_metainfo::TorrentFileV1 {
+                index: 0,
+                length: piece_length,
+                path: rt_path::SafeRelPath::from_name("partial.bin", false).unwrap(),
+                offset: 0,
+                pad: false,
+            }],
+            private: false,
+            raw: Vec::new(),
+        };
+        let info_hash = hex::encode(meta.info_hash);
+        let registry = Arc::new(RwLock::new(SessionRegistry::new()));
+        let mut entry = rt_session::TorrentEntry::new(
+            info_hash.clone(),
+            meta.name.clone(),
+            temp.path().to_string_lossy().into_owned(),
+        );
+        entry.total_length = piece_length;
+        entry.amount_left = piece_length;
+        entry.transition(TorrentState::Downloading).unwrap();
+        persist_task_row(&conn, &entry, &meta);
+        registry.write().await.add(entry).unwrap();
+
+        let db = Arc::new(Mutex::new(conn));
+        let (_cmd_tx, cmd_rx) = mpsc::channel(1);
+        let mut task = TorrentTask::new(
+            meta,
+            temp.path().to_path_buf(),
+            false,
+            TorrentState::Downloading,
+            registry,
+            DbExecutor::direct(Arc::clone(&db)),
+            ResourceGovernor::new(rt_metrics::ResourceGovernorConfig::default()),
+            cmd_rx,
+            temp.path().join("fastresume"),
+            8,
+            6881,
+            10,
+            10,
+            60,
+            1024 * 1024,
+            StorageIoConfig::default(),
+            false,
+            OutboundEgressPolicy::default(),
+            GlobalNetworkBudget::unlimited(),
+            10_000,
+        )
+        .await;
+
+        task.picker.availability.add_have(0);
+        let peer_has = PieceBitmap::from_bools(&[true]);
+        let request = task.picker.pick(&peer_has).unwrap();
+        let payload = bytes::Bytes::from(vec![0xA5; request.length as usize]);
+        task.handle_block(BlockEvent {
+            piece: request.piece,
+            offset: request.begin,
+            data: payload.clone(),
+        })
+        .await;
+        assert!(task.piece_assemblies.contains_key(&request.piece));
+
+        task.save_fastresume(false).await;
+
+        let on_disk = std::fs::read(temp.path().join("partial.bin")).unwrap();
+        assert_eq!(on_disk.len(), piece_length as usize);
+        assert_eq!(&on_disk[..request.length as usize], payload.as_ref());
+        assert!(on_disk[request.length as usize..]
+            .iter()
+            .all(|byte| *byte == 0));
+        let state = task.fastresume.load(&info_hash).unwrap();
+        assert_eq!(
+            state.partial_pieces,
+            vec![PartialPieceState {
+                piece: request.piece,
+                received_blocks: vec![0],
+            }]
+        );
+    }
+
+    #[tokio::test]
+    async fn restored_partial_piece_writes_new_blocks_directly() {
+        let temp = tempfile::tempdir().unwrap();
+        let conn = Connection::open_in_memory().unwrap();
+        rt_db::migrate(&conn).unwrap();
+        let piece_length = u64::from(MAX_BLOCK_SIZE) * 2;
+        let first = vec![0x11; MAX_BLOCK_SIZE as usize];
+        let second = vec![0x22; MAX_BLOCK_SIZE as usize];
+        let mut piece_data = first.clone();
+        piece_data.extend_from_slice(&second);
+        let piece_hash: [u8; 20] = Sha1::digest(&piece_data).into();
+        let meta = TorrentMetaV1 {
+            info_hash: [22; 20],
+            announce: None,
+            announce_list: Vec::new(),
+            webseeds: Vec::new(),
+            comment: None,
+            created_by: None,
+            creation_date: None,
+            name: "restored-partial.bin".into(),
+            piece_length,
+            pieces: vec![piece_hash],
+            files: vec![rt_metainfo::TorrentFileV1 {
+                index: 0,
+                length: piece_length,
+                path: rt_path::SafeRelPath::from_name("restored-partial.bin", false).unwrap(),
+                offset: 0,
+                pad: false,
+            }],
+            private: false,
+            raw: Vec::new(),
+        };
+        let file_path = temp.path().join("restored-partial.bin");
+        let mut initial_data = first.clone();
+        initial_data.extend(vec![0; second.len()]);
+        std::fs::write(&file_path, initial_data).unwrap();
+        let info_hash = hex::encode(meta.info_hash);
+        let mut fastresume =
+            FastresumeState::new_empty(&meta.info_hash, 1, ImportPolicy::RequireVerification);
+        fastresume.clean_shutdown = true;
+        fastresume.partial_pieces = vec![PartialPieceState {
+            piece: 0,
+            received_blocks: vec![0],
+        }];
+        fastresume.file_hints = collect_file_hints(temp.path(), &meta);
+        FastresumeStore::new(temp.path().join("fastresume"))
+            .save(&fastresume)
+            .unwrap();
+
+        let registry = Arc::new(RwLock::new(SessionRegistry::new()));
+        let mut entry = rt_session::TorrentEntry::new(
+            info_hash.clone(),
+            meta.name.clone(),
+            temp.path().to_string_lossy().into_owned(),
+        );
+        entry.total_length = piece_length;
+        entry.amount_left = piece_length;
+        entry.transition(TorrentState::Downloading).unwrap();
+        persist_task_row(&conn, &entry, &meta);
+        registry.write().await.add(entry).unwrap();
+
+        let db = Arc::new(Mutex::new(conn));
+        let (_cmd_tx, cmd_rx) = mpsc::channel(1);
+        let mut task = TorrentTask::new(
+            meta,
+            temp.path().to_path_buf(),
+            false,
+            TorrentState::Downloading,
+            registry,
+            DbExecutor::direct(Arc::clone(&db)),
+            ResourceGovernor::new(rt_metrics::ResourceGovernorConfig::default()),
+            cmd_rx,
+            temp.path().join("fastresume"),
+            8,
+            6881,
+            10,
+            10,
+            60,
+            1024 * 1024,
+            StorageIoConfig::default(),
+            false,
+            OutboundEgressPolicy::default(),
+            GlobalNetworkBudget::unlimited(),
+            10_000,
+        )
+        .await;
+
+        assert!(task.restore_fastresume().await);
+        assert!(task.restored_partial_pieces.contains(&0));
+        assert!(!task.can_aggregate_piece_write(0));
+
+        task.picker.availability.add_have(0);
+        let request = task.picker.pick(&PieceBitmap::from_bools(&[true])).unwrap();
+        assert_eq!(request.begin, MAX_BLOCK_SIZE);
+        task.handle_block(BlockEvent {
+            piece: request.piece,
+            offset: request.begin,
+            data: bytes::Bytes::from(second.clone()),
+        })
+        .await;
+
+        assert!(task.picker.is_complete());
+        assert!(task.piece_assemblies.is_empty());
+        assert!(!task.restored_partial_pieces.contains(&0));
+        let on_disk = std::fs::read(file_path).unwrap();
+        assert_eq!(&on_disk[..first.len()], first.as_slice());
+        assert_eq!(&on_disk[first.len()..], second.as_slice());
     }
 
     #[test]
@@ -7737,7 +8758,7 @@ mod tests {
 
         let evictions = evict_piece_assemblies_to_budget(&mut assemblies, &mut bytes, 3, 2, 12);
 
-        assert_eq!(evictions, 1);
+        assert_eq!(evictions, vec![1]);
         assert_eq!(bytes, 8);
         assert!(!assemblies.contains_key(&1));
         assert!(assemblies.contains_key(&2));
@@ -7773,7 +8794,7 @@ mod tests {
 
         let evictions = evict_piece_assemblies_to_budget(&mut assemblies, &mut bytes, 3, 3, 8);
 
-        assert_eq!(evictions, 1);
+        assert_eq!(evictions, vec![1]);
         assert_eq!(bytes, 8);
         assert!(!assemblies.contains_key(&1));
         assert!(assemblies.contains_key(&2));
@@ -7788,7 +8809,7 @@ mod tests {
 
         let evictions = evict_piece_assemblies_to_budget(&mut assemblies, &mut bytes, 7, 0, 0);
 
-        assert_eq!(evictions, 0);
+        assert!(evictions.is_empty());
         assert_eq!(bytes, 16);
         assert!(assemblies.contains_key(&7));
     }
@@ -7819,7 +8840,10 @@ mod tests {
             memory_aware_request_pipeline(768, 1024),
             PEER_REQUEST_PIPELINE_CONSTRAINED
         );
-        assert_eq!(memory_aware_request_pipeline(1, 0), 0);
+        assert_eq!(
+            memory_aware_request_pipeline(1, 0),
+            PEER_REQUEST_PIPELINE_NORMAL
+        );
     }
 
     #[test]
@@ -7958,6 +8982,113 @@ mod tests {
             tracker_event_after_success(TrackerEvent::Empty, TrackerEvent::Empty),
             TrackerEvent::Empty
         );
+    }
+
+    #[test]
+    fn tracker_success_does_not_clear_a_newer_lifecycle_event() {
+        assert_eq!(
+            tracker_event_after_success(TrackerEvent::Completed, TrackerEvent::Started),
+            TrackerEvent::Completed
+        );
+        assert_eq!(
+            tracker_event_after_success(TrackerEvent::Started, TrackerEvent::Completed),
+            TrackerEvent::Started
+        );
+    }
+
+    #[test]
+    fn incomplete_recheck_discards_stale_terminal_tracker_events() {
+        assert_eq!(
+            tracker_event_after_incomplete_recheck(TrackerEvent::Started),
+            TrackerEvent::Started
+        );
+        assert_eq!(
+            tracker_event_after_incomplete_recheck(TrackerEvent::Empty),
+            TrackerEvent::Empty
+        );
+        assert_eq!(
+            tracker_event_after_incomplete_recheck(TrackerEvent::Completed),
+            TrackerEvent::Empty
+        );
+        assert_eq!(
+            tracker_event_after_incomplete_recheck(TrackerEvent::Stopped),
+            TrackerEvent::Empty
+        );
+    }
+
+    #[tokio::test]
+    async fn restarting_tracker_session_schedules_a_new_started_event_immediately() {
+        let temp = tempfile::tempdir().unwrap();
+        let conn = Connection::open_in_memory().unwrap();
+        rt_db::migrate(&conn).unwrap();
+        let meta = TorrentMetaV1 {
+            info_hash: [25; 20],
+            announce: None,
+            announce_list: Vec::new(),
+            webseeds: Vec::new(),
+            comment: None,
+            created_by: None,
+            creation_date: None,
+            name: "tracker-session.bin".into(),
+            piece_length: 4,
+            pieces: vec![[0; 20]],
+            files: vec![rt_metainfo::TorrentFileV1 {
+                index: 0,
+                length: 4,
+                path: rt_path::SafeRelPath::from_name("tracker-session.bin", false).unwrap(),
+                offset: 0,
+                pad: false,
+            }],
+            private: false,
+            raw: Vec::new(),
+        };
+        let registry = Arc::new(RwLock::new(SessionRegistry::new()));
+        let db = Arc::new(Mutex::new(conn));
+        let (_cmd_tx, cmd_rx) = mpsc::channel(1);
+        let mut task = TorrentTask::new(
+            meta,
+            temp.path().to_path_buf(),
+            false,
+            TorrentState::Downloading,
+            registry,
+            DbExecutor::direct(Arc::clone(&db)),
+            ResourceGovernor::new(rt_metrics::ResourceGovernorConfig::default()),
+            cmd_rx,
+            temp.path().join("fastresume"),
+            8,
+            6881,
+            10,
+            10,
+            60,
+            1024 * 1024,
+            StorageIoConfig::default(),
+            false,
+            OutboundEgressPolicy::default(),
+            GlobalNetworkBudget::unlimited(),
+            10_000,
+        )
+        .await;
+
+        let tracker_urls = vec![
+            "http://tracker-a/announce".to_owned(),
+            "http://tracker-b/announce".to_owned(),
+        ];
+        task.tracker_tiers = tracker_tiers_from_urls(&tracker_urls);
+        for tracker in task.tracker_tiers.iter_mut().flatten() {
+            tracker.next_announce = Some(Instant::now() + Duration::from_secs(3600));
+        }
+        task.tracker_event = TrackerEvent::Completed;
+        task.stopped_announced = true;
+
+        task.restart_tracker_session();
+
+        assert_eq!(task.tracker_event, TrackerEvent::Started);
+        assert!(!task.stopped_announced);
+        assert!(task
+            .tracker_tiers
+            .iter()
+            .flatten()
+            .all(|tracker| tracker.is_due()));
     }
 
     #[test]
@@ -8163,6 +9294,180 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn upload_reads_are_aborted_after_peer_loop_exit() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        struct DropMarker(Arc<AtomicBool>);
+
+        impl Drop for DropMarker {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+
+        let dropped = Arc::new(AtomicBool::new(false));
+        let started = Arc::new(AtomicBool::new(false));
+        let marker = Arc::clone(&dropped);
+        let task_started = Arc::clone(&started);
+        let read = tokio::spawn(async move {
+            task_started.store(true, Ordering::SeqCst);
+            let _marker = DropMarker(marker);
+            std::future::pending::<UploadReadResult>().await
+        });
+        timeout(Duration::from_secs(1), async {
+            while !started.load(Ordering::SeqCst) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("upload read task did not start");
+
+        let upload_reads = futures::stream::FuturesUnordered::new();
+        upload_reads.push(read);
+
+        abort_upload_reads(&upload_reads);
+
+        timeout(Duration::from_secs(1), async {
+            while !dropped.load(Ordering::SeqCst) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("aborting an upload read must cancel its task");
+    }
+
+    #[tokio::test]
+    async fn upload_reads_are_aborted_when_peer_loop_is_cancelled() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        struct DropMarker(Arc<AtomicBool>);
+
+        impl Drop for DropMarker {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+
+        let dropped = Arc::new(AtomicBool::new(false));
+        let started = Arc::new(AtomicBool::new(false));
+        let owner_started = Arc::new(AtomicBool::new(false));
+        let marker = Arc::clone(&dropped);
+        let task_started = Arc::clone(&started);
+        let read = tokio::spawn(async move {
+            task_started.store(true, Ordering::SeqCst);
+            let _marker = DropMarker(marker);
+            std::future::pending::<UploadReadResult>().await
+        });
+        timeout(Duration::from_secs(1), async {
+            while !started.load(Ordering::SeqCst) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("upload read task did not start");
+
+        let task_owner_started = Arc::clone(&owner_started);
+        let peer_loop = tokio::spawn(async move {
+            let upload_reads = UploadReadTasks::default();
+            upload_reads.push(read);
+            task_owner_started.store(true, Ordering::SeqCst);
+            std::future::pending::<()>().await;
+        });
+        timeout(Duration::from_secs(1), async {
+            while !owner_started.load(Ordering::SeqCst) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("upload read owner did not start");
+        peer_loop.abort();
+        assert!(peer_loop.await.unwrap_err().is_cancelled());
+
+        timeout(Duration::from_secs(1), async {
+            while !dropped.load(Ordering::SeqCst) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("cancelling the peer loop must cancel its upload read tasks");
+    }
+
+    #[tokio::test]
+    async fn failed_choke_event_preserves_outstanding_requests() {
+        let (tx, _rx) = mpsc::channel(1);
+        let peer = "127.0.0.1:6881".parse().unwrap();
+        let peer_id = PeerId::new();
+        tx.try_send(PeerEvent::Unchoked { peer, id: peer_id })
+            .unwrap();
+        let request = BlockRequest {
+            piece: 3,
+            begin: 0,
+            length: 4,
+        };
+        let mut outstanding = Vec::new();
+
+        assert!(!send_choke_event(&tx, peer, peer_id, vec![request], &mut outstanding,).await);
+        assert_eq!(drain_outstanding(&mut outstanding), vec![request]);
+    }
+
+    #[tokio::test]
+    async fn terminal_peer_disconnect_waits_for_dedicated_queue_capacity() {
+        let (tx, mut rx) = mpsc::channel(1);
+        let peer = "127.0.0.1:6881".parse().unwrap();
+        let peer_id = PeerId::new();
+        tx.send(PeerEvent::Unchoked { peer, id: peer_id })
+            .await
+            .unwrap();
+
+        let sender = tokio::spawn(async move {
+            send_peer_disconnect_event(
+                &tx,
+                PeerEvent::Disconnected {
+                    peer,
+                    id: peer_id,
+                    outstanding: Vec::new(),
+                },
+            )
+            .await
+        });
+        tokio::task::yield_now().await;
+        assert!(
+            !sender.is_finished(),
+            "terminal disconnect must not be dropped when its queue is full"
+        );
+
+        assert!(matches!(rx.recv().await, Some(PeerEvent::Unchoked { .. })));
+        assert!(sender.await.unwrap());
+        assert!(matches!(
+            rx.recv().await,
+            Some(PeerEvent::Disconnected { .. })
+        ));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn upload_budget_handles_a_block_larger_than_the_rate_limit() {
+        let waiter = tokio::spawn(async {
+            let mut tokens = 1_000;
+            let mut tokens_updated = TokioInstant::now();
+            wait_for_upload_budget(Some(1_000), &mut tokens, &mut tokens_updated, 2_000).await;
+        });
+        tokio::task::yield_now().await;
+        assert!(!waiter.is_finished());
+
+        tokio::time::advance(Duration::from_secs(1)).await;
+        tokio::task::yield_now().await;
+        let finished = waiter.is_finished();
+        if !finished {
+            waiter.abort();
+        }
+        assert!(
+            finished,
+            "an upload block larger than the rate bucket must complete in chunks"
+        );
+        waiter.await.unwrap();
+    }
+
+    #[tokio::test]
     async fn peer_loop_exits_when_command_channel_closes() {
         let temp = tempfile::tempdir().unwrap();
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -8215,17 +9520,207 @@ mod tests {
                 peer_event_tx,
                 peer_cmd_rx,
                 upload,
+                true,
             ),
         )
         .await
         .expect("closed command channel should stop the peer promptly");
 
-        assert!(result.is_ok());
+        assert!(result.result.is_ok());
         assert!(matches!(
             peer_event_rx.recv().await,
             Some(PeerEvent::Disconnected { peer, .. }) if peer == peer_addr
         ));
         drop(client);
+    }
+
+    #[tokio::test]
+    async fn peer_loop_uses_remote_metadata_extension_id_for_upload() {
+        let temp = tempfile::tempdir().unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let peer_addr = listener.local_addr().unwrap();
+        let remote = TcpStream::connect(peer_addr).await.unwrap();
+        let (server, _) = listener.accept().await.unwrap();
+
+        let piece_map = Arc::new(
+            PieceMap::new(
+                4,
+                vec![FileSpan {
+                    file_index: 0,
+                    path: rt_path::SafeRelPath::from_name("peer.bin", false).unwrap(),
+                    content_offset: 0,
+                    length: 4,
+                }],
+            )
+            .unwrap(),
+        );
+        let upload = UploadContext {
+            save_root: temp.path().to_path_buf(),
+            piece_map,
+            storage: MountScheduler::new_for_path(
+                StorageRootId::new(),
+                temp.path(),
+                &SchedulerConfig {
+                    profile: StorageProfile::Unknown,
+                    ..Default::default()
+                },
+            ),
+            resources: ResourceGovernor::new(rt_metrics::ResourceGovernorConfig::default()),
+            have_pieces: PieceBitmap::from_bools(&[false]),
+            metadata: Some(Arc::new(b"metadata".to_vec())),
+            is_private: false,
+            pex_enabled: true,
+            upload_limit_bytes_per_sec: None,
+            global_download: GlobalNetworkBudget::unlimited().download(),
+            global_upload: GlobalNetworkBudget::unlimited().upload(),
+        };
+        let (peer_event_tx, mut peer_event_rx) = mpsc::channel(4);
+        let (peer_cmd_tx, peer_cmd_rx) = mpsc::channel(1);
+        let loop_task = tokio::spawn(run_peer_loop(
+            peer_addr,
+            PeerId::new(),
+            PeerIo::Tcp(Framed::new(server, PeerCodec)),
+            peer_event_tx,
+            peer_cmd_rx,
+            upload,
+            true,
+        ));
+        let mut remote = Framed::new(remote, PeerCodec);
+
+        remote
+            .send(Message::Extended {
+                ext_id: EXT_HANDSHAKE_ID,
+                payload: ExtensionHandshake::new(None).with_ut_metadata(7).encode(),
+            })
+            .await
+            .unwrap();
+        assert!(matches!(
+            timeout(Duration::from_secs(1), peer_event_rx.recv())
+                .await
+                .unwrap(),
+            Some(PeerEvent::ExtendedHandshake {
+                ut_metadata_id: Some(7),
+                ..
+            })
+        ));
+
+        remote
+            .send(Message::Extended {
+                // This is TorrentNG's id, which the remote learned from our
+                // handshake. The response must use the remote's id (7).
+                ext_id: LOCAL_UT_METADATA_ID,
+                payload: UtMetadataMessage::Request { piece: 0 }.encode(),
+            })
+            .await
+            .unwrap();
+
+        let response = timeout(Duration::from_secs(1), remote.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        let Message::Extended { ext_id, payload } = response else {
+            panic!("expected a ut_metadata response");
+        };
+        assert_eq!(ext_id, 7);
+        assert_eq!(
+            UtMetadataMessage::parse(&payload).unwrap(),
+            UtMetadataMessage::Data {
+                piece: 0,
+                total_size: 8,
+                data: b"metadata".to_vec(),
+            }
+        );
+
+        drop(peer_cmd_tx);
+        let exit = timeout(Duration::from_secs(1), loop_task)
+            .await
+            .expect("peer loop should stop when its command channel closes")
+            .unwrap();
+        assert!(exit.result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn peer_loop_returns_outstanding_requests_on_disconnect() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let temp = tempfile::tempdir().unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let peer_addr = listener.local_addr().unwrap();
+        let remote = TcpStream::connect(peer_addr).await.unwrap();
+        let (server, _) = listener.accept().await.unwrap();
+
+        let remote_task = tokio::spawn(async move {
+            let mut remote = remote;
+            remote.write_all(&Message::Unchoke.encode()).await.unwrap();
+            let mut request = [0u8; 128];
+            let _ = remote.read(&mut request).await;
+        });
+
+        let piece_map = Arc::new(
+            PieceMap::new(
+                4,
+                vec![FileSpan {
+                    file_index: 0,
+                    path: rt_path::SafeRelPath::from_name("peer.bin", false).unwrap(),
+                    content_offset: 0,
+                    length: 4,
+                }],
+            )
+            .unwrap(),
+        );
+        let upload = UploadContext {
+            save_root: temp.path().to_path_buf(),
+            piece_map,
+            storage: MountScheduler::new_for_path(
+                StorageRootId::new(),
+                temp.path(),
+                &SchedulerConfig {
+                    profile: StorageProfile::Unknown,
+                    ..Default::default()
+                },
+            ),
+            resources: ResourceGovernor::new(rt_metrics::ResourceGovernorConfig::default()),
+            have_pieces: PieceBitmap::from_bools(&[false]),
+            metadata: None,
+            is_private: false,
+            pex_enabled: true,
+            upload_limit_bytes_per_sec: None,
+            global_download: GlobalNetworkBudget::unlimited().download(),
+            global_upload: GlobalNetworkBudget::unlimited().upload(),
+        };
+        let (peer_event_tx, mut peer_event_rx) = mpsc::channel(4);
+        let (peer_cmd_tx, peer_cmd_rx) = mpsc::channel(4);
+        let loop_task = tokio::spawn(run_peer_loop(
+            peer_addr,
+            PeerId::new(),
+            PeerIo::Tcp(Framed::new(server, PeerCodec)),
+            peer_event_tx,
+            peer_cmd_rx,
+            upload,
+            false,
+        ));
+
+        assert!(matches!(
+            peer_event_rx.recv().await,
+            Some(PeerEvent::Unchoked { peer, .. }) if peer == peer_addr
+        ));
+        let request = BlockRequest {
+            piece: 0,
+            begin: 0,
+            length: 4,
+        };
+        peer_cmd_tx
+            .send(PeerCommand::Request(request))
+            .await
+            .unwrap();
+
+        let exit = timeout(Duration::from_secs(2), loop_task)
+            .await
+            .expect("peer loop did not exit after remote disconnect")
+            .unwrap();
+        assert!(exit.outstanding.contains(&request));
+        remote_task.await.unwrap();
     }
 
     #[test]

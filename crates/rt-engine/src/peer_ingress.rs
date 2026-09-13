@@ -9,6 +9,14 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 const MAX_TRACKED_PEER_INGRESS_IPS: usize = 4_096;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct IngressReservation {
+    id: u64,
+    admitted_at: Instant,
+}
+
+type PerIpReservations = HashMap<IpAddr, VecDeque<IngressReservation>>;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PeerIngressConfig {
     pub max_global_handshakes: usize,
     pub max_handshakes_per_ip: usize,
@@ -38,7 +46,8 @@ pub struct PeerIngressStats {
 pub struct PeerIngressBudget {
     config: PeerIngressConfig,
     global: Arc<Semaphore>,
-    per_ip: Arc<Mutex<HashMap<IpAddr, VecDeque<Instant>>>>,
+    per_ip: Arc<Mutex<PerIpReservations>>,
+    next_reservation_id: AtomicU64,
     accepted: AtomicU64,
     rejected_global_budget: AtomicU64,
     rejected_ip_budget: AtomicU64,
@@ -47,9 +56,9 @@ pub struct PeerIngressBudget {
 #[derive(Debug)]
 pub struct PeerIngressPermit {
     _global: OwnedSemaphorePermit,
-    per_ip: Arc<Mutex<HashMap<IpAddr, VecDeque<Instant>>>>,
+    per_ip: Arc<Mutex<PerIpReservations>>,
     ip: IpAddr,
-    admitted_at: Instant,
+    reservation_id: u64,
 }
 
 impl PeerIngressBudget {
@@ -58,6 +67,7 @@ impl PeerIngressBudget {
             config,
             global: Arc::new(Semaphore::new(config.max_global_handshakes.max(1))),
             per_ip: Arc::new(Mutex::new(HashMap::new())),
+            next_reservation_id: AtomicU64::new(1),
             accepted: AtomicU64::new(0),
             rejected_global_budget: AtomicU64::new(0),
             rejected_ip_budget: AtomicU64::new(0),
@@ -74,7 +84,8 @@ impl PeerIngressBudget {
         now: Instant,
     ) -> Result<PeerIngressPermit, PeerIngressReject> {
         self.prune_ip_window(peer_addr.ip(), now);
-        if !self.reserve_ip_slot(peer_addr.ip(), now) {
+        let reservation_id = self.next_reservation_id.fetch_add(1, Ordering::Relaxed);
+        if !self.reserve_ip_slot(peer_addr.ip(), now, reservation_id) {
             self.rejected_ip_budget.fetch_add(1, Ordering::Relaxed);
             return Err(PeerIngressReject::PerIpBudget);
         }
@@ -86,7 +97,7 @@ impl PeerIngressBudget {
                     _global: permit,
                     per_ip: Arc::clone(&self.per_ip),
                     ip: peer_addr.ip(),
-                    admitted_at: now,
+                    reservation_id,
                 })
             }
             Err(_) => {
@@ -94,7 +105,7 @@ impl PeerIngressBudget {
                 // but this connection never became an admitted handshake.
                 // Roll it back so a saturated global budget cannot permanently
                 // poison an otherwise healthy source IP until the window ends.
-                self.release_ip_slot(peer_addr.ip(), now);
+                self.release_ip_slot(peer_addr.ip(), reservation_id);
                 self.rejected_global_budget.fetch_add(1, Ordering::Relaxed);
                 Err(PeerIngressReject::GlobalBudget)
             }
@@ -115,11 +126,9 @@ impl PeerIngressBudget {
             .lock()
             .expect("peer ingress budget mutex poisoned");
         if let Some(events) = per_ip.get_mut(&ip) {
-            while events
-                .front()
-                .copied()
-                .is_some_and(|then| now.saturating_duration_since(then) > self.config.per_ip_window)
-            {
+            while events.front().copied().is_some_and(|event| {
+                now.saturating_duration_since(event.admitted_at) >= self.config.per_ip_window
+            }) {
                 events.pop_front();
             }
             if events.is_empty() {
@@ -128,24 +137,44 @@ impl PeerIngressBudget {
         }
     }
 
-    fn reserve_ip_slot(&self, ip: IpAddr, now: Instant) -> bool {
+    fn reserve_ip_slot(&self, ip: IpAddr, now: Instant, reservation_id: u64) -> bool {
         let mut per_ip = self
             .per_ip
             .lock()
             .expect("peer ingress budget mutex poisoned");
         if !per_ip.contains_key(&ip) && per_ip.len() >= MAX_TRACKED_PEER_INGRESS_IPS {
-            return false;
+            // An IP that never reconnects cannot trigger the normal per-IP
+            // pruning path. Without sweeping here, the bounded map becomes
+            // permanently saturated after one attempt from enough unique
+            // addresses and every new peer is rejected forever.
+            let window = self.config.per_ip_window;
+            per_ip.retain(|_, events| {
+                while events
+                    .front()
+                    .copied()
+                    .is_some_and(|event| now.saturating_duration_since(event.admitted_at) >= window)
+                {
+                    events.pop_front();
+                }
+                !events.is_empty()
+            });
+            if per_ip.len() >= MAX_TRACKED_PEER_INGRESS_IPS {
+                return false;
+            }
         }
         let events = per_ip.entry(ip).or_default();
         if events.len() >= self.config.max_handshakes_per_ip.max(1) {
             return false;
         }
-        events.push_back(now);
+        events.push_back(IngressReservation {
+            id: reservation_id,
+            admitted_at: now,
+        });
         true
     }
 
-    fn release_ip_slot(&self, ip: IpAddr, now: Instant) {
-        release_ip_slot(&self.per_ip, ip, now);
+    fn release_ip_slot(&self, ip: IpAddr, reservation_id: u64) {
+        release_ip_slot(&self.per_ip, ip, reservation_id);
     }
 }
 
@@ -156,21 +185,17 @@ impl PeerIngressPermit {
     /// this explicit cancellation is only for an attempt that never reached
     /// the handshake task.
     pub fn cancel(self) {
-        release_ip_slot(&self.per_ip, self.ip, self.admitted_at);
+        release_ip_slot(&self.per_ip, self.ip, self.reservation_id);
         // Dropping self releases the global semaphore permit.
     }
 }
 
-fn release_ip_slot(
-    per_ip: &Arc<Mutex<HashMap<IpAddr, VecDeque<Instant>>>>,
-    ip: IpAddr,
-    now: Instant,
-) {
+fn release_ip_slot(per_ip: &Arc<Mutex<PerIpReservations>>, ip: IpAddr, reservation_id: u64) {
     let mut per_ip = per_ip.lock().expect("peer ingress budget mutex poisoned");
     let Some(events) = per_ip.get_mut(&ip) else {
         return;
     };
-    if let Some(index) = events.iter().rposition(|event| *event == now) {
+    if let Some(index) = events.iter().position(|event| event.id == reservation_id) {
         events.remove(index);
     }
     if events.is_empty() {
@@ -280,5 +305,68 @@ mod tests {
         let permit = budget.try_begin(addr(1), now).unwrap();
         permit.cancel();
         assert!(budget.try_begin(addr(2), now).is_ok());
+    }
+
+    #[test]
+    fn release_uses_reservation_identity_when_timestamps_collide() {
+        let budget = PeerIngressBudget::new(PeerIngressConfig {
+            max_global_handshakes: 10,
+            max_handshakes_per_ip: 2,
+            per_ip_window: Duration::from_secs(30),
+            handshake_timeout: Duration::from_secs(5),
+        });
+        let now = Instant::now();
+        let first = budget.try_begin(addr(1), now).unwrap();
+        let second = budget.try_begin(addr(2), now).unwrap();
+
+        first.cancel();
+        let per_ip = budget
+            .per_ip
+            .lock()
+            .expect("peer ingress budget mutex poisoned");
+        let reservations = per_ip.get(&addr(1).ip()).unwrap();
+        assert_eq!(reservations.len(), 1);
+        assert_eq!(reservations[0].id, second.reservation_id);
+        drop(per_ip);
+        drop(second);
+    }
+
+    #[test]
+    fn per_ip_slot_expires_at_window_boundary() {
+        let window = Duration::from_secs(30);
+        let budget = PeerIngressBudget::new(PeerIngressConfig {
+            max_global_handshakes: 10,
+            max_handshakes_per_ip: 1,
+            per_ip_window: window,
+            handshake_timeout: Duration::from_secs(5),
+        });
+        let now = Instant::now();
+        let permit = budget.try_begin(addr(1), now).unwrap();
+        drop(permit);
+
+        assert!(budget.try_begin(addr(2), now + window).is_ok());
+    }
+
+    #[test]
+    fn stale_unique_ips_are_reclaimed_for_new_sources() {
+        let budget = PeerIngressBudget::new(PeerIngressConfig {
+            max_global_handshakes: MAX_TRACKED_PEER_INGRESS_IPS + 1,
+            max_handshakes_per_ip: 1,
+            per_ip_window: Duration::from_secs(30),
+            handshake_timeout: Duration::from_secs(5),
+        });
+        let now = Instant::now();
+        for raw_ip in 0..MAX_TRACKED_PEER_INGRESS_IPS {
+            let ip = IpAddr::V4(std::net::Ipv4Addr::from(raw_ip as u32));
+            let permit = budget.try_begin(SocketAddr::new(ip, 6881), now).unwrap();
+            drop(permit);
+        }
+
+        let new_ip = IpAddr::V4(std::net::Ipv4Addr::from(
+            (MAX_TRACKED_PEER_INGRESS_IPS + 1) as u32,
+        ));
+        assert!(budget
+            .try_begin(SocketAddr::new(new_ip, 6881), now + Duration::from_secs(31))
+            .is_ok());
     }
 }

@@ -4,7 +4,7 @@ use rt_bencode::{decode, BValue};
 
 use crate::{
     error::TrackerError,
-    peer::{parse_compact_peers_v4, parse_compact_peers_v6, Peer},
+    peer::{parse_compact_peers_v4_with_limit, parse_compact_peers_v6_with_limit, Peer},
 };
 
 /// Current status of a tracker.
@@ -101,6 +101,16 @@ fn scrape_int(entry: &BValue<'_>, key: &[u8]) -> Result<u32, TrackerError> {
 impl AnnounceResponse {
     /// Parse a bencoded HTTP announce response.
     pub fn parse(bytes: &[u8]) -> Result<Self, TrackerError> {
+        Self::parse_with_peer_limit(bytes, usize::MAX)
+    }
+
+    /// Parse a bencoded HTTP announce response while bounding peer output.
+    ///
+    /// The response itself is still fully decoded and validated, but only the
+    /// first `max_peers` peer entries are materialized. Callers that already
+    /// know their connection capacity should use this method so a tracker
+    /// cannot force an unnecessarily large temporary peer vector.
+    pub fn parse_with_peer_limit(bytes: &[u8], max_peers: usize) -> Result<Self, TrackerError> {
         let val = decode(bytes).map_err(|e| TrackerError::ParseError(e.to_string()))?;
 
         // Check for failure reason first
@@ -157,7 +167,7 @@ impl AnnounceResponse {
             .and_then(|v| v.as_int())
             .and_then(|i| u32::try_from(i).ok());
 
-        let peers = parse_peers_field(&val)?;
+        let peers = parse_peers_field(&val, max_peers)?;
 
         Ok(AnnounceResponse {
             interval,
@@ -171,16 +181,16 @@ impl AnnounceResponse {
     }
 }
 
-fn parse_peers_field(val: &BValue<'_>) -> Result<Vec<Peer>, TrackerError> {
+fn parse_peers_field(val: &BValue<'_>, max_peers: usize) -> Result<Vec<Peer>, TrackerError> {
     let mut peers = match val.get(b"peers") {
         Some(BValue::Bytes(b)) => {
             // Compact IPv4 format (BEP 23).
-            parse_compact_peers_v4(b)?
+            parse_compact_peers_v4_with_limit(b, max_peers)?
         }
         Some(BValue::List(entries)) => {
             // Non-compact (legacy) format.
-            let mut peers = Vec::with_capacity(entries.len());
-            for entry in entries {
+            let mut peers = Vec::with_capacity(entries.len().min(max_peers));
+            for entry in entries.iter().take(max_peers) {
                 let ip = entry
                     .get(b"ip")
                     .and_then(|v| v.as_bytes())
@@ -232,7 +242,10 @@ fn parse_peers_field(val: &BValue<'_>) -> Result<Vec<Peer>, TrackerError> {
             ));
         };
         // Compact IPv6 format (BEP 7).
-        peers.extend(parse_compact_peers_v6(bytes)?);
+        peers.extend(parse_compact_peers_v6_with_limit(
+            bytes,
+            max_peers.saturating_sub(peers.len()),
+        )?);
     }
 
     Ok(peers)
@@ -270,6 +283,37 @@ mod tests {
         assert_eq!(resp.peers.len(), 2);
         assert_eq!(resp.peers[0].addr.port(), 6881);
         assert_eq!(resp.peers[1].addr.port(), 6882);
+    }
+
+    #[test]
+    fn parse_peer_limit_bounds_compact_response() {
+        let mut peer_bytes = Vec::new();
+        peer_bytes.extend_from_slice(&[10, 0, 0, 1, 0x1A, 0xE1]);
+        peer_bytes.extend_from_slice(&[10, 0, 0, 2, 0x1A, 0xE2]);
+        peer_bytes.extend_from_slice(&[10, 0, 0, 3, 0x1A, 0xE3]);
+        let raw = make_response(1800, Some(&peer_bytes), None);
+
+        let response = AnnounceResponse::parse_with_peer_limit(&raw, 2).unwrap();
+
+        assert_eq!(response.peers.len(), 2);
+        assert_eq!(response.peers[1].addr, "10.0.0.2:6882".parse().unwrap());
+    }
+
+    #[test]
+    fn parse_peer_limit_applies_across_ipv4_and_ipv6_fields() {
+        let mut peers6 = [0u8; 18];
+        peers6[..16].copy_from_slice(&std::net::Ipv6Addr::LOCALHOST.octets());
+        peers6[16..].copy_from_slice(&6881u16.to_be_bytes());
+        let raw = encode(&BValue::Dict(vec![
+            (b"interval".as_ref(), BValue::Int(1800)),
+            (b"peers".as_ref(), BValue::Bytes(&[10, 0, 0, 1, 0x1A, 0xE1])),
+            (b"peers6".as_ref(), BValue::Bytes(&peers6)),
+        ]));
+
+        let response = AnnounceResponse::parse_with_peer_limit(&raw, 1).unwrap();
+
+        assert_eq!(response.peers.len(), 1);
+        assert_eq!(response.peers[0].addr, "10.0.0.1:6881".parse().unwrap());
     }
 
     #[test]

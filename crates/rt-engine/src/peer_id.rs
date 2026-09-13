@@ -109,7 +109,8 @@ fn load_or_generate_suffix(session_dir: &Path) -> std::io::Result<String> {
     }
     let suffix = random_suffix();
     rt_storage::create_dir_all_no_follow(session_dir)?;
-    rt_storage::write_file_no_follow(&path, suffix.as_bytes())?;
+    rt_storage::write_file_no_follow_sync(&path, suffix.as_bytes())?;
+    rt_storage::sync_dir_no_follow(session_dir)?;
     Ok(suffix)
 }
 

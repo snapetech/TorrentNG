@@ -1099,11 +1099,17 @@ pub enum EngineCmd {
     StoragePlanFinished {
         job_id: String,
         affected_torrents: Vec<(String, bool)>,
+        /// Session identities captured when the storage targets were
+        /// admitted. Dormant targets have no live task to quiesce, but still
+        /// need an identity because a completed storage job can be delivered
+        /// after the torrent was removed and re-added.
+        affected_torrent_handles: Vec<(String, TorrentHandle)>,
         manual_recovery_torrents: Vec<String>,
         succeeded: bool,
         terminal_state: String,
         error: Option<String>,
         completed_steps: Vec<usize>,
+        completed_byte_offset: Option<i64>,
         requires_manual_recovery: bool,
     },
     /// Internal completion notification for asynchronous torrent payload
@@ -1116,8 +1122,12 @@ pub enum EngineCmd {
         terminal_state: String,
         error: Option<String>,
         completed_steps: Vec<usize>,
+        completed_byte_offset: Option<i64>,
         requires_manual_recovery: bool,
         quiesced: Vec<(String, bool)>,
+        /// Identity of the task that was quiesced before deletion, when the
+        /// completion belongs to the current process incarnation.
+        quiesced_handle: Option<TorrentHandle>,
     },
     /// Internal completion notification for an asynchronous save-path move.
     StorageMoveFinished {
@@ -1127,10 +1137,14 @@ pub enum EngineCmd {
         old_save_path: PathBuf,
         save_path: PathBuf,
         quiesced: Option<bool>,
+        /// Identity of the task that was quiesced before the move, when the
+        /// completion belongs to the current process incarnation.
+        torrent_handle: Option<TorrentHandle>,
         succeeded: bool,
         terminal_state: String,
         error: Option<String>,
         completed_steps: Vec<usize>,
+        completed_byte_offset: Option<i64>,
         requires_manual_recovery: bool,
         retry_attempt: u8,
     },

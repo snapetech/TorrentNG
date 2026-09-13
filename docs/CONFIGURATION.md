@@ -65,12 +65,12 @@ enables uTP magnet metadata fetch explicitly.
 |---|---|---|
 | `download_dir` | `~/Downloads` or `/tmp` | Default payload download directory |
 | `device_elevator_enabled` | `true` | Enable per-device peer-read elevator scheduling where storage profiles benefit |
-| `file_pool_size` | `512` | Open-file cache entries per scheduler |
+| `file_pool_size` | `512` | Open-file cache entries shared by path-backed schedulers in one process/configuration |
 | `idle_file_ttl_secs` | `300` | Seconds before idle cached file handles are eligible to close |
-| `io_worker_threads` | `4` | Dedicated positioned-I/O worker threads per scheduler |
-| `io_queue_depth` | `256` | Bounded positioned-I/O queue depth per scheduler |
-| `hash_worker_threads` | `2` | Dedicated storage hash worker threads per scheduler |
-| `hash_queue_depth` | `256` | Bounded hash queue depth per scheduler |
+| `io_worker_threads` | `4` | Shared positioned-I/O worker threads for path-backed schedulers in one process/configuration |
+| `io_queue_depth` | `256` | Bounded positioned-I/O queue depth shared by those schedulers |
+| `hash_worker_threads` | `2` | Shared storage hash worker threads for path-backed schedulers in one process/configuration |
+| `hash_queue_depth` | `256` | Bounded hash queue depth shared by those schedulers |
 | `preallocation_mode` | `auto` | Payload preallocation mode: `off`, `auto`, `sparse`, or `full` |
 | `durability_mode` | `checkpoint` | Payload durability mode: `fast`, `checkpoint`, or `strict` |
 | `peer_read_readahead_bytes` | `524288` | Peer-read readahead size used before returning the exact requested slice |
@@ -84,7 +84,7 @@ enables uTP magnet metadata fetch explicitly.
 | `total_cap_mb` | `512` | Process-owned memory cap for governor-managed buffers |
 | `storage_frame_cap_mb` | `128` | Storage frame memory class cap |
 | `queued_disk_cap_mb` | `64` | Queued disk/hash/elevator memory class cap |
-| `piece_assembly_cap_mb` | `128` | Incomplete piece assembly memory class cap |
+| `piece_assembly_cap_mb` | `128` | Incomplete piece assembly memory class cap; `0` disables in-memory assembly and keeps direct block writes enabled |
 | `peer_buffer_cap_mb` | `128` | Peer rx/tx and webseed buffer memory class cap |
 | `metadata_cap_mb` | `32` | Metadata, tracker peer cache, DHT table, and API snapshot class baseline cap |
 | `pressure_constrained_pct` | `75` | Percent of total cap that reports constrained pressure |

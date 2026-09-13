@@ -117,7 +117,7 @@ impl SharedRateLimiter {
                 let now = Instant::now();
                 let elapsed = now.saturating_duration_since(state.updated_at);
                 state.updated_at = now;
-                let refill = ((elapsed.as_nanos() * u128::from(limit)) / 1_000_000_000)
+                let refill = (elapsed.as_nanos().saturating_mul(u128::from(limit)) / 1_000_000_000)
                     .min(u128::from(u64::MAX)) as u64;
                 state.tokens = state
                     .tokens
@@ -139,8 +139,12 @@ impl SharedRateLimiter {
                     Duration::ZERO
                 } else {
                     let missing = requested.saturating_sub(state.tokens);
-                    let wait_nanos = ((u128::from(missing) * 1_000_000_000) / u128::from(limit))
-                        .min(u128::from(u64::MAX)) as u64;
+                    let wait_nanos = (u128::from(missing)
+                        .saturating_mul(1_000_000_000)
+                        .saturating_add(u128::from(limit.saturating_sub(1)))
+                        / u128::from(limit))
+                    .max(1)
+                    .min(u128::from(u64::MAX)) as u64;
                     Duration::from_nanos(wait_nanos)
                 }
             };

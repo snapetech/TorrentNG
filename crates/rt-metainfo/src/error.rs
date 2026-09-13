@@ -20,6 +20,8 @@ pub enum MetainfoError {
     InvalidPiecesLength(usize),
     #[error("invalid piece count: expected {expected}, got {actual}")]
     InvalidPieceCount { expected: usize, actual: usize },
+    #[error("torrent has zero total length")]
+    ZeroTotalLength,
     #[error("invalid piece length: {0}")]
     InvalidPieceLength(u64),
     #[error("invalid file path: {0}")]

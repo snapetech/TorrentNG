@@ -26,6 +26,9 @@ pub enum UtpError {
     #[error("uTP extension {extension} is too long to encode: {length} bytes")]
     ExtensionTooLong { extension: u8, length: usize },
 
+    #[error("uTP datagram is too large: {actual} bytes exceeds configured limit {max}")]
+    DatagramTooLarge { actual: usize, max: usize },
+
     #[error("uTP packet type {packet_type:?} is invalid while connection is {state:?}")]
     InvalidStatePacket {
         state: crate::state::ConnectionState,

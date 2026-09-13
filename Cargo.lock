@@ -1515,6 +1515,7 @@ dependencies = [
  "libc",
  "rt-path",
  "rt-piece-map",
+ "rt-storage",
  "serde",
  "serde_json",
  "tempfile",

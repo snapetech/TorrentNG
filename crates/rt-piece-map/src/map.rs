@@ -155,7 +155,10 @@ impl PieceMap {
             return Err(PieceMapError::BlockTooLarge(length, MAX_BLOCK_SIZE));
         }
         let piece_len = self.piece_len(piece)?;
-        if begin.saturating_add(length) > piece_len {
+        // Compare in a wider type. `u32::saturating_add` turns a request
+        // ending past `u32::MAX` into exactly `u32::MAX`, which accidentally
+        // admits the boundary case when the piece itself is that large.
+        if u64::from(begin) + u64::from(length) > u64::from(piece_len) {
             return Err(PieceMapError::RequestOutOfBounds {
                 offset: begin,
                 len: length,
@@ -318,6 +321,17 @@ mod tests {
         assert_eq!(regions.len(), 1);
         assert_eq!(regions[0].file_offset, 256 * 1024); // piece 1 starts at byte 256K
         assert_eq!(regions[0].length, 16 * 1024);
+    }
+
+    #[test]
+    fn request_past_max_u32_piece_boundary_is_rejected() {
+        let files = make_files(&[(&["huge.bin"], u64::from(u32::MAX))]);
+        let pm = PieceMap::new(u64::from(u32::MAX), files).unwrap();
+
+        assert!(matches!(
+            pm.validate_request(0, u32::MAX - 1, 2),
+            Err(PieceMapError::RequestOutOfBounds { .. })
+        ));
     }
 
     #[test]

@@ -97,6 +97,20 @@ async function installApiMock(page: Page) {
       const limit = Number(url.searchParams.get('limit') ?? 200)
       return json({ total: torrents.length, torrents: torrents.slice(offset, offset + limit) })
     }
+    if (path === '/api/v1/torrents/live') {
+      return json({
+        sampled_at: 1_700_030_000_000,
+        torrents: torrents
+          .filter(torrent => torrent.is_active && !torrent.complete)
+          .map(torrent => ({
+            hash: torrent.hash,
+            amount_left: Math.max(0, torrent.size_bytes - torrent.bytes_done),
+            download_rate: torrent.down_rate,
+            upload_rate: torrent.up_rate,
+            sampled_at: 1_700_030_000_000,
+          })),
+      })
+    }
     if (path === '/api/v1/categories') {
       return json([
         { name: 'Linux', save_path: '/data/linux', torrent_count: 120 },

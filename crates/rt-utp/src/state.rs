@@ -90,6 +90,7 @@ pub struct UtpConnection {
     ids: ConnectionIds,
     seq_nr: u16,
     ack_nr: u16,
+    last_received: Option<u16>,
     oldest_unacked: u16,
     newest_sent: u16,
     remote_window_bytes: u32,
@@ -108,6 +109,7 @@ impl UtpConnection {
             ids: ConnectionIds::new_syn(connection_id),
             seq_nr: initial_seq_nr,
             ack_nr: 0,
+            last_received: None,
             oldest_unacked: initial_seq_nr,
             newest_sent: initial_seq_nr,
             remote_window_bytes: DEFAULT_INITIAL_WINDOW_BYTES,
@@ -132,6 +134,7 @@ impl UtpConnection {
             ids: ConnectionIds::from_syn_for_acceptor(syn.connection_id),
             seq_nr: initial_seq_nr,
             ack_nr: syn.seq_nr,
+            last_received: Some(syn.seq_nr),
             oldest_unacked: initial_seq_nr,
             newest_sent: initial_seq_nr,
             remote_window_bytes: syn.wnd_size,
@@ -201,20 +204,31 @@ impl UtpConnection {
         )
     }
 
-    pub fn build_syn(&self, now_us: u32) -> UtpPacket {
-        UtpPacket {
+    pub fn build_syn(&mut self, now_us: u32) -> UtpPacket {
+        let packet = UtpPacket {
             header: self.header(PacketType::Syn, self.ids.send, now_us, 0),
             extensions: Vec::new(),
             payload: Vec::new(),
-        }
+        };
+        // SYN consumes one sequence number, just like the BEP 29 connection
+        // setup sequence. The first DATA packet therefore uses ISN + 1.
+        self.mark_sent(0);
+        packet
     }
 
-    pub fn build_state(&self, now_us: u32, timestamp_diff: u32) -> UtpPacket {
-        UtpPacket {
+    pub fn build_state(&mut self, now_us: u32, timestamp_diff: u32) -> UtpPacket {
+        let packet = UtpPacket {
             header: self.header(PacketType::State, self.ids.send, now_us, timestamp_diff),
             extensions: Vec::new(),
             payload: Vec::new(),
+        };
+        // The handshake STATE carries the acceptor's initial sequence
+        // number. Once the connection is established, ACK-only STATE packets
+        // do not consume sequence numbers.
+        if self.state == ConnectionState::SynReceived {
+            self.mark_sent(0);
         }
+        packet
     }
 
     pub fn build_data(&mut self, now_us: u32, timestamp_diff: u32, payload: Vec<u8>) -> UtpPacket {
@@ -261,15 +275,27 @@ impl UtpConnection {
 
     pub fn on_inbound(&mut self, packet: &UtpPacket) -> Result<InboundAction, UtpError> {
         self.ids.validate_inbound(&packet.header)?;
+        // RESET is a terminal control packet. Its ACK number is not part of
+        // the data acknowledgement stream, so an old or unrelated ACK must
+        // not prevent the connection from entering Reset.
+        if packet.header.packet_type == PacketType::Reset {
+            self.state = ConnectionState::Reset;
+            return Ok(InboundAction::Reset);
+        }
         self.remote_window_bytes = packet.header.wnd_size;
+        let bytes_acked = self.bytes_in_flight;
+        let ack_advanced = self.apply_ack(packet.header.ack_nr)?;
         if packet.header.timestamp_diff > 0 {
             self.update_rtt(packet.header.timestamp_diff);
             self.congestion.on_ack(DelaySample {
                 timestamp_diff_us: packet.header.timestamp_diff,
-                bytes_acked: packet.payload.len() as u32,
+                // The payload belongs to the inbound packet and says
+                // nothing about how many of our bytes its ACK covered.
+                // ACK-only STATE packets are the normal case, so use the
+                // send-side flight that the ACK actually advanced instead.
+                bytes_acked: if ack_advanced { bytes_acked } else { 0 },
             });
         }
-        self.apply_ack(packet.header.ack_nr)?;
 
         match packet.header.packet_type {
             PacketType::Syn => Err(UtpError::InvalidStatePacket {
@@ -278,6 +304,8 @@ impl UtpConnection {
             }),
             PacketType::State => {
                 if self.state == ConnectionState::SynSent {
+                    self.ack_nr = packet.header.seq_nr;
+                    self.last_received = Some(packet.header.seq_nr);
                     self.state = ConnectionState::Connected;
                 } else if self.state == ConnectionState::FinSent {
                     self.state = ConnectionState::Closing;
@@ -285,14 +313,18 @@ impl UtpConnection {
                 Ok(InboundAction::None)
             }
             PacketType::Data => {
-                self.ack_nr = packet.header.seq_nr;
+                if !self.accept_inbound_sequence(packet.header.seq_nr) {
+                    return Ok(InboundAction::SendState);
+                }
                 if matches!(self.state, ConnectionState::SynReceived) {
                     self.state = ConnectionState::Connected;
                 }
                 Ok(InboundAction::DeliverPayload)
             }
             PacketType::Fin => {
-                self.ack_nr = packet.header.seq_nr;
+                if !self.accept_inbound_sequence(packet.header.seq_nr) {
+                    return Ok(InboundAction::SendState);
+                }
                 self.state = if self.state == ConnectionState::FinSent {
                     ConnectionState::Closing
                 } else {
@@ -300,10 +332,7 @@ impl UtpConnection {
                 };
                 Ok(InboundAction::Close)
             }
-            PacketType::Reset => {
-                self.state = ConnectionState::Reset;
-                Ok(InboundAction::Reset)
-            }
+            PacketType::Reset => unreachable!("RESET is handled before ACK validation"),
         }
     }
 
@@ -313,6 +342,22 @@ impl UtpConnection {
 
     pub fn on_timeout(&mut self) {
         self.congestion.on_timeout();
+    }
+
+    pub(crate) fn all_sent_packets_acked(&self) -> bool {
+        self.oldest_unacked == self.seq_nr
+    }
+
+    fn accept_inbound_sequence(&mut self, seq_nr: u16) -> bool {
+        let Some(last_received) = self.last_received else {
+            return false;
+        };
+        if seq_nr != last_received.wrapping_add(1) {
+            return false;
+        }
+        self.ack_nr = seq_nr;
+        self.last_received = Some(seq_nr);
+        true
     }
 
     fn header(
@@ -341,10 +386,7 @@ impl UtpConnection {
         self.bytes_in_flight = self.bytes_in_flight.saturating_add(payload_len);
     }
 
-    fn apply_ack(&mut self, ack_nr: u16) -> Result<(), UtpError> {
-        if ack_nr == 0 {
-            return Ok(());
-        }
+    fn apply_ack(&mut self, ack_nr: u16) -> Result<bool, UtpError> {
         if sequence_before(self.newest_sent, ack_nr) {
             return Err(UtpError::AckOutOfWindow {
                 ack_nr,
@@ -353,11 +395,11 @@ impl UtpConnection {
             });
         }
         if !sequence_before(self.oldest_unacked, ack_nr) && self.oldest_unacked != ack_nr {
-            return Ok(());
+            return Ok(false);
         }
         self.oldest_unacked = ack_nr.wrapping_add(1);
         self.bytes_in_flight = 0;
-        Ok(())
+        Ok(true)
     }
 
     fn update_rtt(&mut self, measured_us: u32) {
@@ -455,7 +497,7 @@ mod tests {
             seq_nr: 44,
             ack_nr: 0,
         };
-        let conn = UtpConnection::accept(&syn, 9).unwrap();
+        let mut conn = UtpConnection::accept(&syn, 9).unwrap();
         let state = conn.build_state(2, 1);
         assert_eq!(
             conn.ids(),
@@ -475,6 +517,26 @@ mod tests {
         assert_eq!(data.header.seq_nr, 10);
         assert_eq!(conn.next_seq_nr(), 11);
         assert_eq!(conn.bytes_in_flight(), 4);
+    }
+
+    #[test]
+    fn congestion_ack_uses_outgoing_flight_not_inbound_payload() {
+        let mut conn = UtpConnection::connect(1, 10);
+        conn.build_syn(1);
+        let mut handshake = inbound_state(conn.ids(), 90, 10);
+        handshake.header.timestamp_diff = 0;
+        conn.on_inbound(&handshake).unwrap();
+
+        let before = conn.congestion_window_bytes();
+        let data = conn.build_data(2, 0, vec![0; 4_096]);
+        let mut ack = inbound_state(conn.ids(), 91, data.header.seq_nr);
+        ack.header.timestamp_diff = 20_000;
+        // This is an ACK-only STATE packet; its empty payload must not make
+        // the congestion controller believe that zero bytes were delivered.
+        assert!(ack.payload.is_empty());
+        conn.on_inbound(&ack).unwrap();
+
+        assert_eq!(conn.congestion_window_bytes(), before.saturating_add(4_096));
     }
 
     #[test]
@@ -515,6 +577,33 @@ mod tests {
     }
 
     #[test]
+    fn duplicate_and_out_of_order_data_are_acknowledged_without_delivery() {
+        let mut initiator = UtpConnection::connect(50, 10);
+        let syn = initiator.build_syn(1);
+        let mut acceptor = UtpConnection::accept(&syn.header, 20).unwrap();
+        let state = acceptor.build_state(2, 0);
+        initiator.on_inbound(&state).unwrap();
+
+        let data = initiator.build_data(3, 0, b"first".to_vec());
+        assert_eq!(
+            acceptor.on_inbound(&data).unwrap(),
+            InboundAction::DeliverPayload
+        );
+        assert_eq!(
+            acceptor.on_inbound(&data).unwrap(),
+            InboundAction::SendState
+        );
+
+        let mut future = data.clone();
+        future.header.seq_nr = future.header.seq_nr.wrapping_add(2);
+        assert_eq!(
+            acceptor.on_inbound(&future).unwrap(),
+            InboundAction::SendState
+        );
+        assert_eq!(acceptor.ack_nr(), data.header.seq_nr);
+    }
+
+    #[test]
     fn wrong_connection_id_is_rejected() {
         let mut conn = UtpConnection::connect(10, 1);
         let mut state = inbound_state(conn.ids(), 2, 1);
@@ -540,6 +629,29 @@ mod tests {
                 newest_sent: 10
             })
         ));
+    }
+
+    #[test]
+    fn reset_terminates_before_ack_window_validation() {
+        let mut conn = UtpConnection::connect(1, 10);
+        let packet = UtpPacket {
+            header: UtpHeader {
+                packet_type: PacketType::Reset,
+                version: 1,
+                extension: 0,
+                connection_id: conn.ids().recv,
+                timestamp_us: 20,
+                timestamp_diff: 10_000,
+                wnd_size: 32_000,
+                seq_nr: 2,
+                ack_nr: 99,
+            },
+            extensions: Vec::new(),
+            payload: Vec::new(),
+        };
+
+        assert_eq!(conn.on_inbound(&packet).unwrap(), InboundAction::Reset);
+        assert_eq!(conn.state(), ConnectionState::Reset);
     }
 
     #[test]

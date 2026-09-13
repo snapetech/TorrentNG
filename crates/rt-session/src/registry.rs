@@ -79,8 +79,10 @@ pub struct SessionRegistry {
     /// mutable singleton.
     banned_peers: HashSet<SocketAddr>,
     change_notify: Arc<Notify>,
-    snapshot_cache: Mutex<Option<(u64, Arc<Vec<TorrentEntry>>)>>,
+    snapshot_cache: SnapshotCache,
 }
+
+type SnapshotCache = Mutex<Option<(u64, Arc<Vec<TorrentEntry>>)>>;
 
 const CHANGE_LOG_CAPACITY: usize = 16_384;
 pub const MAX_BANNED_PEERS: usize = 65_536;
@@ -258,6 +260,7 @@ pub struct SessionRegistryEntryMut<'a> {
     revision: &'a mut u64,
     changes: &'a mut VecDeque<RegistryChange>,
     change_notify: &'a Notify,
+    snapshot_cache: &'a SnapshotCache,
     info_hash: String,
     before: EntryContribution,
     touched: bool,
@@ -299,6 +302,14 @@ impl Drop for SessionRegistryEntryMut<'_> {
         while self.changes.len() > CHANGE_LOG_CAPACITY {
             self.changes.pop_front();
         }
+        // Mutable entry access advances the registry revision just like
+        // add/remove/category mutations. Invalidate the projection cache at
+        // the same boundary; otherwise snapshot consumers can keep seeing
+        // the pre-mutation entry even though its revision has advanced.
+        self.snapshot_cache
+            .lock()
+            .expect("session snapshot cache mutex poisoned")
+            .take();
         self.change_notify.notify_waiters();
     }
 }
@@ -479,6 +490,7 @@ impl SessionRegistry {
             &mut self.changes,
             self.change_notify.as_ref(),
         );
+        let snapshot_cache = &self.snapshot_cache;
         let entry = match entries.get_mut(&handle)? {
             RegistryRecord::Active(entry) => entry,
             RegistryRecord::Dormant(_) => unreachable!("dormant entry was not promoted"),
@@ -490,6 +502,7 @@ impl SessionRegistry {
             revision,
             changes,
             change_notify,
+            snapshot_cache,
             info_hash,
             before,
             touched: false,
@@ -981,5 +994,20 @@ mod tests {
             snapshot.get(0).unwrap().tracker_message.as_deref(),
             Some("not registered")
         );
+    }
+
+    #[test]
+    fn mutable_entry_updates_invalidate_snapshot_cache() {
+        let mut reg = SessionRegistry::new();
+        reg.add(entry("a")).unwrap();
+
+        let before = reg.snapshot();
+        assert_eq!(before.find("a").unwrap().name, "name");
+
+        reg.get_mut("a").unwrap().name = "changed".to_owned();
+
+        let after = reg.snapshot();
+        assert_eq!(after.revision(), reg.revision());
+        assert_eq!(after.find("a").unwrap().name, "changed");
     }
 }

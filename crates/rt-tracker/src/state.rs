@@ -49,6 +49,19 @@ impl TrackerState {
 
     /// Record a successful announce response.
     pub fn on_success(&mut self, resp: &AnnounceResponse) {
+        self.on_success_with_min_interval(resp, None);
+    }
+
+    /// Record a successful announce response with an optional local minimum.
+    ///
+    /// The local minimum must participate in deadline calculation, not just
+    /// in the diagnostic `interval` field. Otherwise callers can persist the
+    /// configured value while still scheduling the next request too early.
+    pub fn on_success_with_min_interval(
+        &mut self,
+        resp: &AnnounceResponse,
+        configured_min_interval: Option<Duration>,
+    ) {
         let now = Instant::now();
         self.last_announce = Some(now);
         self.last_success = Some(now);
@@ -59,6 +72,9 @@ impl TrackerState {
         if let Some(mi) = resp.min_interval {
             self.min_interval = Duration::from_secs(mi as u64);
         }
+        if let Some(configured_min_interval) = configured_min_interval {
+            self.interval = self.interval.max(configured_min_interval);
+        }
         if let Some(ref id) = resp.tracker_id {
             self.tracker_id = Some(id.clone());
         }
@@ -68,8 +84,9 @@ impl TrackerState {
         // A tracker-provided `min interval` is a lower bound, not merely
         // informational metadata. Keep jitter for herd avoidance, but do
         // not let it schedule an announce before that lower bound.
-        let minimum = self.interval.max(self.min_interval);
-        let jittered = jitter_interval(minimum, 0.1).max(self.min_interval);
+        let configured_minimum = configured_min_interval.unwrap_or(Duration::ZERO);
+        let minimum = self.interval.max(self.min_interval).max(configured_minimum);
+        let jittered = jitter_interval(minimum, 0.1).max(minimum);
         self.next_announce = Some(now + jittered);
 
         self.status = if let Some(ref warn) = resp.warning_message {
@@ -227,5 +244,25 @@ mod tests {
         });
 
         assert!(ts.time_until_next() >= Duration::from_secs(59));
+    }
+
+    #[test]
+    fn configured_min_interval_is_enforced_before_deadline_is_stored() {
+        let mut ts = TrackerState::new("http://tracker.example.com/announce");
+        ts.on_success_with_min_interval(
+            &AnnounceResponse {
+                interval: 1,
+                min_interval: None,
+                peers: Vec::new(),
+                tracker_id: None,
+                warning_message: None,
+                complete: None,
+                incomplete: None,
+            },
+            Some(Duration::from_secs(120)),
+        );
+
+        assert_eq!(ts.interval, Duration::from_secs(120));
+        assert!(ts.time_until_next() >= Duration::from_secs(119));
     }
 }

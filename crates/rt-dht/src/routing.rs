@@ -32,9 +32,15 @@ impl KBucket {
 
     /// Try to insert a node. Returns true if inserted.
     /// Does not insert duplicates (by node ID) or if bucket is full.
+    ///
+    /// A repeated ID is still useful: DHT nodes can change their endpoint.
+    /// Refresh the stored address so future lookups do not keep dialing a
+    /// stale endpoint. The return value remains `false` because no new node
+    /// was inserted.
     pub fn insert(&mut self, node: KNode) -> bool {
-        if self.nodes.iter().any(|n| n.id == node.id) {
-            return false; // already present
+        if let Some(existing) = self.nodes.iter_mut().find(|n| n.id == node.id) {
+            existing.addr = node.addr;
+            return false;
         }
         if self.is_full() {
             return false;
@@ -180,5 +186,29 @@ mod tests {
         let id = NodeId::from_bytes(nid);
         assert!(table.remove(&id));
         assert_eq!(table.total_nodes(), 0);
+    }
+
+    #[test]
+    fn duplicate_node_id_refreshes_endpoint() {
+        let local = NodeId::from_bytes([0u8; 20]);
+        let mut table = RoutingTable::new(local);
+        let id = NodeId::from_bytes({
+            let mut bytes = [0u8; 20];
+            bytes[19] = 1;
+            bytes
+        });
+
+        assert!(table.insert(KNode {
+            id,
+            addr: "127.0.0.1:6881".parse().unwrap(),
+        }));
+        assert!(!table.insert(KNode {
+            id,
+            addr: "127.0.0.2:6882".parse().unwrap(),
+        }));
+
+        let closest = table.closest(&id, 1);
+        assert_eq!(closest[0].addr, "127.0.0.2:6882".parse().unwrap());
+        assert_eq!(table.total_nodes(), 1);
     }
 }

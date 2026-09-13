@@ -40,20 +40,24 @@ impl ListenerCompletion {
     }
 }
 
+pub(crate) struct PeerListenerContext {
+    pub(crate) peer_ingress: Arc<PeerIngressBudget>,
+    pub(crate) network_budget: GlobalNetworkBudget,
+    pub(crate) engine_tx: mpsc::Sender<EngineCmd>,
+    pub(crate) healthy: Arc<AtomicBool>,
+    pub(crate) done: Arc<ListenerCompletion>,
+}
+
 /// Run the socket acceptors independently of the engine command actor.
 pub(crate) async fn run(
     listener: TcpListener,
-    utp_endpoint: Option<UtpEndpoint>,
-    peer_ingress: Arc<PeerIngressBudget>,
-    network_budget: GlobalNetworkBudget,
-    engine_tx: mpsc::Sender<EngineCmd>,
+    mut utp_endpoint: Option<UtpEndpoint>,
+    context: PeerListenerContext,
     stop: watch::Receiver<bool>,
-    healthy: Arc<AtomicBool>,
-    done: Arc<ListenerCompletion>,
 ) {
     let _health_guard = ListenerHealthGuard {
-        healthy: Arc::clone(&healthy),
-        done,
+        healthy: Arc::clone(&context.healthy),
+        done: Arc::clone(&context.done),
     };
     let mut stop = stop;
     let mut handshakes = JoinSet::new();
@@ -68,10 +72,10 @@ pub(crate) async fn run(
             accept_result = listener.accept() => {
                 match accept_result {
                     Ok((stream, peer_addr)) => {
-                        healthy.store(true, Ordering::Release);
-                        match peer_ingress.try_begin(peer_addr, Instant::now()) {
+                        context.healthy.store(true, Ordering::Release);
+                        match context.peer_ingress.try_begin(peer_addr, Instant::now()) {
                             Ok(permit) => {
-                                let Ok(peer_permit) = network_budget.try_acquire_peer() else {
+                                let Ok(peer_permit) = context.network_budget.try_acquire_peer() else {
                                     permit.cancel();
                                     warn!(
                                         component = "peer_listener",
@@ -83,8 +87,8 @@ pub(crate) async fn run(
                                     );
                                     continue;
                                 };
-                                let engine_tx = engine_tx.clone();
-                                let handshake_timeout = peer_ingress.config().handshake_timeout;
+                                let engine_tx = context.engine_tx.clone();
+                                let handshake_timeout = context.peer_ingress.config().handshake_timeout;
                                 handshakes.spawn(async move {
                                     if let Err(error) = handle_incoming(
                                         stream,
@@ -120,7 +124,7 @@ pub(crate) async fn run(
                         }
                     }
                     Err(error) => {
-                        healthy.store(false, Ordering::Release);
+                                context.healthy.store(false, Ordering::Release);
                         warn!(
                             component = "peer_listener",
                             operation = "accept_peer",
@@ -137,9 +141,9 @@ pub(crate) async fn run(
             utp_result = accept_utp_peer(utp_endpoint.as_ref()) => {
                 match utp_result {
                     Ok((stream, peer_addr)) => {
-                        match peer_ingress.try_begin(peer_addr, Instant::now()) {
+                        match context.peer_ingress.try_begin(peer_addr, Instant::now()) {
                             Ok(permit) => {
-                                let Ok(peer_permit) = network_budget.try_acquire_peer() else {
+                                let Ok(peer_permit) = context.network_budget.try_acquire_peer() else {
                                     permit.cancel();
                                     warn!(
                                         component = "peer_listener",
@@ -151,8 +155,8 @@ pub(crate) async fn run(
                                     );
                                     continue;
                                 };
-                                let engine_tx = engine_tx.clone();
-                                let handshake_timeout = peer_ingress.config().handshake_timeout;
+                                let engine_tx = context.engine_tx.clone();
+                                let handshake_timeout = context.peer_ingress.config().handshake_timeout;
                                 handshakes.spawn(async move {
                                     if let Err(error) = handle_incoming_utp(
                                         stream,
@@ -215,6 +219,10 @@ pub(crate) async fn run(
         }
     }
 
+    if let Some(endpoint) = utp_endpoint.take() {
+        endpoint.shutdown().await;
+    }
+
     // A stop signal must release every ingress and global-peer permit held by
     // a slow handshake immediately. Detached handshake tasks used to survive
     // the listener and could hold those limits until their read timeout.
@@ -254,7 +262,7 @@ impl Drop for ListenerHealthGuard {
     fn drop(&mut self) {
         self.healthy.store(false, Ordering::Release);
         self.done.done.store(true, Ordering::Release);
-        self.done.notify.notify_one();
+        self.done.notify.notify_waiters();
     }
 }
 
@@ -316,7 +324,7 @@ async fn handle_incoming_utp(
         .map(|b| format!("{b:02x}"))
         .collect();
     let command = TorrentCmd::AcceptUtpPeer {
-        stream,
+        stream: Box::new(stream),
         peer_addr,
         handshake,
         peer_permit,
@@ -339,4 +347,43 @@ async fn route_incoming_command(
     .await
     .map_err(|_| anyhow::anyhow!("engine command queue timed out"))?
     .map_err(|_| anyhow::anyhow!("engine stopped while routing inbound peer"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::sync::Barrier;
+
+    #[tokio::test]
+    async fn listener_completion_wakes_all_shutdown_waiters() {
+        let completion = Arc::new(ListenerCompletion::new());
+        let ready = Arc::new(Barrier::new(3));
+        let waiters = (0..2)
+            .map(|_| {
+                let completion = Arc::clone(&completion);
+                let ready = Arc::clone(&ready);
+                tokio::spawn(async move {
+                    let mut notified = std::pin::pin!(completion.notify.notified());
+                    notified.as_mut().enable();
+                    ready.wait().await;
+                    notified.await;
+                    completion.done.load(Ordering::Acquire)
+                })
+            })
+            .collect::<Vec<_>>();
+
+        ready.wait().await;
+        let guard = ListenerHealthGuard {
+            healthy: Arc::new(AtomicBool::new(true)),
+            done: Arc::clone(&completion),
+        };
+        drop(guard);
+
+        for waiter in waiters {
+            assert!(timeout(Duration::from_secs(1), waiter)
+                .await
+                .expect("listener shutdown waiter timed out")
+                .expect("listener shutdown waiter panicked"));
+        }
+    }
 }

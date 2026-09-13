@@ -163,7 +163,6 @@ impl PiecePicker {
     pub fn mark_have(&mut self, piece: usize) {
         if piece < self.piece_count {
             self.wanted[piece] = false;
-            self.enabled[piece] = true;
             self.in_progress.remove(&piece);
         }
     }
@@ -200,10 +199,12 @@ impl PiecePicker {
                 *received = true;
             }
         }
-        if state.is_complete() {
-            self.wanted[piece] = false;
-            self.in_progress.remove(&piece);
-        } else {
+        // A partial-piece record contains bytes that were received but never
+        // hash-verified. If it happens to list every block (for example after
+        // a truncated or stale fastresume write), do not turn it into a
+        // completed piece. The torrent actor must request the piece again and
+        // verify it before advertising it as available.
+        if !state.is_complete() {
             self.in_progress.insert(piece, state);
         }
     }
@@ -426,6 +427,28 @@ impl PiecePicker {
         false
     }
 
+    /// Return whether the picker still has partial state for a piece.
+    ///
+    /// Network paths can have duplicate endgame responses in flight. Once the
+    /// first response completes a piece, later responses must not recreate an
+    /// in-memory assembly or be counted as new progress.
+    pub fn is_piece_in_progress(&self, piece: usize) -> bool {
+        self.in_progress.contains_key(&piece)
+    }
+
+    /// Return whether a block has already been accepted for an in-progress
+    /// piece. Endgame requests may be sent to multiple peers; a late duplicate
+    /// must not overwrite the first response or turn a conflicting duplicate
+    /// into a whole-piece rejection.
+    pub fn is_block_received(&self, piece: usize, begin: u32) -> bool {
+        let block_idx = (begin / MAX_BLOCK_SIZE) as usize;
+        self.in_progress
+            .get(&piece)
+            .and_then(|state| state.received.get(block_idx))
+            .copied()
+            .unwrap_or(false)
+    }
+
     /// Cancel an outstanding block request (e.g., peer disconnected).
     pub fn cancel_request(&mut self, piece: usize, begin: u32) {
         let block_idx = (begin / MAX_BLOCK_SIZE) as usize;
@@ -559,6 +582,30 @@ mod tests {
     }
 
     #[test]
+    fn completed_piece_no_longer_accepts_late_blocks() {
+        let mut p = picker_1piece(MAX_BLOCK_SIZE);
+        p.availability.add_have(0);
+        let all = peer_has_all(1);
+        let request = p.pick(&all).unwrap();
+        assert!(p.is_piece_in_progress(0));
+        assert!(!p.is_block_received(0, request.begin));
+        assert!(p.block_received(0, request.begin));
+        assert!(!p.is_piece_in_progress(0));
+        assert!(!p.is_block_received(0, request.begin));
+    }
+
+    #[test]
+    fn received_block_is_detected_during_endgame() {
+        let mut p = picker_1piece(MAX_BLOCK_SIZE * 2);
+        p.availability.add_have(0);
+        let all = peer_has_all(1);
+        let first = p.pick(&all).unwrap();
+        let _second = p.pick(&all).unwrap();
+        assert!(!p.block_received(0, first.begin));
+        assert!(p.is_block_received(0, first.begin));
+    }
+
+    #[test]
     fn mark_have_removes_from_wanted() {
         let mut p = picker_4pieces(MAX_BLOCK_SIZE, MAX_BLOCK_SIZE);
         p.mark_have(0);
@@ -574,6 +621,21 @@ mod tests {
         p.reject_piece(0);
         assert!(!p.is_complete());
         assert_eq!(p.remaining_pieces(), 1);
+    }
+
+    #[test]
+    fn mark_have_does_not_reenable_a_policy_disabled_piece() {
+        let mut p = picker_1piece(MAX_BLOCK_SIZE);
+        p.availability.add_have(0);
+        p.set_piece_enabled(0, false);
+
+        p.mark_have(0);
+        assert!(p.is_complete());
+        assert_eq!(p.have_pieces(), vec![true]);
+
+        p.reject_piece(0);
+        assert!(p.is_complete());
+        assert!(p.pick(&peer_has_all(1)).is_none());
     }
 
     #[test]
@@ -640,6 +702,18 @@ mod tests {
         restored.restore_partial_piece(0, &[0]);
         let next = restored.pick(&all).unwrap();
         assert_eq!(next.begin, second.begin);
+    }
+
+    #[test]
+    fn complete_partial_record_does_not_mark_piece_have() {
+        let mut picker = picker_1piece(MAX_BLOCK_SIZE * 2);
+        picker.availability.add_have(0);
+
+        picker.restore_partial_piece(0, &[0, 1]);
+
+        assert!(!picker.is_complete());
+        assert_eq!(picker.partial_pieces(), Vec::<(u32, Vec<u32>)>::new());
+        assert_eq!(picker.pick(&peer_has_all(1)).unwrap().begin, 0);
     }
 
     #[test]

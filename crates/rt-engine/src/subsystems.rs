@@ -52,6 +52,11 @@ impl EngineRuntimeState {
 
 pub(super) struct EngineSubsystems {
     pub(super) dht_tx: Option<mpsc::Sender<DhtCommand>>,
+    /// The DHT sender alone cannot cancel a task that is inside bootstrap
+    /// DNS resolution. Keep the production join handle so shutdown can
+    /// force-reap a task after its graceful command path times out.
+    #[cfg(not(test))]
+    pub(super) dht_task: Option<JoinHandle<()>>,
     pub(super) resources: ResourceGovernor,
     pub(super) network_budget: GlobalNetworkBudget,
     pub(super) storage_jobs: StorageJobDispatcher,
@@ -75,6 +80,8 @@ impl EngineSubsystems {
     ) -> Self {
         Self {
             dht_tx,
+            #[cfg(not(test))]
+            dht_task: None,
             resources: ResourceGovernor::new(resource_config),
             network_budget,
             storage_jobs,

@@ -37,7 +37,19 @@ pub(crate) fn open_path_no_follow(path: &Path, write: bool, create: bool) -> io:
             .write(write)
             .create(write && create)
             .truncate(false);
-        options.open(path)
+        let file = options.open(path)?;
+        ensure_regular_file(file)
+    }
+}
+
+fn ensure_regular_file(file: File) -> io::Result<File> {
+    if file.metadata()?.is_file() {
+        Ok(file)
+    } else {
+        Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "runtime storage path is not a regular file",
+        ))
     }
 }
 
@@ -108,6 +120,33 @@ pub fn write_file_no_follow(path: &Path, contents: &[u8]) -> io::Result<()> {
     let mut file = open_path_no_follow(path, true, true)?;
     file.set_len(0)?;
     file.write_all(contents)
+}
+
+/// Replace the contents of a runtime-owned file without following a symlink,
+/// and wait for the file data to reach stable storage before returning.
+pub fn write_file_no_follow_sync(path: &Path, contents: &[u8]) -> io::Result<()> {
+    let mut file = open_path_no_follow(path, true, true)?;
+    file.set_len(0)?;
+    file.write_all(contents)?;
+    file.sync_all()
+}
+
+/// Sync a runtime-owned directory after an atomic rename or unlink.
+///
+/// On Unix the directory is opened by descriptor-relative, no-follow
+/// traversal so the sync cannot be redirected through a replaced ancestor.
+/// Other platforms receive the file-level durability already provided by the
+/// caller; directory fsync is not exposed consistently there.
+pub fn sync_dir_no_follow(path: &Path) -> io::Result<()> {
+    #[cfg(unix)]
+    {
+        open_directory_no_follow_unix(path)?.sync_all()
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        Ok(())
+    }
 }
 
 /// Remove a runtime-owned file without following a final component or any
@@ -206,7 +245,10 @@ fn open_path_no_follow_unix(path: &Path, write: bool, create: bool) -> io::Resul
         )
     })?;
     let mut flags = if write { libc::O_RDWR } else { libc::O_RDONLY };
-    flags |= libc::O_CLOEXEC | libc::O_NOFOLLOW;
+    // A runtime file may be replaced by a FIFO between validation and use.
+    // Nonblocking open prevents that special file from stalling a storage
+    // worker before the descriptor can be rejected as non-regular.
+    flags |= libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK;
     if write && create {
         flags |= libc::O_CREAT;
     }
@@ -214,7 +256,7 @@ fn open_path_no_follow_unix(path: &Path, write: bool, create: bool) -> io::Resul
     if fd < 0 {
         Err(io::Error::last_os_error())
     } else {
-        Ok(unsafe { File::from_raw_fd(fd) })
+        ensure_regular_file(unsafe { File::from_raw_fd(fd) })
     }
 }
 
@@ -246,6 +288,30 @@ fn open_parent_no_follow_unix(path: &Path) -> io::Result<(File, OsString)> {
         ));
     };
     Ok((open_parent_from_parts(&parts)?, final_name.into_os_string()))
+}
+
+#[cfg(unix)]
+fn open_directory_no_follow_unix(path: &Path) -> io::Result<File> {
+    if !path.is_absolute() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "runtime storage path must be absolute",
+        ));
+    }
+    let mut parts = Vec::<PathBuf>::new();
+    for component in path.components() {
+        match component {
+            Component::RootDir => {}
+            Component::Normal(value) => parts.push(PathBuf::from(value)),
+            _ => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "runtime storage path contains an unsafe component",
+                ));
+            }
+        }
+    }
+    open_parent_from_parts(&parts)
 }
 
 #[cfg(unix)]
@@ -366,5 +432,27 @@ mod tests {
         let error = read_file_no_follow_limited(&path, 3).unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
         assert_eq!(read_file_no_follow_limited(&path, 4).unwrap(), b"1234");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn sync_directory_uses_the_runtime_directory_boundary() {
+        let temp = tempfile::tempdir().unwrap();
+        sync_dir_no_follow(temp.path()).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn limited_read_rejects_fifo_without_blocking() {
+        use std::os::unix::ffi::OsStrExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("state.fifo");
+        let name = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+        let result = unsafe { libc::mkfifo(name.as_ptr(), 0o600) };
+        assert_eq!(result, 0);
+
+        let error = read_file_no_follow_limited(&path, 64).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
     }
 }

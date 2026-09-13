@@ -203,6 +203,12 @@ pub(crate) fn rollback_plan(
     (rolled_back, failures)
 }
 
+fn sync_directory(directory: &File, path: &Path) -> Result<(), StorageError> {
+    directory
+        .sync_all()
+        .map_err(|error| StorageError::io(path.display().to_string(), error))
+}
+
 fn secure_import(
     source: &Path,
     destination: &Path,
@@ -273,8 +279,34 @@ fn secure_import(
                     ),
                 ));
             }
+            if let Err(sync_error) = sync_directory(&destination_parent, destination) {
+                return Err(staged_uncertain(
+                    "import-cleanup-sync",
+                    format!(
+                        "{error}; removed hard-link destination but failed to sync its parent: {sync_error}"
+                    ),
+                ));
+            }
             return Err(error);
         }
+        sync_directory(&source_parent, source).map_err(|error| {
+            staged_uncertain(
+                "import-sync",
+                format!(
+                    "hard-link import committed but failed to sync source directory {}: {error}",
+                    source.display()
+                ),
+            )
+        })?;
+        sync_directory(&destination_parent, destination).map_err(|error| {
+            staged_uncertain(
+                "import-sync",
+                format!(
+                    "hard-link import committed but failed to sync destination directory {}: {error}",
+                    destination.display()
+                ),
+            )
+        })?;
         Ok(())
     } else {
         secure_copy_entry(
@@ -354,9 +386,19 @@ fn secure_copy_entry(
                     ),
                 ));
             }
+            if let Err(sync_error) = sync_directory(destination_parent, paths.1) {
+                return Err(staged_uncertain(
+                    "copy-cleanup-sync",
+                    format!(
+                        "{error}; removed partial destination but failed to sync its parent: {sync_error}"
+                    ),
+                ));
+            }
+            return Err(error);
         }
         return Err(error);
     }
+    sync_directory(destination_parent, paths.1)?;
     Ok(())
 }
 
@@ -525,6 +567,24 @@ fn secure_rename(
     ) {
         return Err(StorageError::io(destination.display().to_string(), error));
     }
+    if let Err(error) = sync_directory(&source_parent, source) {
+        return Err(staged_uncertain(
+            "rename-sync",
+            format!(
+                "rename committed but failed to sync source directory {}: {error}",
+                source.display()
+            ),
+        ));
+    }
+    if let Err(error) = sync_directory(&destination_parent, destination) {
+        return Err(staged_uncertain(
+            "rename-sync",
+            format!(
+                "rename committed but failed to sync destination directory {}: {error}",
+                destination.display()
+            ),
+        ));
+    }
     if let Err(error) = verify_expected_length(
         &destination_parent,
         &destination_name,
@@ -543,6 +603,17 @@ fn secure_rename(
         )
         .is_ok()
         {
+            if let Err(sync_error) = sync_directory(&source_parent, source)
+                .and_then(|_| sync_directory(&destination_parent, destination))
+            {
+                return Err(staged_uncertain(
+                    "rename-rollback-sync",
+                    format!(
+                        "{error}; restored {} but failed to sync the rollback: {sync_error}",
+                        source.display()
+                    ),
+                ));
+            }
             return Err(error);
         }
         return Err(staged_uncertain(
@@ -684,6 +755,7 @@ fn remove_entry_at_inner(
         let result = unlink_at(parent, name, path, libc::AT_REMOVEDIR);
         if result.is_ok() {
             *removed = true;
+            sync_directory(parent, path)?;
         }
         result
     } else if kind.is_file() || kind.is_symlink() {
@@ -691,6 +763,7 @@ fn remove_entry_at_inner(
         let result = unlink_at(parent, name, path, 0);
         if result.is_ok() {
             *removed = true;
+            sync_directory(parent, path)?;
         }
         result
     } else {
@@ -760,7 +833,18 @@ fn secure_prune(
             source,
             libc::AT_REMOVEDIR,
         ) {
-            Ok(()) => removed = true,
+            Ok(()) => {
+                removed = true;
+                if let Err(error) = sync_directory(&directories[index], source) {
+                    return Err(staged_uncertain(
+                        "prune-sync",
+                        format!(
+                            "directory pruning committed but failed to sync {}: {error}",
+                            source.display()
+                        ),
+                    ));
+                }
+            }
             Err(error) if is_not_found(&error) => {}
             Err(StorageError::Io { source: error, .. })
                 if error.kind() == io::ErrorKind::DirectoryNotEmpty =>
@@ -1320,9 +1404,18 @@ fn directory_names(directory: &File, path: &Path) -> Result<Vec<OsString>, Stora
         ));
     }
     let mut names = Vec::new();
+    // POSIX uses a NULL `readdir` result for both end-of-directory and an
+    // enumeration error. Clear errno before the loop so a stale error from a
+    // previous syscall cannot be mistaken for a current read failure.
+    clear_errno();
+    let mut read_error = None;
     loop {
         let entry = unsafe { libc::readdir(directory_stream) };
         if entry.is_null() {
+            let error = io::Error::last_os_error();
+            if error.raw_os_error().unwrap_or_default() != 0 {
+                read_error = Some(error);
+            }
             break;
         }
         let name = unsafe { CStr::from_ptr((*entry).d_name.as_ptr()) }.to_bytes();
@@ -1332,6 +1425,9 @@ fn directory_names(directory: &File, path: &Path) -> Result<Vec<OsString>, Stora
         names.push(OsString::from_vec(name.to_vec()));
     }
     let close_result = unsafe { libc::closedir(directory_stream) };
+    if let Some(error) = read_error {
+        return Err(StorageError::io(path.display().to_string(), error));
+    }
     if close_result != 0 {
         return Err(StorageError::io(
             path.display().to_string(),
@@ -1339,6 +1435,69 @@ fn directory_names(directory: &File, path: &Path) -> Result<Vec<OsString>, Stora
         ));
     }
     Ok(names)
+}
+
+#[cfg(any(target_os = "linux", target_os = "hurd", target_os = "redox"))]
+fn clear_errno() {
+    unsafe { *libc::__errno_location() = 0 };
+}
+
+#[cfg(target_os = "android")]
+fn clear_errno() {
+    unsafe { *libc::__errno() = 0 };
+}
+
+#[cfg(any(
+    target_os = "macos",
+    target_os = "ios",
+    target_os = "tvos",
+    target_os = "watchos",
+    target_os = "visionos",
+    target_os = "freebsd"
+))]
+fn clear_errno() {
+    unsafe { *libc::__error() = 0 };
+}
+
+#[cfg(any(target_os = "openbsd", target_os = "netbsd"))]
+fn clear_errno() {
+    unsafe { *libc::__errno() = 0 };
+}
+
+#[cfg(any(target_os = "solaris", target_os = "illumos"))]
+fn clear_errno() {
+    unsafe { *libc::___errno() = 0 };
+}
+
+#[cfg(target_os = "dragonfly")]
+fn clear_errno() {
+    unsafe { *libc::__errno_location() = 0 };
+}
+
+#[cfg(all(
+    unix,
+    not(any(
+        target_os = "linux",
+        target_os = "hurd",
+        target_os = "redox",
+        target_os = "android",
+        target_os = "macos",
+        target_os = "ios",
+        target_os = "tvos",
+        target_os = "watchos",
+        target_os = "visionos",
+        target_os = "freebsd",
+        target_os = "openbsd",
+        target_os = "netbsd",
+        target_os = "solaris",
+        target_os = "illumos",
+        target_os = "dragonfly"
+    ))
+))]
+fn clear_errno() {
+    // Keep the Unix fallback buildable on targets whose libc errno accessor
+    // is not exposed by the `libc` crate. The supported targets above use a
+    // real reset before `readdir`.
 }
 
 fn ensure_destination_available(
@@ -1398,5 +1557,26 @@ fn is_not_found(error: &StorageError) -> bool {
         StorageError::FileNotFound { .. } => true,
         StorageError::Io { source, .. } => source.kind() == io::ErrorKind::NotFound,
         _ => false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn directory_names_returns_all_entries() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("file"), b"data").unwrap();
+        std::fs::create_dir(root.path().join("directory")).unwrap();
+
+        let directory = File::open(root.path()).unwrap();
+        let mut names = directory_names(&directory, root.path()).unwrap();
+        names.sort();
+
+        assert_eq!(
+            names,
+            vec![OsString::from("directory"), OsString::from("file")]
+        );
     }
 }

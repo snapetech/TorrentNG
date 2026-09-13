@@ -26,6 +26,21 @@ pub(crate) const STOPPED_TRACKER_ANNOUNCE_DEADLINE: Duration = Duration::from_se
 
 pub(crate) type TrackerKey = (usize, usize);
 
+/// URI schemes are case-insensitive. Dispatch must inspect the scheme with
+/// the same rule; routing `UDP://...` through the HTTP client makes a valid
+/// UDP tracker fail before the UDP announce code gets a chance to parse it.
+pub(crate) fn is_udp_tracker_url(tracker_url: &str) -> bool {
+    tracker_url
+        .get(..6)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("udp://"))
+}
+
+/// Encode the daemon's platform-sized peer ceiling in the tracker protocol's
+/// fixed-width field without allowing a 64-bit value to wrap on the wire.
+pub(crate) fn protocol_numwant(max_peers: usize) -> u32 {
+    u32::try_from(max_peers).unwrap_or(u32::MAX)
+}
+
 #[derive(Clone)]
 pub(crate) struct TrackerAnnounceContext {
     pub(crate) info_hash: [u8; 20],
@@ -113,7 +128,10 @@ impl TrackerWorkers {
                 let response =
                     announce_tracker(&worker_context, &worker_url, event, tracker_id.as_deref())
                         .await;
-                let scrape = if response.is_ok() {
+                // UDP trackers have no HTTP scrape endpoint. Trying to pass
+                // their URL through the HTTP egress policy causes a failed
+                // client/DNS attempt after every successful announce.
+                let scrape = if response.is_ok() && !is_udp_tracker_url(&worker_url) {
                     scrape_tracker(&worker_context, &worker_url).await.ok()
                 } else {
                     None
@@ -187,7 +205,7 @@ pub(crate) async fn announce_tracker(
     event: TrackerEvent,
     tracker_id: Option<&[u8]>,
 ) -> Result<AnnounceResponse, TrackerError> {
-    if tracker_url.starts_with("udp://") {
+    if is_udp_tracker_url(tracker_url) {
         announce_udp(context, tracker_url, event).await
     } else {
         announce_http(context, tracker_url, event, tracker_id).await
@@ -239,7 +257,7 @@ async fn announce_http(
         });
     }
     let bytes = bounded_response_body(response, MAX_TRACKER_RESPONSE_BYTES).await?;
-    AnnounceResponse::parse(&bytes)
+    AnnounceResponse::parse_with_peer_limit(&bytes, context.numwant as usize)
 }
 
 async fn announce_udp(
@@ -309,7 +327,8 @@ async fn announce_udp(
         .await
         .map_err(|_| TrackerError::Timeout)?
         .map_err(|e| TrackerError::Network(e.to_string()))?;
-    let announce_resp = UdpAnnounceResponse::parse(&buf[..n])?;
+    let announce_resp =
+        UdpAnnounceResponse::parse_with_peer_limit(&buf[..n], context.numwant as usize)?;
     if announce_resp.transaction_id != announce.transaction_id {
         return Err(TrackerError::Udp("announce transaction id mismatch".into()));
     }
@@ -394,12 +413,31 @@ pub(crate) async fn bounded_response_body(
 
 #[cfg(test)]
 mod tests {
-    use super::{TrackerWorkers, MAX_TRACKER_ANNOUNCES_IN_FLIGHT};
+    use super::{
+        is_udp_tracker_url, protocol_numwant, TrackerWorkers, MAX_TRACKER_ANNOUNCES_IN_FLIGHT,
+    };
+
+    #[test]
+    fn tracker_scheme_dispatch_is_case_insensitive() {
+        assert!(is_udp_tracker_url("udp://tracker.example:6969/announce"));
+        assert!(is_udp_tracker_url("UDP://tracker.example:6969/announce"));
+        assert!(is_udp_tracker_url("UdP://tracker.example:6969/announce"));
+        assert!(!is_udp_tracker_url("http://tracker.example/announce"));
+        assert!(!is_udp_tracker_url(
+            "udp-tracker://tracker.example/announce"
+        ));
+    }
 
     #[test]
     fn tracker_worker_budget_is_explicit_and_bounded() {
         let workers = TrackerWorkers::new();
         assert_eq!(workers.available(), MAX_TRACKER_ANNOUNCES_IN_FLIGHT);
         assert!(!workers.contains((0, 0)));
+    }
+
+    #[test]
+    fn protocol_peer_limit_does_not_wrap() {
+        assert_eq!(protocol_numwant(200), 200);
+        assert_eq!(protocol_numwant(usize::MAX), u32::MAX);
     }
 }
