@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use rt_bencode::{decode, encode, BValue};
+use rt_bencode::{encode, BValue, Decoder};
 
 use crate::error::WireError;
 
@@ -11,6 +11,17 @@ pub const EXT_HANDSHAKE_ID: u8 = 0;
 pub const UT_METADATA: &str = "ut_metadata";
 /// BEP 11 peer exchange extension name.
 pub const UT_PEX: &str = "ut_pex";
+// Extension headers are small flat dictionaries. Keep their parser from
+// materializing the bencode crate's million-node default when a peer sends a
+// flat node bomb inside an otherwise legal 2 MiB peer-wire message.
+const MAX_EXTENSION_BENCODE_NODES: usize = 16 * 1024;
+
+fn decode_extension_bencode(payload: &[u8]) -> Result<BValue<'_>, WireError> {
+    Decoder::new(payload)
+        .with_max_nodes(MAX_EXTENSION_BENCODE_NODES)
+        .decode()
+        .map_err(invalid)
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExtensionHandshake {
@@ -61,7 +72,7 @@ impl ExtensionHandshake {
     }
 
     pub fn parse(payload: &[u8]) -> Result<Self, WireError> {
-        let value = decode(payload).map_err(invalid)?;
+        let value = decode_extension_bencode(payload)?;
         let dict = match value {
             BValue::Dict(pairs) => pairs,
             _ => return Err(invalid("extension handshake must be a dict")),
@@ -126,7 +137,7 @@ impl UtMetadataMessage {
 
     pub fn parse(payload: &[u8]) -> Result<Self, WireError> {
         let header_len = bencode_value_len(payload).map_err(invalid)?;
-        let header = decode(&payload[..header_len]).map_err(invalid)?;
+        let header = decode_extension_bencode(&payload[..header_len])?;
         let BValue::Dict(pairs) = header else {
             return Err(invalid("ut_metadata header must be a dict"));
         };
@@ -340,6 +351,21 @@ mod tests {
         payload.extend(std::iter::repeat_n(b'l', 10_000));
         let result = ExtensionHandshake::parse(&payload);
         assert!(result.is_err(), "deeply nested handshake must be rejected");
+    }
+
+    #[test]
+    fn extension_parsers_reject_flat_bencode_node_bombs() {
+        let mut payload = b"l".to_vec();
+        for _ in 0..=MAX_EXTENSION_BENCODE_NODES {
+            payload.extend_from_slice(b"i1e");
+        }
+        payload.push(b'e');
+
+        let handshake = ExtensionHandshake::parse(&payload).unwrap_err();
+        assert!(handshake.to_string().contains("node limit exceeded"));
+
+        let metadata = UtMetadataMessage::parse(&payload).unwrap_err();
+        assert!(metadata.to_string().contains("node limit exceeded"));
     }
 
     #[test]

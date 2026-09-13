@@ -13,7 +13,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use futures::{SinkExt, StreamExt};
 use reqwest::header::{CONTENT_RANGE, RANGE};
 use reqwest::StatusCode;
-use rt_bencode::{decode, BValue};
+use rt_bencode::{BValue, Decoder};
 use rusqlite::Connection;
 #[cfg(test)]
 use tokio::net::TcpListener;
@@ -85,6 +85,10 @@ const PEER_EVENT_SEND_TIMEOUT: Duration = Duration::from_millis(500);
 const WEBSEED_RETRY_BASE: Duration = Duration::from_secs(1);
 const WEBSEED_RETRY_MAX: Duration = Duration::from_secs(300);
 const MAX_UT_PEX_PEERS: usize = 2_048;
+// BEP 11 payloads arrive from untrusted peers inside a legal peer-wire
+// message. Keep a flat bencode node bomb from reaching the parser's much
+// larger generic default before the compact-peer count checks run.
+const MAX_UT_PEX_BENCODE_NODES: usize = 16 * 1024;
 const DOWNLOAD_BUCKET_MIN_CAPACITY: u64 = MAX_BLOCK_SIZE as u64;
 
 fn peer_event_channel_capacity(max_peers: usize) -> usize {
@@ -5564,7 +5568,9 @@ struct UtPexPeers {
 /// it removes stale retry candidates but never forcibly disconnects an
 /// otherwise healthy local connection.
 fn parse_ut_pex_peers(payload: &[u8]) -> anyhow::Result<UtPexPeers> {
-    let value = decode(payload)?;
+    let value = Decoder::new(payload)
+        .with_max_nodes(MAX_UT_PEX_BENCODE_NODES)
+        .decode()?;
     let BValue::Dict(pairs) = value else {
         anyhow::bail!("ut_pex payload must be a dict");
     };
@@ -8739,6 +8745,18 @@ mod tests {
                 SocketAddr::V6(SocketAddrV6::new(Ipv6Addr::LOCALHOST, 6881, 0, 0)),
             ]
         );
+    }
+
+    #[test]
+    fn rejects_ut_pex_flat_bencode_node_bombs() {
+        let mut payload = b"l".to_vec();
+        for _ in 0..=MAX_UT_PEX_BENCODE_NODES {
+            payload.extend_from_slice(b"i1e");
+        }
+        payload.push(b'e');
+
+        let error = parse_ut_pex_peers(&payload).unwrap_err();
+        assert!(error.to_string().contains("node limit exceeded"));
     }
 
     #[test]

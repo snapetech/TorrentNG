@@ -23,9 +23,10 @@ use url::Url;
 use rt_engine::{
     EngineGlobalLimits, EnginePeerSnapshot, EnginePieceState, EngineTorrentFile,
     EngineTorrentLimits, EngineTorrentMetadata, EngineTrackerSnapshot, OutboundTargetKind,
-    QueueMove,
+    QueueMove, MAX_MANUAL_PEER_ADDRESSES,
 };
 use rt_metrics::{MemoryClass, MemoryLease};
+use rt_session::MAX_BANNED_PEERS;
 
 use crate::{
     model::{
@@ -2153,7 +2154,7 @@ pub async fn torrents_add_peers(State(state): State<AppState>, body: String) -> 
     };
     let peers = match params
         .get("peers")
-        .and_then(|peers| strict_peer_addrs(peers).ok())
+        .and_then(|peers| strict_peer_addrs(peers, MAX_MANUAL_PEER_ADDRESSES).ok())
     {
         Some(peers) if !peers.is_empty() => peers,
         _ => return StatusCode::BAD_REQUEST,
@@ -3737,7 +3738,7 @@ pub async fn transfer_ban_peers(State(state): State<AppState>, body: String) -> 
     let params = parse_form_body(&body);
     let peers = match params
         .get("peers")
-        .and_then(|peers| strict_peer_addrs(peers).ok())
+        .and_then(|peers| strict_peer_addrs(peers, MAX_BANNED_PEERS).ok())
     {
         Some(peers) if !peers.is_empty() => peers,
         _ => return StatusCode::BAD_REQUEST,
@@ -5571,15 +5572,18 @@ fn parse_peer_addrs(values: &str) -> Vec<SocketAddr> {
         .collect()
 }
 
-fn strict_peer_addrs(values: &str) -> Result<Vec<SocketAddr>, ()> {
-    let values = values.split('|').collect::<Vec<_>>();
-    if values.is_empty() || values.iter().any(|value| value.trim().is_empty()) {
+fn strict_peer_addrs(values: &str, maximum: usize) -> Result<Vec<SocketAddr>, ()> {
+    let mut peers = Vec::new();
+    for (index, value) in values.split('|').enumerate() {
+        if index >= maximum || value.trim().is_empty() {
+            return Err(());
+        }
+        peers.push(value.trim().parse::<SocketAddr>().map_err(|_| ())?);
+    }
+    if peers.is_empty() {
         return Err(());
     }
-    values
-        .into_iter()
-        .map(|peer| peer.trim().parse::<SocketAddr>().map_err(|_| ()))
-        .collect()
+    Ok(peers)
 }
 
 fn normalize_api_text(value: &str) -> Option<String> {
@@ -8728,7 +8732,14 @@ mod tests {
             strict_hashes_from_str("ABCD|ef01").unwrap(),
             vec!["abcd".to_owned(), "ef01".to_owned()]
         );
-        assert!(strict_peer_addrs("127.0.0.1:6881|bad").is_err());
+        assert!(strict_peer_addrs("127.0.0.1:6881|bad", MAX_MANUAL_PEER_ADDRESSES).is_err());
+        assert!(strict_peer_addrs(
+            &std::iter::repeat_n("127.0.0.1:6881", MAX_MANUAL_PEER_ADDRESSES + 1)
+                .collect::<Vec<_>>()
+                .join("|"),
+            MAX_MANUAL_PEER_ADDRESSES
+        )
+        .is_err());
         assert!(strict_numeric_list("0|bad").is_err());
         assert!(strict_tracker_values("udp://one/announce||udp://two/announce").is_err());
         assert_eq!(

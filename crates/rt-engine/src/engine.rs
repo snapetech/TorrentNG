@@ -29,6 +29,7 @@ use rt_metrics::{
 use rt_path::{StorageProfile, StorageRootId};
 use rt_session::{
     DormantTorrent, SessionRegistry, TorrentEntry, TorrentHandle, TorrentState, TransferStats,
+    MAX_BANNED_PEERS,
 };
 #[cfg(test)]
 use rt_storage::StorageError;
@@ -104,6 +105,11 @@ const ENGINE_COMMAND_REPLY_TIMEOUT: Duration = Duration::from_secs(5);
 const TASK_ABORT_GRACE: Duration = Duration::from_millis(100);
 const MAGNET_METADATA_STORAGE_RETRY_DELAY: Duration = Duration::from_millis(250);
 const MAX_STORAGE_PLAN_AFFECTED_TORRENTS: usize = 256;
+/// Bound explicit peer commands before they reach a torrent actor. The actor
+/// can only maintain `max_peers` live connections, so retaining thousands of
+/// more addresses is wasted work and lets a compatibility request monopolize
+/// the command path.
+pub const MAX_MANUAL_PEER_ADDRESSES: usize = 4_096;
 static RECHECK_JOB_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 static STORAGE_PLAN_JOB_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 static DHT_COMMAND_SEQUENCE: AtomicU64 = AtomicU64::new(1);
@@ -545,6 +551,15 @@ fn memory_pressure_for(
     } else {
         MemoryPressure::Normal
     }
+}
+
+fn validate_peer_command_len(count: usize, maximum: usize, kind: &str) -> CmdResult<()> {
+    if count > maximum {
+        return Err(format!(
+            "{kind} contains {count} addresses; maximum is {maximum}"
+        ));
+    }
+    Ok(())
 }
 
 /// Handle given to the API layer. Clone freely; all sends are channel-based.
@@ -1043,6 +1058,7 @@ impl EngineHandle {
     /// with every torrent task, so a ban applies immediately to active tasks
     /// and to incoming connections that would otherwise trigger promotion.
     pub async fn ban_peers(&self, peers: Vec<SocketAddr>) -> CmdResult<()> {
+        validate_peer_command_len(peers.len(), MAX_BANNED_PEERS, "peer ban list")?;
         let (reply, rx) = tokio::sync::oneshot::channel();
         self.send_command(EngineCmd::BanPeers { peers, reply })
             .await?;
@@ -1187,6 +1203,7 @@ impl EngineHandle {
     }
 
     pub async fn add_peers(&self, info_hash: String, peers: Vec<SocketAddr>) -> CmdResult<()> {
+        validate_peer_command_len(peers.len(), MAX_MANUAL_PEER_ADDRESSES, "manual peer list")?;
         let info_hash = canonical_info_hash(info_hash);
         let (reply, rx) = tokio::sync::oneshot::channel();
         self.send_command(EngineCmd::AddPeers {
@@ -2291,6 +2308,12 @@ impl Engine {
             }
 
             EngineCmd::BanPeers { peers, reply } => {
+                if let Err(error) =
+                    validate_peer_command_len(peers.len(), MAX_BANNED_PEERS, "peer ban list")
+                {
+                    let _ = reply.send(Err(error));
+                    return true;
+                }
                 let accepted = self.registry.read().await.bannable_peers(peers);
                 let result = if accepted.is_empty() {
                     Ok(())
@@ -8912,6 +8935,12 @@ impl Engine {
         peers: Vec<SocketAddr>,
         reply: oneshot::Sender<CmdResult<()>>,
     ) {
+        if let Err(error) =
+            validate_peer_command_len(peers.len(), MAX_MANUAL_PEER_ADDRESSES, "manual peer list")
+        {
+            let _ = reply.send(Err(error));
+            return;
+        }
         if let Err(error) = self.ensure_torrent_storage_idle(&info_hash).await {
             let _ = reply.send(Err(error));
             return;
@@ -8983,6 +9012,7 @@ impl Engine {
 
     #[cfg(test)]
     async fn add_peers_inner(&mut self, info_hash: &str, peers: Vec<SocketAddr>) -> CmdResult<()> {
+        validate_peer_command_len(peers.len(), MAX_MANUAL_PEER_ADDRESSES, "manual peer list")?;
         self.ensure_torrent_storage_idle(info_hash).await?;
         if peers.is_empty() {
             return Ok(());
@@ -14541,6 +14571,31 @@ mod tests {
         assert!(handle.is_alive());
         drop(rx);
         assert!(!handle.is_alive());
+    }
+
+    #[test]
+    fn peer_command_limits_reject_oversized_inputs_at_the_boundary() {
+        assert!(validate_peer_command_len(
+            MAX_MANUAL_PEER_ADDRESSES,
+            MAX_MANUAL_PEER_ADDRESSES,
+            "manual peer list"
+        )
+        .is_ok());
+        let manual_error = validate_peer_command_len(
+            MAX_MANUAL_PEER_ADDRESSES + 1,
+            MAX_MANUAL_PEER_ADDRESSES,
+            "manual peer list",
+        )
+        .unwrap_err();
+        assert!(manual_error.contains("maximum is 4096"));
+
+        assert!(
+            validate_peer_command_len(MAX_BANNED_PEERS, MAX_BANNED_PEERS, "peer ban list").is_ok()
+        );
+        assert!(
+            validate_peer_command_len(MAX_BANNED_PEERS + 1, MAX_BANNED_PEERS, "peer ban list")
+                .is_err()
+        );
     }
 
     #[tokio::test]

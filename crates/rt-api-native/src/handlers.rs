@@ -26,6 +26,7 @@ use rt_api_model::{
 use rt_engine::{
     EngineGlobalLimits, EngineHandle, EngineJob, EngineNetworkFeatures, EngineStorageRoot,
     EngineSubsystemHealth, EngineTorrentLimits, QueueMove, TorrentLiveStats,
+    MAX_MANUAL_PEER_ADDRESSES,
 };
 use rt_metainfo::parse_magnet;
 use rt_metrics::MemoryClass;
@@ -34,7 +35,10 @@ use rt_storage::{
     runtime::StorageRuntime, DeletePlanRequest, ImportPlanRequest, MovePlanRequest, PlanIssue,
     PlannedStorageAction, StoragePlan, StoragePlanStep, STORAGE_LATENCY_BUCKETS_NS,
 };
-use serde::{Deserialize, Deserializer, Serialize};
+use serde::{
+    de::{self, SeqAccess, Visitor},
+    Deserialize, Deserializer, Serialize,
+};
 use sha2::{Digest, Sha256};
 
 use crate::state::{
@@ -1029,7 +1033,7 @@ pub struct UpdateTorrentLimitsRequest {
 
 #[derive(Debug, Deserialize)]
 pub struct AddTorrentPeersRequest {
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_bounded_peer_strings")]
     pub peers: Vec<String>,
 }
 
@@ -1045,6 +1049,44 @@ where
     D: Deserializer<'de>,
 {
     serde_json::Value::deserialize(deserializer).map(Some)
+}
+
+fn deserialize_bounded_peer_strings<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    struct PeerListVisitor;
+
+    impl<'de> Visitor<'de> for PeerListVisitor {
+        type Value = Vec<String>;
+
+        fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter.write_str("a bounded array of peer address strings")
+        }
+
+        fn visit_seq<A>(self, mut sequence: A) -> Result<Self::Value, A::Error>
+        where
+            A: SeqAccess<'de>,
+        {
+            let mut peers = Vec::with_capacity(
+                sequence
+                    .size_hint()
+                    .unwrap_or_default()
+                    .min(MAX_MANUAL_PEER_ADDRESSES),
+            );
+            while let Some(peer) = sequence.next_element::<String>()? {
+                if peers.len() >= MAX_MANUAL_PEER_ADDRESSES {
+                    return Err(de::Error::custom(format!(
+                        "manual peer list exceeds maximum of {MAX_MANUAL_PEER_ADDRESSES} addresses"
+                    )));
+                }
+                peers.push(peer);
+            }
+            Ok(peers)
+        }
+    }
+
+    deserializer.deserialize_seq(PeerListVisitor)
 }
 
 #[derive(Debug, Serialize)]
@@ -7347,6 +7389,14 @@ mod tests {
         assert_eq!(level_from_kind("torrent_added"), "info");
         assert_eq!(level_from_kind("tracker_warning"), "warn");
         assert_eq!(level_from_kind("storage_failed"), "error");
+    }
+
+    #[test]
+    fn explicit_peer_request_rejects_oversized_arrays() {
+        let request = serde_json::json!({
+            "peers": vec!["127.0.0.1:6881"; MAX_MANUAL_PEER_ADDRESSES + 1]
+        });
+        assert!(serde_json::from_value::<AddTorrentPeersRequest>(request).is_err());
     }
 
     #[test]

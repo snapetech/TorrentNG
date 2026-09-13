@@ -25,7 +25,7 @@ pub use egress_policy::{
     egress_policy_metrics, AddressClass, EgressPolicyError, EgressPolicyMetricsSnapshot,
     OutboundEgressPolicy, OutboundTargetKind,
 };
-pub use engine::{Engine, EngineHandle};
+pub use engine::{Engine, EngineHandle, MAX_MANUAL_PEER_ADDRESSES};
 pub use peer_ingress::{
     PeerIngressBudget, PeerIngressConfig, PeerIngressPermit, PeerIngressReject, PeerIngressStats,
 };
