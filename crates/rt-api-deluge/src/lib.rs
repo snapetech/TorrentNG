@@ -42,6 +42,11 @@ const MAX_LEGACY_FULL_LIST_ENTRIES: usize = 10_000;
 // Bound compatibility input arrays before they become per-torrent or
 // per-file engine calls and response-sized temporary allocations.
 const MAX_DELUGE_MUTATION_ITEMS: usize = 16_384;
+// URL-download tokens are one-shot compatibility state. Keep abandoned WebUI
+// tokens from becoming an unbounded in-memory map, and reject values that are
+// disproportionate to the small token they produce.
+const MAX_DELUGE_PENDING_URL_DOWNLOADS: usize = 1_024;
+const MAX_DELUGE_URL_BYTES: usize = 16 * 1024;
 const DELUGE_RUNTIME_PROJECTION_CONCURRENCY: usize = 64;
 
 struct DelugeRuntimeProjection {
@@ -521,8 +526,9 @@ async fn dispatch(state: &AppState, method: &str, params: &[Value]) -> Result<Va
                 .unwrap_or(false);
             let hash = canonical_torrent_hash(state, hash).await?;
             deluge_engine(state)?
-                .remove_torrent(hash, remove_data)
+                .remove_torrent(hash.clone(), remove_data)
                 .await?;
+            forget_deluge_torrent_state(state, &hash).await;
             Ok(json!(true))
         }
         "core.add_torrent_magnet" => {
@@ -893,15 +899,26 @@ async fn web_download_torrent_from_url(
     if !(url.starts_with("http://") || url.starts_with("https://") || url.starts_with("magnet:")) {
         return Err("unsupported torrent URL scheme".to_owned());
     }
+    if url.len() > MAX_DELUGE_URL_BYTES {
+        return Err(format!(
+            "torrent URL exceeds the {MAX_DELUGE_URL_BYTES} byte limit"
+        ));
+    }
 
+    let mut url_downloads = state.url_downloads.write().await;
+    if url_downloads.len() >= MAX_DELUGE_PENDING_URL_DOWNLOADS {
+        return Err(format!(
+            "too many pending torrent URL downloads; maximum is {MAX_DELUGE_PENDING_URL_DOWNLOADS}"
+        ));
+    }
     let mut next = state.next_url_download_id.write().await;
-    let token = format!("torrentng-url-download-{}.torrent", *next);
-    *next = next.saturating_add(1);
-    state
-        .url_downloads
-        .write()
-        .await
-        .insert(token.clone(), url.to_owned());
+    let token_id = *next;
+    let next_token_id = token_id
+        .checked_add(1)
+        .ok_or_else(|| "torrent URL download token sequence is exhausted".to_owned())?;
+    let token = format!("torrentng-url-download-{token_id}.torrent");
+    *next = next_token_id;
+    url_downloads.insert(token.clone(), url.to_owned());
     Ok(json!(token))
 }
 
@@ -2282,11 +2299,13 @@ async fn set_torrent_options(state: &AppState, params: &[Value]) -> Result<Value
                 .await
                 .insert(hash.clone(), move_completed);
         }
-        state
-            .torrent_options
-            .write()
-            .await
-            .insert(hash.clone(), limits.clone());
+        if state.engine.is_none() {
+            state
+                .torrent_options
+                .write()
+                .await
+                .insert(hash.clone(), limits.clone());
+        }
     }
     Ok(json!(true))
 }
@@ -2326,9 +2345,15 @@ async fn set_prioritize_first_last(state: &AppState, params: &[Value]) -> Result
         engine
             .update_torrent_limits(hash.clone(), limits.clone())
             .await?;
-        state.torrent_options.write().await.insert(hash, limits);
+        // The engine is authoritative in this path; the compatibility map is
+        // only used by no-engine embedders and tests.
     }
     Ok(json!(true))
+}
+
+async fn forget_deluge_torrent_state(state: &AppState, hash: &str) {
+    state.torrent_options.write().await.remove(hash);
+    state.move_completed_options.write().await.remove(hash);
 }
 
 async fn set_file_priorities(state: &AppState, params: &[Value]) -> Result<Value, String> {
@@ -3996,6 +4021,72 @@ mod tests {
             "https://example.invalid/file.torrent"
         );
         assert_eq!(result["result"]["downloaded"], false);
+    }
+
+    #[tokio::test]
+    async fn deluge_url_download_pending_state_is_bounded() {
+        let state = AppState::new(Arc::new(RwLock::new(SessionRegistry::new())));
+        let oversized = Value::String(format!(
+            "https://example.invalid/{}",
+            "x".repeat(MAX_DELUGE_URL_BYTES)
+        ));
+        let error = web_download_torrent_from_url(&state, &[oversized])
+            .await
+            .expect_err("oversized URL should be rejected");
+        assert!(error.contains("byte limit"), "{error}");
+
+        {
+            let mut pending = state.url_downloads.write().await;
+            for index in 0..MAX_DELUGE_PENDING_URL_DOWNLOADS {
+                pending.insert(
+                    format!("pending-{index}"),
+                    "https://example.invalid/file.torrent".to_owned(),
+                );
+            }
+        }
+        let error = web_download_torrent_from_url(
+            &state,
+            &[Value::String(
+                "https://example.invalid/next.torrent".to_owned(),
+            )],
+        )
+        .await
+        .expect_err("pending URL capacity should be enforced");
+        assert!(error.contains("too many pending"), "{error}");
+
+        state.url_downloads.write().await.clear();
+        *state.next_url_download_id.write().await = u64::MAX;
+        let error = web_download_torrent_from_url(
+            &state,
+            &[Value::String(
+                "https://example.invalid/last.torrent".to_owned(),
+            )],
+        )
+        .await
+        .expect_err("exhausted token sequence should be rejected");
+        assert!(error.contains("sequence is exhausted"), "{error}");
+        assert!(state.url_downloads.read().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn deluge_torrent_state_cleanup_removes_all_projections() {
+        let state = AppState::new(Arc::new(RwLock::new(SessionRegistry::new())));
+        let hash = "a".repeat(40);
+        state
+            .torrent_options
+            .write()
+            .await
+            .insert(hash.clone(), EngineTorrentLimits::default());
+        state
+            .move_completed_options
+            .write()
+            .await
+            .insert(hash.clone(), DelugeMoveCompletedOptions::default());
+
+        forget_deluge_torrent_state(&state, &hash).await;
+
+        assert!(state.torrent_options.read().await.is_empty());
+        assert!(state.move_completed_options.read().await.is_empty());
     }
 
     #[tokio::test]

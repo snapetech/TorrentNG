@@ -14,7 +14,7 @@ use axum::{
     middleware::{self, Next},
     response::{IntoResponse, Response},
 };
-use tokio::sync::{oneshot, Notify, RwLock};
+use tokio::sync::{oneshot, Notify, RwLock, Semaphore};
 use tower_http::services::{ServeDir, ServeFile};
 use tracing::info;
 
@@ -31,6 +31,12 @@ use rt_session::SessionRegistry;
 
 mod export;
 mod migrate;
+
+/// Bound request handlers that can fan out into engine/database work. The
+/// limit is deliberately enforced at the daemon boundary so all mounted API
+/// facades share one budget instead of each compatibility router admitting
+/// its own workload.
+const MAX_CONCURRENT_DAEMON_REQUESTS: usize = 256;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -166,6 +172,10 @@ async fn main() -> anyhow::Result<()> {
         .layer(middleware::from_fn_with_state(
             Arc::new(config.auth.api_tokens.clone()),
             daemon_auth_guard,
+        ))
+        .layer(middleware::from_fn_with_state(
+            Arc::new(Semaphore::new(MAX_CONCURRENT_DAEMON_REQUESTS)),
+            request_concurrency_guard,
         ));
 
     let api_addr: std::net::SocketAddr = match config
@@ -342,6 +352,36 @@ async fn daemon_auth_guard(
         r#"{"code":"UNAUTHORIZED","message":"missing or invalid API token"}"#,
     )
         .into_response()
+}
+
+/// Keep request-driven engine fan-out bounded across all API facades. A
+/// `try_acquire` is intentional: when the daemon is saturated, reject new
+/// work immediately instead of creating another unbounded queue of HTTP
+/// futures waiting for the same engine/database resources.
+async fn request_concurrency_guard(
+    State(limiter): State<Arc<Semaphore>>,
+    req: Request<Body>,
+    next: Next,
+) -> Response {
+    if request_concurrency_bypass(req.uri().path()) {
+        return next.run(req).await;
+    }
+
+    let Ok(_permit) = limiter.try_acquire() else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "daemon request capacity exhausted; retry later",
+        )
+            .into_response();
+    };
+    next.run(req).await
+}
+
+fn request_concurrency_bypass(path: &str) -> bool {
+    // These responses intentionally outlive ordinary request work. The SSE
+    // handler has its own client accounting, and `/ws` is reserved for the
+    // websocket compatibility surface.
+    path == "/api/v1/events" || path == "/ws"
 }
 
 fn daemon_public_path(path: &str) -> bool {

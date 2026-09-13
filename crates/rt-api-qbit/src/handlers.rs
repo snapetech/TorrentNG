@@ -50,6 +50,7 @@ const QBIT_LIST_INITIAL_CAPACITY: usize = 256;
 const QBIT_LIMIT_PROJECTION_CONCURRENCY: usize = 64;
 const QBIT_LIVE_PROJECTION_CONCURRENCY: usize = 64;
 const MAX_QBIT_MUTATION_ITEMS: usize = 16_384;
+const MAX_QBIT_TRACKER_PROJECTION_CACHE: usize = 4_096;
 // qBittorrent forms use one value per named option. Keep the compatibility
 // parser from retaining an attacker-controlled number of distinct fields even
 // when the request body is otherwise within the multipart/body byte limit.
@@ -1881,9 +1882,10 @@ pub async fn torrents_delete(State(state): State<AppState>, body: String) -> imp
         return StatusCode::SERVICE_UNAVAILABLE;
     };
     for hash in hashes {
-        if let Err(error) = engine.remove_torrent(hash, delete_files).await {
+        if let Err(error) = engine.remove_torrent(hash.clone(), delete_files).await {
             return qbit_engine_error_status(error);
         }
+        forget_qbit_torrent_state(&state, &hash).await;
     }
     StatusCode::OK
 }
@@ -5125,6 +5127,25 @@ async fn get_torrent_limits_result(
         .unwrap_or_default())
 }
 
+async fn forget_qbit_torrent_state(state: &AppState, hash: &str) {
+    state.tracker_projection_cache.write().await.remove(hash);
+    state.torrent_limits.write().await.remove(hash);
+}
+
+async fn cache_qbit_tracker_projection(
+    state: &AppState,
+    info_hash: &str,
+    projection: (String, u32),
+) {
+    let mut cache = state.tracker_projection_cache.write().await;
+    if !cache.contains_key(info_hash) && cache.len() >= MAX_QBIT_TRACKER_PROJECTION_CACHE {
+        if let Some(evicted) = cache.keys().next().cloned() {
+            cache.remove(&evicted);
+        }
+    }
+    cache.insert(info_hash.to_owned(), projection);
+}
+
 /// Read-only qBittorrent limit maps are full-list compatibility endpoints.
 /// Fetch their per-torrent engine projections in bounded batches so one
 /// client request does not serialize thousands of actor round trips.
@@ -5469,11 +5490,7 @@ async fn qbit_tracker_projection(
             u32::try_from(meta.trackers.len()).unwrap_or(u32::MAX),
         );
         if projection.1 > 0 {
-            state
-                .tracker_projection_cache
-                .write()
-                .await
-                .insert(info_hash.to_owned(), projection.clone());
+            cache_qbit_tracker_projection(state, info_hash, projection.clone()).await;
         }
         return Ok(projection);
     };
@@ -7571,6 +7588,44 @@ mod tests {
         assert_eq!(
             qbit_tracker_projection_from_snapshots(&trackers),
             ("https://tracker-a.example/announce".to_owned(), 2)
+        );
+    }
+
+    #[tokio::test]
+    async fn qbit_torrent_state_cleanup_removes_all_projections() {
+        let state = AppState::new();
+        let hash = "a".repeat(40);
+        state.tracker_projection_cache.write().await.insert(
+            hash.clone(),
+            ("https://tracker.example/announce".to_owned(), 1),
+        );
+        state
+            .torrent_limits
+            .write()
+            .await
+            .insert(hash.clone(), EngineTorrentLimits::default());
+
+        forget_qbit_torrent_state(&state, &hash).await;
+
+        assert!(state.tracker_projection_cache.read().await.is_empty());
+        assert!(state.torrent_limits.read().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn qbit_tracker_projection_cache_is_bounded() {
+        let state = AppState::new();
+        for index in 0..=MAX_QBIT_TRACKER_PROJECTION_CACHE {
+            cache_qbit_tracker_projection(
+                &state,
+                &format!("{index:040x}"),
+                ("https://tracker.example/announce".to_owned(), 1),
+            )
+            .await;
+        }
+
+        assert_eq!(
+            state.tracker_projection_cache.read().await.len(),
+            MAX_QBIT_TRACKER_PROJECTION_CACHE
         );
     }
 

@@ -853,10 +853,15 @@ async fn transmission_rpc_payload(state: &AppState, body: Value) -> Value {
                 Ok(engine) => engine,
                 Err(error) => return transmission_response(tag, id, json_rpc, Err(error)),
             };
+            let _mutation_guard = state.compat_mutation_lock.lock().await;
             for hash in hashes {
-                if let Err(error) = engine.remove_torrent(hash, delete_files).await {
+                if let Err(error) = engine.remove_torrent(hash.clone(), delete_files).await {
                     return transmission_response(tag.clone(), id.clone(), json_rpc, Err(error));
                 }
+                forget_transmission_torrent_state(state, &hash).await;
+            }
+            if let Err(error) = persist_transmission_state(state).await {
+                return transmission_response(tag, id, json_rpc, Err(error));
             }
             Ok(json!({}))
         }
@@ -980,16 +985,27 @@ async fn torrent_set(state: &AppState, args: &Value) -> Result<Value, String> {
                 engine
                     .update_torrent_limits(hash.clone(), limits.clone())
                     .await?;
+            } else {
+                state
+                    .torrent_limits
+                    .write()
+                    .await
+                    .insert(hash.clone(), limits);
             }
-            state
-                .torrent_limits
-                .write()
-                .await
-                .insert(hash.clone(), limits);
         }
     }
     persist_transmission_state(state).await?;
     Ok(json!({}))
+}
+
+async fn forget_transmission_torrent_state(state: &AppState, hash: &str) {
+    state.torrent_limits.write().await.remove(hash);
+    state.torrent_groups.write().await.remove(hash);
+    state
+        .torrent_sequential_from_piece
+        .write()
+        .await
+        .remove(hash);
 }
 
 async fn group_get(state: &AppState, args: &Value) -> Result<Value, String> {
@@ -1088,11 +1104,6 @@ async fn apply_transmission_group_limits(
     engine
         .update_torrent_limits(hash.to_owned(), limits.clone())
         .await?;
-    state
-        .torrent_limits
-        .write()
-        .await
-        .insert(hash.to_owned(), limits);
     Ok(())
 }
 
@@ -4978,6 +4989,33 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
+    #[tokio::test]
+    async fn transmission_torrent_state_cleanup_removes_all_projections() {
+        let state = AppState::new(Arc::new(RwLock::new(SessionRegistry::new())));
+        let hash = "a".repeat(40);
+        state
+            .torrent_limits
+            .write()
+            .await
+            .insert(hash.clone(), EngineTorrentLimits::default());
+        state
+            .torrent_groups
+            .write()
+            .await
+            .insert(hash.clone(), "archive".to_owned());
+        state
+            .torrent_sequential_from_piece
+            .write()
+            .await
+            .insert(hash.clone(), 7);
+
+        forget_transmission_torrent_state(&state, &hash).await;
+
+        assert!(state.torrent_limits.read().await.is_empty());
+        assert!(state.torrent_groups.read().await.is_empty());
+        assert!(state.torrent_sequential_from_piece.read().await.is_empty());
     }
 
     #[tokio::test]
