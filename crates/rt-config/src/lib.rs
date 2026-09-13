@@ -40,6 +40,13 @@ pub struct Config {
 // configuration boundary aligned with that runtime limit so an invalid peer
 // budget is reported as a config error instead of panicking during startup.
 const MAX_SEMAPHORE_PERMITS: usize = usize::MAX >> 3;
+// Storage resources are process-wide but are constructed from operator-owned
+// configuration. Keep malformed values from spawning an unbounded number of
+// OS threads, allocating enormous channel capacities, or retaining an
+// unreasonable number of open-file cache entries.
+const MAX_STORAGE_WORKER_THREADS: usize = 64;
+const MAX_STORAGE_QUEUE_DEPTH: usize = 16_384;
+const MAX_STORAGE_FILE_POOL_SIZE: usize = 65_536;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -405,24 +412,40 @@ impl Config {
             "storage.file_pool_size must be greater than zero",
         )?;
         require(
+            self.storage.file_pool_size <= MAX_STORAGE_FILE_POOL_SIZE,
+            format!("storage.file_pool_size must be <= {MAX_STORAGE_FILE_POOL_SIZE}"),
+        )?;
+        require(
             self.storage.io_worker_threads > 0,
             "storage.io_worker_threads must be greater than zero",
+        )?;
+        require(
+            self.storage.io_worker_threads <= MAX_STORAGE_WORKER_THREADS,
+            format!("storage.io_worker_threads must be <= {MAX_STORAGE_WORKER_THREADS}"),
         )?;
         require(
             self.storage.io_queue_depth > 0,
             "storage.io_queue_depth must be greater than zero",
         )?;
         require(
-            self.storage.io_queue_depth <= MAX_SEMAPHORE_PERMITS,
-            format!("storage.io_queue_depth must be <= {MAX_SEMAPHORE_PERMITS}"),
+            self.storage.io_queue_depth <= MAX_STORAGE_QUEUE_DEPTH,
+            format!("storage.io_queue_depth must be <= {MAX_STORAGE_QUEUE_DEPTH}"),
         )?;
         require(
             self.storage.hash_worker_threads > 0,
             "storage.hash_worker_threads must be greater than zero",
         )?;
         require(
+            self.storage.hash_worker_threads <= MAX_STORAGE_WORKER_THREADS,
+            format!("storage.hash_worker_threads must be <= {MAX_STORAGE_WORKER_THREADS}"),
+        )?;
+        require(
             self.storage.hash_queue_depth > 0,
             "storage.hash_queue_depth must be greater than zero",
+        )?;
+        require(
+            self.storage.hash_queue_depth <= MAX_STORAGE_QUEUE_DEPTH,
+            format!("storage.hash_queue_depth must be <= {MAX_STORAGE_QUEUE_DEPTH}"),
         )?;
         require(
             self.storage.peer_read_readahead_bytes <= 64 * 1024 * 1024,
@@ -724,6 +747,22 @@ mod tests {
 
         let mut c = Config::default();
         c.storage.io_queue_depth = usize::MAX;
+        assert!(matches!(c.validate(), Err(ConfigError::Validation(_))));
+
+        let mut c = Config::default();
+        c.storage.hash_queue_depth = usize::MAX;
+        assert!(matches!(c.validate(), Err(ConfigError::Validation(_))));
+
+        let mut c = Config::default();
+        c.storage.io_worker_threads = MAX_STORAGE_WORKER_THREADS + 1;
+        assert!(matches!(c.validate(), Err(ConfigError::Validation(_))));
+
+        let mut c = Config::default();
+        c.storage.hash_worker_threads = MAX_STORAGE_WORKER_THREADS + 1;
+        assert!(matches!(c.validate(), Err(ConfigError::Validation(_))));
+
+        let mut c = Config::default();
+        c.storage.file_pool_size = MAX_STORAGE_FILE_POOL_SIZE + 1;
         assert!(matches!(c.validate(), Err(ConfigError::Validation(_))));
 
         let mut c = Config::default();

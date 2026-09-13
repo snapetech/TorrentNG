@@ -65,12 +65,12 @@ enables uTP magnet metadata fetch explicitly.
 |---|---|---|
 | `download_dir` | `~/Downloads` or `/tmp` | Default payload download directory |
 | `device_elevator_enabled` | `true` | Enable per-device peer-read elevator scheduling where storage profiles benefit |
-| `file_pool_size` | `512` | Open-file cache entries shared by path-backed schedulers in one process/configuration |
+| `file_pool_size` | `512` | Open-file cache entries shared by path-backed schedulers in one process/configuration; maximum `65536` |
 | `idle_file_ttl_secs` | `300` | Seconds before idle cached file handles are eligible to close |
-| `io_worker_threads` | `4` | Shared positioned-I/O worker threads for path-backed schedulers in one process/configuration |
-| `io_queue_depth` | `256` | Bounded positioned-I/O queue depth shared by those schedulers |
-| `hash_worker_threads` | `2` | Shared storage hash worker threads for path-backed schedulers in one process/configuration |
-| `hash_queue_depth` | `256` | Bounded hash queue depth shared by those schedulers |
+| `io_worker_threads` | `4` | Shared positioned-I/O worker threads for path-backed schedulers in one process/configuration; maximum `64` |
+| `io_queue_depth` | `256` | Bounded positioned-I/O queue depth shared by those schedulers; maximum `16384` |
+| `hash_worker_threads` | `2` | Shared storage hash worker threads for path-backed schedulers in one process/configuration; maximum `64` |
+| `hash_queue_depth` | `256` | Bounded hash queue depth shared by those schedulers; maximum `16384` |
 | `preallocation_mode` | `auto` | Payload preallocation mode: `off`, `auto`, `sparse`, or `full` |
 | `durability_mode` | `checkpoint` | Payload durability mode: `fast`, `checkpoint`, or `strict` |
 | `peer_read_readahead_bytes` | `524288` | Peer-read readahead size used before returning the exact requested slice |

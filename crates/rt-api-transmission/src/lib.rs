@@ -1,7 +1,7 @@
 #![recursion_limit = "256"]
 
 use std::{
-    collections::{BTreeMap, BTreeSet, HashMap},
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     sync::Arc,
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -38,6 +38,8 @@ use tokio::{
 
 const SESSION_ID: &str = "TorrentNG";
 const MAX_TRANSMISSION_BATCH_REQUESTS: usize = 128;
+// Compatibility list inputs can fan out into one engine call per item.
+const MAX_TRANSMISSION_MUTATION_ITEMS: usize = 16_384;
 const SETTING_TRANSMISSION_SESSION: &str = "compat.transmission.session";
 const MAX_TRANSMISSION_SESSION_BYTES: usize = 64 * 1024;
 // Transmission's torrent-get contract has no page/cursor parameter. Bound
@@ -1278,7 +1280,7 @@ fn transmission_torrent_limit_updates(args: &Value) -> Option<TransmissionTorren
 
 async fn torrent_set_tracker_list(state: &AppState, args: &Value) -> Result<Value, String> {
     validate_transmission_tracker_list_args(args)?;
-    let trackers = transmission_tracker_list_arg(args);
+    let trackers = transmission_tracker_list_arg(args)?;
     let hashes = mutation_ids(state, args).await?;
     if hashes.is_empty() {
         return Ok(json!({}));
@@ -1306,7 +1308,7 @@ async fn torrent_set_file_wanted(
         return Err(format!("missing Transmission file field {key}"));
     }
     validate_transmission_file_id_arg(args, key)?;
-    let file_ids = file_ids_arg(args, key);
+    let file_ids = file_ids_arg(args, key)?;
     let hashes = mutation_ids(state, args).await?;
     if file_ids.is_empty() || hashes.is_empty() {
         return Ok(json!({}));
@@ -1320,41 +1322,53 @@ async fn torrent_set_file_wanted(
     Ok(json!({}))
 }
 
-fn transmission_tracker_list_arg(args: &Value) -> Vec<String> {
+fn transmission_tracker_list_arg(args: &Value) -> Result<Vec<String>, String> {
     let value = args
         .get("trackerList")
         .or_else(|| args.get("tracker-list"))
         .or_else(|| args.get("trackers"));
     let Some(value) = value else {
-        return Vec::new();
+        return Ok(Vec::new());
     };
     let mut trackers = Vec::new();
-    collect_tracker_values(value, &mut trackers);
-    normalize_tracker_values(trackers)
+    collect_tracker_values(value, &mut trackers)?;
+    Ok(normalize_tracker_values(trackers))
 }
 
-fn collect_tracker_values(value: &Value, out: &mut Vec<String>) {
+fn collect_tracker_values(value: &Value, out: &mut Vec<String>) -> Result<(), String> {
     match value {
-        Value::String(s) => out.push(s.to_owned()),
+        Value::String(s) => {
+            ensure_transmission_input_bound(
+                out.len().saturating_add(1),
+                "Transmission tracker list",
+            )?;
+            out.push(s.to_owned());
+        }
         Value::Array(values) => {
             for value in values {
-                collect_tracker_values(value, out);
+                collect_tracker_values(value, out)?;
             }
         }
         Value::Object(obj) => {
             if let Some(announce) = obj.get("announce").and_then(Value::as_str) {
+                ensure_transmission_input_bound(
+                    out.len().saturating_add(1),
+                    "Transmission tracker list",
+                )?;
                 out.push(announce.to_owned());
             }
         }
         _ => {}
     }
+    Ok(())
 }
 
 fn normalize_tracker_values(values: Vec<String>) -> Vec<String> {
+    let mut seen = HashSet::new();
     let mut out = Vec::new();
-    for value in values {
+    for value in &values {
         let value = value.trim();
-        if !value.is_empty() && !out.iter().any(|existing| existing == value) {
+        if !value.is_empty() && seen.insert(value) {
             out.push(value.to_owned());
         }
     }
@@ -1389,15 +1403,15 @@ fn transmission_file_priority_updates(args: &Value) -> Result<Vec<(Vec<u32>, i64
         validate_transmission_file_id_arg(args, key)?;
     }
     let mut updates = Vec::new();
-    let high = file_ids_arg(args, "priority-high");
+    let high = file_ids_arg(args, "priority-high")?;
     if !high.is_empty() {
         updates.push((high, 2));
     }
-    let normal = file_ids_arg(args, "priority-normal");
+    let normal = file_ids_arg(args, "priority-normal")?;
     if !normal.is_empty() {
         updates.push((normal, 1));
     }
-    let low = file_ids_arg(args, "priority-low");
+    let low = file_ids_arg(args, "priority-low")?;
     if !low.is_empty() {
         updates.push((low, 0));
     }
@@ -1478,16 +1492,26 @@ fn renamed_file_path(path: &str, name: &str) -> String {
     }
 }
 
-fn file_ids_arg(args: &Value, key: &str) -> Vec<u32> {
-    args.get(key)
-        .and_then(Value::as_array)
-        .map(|values| {
-            values
-                .iter()
-                .filter_map(|value| value.as_u64().and_then(|id| u32::try_from(id).ok()))
-                .collect::<Vec<_>>()
+fn file_ids_arg(args: &Value, key: &str) -> Result<Vec<u32>, String> {
+    let Some(value) = args.get(key) else {
+        return Ok(Vec::new());
+    };
+    let Some(values) = value.as_array() else {
+        return Err(format!("Transmission file field {key} must be an array"));
+    };
+    ensure_transmission_input_bound(values.len(), &format!("Transmission file field {key}"))?;
+    values
+        .iter()
+        .enumerate()
+        .map(|(index, value)| {
+            let id = value.as_u64().ok_or_else(|| {
+                format!("Transmission file field {key}[{index}] must be a uint32 file id")
+            })?;
+            u32::try_from(id).map_err(|_| {
+                format!("Transmission file field {key}[{index}] must be a uint32 file id")
+            })
         })
-        .unwrap_or_default()
+        .collect()
 }
 
 fn transmission_response(
@@ -2816,6 +2840,7 @@ async fn ids(state: &AppState, args: &Value) -> Result<Vec<String>, String> {
     let Some(values) = value.as_array() else {
         return Err("Transmission ids must be an array".to_owned());
     };
+    ensure_transmission_input_bound(values.len(), "Transmission ids")?;
     let reg = state.registry.read().await;
     let snapshot = reg.snapshot();
     let mut hashes = Vec::with_capacity(values.len());
@@ -3327,6 +3352,15 @@ fn validate_transmission_session_args(args: &Value) -> Result<(), String> {
     Ok(())
 }
 
+fn ensure_transmission_input_bound(count: usize, field: &str) -> Result<(), String> {
+    if count > MAX_TRANSMISSION_MUTATION_ITEMS {
+        return Err(format!(
+            "{field} contains {count} items; maximum is {MAX_TRANSMISSION_MUTATION_ITEMS}"
+        ));
+    }
+    Ok(())
+}
+
 /// Validate the fields that `torrent-set` actually consumes before applying
 /// any of them.  Transmission clients commonly send a large settings object;
 /// unknown fields remain forward-compatible, but a recognized field with an
@@ -3342,6 +3376,7 @@ fn validate_transmission_torrent_set_args(args: &Value) -> Result<(), String> {
         let Some(labels) = value.as_array() else {
             return Err("Transmission torrent field labels must be an array".to_owned());
         };
+        ensure_transmission_input_bound(labels.len(), "Transmission torrent field labels")?;
         if labels.iter().any(|label| !label.is_string()) {
             return Err("Transmission torrent field labels must contain only strings".to_owned());
         }
@@ -3418,6 +3453,7 @@ fn validate_transmission_torrent_get_args(args: &Value) -> Result<(), String> {
         let Some(fields) = fields.as_array() else {
             return Err("Transmission torrent-get fields must be an array".to_owned());
         };
+        ensure_transmission_input_bound(fields.len(), "Transmission torrent-get fields")?;
         if fields.iter().any(|field| !field.is_string()) {
             return Err("Transmission torrent-get fields must contain only strings".to_owned());
         }
@@ -3463,6 +3499,10 @@ fn validate_transmission_subscription_args(args: &Value) -> Result<(), String> {
                 "Transmission subscription field {key} must be an array"
             ));
         };
+        ensure_transmission_input_bound(
+            values.len(),
+            &format!("Transmission subscription field {key}"),
+        )?;
         if values.iter().any(|value| !value.is_string()) {
             return Err(format!(
                 "Transmission subscription field {key} must contain only strings"
@@ -3479,7 +3519,13 @@ fn validate_transmission_tracker_list_args(args: &Value) -> Result<(), String> {
             continue;
         };
         found = true;
-        if !transmission_tracker_value_is_valid(value) {
+        let mut count = 0;
+        if !transmission_tracker_value_is_valid(value, &mut count) {
+            if count > MAX_TRANSMISSION_MUTATION_ITEMS {
+                return Err(format!(
+                    "Transmission torrent field {key} contains too many tracker entries; maximum is {MAX_TRANSMISSION_MUTATION_ITEMS}"
+                ));
+            }
             return Err(format!(
                 "Transmission torrent field {key} must contain tracker strings"
             ));
@@ -3491,14 +3537,28 @@ fn validate_transmission_tracker_list_args(args: &Value) -> Result<(), String> {
     Ok(())
 }
 
-fn transmission_tracker_value_is_valid(value: &Value) -> bool {
+fn transmission_tracker_value_is_valid(value: &Value, count: &mut usize) -> bool {
     match value {
-        Value::String(value) => !value.trim().is_empty(),
-        Value::Array(values) => values.iter().all(transmission_tracker_value_is_valid),
-        Value::Object(object) => object
-            .get("announce")
-            .and_then(Value::as_str)
-            .is_some_and(|announce| !announce.trim().is_empty()),
+        Value::String(value) => {
+            if value.trim().is_empty() {
+                return false;
+            }
+            *count = count.saturating_add(1);
+            *count <= MAX_TRANSMISSION_MUTATION_ITEMS
+        }
+        Value::Array(values) => values
+            .iter()
+            .all(|value| transmission_tracker_value_is_valid(value, count)),
+        Value::Object(object) => {
+            let valid = object
+                .get("announce")
+                .and_then(Value::as_str)
+                .is_some_and(|announce| !announce.trim().is_empty());
+            if valid {
+                *count = count.saturating_add(1);
+            }
+            valid && *count <= MAX_TRANSMISSION_MUTATION_ITEMS
+        }
         _ => false,
     }
 }
@@ -3510,6 +3570,7 @@ fn validate_transmission_file_id_arg(args: &Value, key: &str) -> Result<(), Stri
     let Some(values) = value.as_array() else {
         return Err(format!("Transmission file field {key} must be an array"));
     };
+    ensure_transmission_input_bound(values.len(), &format!("Transmission file field {key}"))?;
     if values
         .iter()
         .any(|value| value.as_u64().is_none_or(|id| id > u64::from(u32::MAX)))
@@ -3541,6 +3602,7 @@ fn validate_transmission_torrent_add_args(args: &Value) -> Result<(), String> {
         let Some(labels) = labels.as_array() else {
             return Err("Transmission torrent-add labels must be an array".to_owned());
         };
+        ensure_transmission_input_bound(labels.len(), "Transmission torrent-add labels")?;
         if labels.iter().any(|label| !label.is_string()) {
             return Err("Transmission torrent-add labels must contain only strings".to_owned());
         }
@@ -5147,13 +5209,68 @@ mod tests {
             ]
         });
         assert_eq!(
-            transmission_tracker_list_arg(&args),
+            transmission_tracker_list_arg(&args).unwrap(),
             vec![
                 "udp://one/announce".to_owned(),
                 "https://two/announce".to_owned(),
                 "http://three/announce".to_owned(),
             ]
         );
+    }
+
+    #[test]
+    fn transmission_compatibility_input_lists_are_bounded() {
+        let oversized_strings = || {
+            Value::Array(
+                (0..=MAX_TRANSMISSION_MUTATION_ITEMS)
+                    .map(|_| Value::String("item".to_owned()))
+                    .collect(),
+            )
+        };
+        assert!(validate_transmission_torrent_set_args(&json!({
+            "labels": oversized_strings(),
+        }))
+        .is_err());
+        assert!(validate_transmission_torrent_add_args(&json!({
+            "filename": "magnet:?xt=urn:btih:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "labels": oversized_strings(),
+        }))
+        .is_err());
+        assert!(validate_transmission_torrent_get_args(&json!({
+            "fields": oversized_strings(),
+        }))
+        .is_err());
+        assert!(validate_transmission_subscription_args(&json!({
+            "fields": oversized_strings(),
+        }))
+        .is_err());
+        assert!(validate_transmission_tracker_list_args(&json!({
+            "trackerList": oversized_strings(),
+        }))
+        .is_err());
+
+        let oversized_ids = json!({
+            "files-wanted": Value::Array(
+                (0..=MAX_TRANSMISSION_MUTATION_ITEMS)
+                    .map(|_| Value::from(1_u64))
+                    .collect::<Vec<_>>(),
+            ),
+        });
+        assert!(validate_transmission_file_id_arg(&oversized_ids, "files-wanted").is_err());
+    }
+
+    #[tokio::test]
+    async fn transmission_ids_reject_oversized_lists() {
+        let state = AppState::new(Arc::new(RwLock::new(SessionRegistry::new())));
+        let args = json!({
+            "ids": Value::Array(
+                (0..=MAX_TRANSMISSION_MUTATION_ITEMS)
+                    .map(|_| Value::String("a".repeat(40)))
+                    .collect::<Vec<_>>(),
+            ),
+        });
+        let error = ids(&state, &args).await.unwrap_err();
+        assert!(error.contains("maximum"));
     }
 
     #[test]

@@ -39,6 +39,9 @@ use tokio::{
 // full-list calls bounded rather than allowing one client request to turn
 // into an unbounded response and one live-engine query per torrent.
 const MAX_LEGACY_FULL_LIST_ENTRIES: usize = 10_000;
+// Bound compatibility input arrays before they become per-torrent or
+// per-file engine calls and response-sized temporary allocations.
+const MAX_DELUGE_MUTATION_ITEMS: usize = 16_384;
 const DELUGE_RUNTIME_PROJECTION_CONCURRENCY: usize = 64;
 
 struct DelugeRuntimeProjection {
@@ -367,6 +370,7 @@ pub async fn json_rpc(
 }
 
 async fn dispatch(state: &AppState, method: &str, params: &[Value]) -> Result<Value, String> {
+    ensure_deluge_input_bound(params.len(), "Deluge RPC params")?;
     match method {
         "auth.login" => Ok(json!(true)),
         "auth.check_session" => Ok(json!(true)),
@@ -762,13 +766,14 @@ async fn deluge_config(state: &AppState) -> Result<Value, String> {
 }
 
 async fn deluge_config_values(state: &AppState, keys: Option<&Value>) -> Result<Value, String> {
-    let config = deluge_config(state).await?;
     let Some(value) = keys else {
-        return Ok(config);
+        return deluge_config(state).await;
     };
     let Some(keys) = value.as_array() else {
         return Err("Deluge config keys must be an array of strings".to_owned());
     };
+    ensure_deluge_input_bound(keys.len(), "Deluge config keys")?;
+    let config = deluge_config(state).await?;
     let mut out = serde_json::Map::new();
     for (index, value) in keys.iter().enumerate() {
         let key = value
@@ -817,6 +822,7 @@ async fn web_add_torrents(state: &AppState, params: &[Value]) -> Result<Value, S
     let Some(torrents) = params.first().and_then(Value::as_array) else {
         return Err("missing torrent list".to_owned());
     };
+    ensure_deluge_input_bound(torrents.len(), "Deluge torrent list")?;
     let mut results = Vec::new();
     for torrent in torrents {
         let options = torrent.get("options").or_else(|| torrent.get("params"));
@@ -942,6 +948,7 @@ async fn deluge_free_space(state: &AppState) -> Result<Value, String> {
 async fn session_state(state: &AppState) -> Result<Value, String> {
     let reg = state.registry.read().await;
     let snapshot = reg.snapshot();
+    ensure_legacy_full_list_bound(snapshot.len(), "Deluge core.get_session_state")?;
     Ok(json!(snapshot
         .iter()
         .map(|entry| entry.info_hash.clone())
@@ -1680,6 +1687,15 @@ fn ensure_legacy_full_list_bound(count: usize, endpoint: &str) -> Result<(), Str
     Ok(())
 }
 
+fn ensure_deluge_input_bound(count: usize, field: &str) -> Result<(), String> {
+    if count > MAX_DELUGE_MUTATION_ITEMS {
+        return Err(format!(
+            "{field} contains {count} items; maximum is {MAX_DELUGE_MUTATION_ITEMS}"
+        ));
+    }
+    Ok(())
+}
+
 fn deluge_torrent_matches_filter(
     entry: &rt_session::TorrentEntry,
     filter: Option<&Value>,
@@ -1691,35 +1707,25 @@ fn deluge_torrent_matches_filter(
     for (key, value) in filter {
         match key.as_str() {
             "id" | "ids" | "hash" | "hashes" => {
-                let values = string_list(Some(value));
-                if !values.is_empty()
-                    && !values
-                        .iter()
-                        .any(|hash| hash.eq_ignore_ascii_case(&entry.info_hash))
+                if !string_array_matches(value, |hash| hash.eq_ignore_ascii_case(&entry.info_hash))
                 {
                     return false;
                 }
             }
             "label" => {
-                let values = string_list(Some(value));
-                if !values.is_empty()
-                    && !values
-                        .iter()
-                        .any(|label| entry.category.as_deref().unwrap_or_default() == label)
-                {
+                if !string_array_matches(value, |label| {
+                    entry.category.as_deref().unwrap_or_default() == label
+                }) {
                     return false;
                 }
             }
-            "state" => {
-                let values = string_list(Some(value));
-                if !values.is_empty()
-                    && !values.iter().any(|state| {
-                        deluge_state_with_recheck(entry.state.as_str(), active_recheck)
-                            .eq_ignore_ascii_case(state)
-                    })
-                {
-                    return false;
-                }
+            "state"
+                if !string_array_matches(value, |state| {
+                    deluge_state_with_recheck(entry.state.as_str(), active_recheck)
+                        .eq_ignore_ascii_case(state)
+                }) =>
+            {
+                return false;
             }
             _ => {}
         }
@@ -1744,6 +1750,7 @@ fn validate_deluge_status_filter(value: Option<&Value>) -> Result<(), String> {
         let values = value
             .as_array()
             .ok_or_else(|| format!("Deluge status filter {key} must be an array"))?;
+        ensure_deluge_input_bound(values.len(), &format!("Deluge status filter {key}"))?;
         for (index, item) in values.iter().enumerate() {
             if item
                 .as_str()
@@ -1831,6 +1838,7 @@ fn deluge_requested_fields(
     let Some(fields) = value.as_array() else {
         return Err("Deluge requested fields must be an array".to_owned());
     };
+    ensure_deluge_input_bound(fields.len(), "Deluge requested fields")?;
     if fields.is_empty() {
         return Ok(None);
     }
@@ -2423,23 +2431,21 @@ async fn rename_folder(state: &AppState, params: &[Value]) -> Result<Value, Stri
     Ok(json!(true))
 }
 
-fn string_list(value: Option<&Value>) -> Vec<String> {
-    value
-        .and_then(Value::as_array)
-        .map(|items| {
-            items
-                .iter()
-                .filter_map(Value::as_str)
-                .map(str::to_owned)
-                .collect()
-        })
-        .unwrap_or_default()
+fn string_array_matches<F>(value: &Value, predicate: F) -> bool
+where
+    F: FnMut(&str) -> bool,
+{
+    let Some(values) = value.as_array() else {
+        return false;
+    };
+    values.is_empty() || values.iter().filter_map(Value::as_str).any(predicate)
 }
 
 fn strict_string_list(value: Option<&Value>, field: &str) -> Result<Vec<String>, String> {
     let values = value
         .and_then(Value::as_array)
         .ok_or_else(|| format!("{field} must be an array of non-empty strings"))?;
+    ensure_deluge_input_bound(values.len(), field)?;
     values
         .iter()
         .enumerate()
@@ -2479,18 +2485,21 @@ fn strict_hashes_from_param(value: Option<&Value>) -> Result<Vec<String>, String
                 Ok(vec![hash.to_owned()])
             }
         }
-        Some(Value::Array(values)) => values
-            .iter()
-            .enumerate()
-            .map(|(index, value)| {
-                value
-                    .as_str()
-                    .map(str::trim)
-                    .filter(|hash| !hash.is_empty())
-                    .map(str::to_owned)
-                    .ok_or_else(|| format!("torrent ids[{index}] must be a non-empty string"))
-            })
-            .collect(),
+        Some(Value::Array(values)) => {
+            ensure_deluge_input_bound(values.len(), "torrent ids")?;
+            values
+                .iter()
+                .enumerate()
+                .map(|(index, value)| {
+                    value
+                        .as_str()
+                        .map(str::trim)
+                        .filter(|hash| !hash.is_empty())
+                        .map(str::to_owned)
+                        .ok_or_else(|| format!("torrent ids[{index}] must be a non-empty string"))
+                })
+                .collect()
+        }
         Some(_) => Err("torrent id must be a string or an array of strings".to_owned()),
         None => Err("missing torrent id".to_owned()),
     }
@@ -2714,6 +2723,7 @@ fn deluge_file_priority_updates(
     let Some(priorities) = ids_or_priorities.and_then(Value::as_array) else {
         return Err("file priorities must be an array".to_owned());
     };
+    ensure_deluge_input_bound(priorities.len(), "Deluge file priorities")?;
     let mut skipped = Vec::new();
     let mut normal = Vec::new();
     let mut high = Vec::new();
@@ -2745,6 +2755,7 @@ fn deluge_file_ids(value: Option<&Value>) -> Result<Vec<u32>, String> {
     let Some(values) = value.and_then(Value::as_array) else {
         return Err("file ids must be an array".to_owned());
     };
+    ensure_deluge_input_bound(values.len(), "Deluge file ids")?;
     values
         .iter()
         .enumerate()
@@ -2777,7 +2788,10 @@ fn deluge_trackers_arg(value: Option<&Value>) -> Result<Vec<String>, String> {
 
 fn collect_deluge_trackers(value: &Value, out: &mut Vec<String>) -> Result<(), String> {
     match value {
-        Value::String(value) if !value.trim().is_empty() => out.push(value.to_owned()),
+        Value::String(value) if !value.trim().is_empty() => {
+            ensure_deluge_input_bound(out.len().saturating_add(1), "Deluge tracker list")?;
+            out.push(value.to_owned());
+        }
         Value::String(_) => return Err("tracker URL must not be empty".to_owned()),
         Value::Array(values) => {
             for value in values {
@@ -2794,6 +2808,7 @@ fn collect_deluge_trackers(value: &Value, out: &mut Vec<String>) -> Result<(), S
             else {
                 return Err("tracker entry must contain a non-empty url".to_owned());
             };
+            ensure_deluge_input_bound(out.len().saturating_add(1), "Deluge tracker list")?;
             out.push(url.to_owned());
         }
         _ => return Err("tracker list contains an invalid entry".to_owned()),
@@ -2802,10 +2817,11 @@ fn collect_deluge_trackers(value: &Value, out: &mut Vec<String>) -> Result<(), S
 }
 
 fn normalize_deluge_trackers(values: Vec<String>) -> Vec<String> {
+    let mut seen = HashSet::new();
     let mut out = Vec::new();
-    for value in values {
+    for value in &values {
         let value = value.trim();
-        if !value.is_empty() && !out.iter().any(|existing| existing == value) {
+        if !value.is_empty() && seen.insert(value) {
             out.push(value.to_owned());
         }
     }
@@ -2852,6 +2868,7 @@ fn deluge_rename_file_args(value: Option<&Value>) -> Result<Vec<(u32, String)>, 
     let Some(values) = value.and_then(Value::as_array) else {
         return Err("file renames must be an array".to_owned());
     };
+    ensure_deluge_input_bound(values.len(), "Deluge file renames")?;
     values.iter().map(deluge_rename_file_arg).collect()
 }
 
@@ -3407,6 +3424,34 @@ mod tests {
         assert!(deluge_requested_fields(Some(&json!("name"))).is_err());
         assert!(deluge_requested_fields(Some(&json!(["name", 1]))).is_err());
         assert!(deluge_requested_fields(Some(&json!(["name", "progress"]))).is_ok());
+    }
+
+    #[test]
+    fn deluge_compatibility_input_lists_are_bounded() {
+        let oversized_strings = || {
+            Value::Array(
+                (0..=MAX_DELUGE_MUTATION_ITEMS)
+                    .map(|_| Value::String("item".to_owned()))
+                    .collect(),
+            )
+        };
+        assert!(validate_deluge_status_filter(Some(&json!({
+            "state": oversized_strings(),
+        })))
+        .is_err());
+        assert!(deluge_requested_fields(Some(&oversized_strings())).is_err());
+        assert!(strict_string_list(Some(&oversized_strings()), "torrent ids").is_err());
+        assert!(strict_hashes_from_param(Some(&oversized_strings())).is_err());
+        assert!(deluge_trackers_arg(Some(&oversized_strings())).is_err());
+        assert!(deluge_rename_file_args(Some(&oversized_strings())).is_err());
+
+        let oversized_numbers = Value::Array(
+            (0..=MAX_DELUGE_MUTATION_ITEMS)
+                .map(|_| Value::from(1_u64))
+                .collect(),
+        );
+        assert!(deluge_file_ids(Some(&oversized_numbers)).is_err());
+        assert!(deluge_file_priority_updates(Some(&oversized_numbers), None).is_err());
     }
 
     fn assert_json_keys(value: &Value, keys: &[&str]) {
