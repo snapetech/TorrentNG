@@ -4,74 +4,74 @@
 
 Support TorrentNG through [Ko-fi](https://ko-fi.com/snapetech).
 
-TorrentNG is a backend-independent BitTorrent WebUI and API. It gives one
-management surface to compatible torrent clients such as rTorrent,
-qBittorrent, Transmission, and Deluge, and to TorrentNG's next-generation
-client, `torrentngd`. It provides the WebUI, TorrentNG REST and SSE APIs,
-compatibility APIs, migration tools, metrics, and deployment assets.
+> The universal torrent client interface.
 
-TorrentNG separates the user-facing control surface from the transfer client.
-You can keep an existing client and put TorrentNG in front of it, or run the
-TorrentNG client itself. The selected transfer client determines where peer
-traffic and payload work run and which system owns authoritative state.
+TorrentNG is a universally compatible WebUI and client interface: one modern
+home for torrents running on the TorrentNG Engine, qBittorrent, rTorrent,
+Transmission, Deluge, and other supported clients. Keep the client and library
+you already trust—or let TorrentNG run the transfers itself.
+
+Use TorrentNG to:
+
+- manage torrents through one fast, consistent interface, whatever supported
+  client you choose;
+- connect to an existing qBittorrent, rTorrent, Transmission, or Deluge
+  installation without moving its library;
+- run the built-in TorrentNG Engine (`torrentngd`) when you want TorrentNG to
+  own transfers, storage, persistence, and recovery; and
+- move between clients with migration and export tools instead of locking your
+  data into one ecosystem.
 
 ![TorrentNG WebUI using the Sietch Neon theme while downloading Linux ISO test data](docs/assets/torrentng-sietch-neon-linux-isos.png)
 
-## Product terminology
+## Keep your client. Or run ours.
 
-TorrentNG is the WebUI/API product. The transfer backend is a separate
-client/daemon:
+TorrentNG is one universal interface with two ways to run the torrent work:
 
-- **Compatible clients** are rTorrent, qBittorrent, Transmission, and Deluge.
-  TorrentNG can connect to one of them without replacing its library or
-  session state.
-- **TorrentNG client** is `torrentngd`, TorrentNG's first-party,
-  next-generation transfer client. It owns transfers, storage, and durable
-  session state.
-- **Compatible-client service** is the `torrentng` WebUI/API host used when a
-  compatible client is selected. Its implementation remains under
-  `sidecar/`; it adapts and caches the selected client but does not transfer
-  torrent data.
+| Choose this | What it means | Best for |
+|---|---|---|
+| **Connect an existing client** | TorrentNG becomes the interface for rTorrent, qBittorrent, Transmission, or Deluge. That client keeps performing transfers and keeps its library and session state. | Modernize an existing setup without rebuilding it |
+| **Run the TorrentNG Engine** | `torrentngd`, TorrentNG's built-in next-generation client, performs transfers, storage, persistence, jobs, and recovery while serving the same WebUI and automation interfaces. | New deployments or users who want TorrentNG to own the full stack |
 
-“Next-generation client” describes `torrentngd`'s product position. It is not
-a second TorrentNG product name.
+The interface stays familiar when you change what runs underneath it. Existing
+clients remain useful, while the TorrentNG Engine gives TorrentNG a first-party
+transfer engine with a durable data model and modern operational controls.
 
-## TorrentNG arrangements
+## How TorrentNG works
 
-| Arrangement | TorrentNG WebUI/API | Transfer client | Authoritative state | Use it for |
-|---|---|---|---|---|
-| Compatible-client integration | `torrentng` WebUI/API service | rTorrent, qBittorrent, Transmission, or Deluge | The selected compatible client remains authoritative; TorrentNG maintains a cache and projects the common API | Keep an existing library and client, modernize its UI/API, or migrate gradually |
-| TorrentNG client | `torrentngd` serves the WebUI/API directly | `torrentngd` | TorrentNG SQLite state, metainfo, and fast-resume data | New deployments and a next-generation client with owned storage, durable jobs, rechecks, recovery, and first-party protocol behavior |
+| | Your existing client | TorrentNG Engine |
+|---|---|---|
+| **Transfer and storage** | The selected client | `torrentngd` |
+| **Source of truth** | The selected client's session and library; TorrentNG maintains the state needed for the shared interface | TorrentNG SQLite state, metainfo, and fast-resume data |
+| **Interface** | TorrentNG WebUI plus TorrentNG, qBittorrent, Transmission, and Deluge compatibility routes | The same WebUI and compatibility routes, served directly by `torrentngd` |
 
-In a compatible-client integration, the `torrentng` service selects one
-backend adapter, translates the common TorrentNG control surface to that
-client's API, and caches its state. The compatible client still performs peer,
-tracker, storage, and session work. This works with local or remote clients
-and does not require moving an existing library first.
+When you connect an existing client, TorrentNG translates the common interface
+to that client's native connection and keeps its state available to the WebUI.
+The client still performs peer, tracker, storage, and session work. This works
+with local or remote clients and does not require moving an existing library.
 
-In the TorrentNG client arrangement, `torrentngd` performs peer, tracker, DHT,
-storage, job, and session work and serves the same WebUI/API directly. Its
-owned model provides durable SQLite state, supervised persistence, resumable
-and cancellable rechecks and storage jobs, crash recovery, first-party protocol
-control, and one state model for the WebUI and compatibility APIs. Migration
-and reverse export remain available when an existing client needs to move in
-or out.
+With the TorrentNG Engine, `torrentngd` performs peer, tracker, DHT, storage,
+job, and session work and serves the same interface directly. Its data model
+provides durable SQLite state, supervised persistence, resumable and cancellable
+rechecks and storage jobs, crash recovery, first-party protocol control, and
+one state model for the WebUI and compatibility routes. Migration and reverse
+export remain available when an existing client needs to move in or out.
 
-The `webui/` directory contains the shared React frontend. The separate
-`sidecar/` directory is the current repository path for the compatible-client
-WebUI/API service; the path is retained for compatibility while public
-documentation uses the product role rather than the old deployment nickname.
+The `webui/` directory contains the shared React frontend. The existing-client
+connector is built from the separate `sidecar/` workspace; that is an internal
+repository path, not a separate product.
 
 Read [the engine rewrite guide](docs/ENGINE_REWRITE.md) for the architectural
-comparison and migration considerations.
+comparison, connection model, and migration considerations.
 
-## TorrentNG client (`torrentngd`)
+## TorrentNG Engine (`torrentngd`)
 
-`torrentngd` is TorrentNG's next-generation first-party BitTorrent client. It
-wires the engine crates, owns startup and shutdown, serves the WebUI and API,
-and reports its capability manifest through `/health`.
+The TorrentNG Engine is TorrentNG's built-in, next-generation BitTorrent client.
+The `torrentngd` process wires the transfer crates together, owns startup and
+shutdown, serves the WebUI and automation routes, and reports its capability
+manifest through `/health`.
 
-The TorrentNG client currently covers:
+The TorrentNG Engine currently covers:
 
 - BitTorrent v1, v2, and hybrid metainfo parsing, identity, and metadata
   projection, including `btih` and `btmh` magnets.
@@ -97,15 +97,15 @@ pure-v2 metadata completion and peer transfer remain explicit unsupported
 capabilities. v1 and hybrid torrents are the supported transfer paths. See
 [ENGINE.md](docs/ENGINE.md) for the protocol boundary.
 
-## WebUI and API surface
+## Universal WebUI and automation interface
 
-TorrentNG exposes the same user-facing WebUI and familiar API families whether
-it is connected to a compatible client or running its own client. Compatibility
-is defined by route, field, error, and state behavior where a workflow is
-implemented; it does not make every upstream plugin or option meaningful on
-every backend.
+TorrentNG gives you the same user-facing WebUI and familiar API families
+whether it is connected to an existing client or running the TorrentNG Engine.
+Compatibility is capability-aware: it is defined by route, field, error, and
+state behavior where a workflow is implemented. Not every upstream plugin or
+option is meaningful for every client.
 
-| Surface | Purpose |
+| Interface | Purpose |
 |---|---|
 | `GET /health` | Liveness, readiness, capability, and subsystem health |
 | `/api/v1` | TorrentNG REST API for torrents, session settings, storage, jobs, logs, events, and transfer state |
@@ -116,7 +116,7 @@ every backend.
 | rTorrent XML-RPC library boundary | Library-level rTorrent compatibility and migration-oriented calls; this boundary is documented separately |
 | `GET /metrics` | Prometheus metrics |
 
-For TorrentNG-client torrent lists, use the snapshot returned by
+When using the TorrentNG Engine, use the snapshot returned by
 `GET /api/v1/torrents` while paging:
 
 - `limit` defaults to 200 and is capped at 5,000.
@@ -139,9 +139,9 @@ The complete route and field matrices are in
 
 ## Storage, jobs, and state
 
-TorrentNG separates durable control-plane state from payload files.
+TorrentNG keeps durable control state separate from payload files.
 
-In the TorrentNG client arrangement:
+In TorrentNG Engine mode:
 
 - SQLite stores torrent identity, settings, lifecycle state, event history,
   and durable job state.
@@ -167,10 +167,10 @@ configuration. See [STORAGE_IO.md](docs/STORAGE_IO.md),
 [STORAGE_NG.md](docs/STORAGE_NG.md), and
 [STORAGE_MEMORY_GAP_REGISTER.md](docs/STORAGE_MEMORY_GAP_REGISTER.md).
 
-## Quick start: TorrentNG client
+## Quick start: run the TorrentNG Engine
 
-The checked-in Compose file builds the TorrentNG client and publishes its
-WebUI/API on host port `28082`. It expects an external Docker volume named
+The checked-in Compose file builds the TorrentNG Engine and publishes its WebUI
+and HTTP interface on host port `28082`. It expects an external Docker volume named
 `certification_downloads`; create that volume or edit the Compose file for a
 different payload location.
 
@@ -180,8 +180,8 @@ export TORRENTNG_API_TOKEN="$(openssl rand -hex 32)"
 docker compose -f deploy/native/compose.yml up --build
 ```
 
-Open the WebUI at `http://localhost:28082`. Check the daemon and make an
-authenticated API request with:
+Open the WebUI at `http://localhost:28082`. Check the engine and make an
+authenticated request with:
 
 ```sh
 curl -fsS http://localhost:28082/health
@@ -196,15 +196,15 @@ Prometheus and Grafana can be started with the observability profile:
 docker compose -f deploy/native/compose.yml --profile observability up --build
 ```
 
-The TorrentNG-client Compose config is a development and certification starting point.
+The TorrentNG Engine Compose config is a development and certification starting point.
 For a public deployment, configure durable volumes, a real secret, a trusted
 proxy or TLS, firewall rules for the peer port, and backups before importing or
-moving a library. See the [TorrentNG client deployment guide](docs/NATIVE_DEPLOYMENT.md) and
+moving a library. See the [TorrentNG Engine deployment guide](docs/NATIVE_DEPLOYMENT.md) and
 [CONFIGURATION.md](docs/CONFIGURATION.md).
 
 ### Run `torrentngd` directly
 
-Build the TorrentNG client and point it at a configuration file:
+Build the TorrentNG Engine and point it at a configuration file:
 
 ```sh
 cargo build --release -p torrentngd
@@ -219,8 +219,8 @@ layouts.
 
 ## Migration
 
-`torrentngd migrate` imports compatible-client state into the TorrentNG client.
-`torrentngd export` writes a compatible-client layout from TorrentNG state.
+`torrentngd migrate` imports existing-client state into the TorrentNG Engine.
+`torrentngd export` writes an existing-client layout from TorrentNG state.
 Both commands default to a read-only plan and report; `--apply` writes the
 result, and the source is not modified by an import.
 
@@ -270,20 +270,19 @@ The exact result depends on source state, destination format, path mapping, and
 whether payload files are present. Read [MIGRATION.md](docs/MIGRATION.md)
 before applying a large import or export.
 
-## Compatible-client integration
+## Connect your existing client
 
-The TorrentNG WebUI/API service can work with a compatible client that is
-already running. Current integrations include rTorrent through SCGI/XML-RPC,
-qBittorrent through its Web API, Transmission through RPC, and Deluge through
-JSON-RPC. TorrentNG translates the common UI/API surface and maintains a
-cache; the selected client remains authoritative for torrent lifecycle and
-payload operations.
+TorrentNG can connect to a client that is already running. Current connections
+include rTorrent through SCGI/XML-RPC, qBittorrent through its Web API,
+Transmission through RPC, and Deluge through JSON-RPC. TorrentNG translates the
+common interface and maintains the live state needed by the WebUI; the selected
+client remains responsible for torrent lifecycle and payload operations.
 
-This arrangement lets you keep an existing library and daemon, modernize its
-interface, expose the APIs automation tools already use, or compare it with
-the TorrentNG client before migrating.
+This lets you keep an existing library and client, modernize its interface,
+give automation tools the APIs they already use, or compare it with the
+TorrentNG Engine before migrating.
 
-Start the standard rTorrent-compatible stack with explicit secrets:
+Start the standard rTorrent connection with explicit secrets:
 
 ```sh
 export TNG_SECRET_KEY="$(openssl rand -hex 32)"
@@ -291,8 +290,8 @@ export TNG_API_TOKENS="$(openssl rand -hex 32)"
 docker compose -f deploy/docker/compose.yml up --build
 ```
 
-The nginx front door is at `http://localhost`; the TorrentNG WebUI/API service
-is also published directly on `http://localhost:8080`. The default rTorrent incoming
+The nginx front door is at `http://localhost`; the TorrentNG connector is also
+published directly at `http://localhost:8080`. The default rTorrent incoming
 port is `50000` TCP/UDP. The lower-level Phase 1 rTorrent/ruTorrent bundle is
 available for profile testing:
 
@@ -300,10 +299,10 @@ available for profile testing:
 docker compose -f deploy/docker/compose.phase1.yml up --build
 ```
 
-Do not share TorrentNG-client session state and rTorrent session directories. If both
-modes use the same payload files, stop one stack before starting the other and
-keep their state volumes separate unless you have deliberately planned the
-handoff.
+Do not share TorrentNG Engine session state and rTorrent session directories.
+If both modes use the same payload files, stop one stack before starting the
+other and keep their state volumes separate unless you have deliberately
+planned the handoff.
 
 ## Status and evidence
 
@@ -313,9 +312,9 @@ particular machine, client version, network, device, or elapsed run time.
 
 | Area | Current interpretation |
 |---|---|
-| TorrentNG client | Unit, integration, fault, and release gates cover the implemented client paths; target-device and long-duration behavior are separate evidence |
+| TorrentNG Engine | Unit, integration, fault, and release gates cover the implemented client paths; target-device and long-duration behavior are separate evidence |
 | WebUI | Build, lint, browser, accessibility, visual, and virtualized-table checks exist; browser coverage is not a substitute for every client workflow |
-| API compatibility | Deterministic route/field/error matrices exist for the TorrentNG client, qBittorrent, Transmission, Deluge, and rTorrent boundaries; unsupported operations should fail explicitly |
+| Interface compatibility | Deterministic route/field/error matrices exist for the TorrentNG Engine, qBittorrent, Transmission, Deluge, and rTorrent boundaries; unsupported operations should fail explicitly |
 | Import/export | Generated corpus, apply, and round-trip tests cover the declared client formats; migration fidelity remains data- and path-dependent |
 | Storage and memory | Bounded I/O, worker, durability, move/import/delete, and accounting code has local release coverage; hardware and workload results depend on the target environment |
 | Interoperability and soak | Local Docker/public-client scripts and soak gates are explicit runs. A report is evidence only while its environment and timestamp remain relevant |
@@ -323,7 +322,7 @@ particular machine, client version, network, device, or elapsed run time.
 Use `scripts/certification_status.sh` for the current evidence roll-up. The
 broader audit and burndown are in
 [PROJECT_GAP_AUDIT.md](docs/PROJECT_GAP_AUDIT.md) and
-[BACKEND_AUDIT_BURN_DOWN.md](docs/BACKEND_AUDIT_BURN_DOWN.md).
+[engine audit burn-down](docs/BACKEND_AUDIT_BURN_DOWN.md).
 
 Known boundaries are documented rather than hidden behind successful-looking
 compatibility responses:
@@ -347,7 +346,7 @@ cargo test --workspace --all-targets --locked
 cargo clippy --workspace --all-targets --locked -- -D warnings
 ```
 
-The compatible-client WebUI/API service is a separate workspace:
+The existing-client connector is a separate workspace:
 
 ```sh
 cd sidecar
@@ -363,8 +362,8 @@ npm run build
 npm run lint
 ```
 
-Run the TorrentNG-client certification and client interoperability checks from the
-repository root:
+Run the TorrentNG Engine certification and client interoperability checks from
+the repository root:
 
 ```sh
 scripts/native_engine_certification_report.sh
@@ -372,7 +371,7 @@ scripts/interop_matrix.sh --local
 scripts/interop_matrix.sh --public
 ```
 
-The local matrix uses Docker fixtures for TorrentNG, qBittorrent,
+The local matrix uses Docker fixtures for the TorrentNG Engine, qBittorrent,
 Transmission, Deluge, rTorrent, opentracker, and HTTP/webseed services. The
 public matrix resolves official Debian, Ubuntu, and Fedora torrents at runtime
 and downloads them by default. See [INTEROP_MATRIX.md](docs/INTEROP_MATRIX.md)
@@ -382,10 +381,10 @@ for prerequisites, coverage, and release-gate commands.
 
 | Path | Purpose |
 |---|---|
-| `crates/` | TorrentNG client, API, migration, metrics, and testkit crates |
-| `crates/torrentngd/` | TorrentNG client binary ([package README](crates/torrentngd/README.md)) |
-| `crates/rt-*` | TorrentNG client engine and API/protocol crates |
-| [`sidecar/`](sidecar/README.md) | Compatible-client WebUI/API service workspace (the implementation path is retained for compatibility) |
+| `crates/` | TorrentNG Engine, interface, migration, metrics, and testkit crates |
+| `crates/torrentngd/` | TorrentNG Engine binary ([package README](crates/torrentngd/README.md)) |
+| `crates/rt-*` | TorrentNG transfer engine and interface/protocol crates |
+| [`sidecar/`](sidecar/README.md) | Existing-client connector workspace; its binary is `torrentng` |
 | [`webui/`](webui/README.md) | Shared React/Vite frontend |
 | [`deploy/`](deploy/README.md) | Compose, Docker, systemd, Kubernetes, nginx, Prometheus, and Grafana assets |
 | `certification/` | Checked-in certification fixtures and reports |
@@ -397,10 +396,10 @@ for prerequisites, coverage, and release-gate commands.
 
 Start with the [documentation index](docs/README.md). The main references are:
 
-- [Engine rewrite guide](docs/ENGINE_REWRITE.md) — compatible-client
-  integrations, the TorrentNG client, and migration/comparison guidance
-- [TorrentNG client deployment](docs/NATIVE_DEPLOYMENT.md)
-- [Compatible-client deployment](docs/DEPLOYMENT.md)
+- [Engine rewrite guide](docs/ENGINE_REWRITE.md) — running the TorrentNG Engine
+  or connecting an existing client, with migration/comparison guidance
+- [TorrentNG Engine deployment](docs/NATIVE_DEPLOYMENT.md)
+- [Existing-client connection deployment](docs/DEPLOYMENT.md)
 - [Configuration](docs/CONFIGURATION.md)
 - [API reference](docs/API.md)
 - [Client compatibility matrices](docs/CLIENT_COMPATIBILITY_MATRICES.md)
