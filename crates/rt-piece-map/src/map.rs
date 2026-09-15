@@ -114,11 +114,30 @@ impl PieceMap {
         Ok((start, end))
     }
 
+    /// Index of the first file span whose exclusive end lands at or past
+    /// `start`.
+    ///
+    /// `files` is stored in content-stream order with contiguous,
+    /// non-overlapping spans (enforced in `new`), so a binary search finds
+    /// the first possibly-overlapping file directly instead of scanning
+    /// every file span on every call — this is the hot path for both
+    /// per-piece recheck/priority-rebuild lookups and per-block peer
+    /// request validation, so an O(files) scan here becomes O(files) work
+    /// per piece/request across a whole torrent.
+    fn first_file_at_or_after(&self, start: u64) -> usize {
+        self.files
+            .partition_point(|file| file.content_offset.saturating_add(file.length) <= start)
+    }
+
     /// All file regions that a piece spans.
     pub fn piece_to_file_regions(&self, piece: u32) -> Result<Vec<FileRegion>, PieceMapError> {
         let (piece_start, piece_end) = self.piece_content_range(piece)?;
         let mut regions = Vec::new();
-        for file in &self.files {
+        let start_idx = self.first_file_at_or_after(piece_start);
+        for file in &self.files[start_idx..] {
+            if file.content_offset >= piece_end {
+                break;
+            }
             let file_end = file
                 .content_offset
                 .checked_add(file.length)
@@ -137,6 +156,39 @@ impl PieceMap {
             });
         }
         Ok(regions)
+    }
+
+    /// Return the half-open piece ranges touched by the selected file indexes.
+    ///
+    /// `file_indices` must be sorted and deduplicated. The map scans its file
+    /// spans once, so callers can invalidate many changed files without doing
+    /// a file-map lookup for every changed index.
+    pub fn piece_ranges_for_file_indices(
+        &self,
+        file_indices: &[u32],
+    ) -> Result<Vec<(u32, u32)>, PieceMapError> {
+        let mut ranges = Vec::new();
+        for file in &self.files {
+            if file_indices.binary_search(&file.file_index).is_err() || file.length == 0 {
+                continue;
+            }
+            let file_end = file
+                .content_offset
+                .checked_add(file.length)
+                .ok_or(PieceMapError::IntegerOverflow("file span end"))?;
+            let first = u32::try_from(file.content_offset / self.piece_length)
+                .map_err(|_| PieceMapError::IntegerOverflow("file piece start"))?;
+            let last = u32::try_from(
+                file_end
+                    .div_ceil(self.piece_length)
+                    .min(u64::from(self.piece_count)),
+            )
+            .map_err(|_| PieceMapError::IntegerOverflow("file piece end"))?;
+            if first < last {
+                ranges.push((first, last));
+            }
+        }
+        Ok(ranges)
     }
 
     /// Validate a peer block request (BEP 3) and return file regions to read.
@@ -177,7 +229,11 @@ impl PieceMap {
             .ok_or(PieceMapError::IntegerOverflow("request end"))?;
 
         let mut regions = Vec::new();
-        for file in &self.files {
+        let start_idx = self.first_file_at_or_after(request_start);
+        for file in &self.files[start_idx..] {
+            if file.content_offset >= request_end {
+                break;
+            }
             let file_end = file
                 .content_offset
                 .checked_add(file.length)
@@ -270,6 +326,21 @@ mod tests {
         // empty file contributes no bytes
         assert_eq!(regions.len(), 1);
         assert_eq!(regions[0].file_index, 1);
+    }
+
+    #[test]
+    fn file_piece_ranges_cover_only_selected_file_bytes() {
+        let pm = PieceMap::new(512, make_files(&[(&["a.bin"], 300), (&["b.bin"], 300)])).unwrap();
+
+        assert_eq!(
+            pm.piece_ranges_for_file_indices(&[1]).unwrap(),
+            vec![(0, 2)]
+        );
+        assert_eq!(
+            pm.piece_ranges_for_file_indices(&[0]).unwrap(),
+            vec![(0, 1)]
+        );
+        assert!(pm.piece_ranges_for_file_indices(&[2]).unwrap().is_empty());
     }
 
     #[test]
