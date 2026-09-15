@@ -8,6 +8,18 @@ use crate::availability::Availability;
 /// Maximum block size enforced by the picker (mirrors BEP 3).
 pub const MAX_BLOCK_SIZE: u32 = 16 * 1024;
 
+/// Maximum number of distinct piece states retained while requests are in
+/// flight or partial data is being restored. This matches the fast-resume
+/// partial-piece admission limit so live state cannot exceed what can be
+/// persisted and loaded safely.
+pub const MAX_IN_PROGRESS_PIECES: usize = 16_384;
+
+/// Maximum estimated backing storage for all in-progress piece states in one
+/// picker. The estimate is intentionally conservative for `Vec<bool>` so a
+/// large protocol-legal piece length cannot multiply into an unbounded
+/// per-torrent allocation when many partial pieces are restored.
+pub const MAX_IN_PROGRESS_PIECE_STATE_BYTES: usize = 64 * 1024 * 1024;
+
 /// A single block request (piece + byte range).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct BlockRequest {
@@ -101,11 +113,12 @@ impl PieceState {
         self.received.iter().all(|&r| r)
     }
 
-    fn received_blocks(&self) -> Vec<u32> {
+    fn received_blocks_limited(&self, maximum: usize) -> Vec<u32> {
         self.received
             .iter()
             .enumerate()
             .filter_map(|(idx, received)| received.then_some(idx as u32))
+            .take(maximum)
             .collect()
     }
 
@@ -125,6 +138,13 @@ fn n_blocks(piece_length: u32) -> usize {
     piece_length.div_ceil(MAX_BLOCK_SIZE) as usize
 }
 
+fn piece_state_memory_bytes(piece_length: u32) -> usize {
+    let blocks = n_blocks(piece_length);
+    std::mem::size_of::<PieceState>()
+        .saturating_add(blocks.saturating_mul(std::mem::size_of::<u16>()))
+        .saturating_add(blocks.saturating_mul(std::mem::size_of::<bool>()))
+}
+
 /// The piece picker.
 pub struct PiecePicker {
     piece_count: usize,
@@ -136,14 +156,39 @@ pub struct PiecePicker {
     enabled: Vec<bool>,
     /// In-progress pieces (piece index → state).
     in_progress: std::collections::HashMap<usize, PieceState>,
+    in_progress_bytes: usize,
     /// Priority pieces (selected before rarest-first or sequential order).
-    priority: Vec<usize>,
+    ///
+    /// Keep this as packed flags rather than a `Vec<usize>`. A high-priority
+    /// file can span every piece in a large torrent, and retaining one usize
+    /// per piece would make a policy reload allocate hundreds of MiB.
+    priority: Vec<bool>,
     sequential: bool,
     sequential_start_piece: usize,
     pub availability: Availability,
+    /// Count of pieces where `wanted && enabled`, maintained incrementally
+    /// so completion checks and the `pick`/`pick_endgame` fast path for a
+    /// fully-seeded torrent are O(1) instead of a full scan. This is the
+    /// common steady-state for a long-term seeder.
+    outstanding_wanted: usize,
 }
 
 impl PiecePicker {
+    /// Estimate the backing storage for the persistent per-torrent piece
+    /// index. The three `Vec<bool>` fields are bit-packed, while availability
+    /// stores one `u32` count per piece. Include allocator slack for the
+    /// independent vectors and picker bookkeeping so the engine can reserve
+    /// before constructing a large picker.
+    pub fn memory_bytes_for_piece_count(piece_count: usize) -> usize {
+        let bitset_bytes = piece_count
+            .div_ceil(usize::BITS as usize)
+            .saturating_mul(std::mem::size_of::<usize>());
+        bitset_bytes
+            .saturating_mul(3)
+            .saturating_add(piece_count.saturating_mul(std::mem::size_of::<u32>()))
+            .saturating_add(64 * 1024)
+    }
+
     pub fn new(piece_count: usize, default_piece_length: u32, last_piece_length: u32) -> Self {
         PiecePicker {
             piece_count,
@@ -152,34 +197,71 @@ impl PiecePicker {
             wanted: vec![true; piece_count],
             enabled: vec![true; piece_count],
             in_progress: std::collections::HashMap::new(),
-            priority: Vec::new(),
+            in_progress_bytes: 0,
+            priority: vec![false; piece_count],
             sequential: false,
             sequential_start_piece: 0,
             availability: Availability::new(piece_count),
+            outstanding_wanted: piece_count,
+        }
+    }
+
+    /// Update `outstanding_wanted` for a piece whose `wanted` and/or
+    /// `enabled` flags just changed, and keep `availability`'s bucket walk
+    /// in sync: retire the piece once it's no longer outstanding (so a
+    /// long-lived download doesn't accumulate ever more completed pieces
+    /// in a crowded bucket) or reinstate it if it becomes outstanding
+    /// again. A piece counts as outstanding exactly when both flags are
+    /// true, matching `is_complete`'s predicate.
+    fn adjust_outstanding(
+        &mut self,
+        piece: usize,
+        old_wanted: bool,
+        old_enabled: bool,
+        new_wanted: bool,
+        new_enabled: bool,
+    ) {
+        let was_outstanding = old_wanted && old_enabled;
+        let is_outstanding = new_wanted && new_enabled;
+        if is_outstanding && !was_outstanding {
+            self.outstanding_wanted = self.outstanding_wanted.saturating_add(1);
+            self.availability.reinstate(piece);
+        } else if was_outstanding && !is_outstanding {
+            self.outstanding_wanted = self.outstanding_wanted.saturating_sub(1);
+            self.availability.retire(piece);
         }
     }
 
     /// Mark a piece as already complete (from fastresume).
     pub fn mark_have(&mut self, piece: usize) {
         if piece < self.piece_count {
+            let old_wanted = self.wanted[piece];
+            let enabled = self.enabled[piece];
             self.wanted[piece] = false;
-            self.in_progress.remove(&piece);
+            self.adjust_outstanding(piece, old_wanted, enabled, false, enabled);
+            self.remove_in_progress(piece);
         }
     }
 
     /// Mark a piece as needed again after verification failed.
     pub fn reject_piece(&mut self, piece: usize) {
         if piece < self.piece_count {
+            let old_wanted = self.wanted[piece];
+            let enabled = self.enabled[piece];
             self.wanted[piece] = true;
-            self.in_progress.remove(&piece);
+            self.adjust_outstanding(piece, old_wanted, enabled, true, enabled);
+            self.remove_in_progress(piece);
         }
     }
 
     pub fn set_piece_enabled(&mut self, piece: usize, enabled: bool) {
         if piece < self.piece_count {
+            let wanted = self.wanted[piece];
+            let old_enabled = self.enabled[piece];
             self.enabled[piece] = enabled;
+            self.adjust_outstanding(piece, wanted, old_enabled, wanted, enabled);
             if !enabled {
-                self.in_progress.remove(&piece);
+                self.remove_in_progress(piece);
             }
         }
     }
@@ -189,10 +271,13 @@ impl PiecePicker {
             || received_blocks.is_empty()
             || !self.wanted[piece]
             || !self.enabled[piece]
+            || self.in_progress.contains_key(&piece)
+            || !self.can_admit_piece_state(self.piece_length_for(piece))
         {
             return;
         }
         let piece_length = self.piece_length_for(piece);
+        let state_bytes = piece_state_memory_bytes(piece_length);
         let mut state = PieceState::new(piece_length);
         for block_idx in received_blocks {
             if let Some(received) = state.received.get_mut(*block_idx as usize) {
@@ -205,18 +290,34 @@ impl PiecePicker {
         // completed piece. The torrent actor must request the piece again and
         // verify it before advertising it as available.
         if !state.is_complete() {
+            self.in_progress_bytes = self.in_progress_bytes.saturating_add(state_bytes);
             self.in_progress.insert(piece, state);
         }
     }
 
     /// Set priority pieces (head/tail of each file for fast preview).
-    pub fn set_priority(&mut self, pieces: Vec<usize>) {
-        // Priority lists can come from API/user input. Keep the picker
-        // invariant that every later direct index is within its bitsets.
-        self.priority = pieces
-            .into_iter()
-            .filter(|piece| *piece < self.piece_count)
-            .collect();
+    pub fn set_priority<I>(&mut self, pieces: I)
+    where
+        I: IntoIterator<Item = usize>,
+    {
+        let mut priority = vec![false; self.piece_count];
+        for piece in pieces {
+            if let Some(flag) = priority.get_mut(piece) {
+                *flag = true;
+            }
+        }
+        self.priority = priority;
+    }
+
+    /// Replace the packed priority flags without first expanding them into a
+    /// list of piece indexes. The engine uses this when applying a durable
+    /// file policy to a large torrent.
+    pub fn set_priority_mask(&mut self, priority: Vec<bool>) {
+        if priority.len() == self.piece_count {
+            self.priority = priority;
+        } else {
+            self.priority.fill(false);
+        }
     }
 
     /// Enable or disable sequential piece selection.
@@ -245,13 +346,18 @@ impl PiecePicker {
     ///
     /// Returns `None` if nothing is available from this peer right now.
     pub fn pick<A: PieceAvailability + ?Sized>(&mut self, peer_has: &A) -> Option<BlockRequest> {
+        // Fast path: nothing left to request (e.g. a fully-seeded torrent,
+        // the common steady state for a long-term seeder). Every branch
+        // below requires a wanted+enabled piece, so this is exact, not an
+        // approximation.
+        if self.outstanding_wanted == 0 {
+            return None;
+        }
+
         // Priority pieces first.
-        if let Some(piece) = self
-            .priority
-            .iter()
-            .copied()
-            .find(|&piece| self.piece_is_requestable(piece) && peer_has.has_piece(piece))
-        {
+        if let Some(piece) = (0..self.piece_count).find(|&piece| {
+            self.priority[piece] && self.piece_is_requestable(piece) && peer_has.has_piece(piece)
+        }) {
             return self.pick_block_from(piece);
         }
 
@@ -268,10 +374,8 @@ impl PiecePicker {
             return None;
         }
 
-        // Rarest-first among wanted pieces the peer has. Scan for the
-        // smallest (availability, piece index) pair instead of materializing
-        // an order vector proportional to the torrent's total piece count on
-        // every request.
+        // Rarest-first among wanted pieces the peer has. See
+        // `rarest_requestable_piece` for the bucket-walk this delegates to.
         let piece = self.rarest_requestable_piece(peer_has)?;
         self.pick_block_from(piece)
     }
@@ -279,11 +383,8 @@ impl PiecePicker {
     /// Pick from a source that is known to have every piece but is not counted
     /// in peer availability, such as a BEP19 webseed.
     pub fn pick_from_seed(&mut self) -> Option<BlockRequest> {
-        if let Some(piece) = self
-            .priority
-            .iter()
-            .copied()
-            .find(|&piece| self.piece_is_requestable(piece))
+        if let Some(piece) = (0..self.piece_count)
+            .find(|&piece| self.priority[piece] && self.piece_is_requestable(piece))
         {
             return self.pick_block_from(piece);
         }
@@ -338,24 +439,19 @@ impl PiecePicker {
                 .is_none_or(|state| state.next_unrequested().is_some())
     }
 
+    /// Rarest-first selection among wanted, requestable pieces the peer has.
+    ///
+    /// Walks the availability buckets from the rarest nonzero count upward
+    /// instead of scanning every piece: O(buckets visited) amortized rather
+    /// than O(piece_count) per call. This matters because `pick` is called
+    /// once per outstanding block-request slot per peer (up to
+    /// `PEER_REQUEST_PIPELINE_NORMAL` times per unchoke cycle).
     fn rarest_requestable_piece<A: PieceAvailability + ?Sized>(
         &self,
         peer_has: &A,
     ) -> Option<usize> {
-        let mut best = None;
-        for piece in 0..self.piece_count {
-            if !self.piece_is_requestable(piece) || !peer_has.has_piece(piece) {
-                continue;
-            }
-            let candidate = (self.availability.count(piece), piece);
-            if candidate.0 == 0 {
-                continue;
-            }
-            if best.map(|current| candidate < current).unwrap_or(true) {
-                best = Some(candidate);
-            }
-        }
-        best.map(|(_, piece)| piece)
+        self.availability
+            .rarest_matching(|piece| self.piece_is_requestable(piece) && peer_has.has_piece(piece))
     }
 
     fn next_endgame_piece<A: PieceAvailability + ?Sized>(
@@ -377,11 +473,8 @@ impl PiecePicker {
 
         // Preserve the old order's priority-first behavior without cloning
         // the complete priority vector.
-        if let Some(piece) = self
-            .priority
-            .iter()
-            .copied()
-            .find(|&piece| is_candidate(piece))
+        if let Some(piece) =
+            (0..self.piece_count).find(|&piece| self.priority[piece] && is_candidate(piece))
         {
             return Some(piece);
         }
@@ -392,44 +485,29 @@ impl PiecePicker {
                 .min(self.piece_count.saturating_sub(1));
             return (start..self.piece_count)
                 .chain(0..start)
-                .find(|&piece| is_candidate(piece) && !self.priority.contains(&piece));
+                .find(|&piece| is_candidate(piece) && !self.priority[piece]);
         }
 
-        let mut best = None;
-        for piece in 0..self.piece_count {
-            if self.priority.contains(&piece) || !is_candidate(piece) {
-                continue;
-            }
-            let candidate = (self.availability.count(piece), piece);
-            if candidate.0 == 0 {
-                continue;
-            }
-            if best.map(|current| candidate < current).unwrap_or(true) {
-                best = Some(candidate);
-            }
-        }
-        best.map(|(_, piece)| piece)
+        // Same bucket-walk as `rarest_requestable_piece`; see its doc comment.
+        self.availability
+            .rarest_matching(|piece| !self.priority[piece] && is_candidate(piece))
     }
 
     fn endgame_active(&self) -> bool {
-        let has_wanted = self
-            .wanted
+        if self.outstanding_wanted == 0 {
+            return false;
+        }
+        self.wanted
             .iter()
             .zip(self.enabled.iter())
-            .any(|(wanted, enabled)| *wanted && *enabled);
-        has_wanted
-            && self
-                .wanted
-                .iter()
-                .zip(self.enabled.iter())
-                .enumerate()
-                .filter(|(_, (wanted, enabled))| **wanted && **enabled)
-                .all(|(piece, _)| {
-                    self.in_progress
-                        .get(&piece)
-                        .and_then(PieceState::next_unrequested)
-                        .is_none()
-                })
+            .enumerate()
+            .filter(|(_, (wanted, enabled))| **wanted && **enabled)
+            .all(|(piece, _)| {
+                self.in_progress
+                    .get(&piece)
+                    .and_then(PieceState::next_unrequested)
+                    .is_none()
+            })
     }
 
     fn piece_length_for(&self, piece: usize) -> u32 {
@@ -441,7 +519,19 @@ impl PiecePicker {
     }
 
     fn pick_block_from(&mut self, piece: usize) -> Option<BlockRequest> {
+        if piece >= self.piece_count {
+            return None;
+        }
         let pl = self.piece_length_for(piece);
+        let is_new = !self.in_progress.contains_key(&piece);
+        if is_new && !self.can_admit_piece_state(pl) {
+            return None;
+        }
+        if is_new {
+            self.in_progress_bytes = self
+                .in_progress_bytes
+                .saturating_add(piece_state_memory_bytes(pl));
+        }
         let state = self
             .in_progress
             .entry(piece)
@@ -457,8 +547,11 @@ impl PiecePicker {
         if let Some(state) = self.in_progress.get_mut(&piece) {
             state.mark_received(block_idx);
             if state.is_complete() {
-                self.in_progress.remove(&piece);
+                self.remove_in_progress(piece);
+                let old_wanted = self.wanted[piece];
+                let enabled = self.enabled[piece];
                 self.wanted[piece] = false;
+                self.adjust_outstanding(piece, old_wanted, enabled, false, enabled);
                 return true;
             }
         }
@@ -506,18 +599,11 @@ impl PiecePicker {
     }
 
     pub fn is_complete(&self) -> bool {
-        self.wanted
-            .iter()
-            .zip(self.enabled.iter())
-            .all(|(wanted, enabled)| !*enabled || !*wanted)
+        self.outstanding_wanted == 0
     }
 
     pub fn remaining_pieces(&self) -> usize {
-        self.wanted
-            .iter()
-            .zip(self.enabled.iter())
-            .filter(|(wanted, enabled)| **wanted && **enabled)
-            .count()
+        self.outstanding_wanted
     }
 
     pub fn bytes_left(&self) -> u64 {
@@ -556,16 +642,41 @@ impl PiecePicker {
     }
 
     pub fn partial_pieces(&self) -> Vec<(u32, Vec<u32>)> {
+        self.partial_pieces_limited(usize::MAX)
+    }
+
+    /// Snapshot received block hints with a per-piece allocation bound.
+    ///
+    /// Fastresume treats these indexes as an optimization, not as verified
+    /// truth. Callers that persist them can therefore omit excess hints and
+    /// let the torrent re-request those blocks after restart.
+    pub fn partial_pieces_limited(&self, max_blocks_per_piece: usize) -> Vec<(u32, Vec<u32>)> {
         let mut partials: Vec<_> = self
             .in_progress
             .iter()
             .filter_map(|(piece, state)| {
-                let blocks = state.received_blocks();
+                let blocks = state.received_blocks_limited(max_blocks_per_piece);
                 (!blocks.is_empty()).then_some((*piece as u32, blocks))
             })
             .collect();
         partials.sort_by_key(|(piece, _)| *piece);
         partials
+    }
+
+    fn can_admit_piece_state(&self, piece_length: u32) -> bool {
+        self.in_progress.len() < MAX_IN_PROGRESS_PIECES
+            && self
+                .in_progress_bytes
+                .checked_add(piece_state_memory_bytes(piece_length))
+                .is_some_and(|next| next <= MAX_IN_PROGRESS_PIECE_STATE_BYTES)
+    }
+
+    fn remove_in_progress(&mut self, piece: usize) {
+        if let Some(state) = self.in_progress.remove(&piece) {
+            self.in_progress_bytes = self
+                .in_progress_bytes
+                .saturating_sub(piece_state_memory_bytes(state.piece_length));
+        }
     }
 }
 
@@ -749,6 +860,15 @@ mod tests {
     }
 
     #[test]
+    fn partial_piece_snapshot_can_bound_received_blocks() {
+        let mut p = picker_1piece(MAX_BLOCK_SIZE * 4);
+        p.restore_partial_piece(0, &[0, 1, 2]);
+
+        assert_eq!(p.partial_pieces_limited(2), vec![(0, vec![0, 1])]);
+        assert_eq!(p.partial_pieces(), vec![(0, vec![0, 1, 2])]);
+    }
+
+    #[test]
     fn complete_partial_record_does_not_mark_piece_have() {
         let mut picker = picker_1piece(MAX_BLOCK_SIZE * 2);
         picker.availability.add_have(0);
@@ -758,6 +878,26 @@ mod tests {
         assert!(!picker.is_complete());
         assert_eq!(picker.partial_pieces(), Vec::<(u32, Vec<u32>)>::new());
         assert_eq!(picker.pick(&peer_has_all(1)).unwrap().begin, 0);
+    }
+
+    #[test]
+    fn reinstated_piece_is_requestable_again_via_rarest_first() {
+        let mut p = picker_1piece(MAX_BLOCK_SIZE);
+        p.availability.add_have(0);
+        let all = peer_has_all(1);
+        let req = p.pick(&all).unwrap();
+        assert!(p.block_received(0, req.begin));
+        assert!(p.is_complete());
+        // Completing the piece must retire it from the rarest-first bucket
+        // walk, not just from `wanted`.
+        assert!(p.pick(&all).is_none());
+
+        p.reject_piece(0);
+        assert!(!p.is_complete());
+        // reject_piece must reinstate it into its bucket so rarest-first
+        // finds it again, not just flip `wanted` back to true.
+        let req2 = p.pick(&all).unwrap();
+        assert_eq!(req2.piece, 0);
     }
 
     #[test]
@@ -968,5 +1108,117 @@ mod tests {
         let req = p.pick(&peer_has_all(4)).unwrap();
         assert_eq!(req.piece, 3);
         assert_eq!(req.length, half);
+    }
+
+    #[test]
+    fn in_progress_piece_states_are_bounded() {
+        let mut picker =
+            PiecePicker::new(MAX_IN_PROGRESS_PIECES + 1, MAX_BLOCK_SIZE, MAX_BLOCK_SIZE);
+
+        for piece in 0..MAX_IN_PROGRESS_PIECES {
+            assert!(picker.pick_block_from(piece).is_some());
+        }
+
+        assert!(picker.pick_block_from(MAX_IN_PROGRESS_PIECES).is_none());
+        picker.restore_partial_piece(MAX_IN_PROGRESS_PIECES, &[0]);
+        assert!(!picker.is_piece_in_progress(MAX_IN_PROGRESS_PIECES));
+        assert_eq!(picker.in_progress.len(), MAX_IN_PROGRESS_PIECES);
+    }
+
+    #[test]
+    fn in_progress_piece_state_bytes_are_bounded() {
+        let piece_length = u32::MAX;
+        let state_bytes = piece_state_memory_bytes(piece_length);
+        let admitted = MAX_IN_PROGRESS_PIECE_STATE_BYTES / state_bytes;
+        let mut picker = PiecePicker::new(admitted + 1, piece_length, piece_length);
+
+        for piece in 0..admitted {
+            picker.restore_partial_piece(piece, &[0]);
+        }
+        picker.restore_partial_piece(admitted, &[0]);
+
+        assert_eq!(picker.in_progress.len(), admitted);
+        assert!(picker.in_progress_bytes <= MAX_IN_PROGRESS_PIECE_STATE_BYTES);
+        assert!(!picker.is_piece_in_progress(admitted));
+    }
+
+    #[test]
+    fn piece_index_memory_estimate_accounts_for_dense_state() {
+        let empty = PiecePicker::memory_bytes_for_piece_count(0);
+        let one = PiecePicker::memory_bytes_for_piece_count(1);
+        let many = PiecePicker::memory_bytes_for_piece_count(16_000_000);
+
+        assert!(empty >= 64 * 1024);
+        assert!(one >= empty);
+        assert!(many > one);
+        assert!(many >= 16_000_000 * std::mem::size_of::<u32>());
+    }
+
+    /// Large-scale correctness check for the availability-bucketed rarest
+    /// picker (see `rarest_requestable_piece` / `Availability::rarest_matching`).
+    ///
+    /// Uses a piece count well past anything a linear-scan bug would pass
+    /// unnoticed at small scale, a swarm with several overlapping,
+    /// deterministic per-peer bitfields (so availability counts vary and
+    /// buckets actually differ in size), and a downloading peer that has
+    /// every piece so the rarest-first branch alone decides every pick.
+    /// After each pick the block is immediately marked received, which
+    /// exercises piece retirement (see `Availability::retire`) on every
+    /// single iteration — the scenario where a naive bucket implementation
+    /// would silently degrade back toward O(piece_count) as a download
+    /// nears completion.
+    ///
+    /// Asserts the three ways bucket bookkeeping could go wrong: a piece
+    /// never returned, a piece returned more than once while still
+    /// in-flight, and a violation of the rarest-first ordering guarantee
+    /// (availability counts of successive picks must be non-decreasing,
+    /// since nothing else changes availability mid-run).
+    #[test]
+    fn rarest_first_bucket_walk_is_correct_at_scale() {
+        const PIECE_COUNT: usize = 12_000;
+        let mut p = PiecePicker::new(PIECE_COUNT, MAX_BLOCK_SIZE, MAX_BLOCK_SIZE);
+
+        // Overlapping synthetic peers: peer 0 has every piece (guarantees
+        // full coverage so every piece is eventually requestable), the
+        // rest have deterministic sparser subsets so availability counts
+        // vary across a handful of rarity buckets (1..=5).
+        let moduli = [1usize, 2, 3, 5, 7];
+        for &modulus in &moduli {
+            for piece in (0..PIECE_COUNT).step_by(modulus) {
+                p.availability.add_have(piece);
+            }
+        }
+
+        let peer_has_everything = vec![true; PIECE_COUNT];
+
+        let mut seen = std::collections::HashSet::with_capacity(PIECE_COUNT);
+        let mut last_count = 0u32;
+        for _ in 0..PIECE_COUNT {
+            let req = p
+                .pick(&peer_has_everything)
+                .expect("every piece has availability >= 1 from peer 0's full bitfield");
+
+            let piece = req.piece as usize;
+            assert!(
+                seen.insert(piece),
+                "piece {piece} was returned more than once while outstanding"
+            );
+
+            let count = p.availability.count(piece);
+            assert!(
+                count >= last_count,
+                "rarest-first ordering violated: piece {piece} (count {count}) picked after a piece with count {last_count}"
+            );
+            last_count = count;
+
+            // Immediately complete the piece so the next pick has to walk
+            // past an ever-growing set of retired pieces if retirement is
+            // broken — this is the regression this test is meant to catch.
+            assert!(p.block_received(piece, req.begin));
+        }
+
+        assert_eq!(seen.len(), PIECE_COUNT);
+        assert!(p.is_complete());
+        assert!(p.pick(&peer_has_everything).is_none());
     }
 }
