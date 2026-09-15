@@ -36,7 +36,7 @@ use rt_tracker::{TrackerEvent, TrackerState, TrackerStatus};
 use rt_utp::UtpStream;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
-use tokio::sync::{mpsc, OwnedSemaphorePermit, RwLock};
+use tokio::sync::{mpsc, watch, OwnedSemaphorePermit, RwLock};
 use tokio::time::{interval, sleep, timeout};
 use tokio_util::codec::Framed;
 use tracing::{debug, warn};
@@ -378,6 +378,7 @@ struct V2PeerContext {
     resources: ResourceGovernor,
     network_budget: GlobalNetworkBudget,
     local_have: Arc<RwLock<V2Bitmap>>,
+    have_updates: watch::Sender<()>,
     file_policy: Arc<HashMap<u32, (bool, i64)>>,
     assembly_cap_bytes: usize,
     events: mpsc::Sender<V2PeerEvent>,
@@ -530,6 +531,7 @@ pub struct V2TorrentTask {
     events_tx: mpsc::Sender<V2PeerEvent>,
     events_rx: mpsc::Receiver<V2PeerEvent>,
     local_have: Arc<RwLock<V2Bitmap>>,
+    have_updates: watch::Sender<()>,
     peers: HashMap<SocketAddr, V2PeerHandle>,
     paused: bool,
     initial_state: TorrentState,
@@ -659,6 +661,7 @@ impl V2TorrentTask {
         let peer_event_capacity = max_peers.clamp(64, 512);
         let (events_tx, events_rx) = mpsc::channel(peer_event_capacity);
         let local_have = Arc::new(RwLock::new(V2Bitmap::new(piece_map.piece_count as usize)));
+        let (have_updates, _) = watch::channel(());
         let storage = MountScheduler::new_for_path(
             StorageRootId::new(),
             &save_root,
@@ -684,6 +687,7 @@ impl V2TorrentTask {
             events_tx,
             events_rx,
             local_have,
+            have_updates,
             peers: HashMap::new(),
             paused,
             initial_state,
@@ -732,6 +736,7 @@ impl V2TorrentTask {
     pub async fn run(mut self) {
         let new_have = self.recheck_files().await;
         *self.local_have.write().await = new_have;
+        self.notify_local_have_changed();
 
         let startup_state = if self.paused {
             match self.initial_state {
@@ -1184,6 +1189,10 @@ impl V2TorrentTask {
                 .0
     }
 
+    fn notify_local_have_changed(&self) {
+        let _ = self.have_updates.send(());
+    }
+
     fn schedule_trackers_now(&mut self) {
         for tier in &mut self.tracker_tiers {
             for tracker in tier {
@@ -1544,8 +1553,13 @@ impl V2TorrentTask {
     }
 
     async fn recheck_and_set_state(&mut self) {
+        // Peer contexts retain an immutable file-policy snapshot and may have
+        // advertised pieces that the recheck invalidates.  Recheck from a
+        // clean peer set so no connection can use stale availability.
+        self.shutdown_peers().await;
         let new_have = self.recheck_files().await;
         *self.local_have.write().await = new_have;
+        self.notify_local_have_changed();
         let target = if self.paused {
             TorrentState::Paused
         } else if self.is_complete().await {
@@ -1561,6 +1575,15 @@ impl V2TorrentTask {
                 result = "error",
                 error = %error,
                 "failed to persist pure-v2 recheck state"
+            );
+        } else if let Err(error) = self.persist_tracker_state().await {
+            warn!(
+                component = "torrent_v2",
+                operation = "recheck_tracker_state",
+                torrent = %self.info_hash_hex,
+                result = "error",
+                error = %error,
+                "failed to persist pure-v2 tracker state after recheck"
             );
         }
     }
@@ -1743,6 +1766,7 @@ impl V2TorrentTask {
             resources: self.resources.clone(),
             network_budget: self.network_budget.clone(),
             local_have: Arc::clone(&self.local_have),
+            have_updates: self.have_updates.clone(),
             file_policy: Arc::clone(&self.file_policy),
             assembly_cap_bytes: self.assembly_cap_bytes,
             events: self.events_tx.clone(),
@@ -2424,7 +2448,10 @@ async fn run_v2_peer_protocol(
             })
             .await?;
     }
-    send_v2_have(&context, &mut framed, remote_supports_fast).await?;
+    let mut have_updates = context.have_updates.subscribe();
+    let initial_have = context.local_have.read().await.clone();
+    send_v2_have_bitmap(&mut framed, &initial_have, remote_supports_fast).await?;
+    let mut announced_have = initial_have;
 
     let mut outstanding = HashMap::<(u32, u32), u32>::new();
     let mut assemblies = HashMap::<u32, V2PieceAssembly>::new();
@@ -2443,6 +2470,20 @@ async fn run_v2_peer_protocol(
 
     loop {
         tokio::select! {
+            changed = have_updates.changed() => {
+                if changed.is_err() {
+                    return Ok(());
+                }
+                let current_have = context.local_have.read().await.clone();
+                for piece_index in 0..current_have.len() {
+                    if current_have.get(piece_index) && !announced_have.get(piece_index) {
+                        let piece = u32::try_from(piece_index)
+                            .map_err(|_| anyhow::anyhow!("v2 piece index exceeds wire range"))?;
+                        framed.send(Message::Have(piece)).await?;
+                    }
+                    announced_have.set(piece_index, current_have.get(piece_index));
+                }
+            }
             message = framed.next() => {
                 let message = message?;
                 let Some(message) = message else {
@@ -2566,7 +2607,6 @@ async fn run_v2_peer_protocol(
                     Message::Piece { piece, begin, data } => {
                         handle_v2_piece(
                             &context,
-                            &mut framed,
                             &state,
                             &mut outstanding,
                             &mut assemblies,
@@ -2611,12 +2651,11 @@ async fn run_v2_peer_protocol(
     }
 }
 
-async fn send_v2_have(
-    context: &V2PeerContext,
+async fn send_v2_have_bitmap(
     framed: &mut PeerIo,
+    have: &V2Bitmap,
     remote_supports_fast: bool,
 ) -> anyhow::Result<()> {
-    let have = context.local_have.read().await.clone();
     let count = have.count_ones();
     if remote_supports_fast && have.len() > 0 && count == have.len() {
         framed.send(Message::HaveAll).await?;
@@ -2760,7 +2799,6 @@ async fn fill_v2_requests(
 #[allow(clippy::too_many_arguments)]
 async fn handle_v2_piece(
     context: &V2PeerContext,
-    framed: &mut PeerIo,
     state: &Arc<Mutex<V2PeerState>>,
     outstanding: &mut HashMap<(u32, u32), u32>,
     assemblies: &mut HashMap<u32, V2PieceAssembly>,
@@ -2874,11 +2912,13 @@ async fn handle_v2_piece(
             .await?;
         }
     }
-    if context.local_have.write().await.get(piece as usize) {
+    let mut local_have = context.local_have.write().await;
+    if local_have.get(piece as usize) {
         return Ok(());
     }
-    context.local_have.write().await.set(piece as usize, true);
-    framed.send(Message::Have(piece)).await?;
+    local_have.set(piece as usize, true);
+    drop(local_have);
+    let _ = context.have_updates.send(());
     let _ = context
         .events
         .send(V2PeerEvent::Downloaded {
