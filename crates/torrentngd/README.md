@@ -17,3 +17,9 @@ metrics, and diagnostics.
 
 Current hardening focus is certification evidence on target hardware and live
 client environments.
+
+Pure-v2 `btmh` magnets are supported through the native bounded BEP 9/BEP 52
+metadata path: the exact info dictionary and required piece layers are
+authenticated before promotion. See
+[`docs/API.md`](../../docs/API.md#pure-v2-boundary) for limits, restart
+behavior, and the remaining qualification boundary.

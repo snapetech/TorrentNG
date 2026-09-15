@@ -2,7 +2,7 @@
 
 > Historical baseline: this document preserves the original review narrative.
 > Current implementation status and remaining actions are maintained in
-> [`BACKEND_AUDIT_BURN_DOWN.md`](BACKEND_AUDIT_BURN_DOWN.md), updated 2026-09-03.
+> [`BACKEND_AUDIT_BURN_DOWN.md`](BACKEND_AUDIT_BURN_DOWN.md), updated 2026-09-15.
 
 This review is intentionally hostile. The target is not "does it work on a happy path". The target is: can TorrentNG survive hostile torrents, hostile peers, high-latency storage, huge libraries, bad operator config, reverse proxies, and sustained high-throughput workloads without lying to the user or corrupting data.
 
@@ -11,7 +11,7 @@ reconciled and actioned in the current tree; the canonical current status is
 [`BACKEND_AUDIT_BURN_DOWN.md`](BACKEND_AUDIT_BURN_DOWN.md), not the pre-fix
 narrative in this file.
 
-## Current disposition (2026-09-04)
+## Current disposition (2026-09-15)
 
 The former implementation gaps are closed locally: checked metainfo bounds,
 server-owned storage execution, policy-gated tracker/webseed egress, shared
@@ -24,9 +24,10 @@ release smoke reports are linked from the backend ledger.
 Remaining items are qualification evidence rather than unimplemented code:
 target-hardware storage/performance, hostile public-network traffic, hosted CI
 observation, representative allocator profiling, public/client compatibility,
-and a completed 24-hour soak. Complete pure-v2 metainfo transfer and tracker
-lifecycle are implemented; pure-v2 magnet metadata completion remains an
-explicit unsupported capability.
+and a completed 24-hour soak. Pure-v2 metainfo transfer, tracker lifecycle, and
+`btmh` magnet metadata completion are implemented with bounded BEP 9/BEP 52
+exchange and proof verification. Public-client, target-device, and long-soak
+qualification remain evidence gates; they are not missing local protocol code.
 
 ## Executive verdict
 

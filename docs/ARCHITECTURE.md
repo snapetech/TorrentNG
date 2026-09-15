@@ -94,7 +94,8 @@ parse metainfo or magnet identity
 persist torrent row, metadata, labels, trackers, and event
       │
       ▼
-spawn v1/hybrid torrent task or taskless pure-v2 metadata projection
+spawn metadata task for magnets; promote verified info/piece layers to
+v1, hybrid, or pure-v2 torrent task
       │
       ├── tracker manager persists announce/scrape state
       ├── peer tasks verify pieces before completion
@@ -102,9 +103,12 @@ spawn v1/hybrid torrent task or taskless pure-v2 metadata projection
       └── APIs project registry + metadata + fastresume state
 ```
 
-Startup restores persisted torrents from the DB and metadata store. Pure v2
-rows restore as taskless metadata projections when there is no v1 peer-wire
-task to spawn.
+Startup restores persisted torrents from the DB and metadata store. A
+metadata-pending v1, hybrid, or pure-v2 row restores its bounded metadata task;
+completed rows restore the corresponding v1/hybrid/v2 peer-wire task. A
+metadata task is never treated as a completed torrent and cannot expose a
+payload runtime until its exact infohash (and, for layered v2 files, piece
+layers) have been verified.
 
 ## Shared Runtime API Layer
 

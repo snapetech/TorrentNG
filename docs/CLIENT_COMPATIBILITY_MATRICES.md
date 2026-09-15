@@ -69,9 +69,11 @@ certification artifact. Rows described as `Partial` in the historical feature
 vocabulary identify projection depth or deliberately limited compatibility;
 they are not a silent claim of full upstream parity. Remaining work is
 qualification against real public clients, live plugin behavior, public swarm
-traffic, and larger corpus/load evidence. Pure-v2 transfer/completion and
-unsupported plugin or option mutations remain deliberate non-goals and must
-continue to return explicit unsupported results.
+traffic, and larger corpus/load evidence. Pure-v2 transfer and `btmh` metadata
+completion are implemented in the native TorrentNG client with bounded BEP
+9/BEP 52 exchange; public-client interoperability and target-device evidence
+remain open. Unsupported plugin or option mutations remain deliberate
+non-goals and must continue to return explicit unsupported results.
 
 ## 1. Feature Matrix
 

@@ -1,6 +1,6 @@
 # TorrentNG Backend Audit Burn-down
 
-Status: **implementation burn-down complete; current qualification evidence refreshed 2026-09-10**
+Status: **implementation burn-down complete; current qualification evidence refreshed 2026-09-15**
 Baseline: 2026-09-01, `main`  
 Scope: the TorrentNG client (`torrentngd`), the compatible-client WebUI/API
 service (`torrentng`), their API facades, storage, deployment, CI, and release
@@ -20,7 +20,7 @@ functional storage, lifecycle, snapshot, and compatibility gaps, and the
 release binary passes the local authenticated daemon smoke. One official public
 Debian transfer, its completed counted soak, and the current kspls0 LVM storage
 qualification now have passing evidence. The release posture remains **do not
-make unqualified scale, security, pure-v2, or universal-compatibility claims**
+make unqualified scale, security, public-interoperability, or universal-compatibility claims**
 until the remaining evidence exists.
 
 The burn-down order is:
@@ -175,6 +175,20 @@ The current strict external preflight is
 Docker, public opt-in, writable target, migration corpus, and completed soak
 are green with no warnings.
 
+### Pure-v2 metadata-completion evidence (2026-09-15 local)
+
+The bounded native `btmh` path is locally covered, but this is synthetic
+protocol evidence rather than public-client certification. The focused package
+run passed 413 `rt-engine` tests, 53 `rt-metainfo` tests, and 7 `rt-metrics`
+tests. It includes a trackerless TCP direct-peer exchange that sends the exact
+BEP 9 `info` dictionary, requests a BEP 52 piece layer, authenticates its
+Merkle proof, emits `CompleteMagnet`, and parses the promoted pure-v2
+metainfo. Parser tests cover IPv4/IPv6 `x.pe` deduplication and limits, exact
+v2 info extraction, and the no-top-level-layer preflight view. Engine tests
+cover durable pending rows, restart restoration of the metadata worker, and
+promotion into the normal v2 runtime. Public-client, target-device, hostile
+network, and long-duration evidence remain separate open gates.
+
 ### Historical functional isolation checkpoint (2026-09-02)
 
 This checkpoint predates the current release artifact recorded above. It is
@@ -261,10 +275,10 @@ Still genuinely open after this pass:
 - TNG-013 has a local 32-client/8-slow-SSE release-process load result, but no
   representative production-corpus allocator profile or public-client load
   evidence. Arbitrary filter-index refresh remains linear by design.
-- TNG-016's local pure-v2 transfer and tracker lifecycle implementation is
-  present for complete metainfo. Pure-v2 magnet metadata completion remains
-  unsupported; public-network interoperability and broader transfer evidence
-  are still external gates.
+- TNG-016's local pure-v2 transfer, tracker lifecycle, and `btmh` magnet
+  metadata-completion implementation is present with bounded BEP 9/BEP 52
+  exchange and proof validation. Public-network interoperability and broader
+  transfer evidence are still external gates.
 - TNG-023 still needs accepted certification evidence before its `certified`
   state can change. TNG-025/027/028 now have hosted CI evidence in run
   `33916500668`; branch-protection enforcement remains a repository-settings
@@ -325,7 +339,7 @@ and is superseded by the source reconciliation above.
 | TNG-013 | Implemented and locally load-tested: immutable snapshots, indexes, pagination, journals, bounded SSE chunks; 204,936-request many-client/slow-consumer run passes with zero errors | Representative production corpus, allocator profile, and public/client load evidence remain external |
 | TNG-014 | Implemented locally: packed bitmaps, shared immutable piece maps, and governor-bounded peer/piece state | Run peer-count and large-piece-count memory profile |
 | TNG-015 | Implemented locally: guarded webseed timer and exponential retry backoff | Run idle/large-swarm benchmark |
-| TNG-016 | Implemented locally: pure-v2 file-root recheck, BEP 52 TCP/uTP transfer, and tracker lifecycle | Pure-v2 magnet metadata completion and public interoperability evidence remain open |
+| TNG-016 | Implemented locally: pure-v2 file-root recheck, BEP 9 `btmh` completion, BEP 52 TCP/uTP transfer, piece-layer proof validation, and tracker lifecycle | Public pure-v2 interoperability and broader transfer evidence remain open |
 | TNG-017 | Implemented locally: independent rate windows and choker inputs | Run controlled transfer proof |
 | TNG-018 | Implemented locally: handshake, idle, request, and response budgets | Run scheduler-saturation evidence |
 | TNG-019 | Implemented locally for IPv4 and IPv6 live-DHT routing: bounds, source checks, tokens, caps, and stale-query pruning | Run hostile-input/load and restart evidence |
@@ -1036,9 +1050,9 @@ Acceptance: idle-torrent CPU/timer counts and webseed recovery benchmarks.
 
 ## P1 — protocol and transfer correctness
 
-### TNG-016 — Pure v2 completion is a capability boundary
+### TNG-016 — Pure v2 completion is a bounded capability
 
-**Status: Implemented locally for complete metainfo; metadata completion remains unsupported; evidence deferred** · **Priority: P1** · **Confidence: high**
+**Status: Implemented locally for complete metainfo and `btmh` magnet completion; external evidence deferred** · **Priority: P1** · **Confidence: high**
 
 The native engine now starts a dedicated pure-v2 actor for complete `.torrent`
 or raw metainfo. It restores v2 file paths and priorities, rechecks file roots,
@@ -1046,19 +1060,20 @@ handles partial resume and seeding, serves and downloads BEP 52 pieces over TCP
 and uTP, performs bounded hash exchange with `hash reject` responses for
 unsupported ranges, and runs the v2 tracker announce/update/reannounce
 lifecycle using the truncated v2 infohash required by the tracker protocol.
-BEP 47 padding is treated as synthetic zero content and is not required on
-disk.
+Hybrid BEP 47 padding is treated as synthetic zero content and is not required
+on disk. Pure-v2 file trees use BEP 52 alignment gaps between non-empty files;
+they do not require a materialized padding file.
 
-Pure-v2 `btmh` magnet metadata completion remains unsupported because the
-current metadata exchange path does not acquire the v2 file tree and piece
-layers. The capability manifest therefore keeps
-`pure_v2_metadata_completion: false` while reporting pure-v2 transfer as
-implemented. Public-network interoperability, real-client coverage, and
-target-hardware evidence remain external gates.
+Pure-v2 `btmh` magnet metadata completion now obtains the exact BEP 9 info
+dictionary, verifies the full v2 SHA-256 identity, acquires required BEP 52
+piece layers with bounded hash exchange and Merkle-proof validation, and
+promotes only verified metainfo. The capability manifest reports
+`pure_v2_metadata_completion: true`; public-network interoperability,
+real-client coverage, and target-hardware evidence remain external gates.
 
 Acceptance: focused v2 recheck, path-policy, peer-wire, hash-exchange,
-padding, tracker, and uTP tests pass; magnet metadata completion remains an
-explicit unsupported boundary.
+padding, tracker, uTP, BEP 9 metadata, direct-peer, and engine-promotion tests
+pass; public-client/device/soak evidence remains deferred.
 
 ### TNG-017 — Peer rate snapshots and choker inputs are wrong
 
@@ -1316,11 +1331,12 @@ completion and blocklist/plugin behavior are not claimed as TorrentNG-client fea
 Verified evidence: the TorrentNG-client capability manifest now separates
 `implemented`, `enabled`, `certified`, and `experimental` assurance states.
 Runtime/config-dependent uTP fields are derived from active policy, while
-pure-v2 metadata completion and scale certification remain outside the
-advertised implemented/certified set. Pure-v2 transfer and IPv4/IPv6 live-DHT
-routing are now advertised as implemented, with certification still governed
-by accepted external evidence. Contract tests cover the manifest shape and
-mounted routes.
+scale certification remains outside the advertised implemented/certified set.
+Pure-v2 metadata completion is now
+advertised as implemented after exact infohash and piece-layer proof
+validation. Pure-v2 transfer and IPv4/IPv6 live-DHT routing remain locally
+implemented but not certified; certification is still governed by accepted
+external evidence. Contract tests cover the manifest shape and mounted routes.
 
 The remaining action is to keep `certified` empty for capabilities without
 accepted external evidence and to update it only from a release/evidence
@@ -1591,7 +1607,8 @@ Until the corresponding ledger item is resolved, these claims are not release
 claims:
 
 - “100k torrents” as a production capacity guarantee;
-- “pure v2 metadata completion” as a supported native capability;
+- “pure v2 metadata completion” without the bounded BEP 9/BEP 52 validation
+  and evidence boundary documented in TNG-016;
 - “universal compatibility” across clients and transports without live
   interoperability evidence;
 - “bounded graceful shutdown” without signal and join tests;

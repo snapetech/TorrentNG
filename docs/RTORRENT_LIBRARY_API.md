@@ -27,7 +27,8 @@ enforcement. This closes the documentation/test ambiguity without claiming an
 HTTP deployment surface that does not exist.
 
 The facade also rejects path-based loads at the library boundary. Embedded raw
-metainfo and magnets are supported. Complete pure-v2 metainfo uses the native
-engine's BEP 52 recheck, TCP/uTP peer transfer, and tracker lifecycle; pure-v2
-magnet metadata completion remains unsupported. See
-[API.md](API.md#pure-v2-boundary).
+metainfo and magnets are supported. Pure-v2 magnets use the native engine's
+BEP 9 metadata exchange and BEP 52 piece-layer verification before promotion;
+complete pure-v2 metainfo then uses the v2 recheck, TCP/uTP peer transfer, and
+tracker lifecycle. See [API.md](API.md#pure-v2-boundary) for the bounded
+protocol limits and qualification boundary.

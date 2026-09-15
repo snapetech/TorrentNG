@@ -275,9 +275,12 @@ remains the release quality bar.
 ## Track 2 — Phase 11: BEP 52 / v2 / hybrid torrents
 
 Implemented for v2/hybrid parsing, file trees, SHA-256 file-root verification,
-hybrid torrent identity, durable metadata projection, pure-v2 magnet
-placeholders, fast-resume identity, and qBit/Transmission/Deluge-compatible API
-surfaces.
+hybrid torrent identity, durable metadata projection, pure-v2 `btmh` metadata
+completion, BEP 52 piece-layer exchange/proof validation, fast-resume identity,
+and qBit/Transmission/Deluge-compatible API surfaces. Complete pure-v2
+metainfo and verified pure-v2 magnet metadata promote through the same native
+v2 runtime; public-client, target-device, and long-duration interoperability
+remain qualification evidence rather than unimplemented protocol work.
 
 ## Track 2 — Phase 12: Production 1.0
 

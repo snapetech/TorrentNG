@@ -530,16 +530,32 @@ it was not.
 
 ### Pure-v2 boundary
 
-Pure-v2 torrents are an explicit partial-support boundary, not a hidden
-capability claim. TorrentNG-client parsing, storage projection, file-root
-recheck, live BEP 52 TCP/uTP peer transfer, tracker announce state, tracker
-updates, and reannounce are implemented for complete `.torrent` or raw
-metainfo. Pure-v2 metadata completion from a `btmh` magnet remains
-unsupported because the metadata exchange path does not yet acquire the v2
-file tree and piece layers. The capability manifest reports metadata
-completion as unsupported and pure-v2 transfer as implemented; public-network
-and target-hardware interoperability remain evidence gates rather than local
-capability claims.
+Pure-v2 torrents are supported end to end within the bounded native-engine
+protocol surface. A `btmh` magnet creates a durable metadata-pending row and a
+metadata task. The task can obtain the exact `info` dictionary through BEP 9
+`ut_metadata` from tracker/DHT peers or BEP 9 `x.pe` direct peers, authenticate
+it with the full SHA-256 v2 infohash, request every required BEP 52 piece layer
+through bounded hash exchange, verify the returned Merkle proofs and piece
+roots, and only then promote the row to the normal v2 runtime task. Complete
+`.torrent` and raw metainfo use the same v2 file-root recheck, TCP/uTP peer
+transfer, tracker state/update/reannounce, persistence, and recovery paths.
+Hybrid metadata retains BEP 47 padding compatibility; pure-v2 file trees use
+BEP 52 piece-boundary alignment gaps rather than requiring padding files.
+
+The implementation limits one metadata transfer to 16 MiB, one raw metainfo
+blob to the metainfo parser's 64 MiB ceiling, hash requests to at most 512
+power-of-two hashes, and direct `x.pe` hints to 256 typed socket addresses.
+`x.pe` is an acquisition hint supplied with the add request; it is not a
+durable peer database. After restart, a pending magnet resumes from its
+persisted trackers and normal DHT registration when policy permits, so a
+trackerless magnet that relies only on `x.pe` must be re-added with the hint
+if the first process exits before metadata completion.
+Malformed metadata, missing or unauthenticated piece layers, invalid proofs,
+hash rejects, and memory-governor denials leave the torrent pending and are not
+reported as completed. The capability manifest reports
+`pure_v2_metadata_completion: true`; `pure_v2_transfer` remains separately
+marked experimental until public-client, target-device, and longer-duration
+qualification evidence is accepted.
 
 The rTorrent facade follows the same boundary and is a library-only entry
 point; see [RTORRENT_LIBRARY_API.md](RTORRENT_LIBRARY_API.md).

@@ -179,6 +179,7 @@ or compatibility behaviors.
 | `rust-udp-tracker` | Rust announces to opentracker through `udp://opentracker:6969/announce`. | Complete and hash match | Implemented |
 | `rust-qbit-mutation-facade` | qBittorrent-compatible `filePrio`, `recheck`, tracker add/edit/remove, `trackers`, and `files` endpoints. | Endpoints succeed and reflected state is visible | Implemented |
 | `rust-trackerless-magnet` | Rust adds a trackerless `btih` magnet and receives metadata/payload from an explicitly bridged qBittorrent peer. | Complete and hash match | Implemented |
+| `rust-pure-v2-btmh-magnet` | Rust adds a pure-v2 `btmh` magnet, obtains the exact BEP 9 info dictionary, acquires required BEP 52 piece layers from a direct peer, validates the Merkle proof, and promotes the torrent. | Complete raw metainfo has the expected SHA-256 identity and piece-layer hashes | Implemented locally; public-client qualification pending |
 | `magnet-dht-only` | Magnet metadata and peer discovery without trackers. DHT `get_peers` forwarding into torrent commands and trackerless BEP 9 metadata completion from discovered peers are covered by `rt-engine` tests; full Docker transfer certification remains planned. | Complete and hash match | Planned |
 | `rust-multi-tracker-fallback` | Dead tracker in the first tier, working tracker fallback. | Rust completes through fallback tracker | Implemented |
 | `tracker-outage-after-peer-discovery` | Stop the local tracker after TorrentNG has an explicit known peer for a tracker-only transfer. | Transfer continues through the known peer and final hash matches | Implemented |
@@ -290,7 +291,7 @@ BitTorrent compatibility rather than strong baseline interoperability.
 
 | Area | Implemented coverage | Remaining rows |
 |---|---|---|
-| Magnet links | `rust-magnet-with-tracker`; engine unit coverage for trackerless DHT peer candidates and BEP 9 metadata fetch | `magnet-dht-only` Docker transfer, `magnet-metadata-from-qbit`, `magnet-metadata-from-transmission`, `magnet-resume-after-restart` |
+| Magnet links | `rust-magnet-with-tracker`, `rust-trackerless-magnet`, and native pure-v2 `btmh` completion with direct-peer piece-layer proof coverage | `magnet-dht-only` Docker transfer, `magnet-metadata-from-qbit`, `magnet-metadata-from-transmission`, `magnet-resume-after-restart` |
 | DHT, PEX, LSD | `private-torrent-no-dht-pex`; DHT get-peers and metadata-fetch unit evidence | `dht-only-discovery` Docker row, `pex-peer-discovery`, `lsd-docker-lan-discovery`, `dht-bootstrap-recovery-after-restart` |
 | Trackers | `rust-udp-tracker`, `rust-multi-tracker-fallback`, `tracker-outage-after-peer-discovery`, `private-torrent-no-dht-pex` | HTTP scrape detail, UDP scrape detail, deeper multi-tracker tier ordering |
 | Protocol behavior | `rust-magnet-with-tracker` exercises extension handshake and `ut_metadata`; `endgame-multi-peer` covers duplicate-write/endgame pressure | fast extension, choke/unchoke contention, optimistic unchoke, rarest-first partial availability |

@@ -261,7 +261,7 @@ Moving 200+ TB is a database migration, not a file copy:
 | BEP | Description | Status |
 |---|---|---|
 | BEP 3 | BitTorrent v1 baseline | implemented |
-| BEP 9 | Metadata exchange / magnet | implemented for v1 metadata from tracker or DHT-discovered peers; pure v2 placeholders/completion are taskless |
+| BEP 9 | Metadata exchange / magnet | implemented for v1, hybrid, and pure-v2 metadata from tracker/DHT peers or bounded `x.pe` direct peers; exact infohash verification and v2 promotion are required |
 | BEP 10 | Extension protocol | implemented |
 | BEP 11 | PEX | compatibility policy present; private torrents disable peer discovery by default |
 | BEP 12 | Multitracker | implemented |
@@ -271,7 +271,7 @@ Moving 200+ TB is a database migration, not a file copy:
 | BEP 27 | Private torrents | implemented |
 | BEP 29 | uTP | implemented for packet/state/UDP stream primitives plus opt-in engine peer-wire and metadata paths; public interop remains release evidence |
 | BEP 32 | IPv6 | implemented for tracker compact IPv6 peers and live DHT bind/routing, with the same bounded source validation and peer admission policy |
-| BEP 52 | BitTorrent v2 / hybrid | implemented for parsing, identity, metadata projection, storage root verification, fastresume, pure-v2 TCP/uTP peer transfer, hash exchange, and tracker lifecycle; pure-v2 magnet metadata completion remains unsupported |
+| BEP 52 | BitTorrent v2 / hybrid | implemented for parsing, identity, BEP 9 magnet completion, piece-layer hash exchange/proof verification, metadata projection, storage root verification, fastresume, pure-v2 TCP/uTP peer transfer, BEP 52 file alignment gaps, and tracker lifecycle; hybrid BEP 47 padding remains supported; public-client/device qualification remains evidence work |
 
 DHT is implemented in Phase 10 for IPv4 and IPv6 live routing. Private-tracker
 profiles disable DHT/PEX/LSD by default; this policy is independent of the

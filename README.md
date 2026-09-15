@@ -103,11 +103,17 @@ blocking persistence or filesystem work. This distinction is visible through
 `/api/v1/jobs` and the storage metrics.
 
 Complete pure-v2 metainfo supports storage-root verification, partial resume,
-BEP 52 TCP/uTP peer transfer, and tracker lifecycle. Pure-v2 `btmh` magnet
-metadata completion remains unsupported because the current metadata exchange
-path does not acquire the v2 file tree and piece layers. Public-network
-interoperability remains an evidence gate. See [ENGINE.md](docs/ENGINE.md)
-for the protocol boundary.
+BEP 52 TCP/uTP peer transfer, and tracker lifecycle. Pure-v2 `btmh` magnets
+are also supported: the native metadata task obtains the exact BEP 9 `info`
+dictionary from tracker/DHT peers or bounded `x.pe` direct-peer hints,
+authenticates the full SHA-256 identity, fetches and verifies required BEP 52
+piece layers, and promotes only verified metainfo. Public-client,
+target-device, and long-duration interoperability remain qualification gates.
+`x.pe` direct peers are bounded acquisition hints and are not persisted as a
+peer database; a trackerless magnet must supply them again after a restart if
+metadata was not completed.
+See [ENGINE.md](docs/ENGINE.md) and the [API pure-v2 boundary](docs/API.md#pure-v2-boundary)
+for the protocol limits and capability distinction.
 
 ## Universal WebUI and automation interface
 
@@ -339,8 +345,9 @@ broader audit and burndown are in
 Known boundaries are documented rather than hidden behind successful-looking
 compatibility responses:
 
-- Pure-v2 peer transfer, tracker lifecycle, and metadata completion are
-  unsupported.
+- Pure-v2 peer transfer, tracker lifecycle, and `btmh` metadata completion are
+  implemented in the native engine within the documented BEP 52 limits;
+  public-client and target-device qualification remain separate evidence.
 - Some compatibility settings are projections for client discovery; they are
   only reported as successful when the selected client applies them.
 - The rTorrent XML-RPC library entry point is a library contract with an
