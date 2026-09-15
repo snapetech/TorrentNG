@@ -19,6 +19,7 @@ pub enum OutboundTargetKind {
 }
 
 const HTTP_CLIENT_CACHE_CAPACITY: usize = 256;
+const MAX_RESOLVED_ADDRESSES: usize = 64;
 
 static SCHEME_DENIED_TOTAL: AtomicU64 = AtomicU64::new(0);
 static ADDRESS_DENIED_TOTAL: AtomicU64 = AtomicU64::new(0);
@@ -201,7 +202,7 @@ impl OutboundEgressPolicy {
             RESOLUTION_FAILED_TOTAL.fetch_add(1, Ordering::Relaxed);
             EgressPolicyError::MissingPort
         })?;
-        let addresses = timeout(resolve_timeout, lookup_host((host.as_str(), port)))
+        let resolved = timeout(resolve_timeout, lookup_host((host.as_str(), port)))
             .await
             .map_err(|_| {
                 RESOLUTION_FAILED_TOTAL.fetch_add(1, Ordering::Relaxed);
@@ -210,8 +211,14 @@ impl OutboundEgressPolicy {
             .map_err(|error| {
                 RESOLUTION_FAILED_TOTAL.fetch_add(1, Ordering::Relaxed);
                 EgressPolicyError::Resolution(error.to_string())
-            })?
-            .collect::<Vec<_>>();
+            })?;
+        let addresses = match bounded_resolved_addresses(resolved) {
+            Ok(addresses) => addresses,
+            Err(error) => {
+                RESOLUTION_FAILED_TOTAL.fetch_add(1, Ordering::Relaxed);
+                return Err(error);
+            }
+        };
         if addresses.is_empty() {
             RESOLUTION_FAILED_TOTAL.fetch_add(1, Ordering::Relaxed);
             return Err(EgressPolicyError::Resolution(format!(
@@ -287,6 +294,21 @@ impl OutboundEgressPolicy {
         cache.insert(key, client.clone());
         Ok(client)
     }
+}
+
+fn bounded_resolved_addresses(
+    addresses: impl IntoIterator<Item = SocketAddr>,
+) -> Result<Vec<SocketAddr>, EgressPolicyError> {
+    let addresses = addresses
+        .into_iter()
+        .take(MAX_RESOLVED_ADDRESSES.saturating_add(1))
+        .collect::<Vec<_>>();
+    if addresses.len() > MAX_RESOLVED_ADDRESSES {
+        return Err(EgressPolicyError::Resolution(format!(
+            "DNS returned more than {MAX_RESOLVED_ADDRESSES} addresses"
+        )));
+    }
+    Ok(addresses)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -509,6 +531,21 @@ mod tests {
         policy
             .validate_ip("2001:4860:4860::8888".parse().unwrap())
             .unwrap();
+    }
+
+    #[test]
+    fn dns_answer_sets_are_bounded_before_collection() {
+        let addresses = (0..=MAX_RESOLVED_ADDRESSES)
+            .map(|index| SocketAddr::from(([192, 0, 2, (index % 254 + 1) as u8], 6881)));
+        assert!(matches!(
+            bounded_resolved_addresses(addresses),
+            Err(EgressPolicyError::Resolution(message))
+                if message.contains("more than 64 addresses")
+        ));
+
+        let addresses = (0..MAX_RESOLVED_ADDRESSES)
+            .map(|index| SocketAddr::from(([192, 0, 2, (index % 254 + 1) as u8], 6881)));
+        assert_eq!(bounded_resolved_addresses(addresses).unwrap().len(), 64);
     }
 
     #[tokio::test]

@@ -1,6 +1,6 @@
 //! Minimal BEP 5 DHT service loop.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::{IpAddr, SocketAddr, SocketAddrV4, SocketAddrV6};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
@@ -10,16 +10,23 @@ use rt_dht::{DhtError, DhtQuery, DhtResponse, KNode, KrpcMessage, NodeId, Routin
 use sha1::{Digest, Sha1};
 use tokio::net::UdpSocket;
 use tokio::sync::{mpsc, oneshot};
-use tokio::time::interval;
+use tokio::time::{interval, timeout};
 use tracing::{debug, info, warn};
 
+use crate::command::EngineCmd;
 use crate::torrent_task::TorrentCmd;
 
 const DHT_ANNOUNCED_PEERS_PER_INFO_HASH_CAP: usize = 512;
 const DHT_ANNOUNCED_PEER_SET_CAP: usize = 4_096;
 const DHT_ANNOUNCED_PEERS_GLOBAL_CAP: usize = 16_384;
-const DHT_TRACKED_TORRENTS_CAP: usize = 16_384;
-const DHT_COMMAND_GENERATION_CAP: usize = DHT_TRACKED_TORRENTS_CAP.saturating_mul(2);
+// The tracked-torrent admission cap used to be a hardcoded constant here
+// (16,384), which silently dropped DHT peer discovery for any torrent beyond
+// that count with no operator-visible signal beyond a single debug-level
+// scan of the logs. It is now `DhtTask::tracked_torrents_cap`, sourced from
+// `rt_config::DhtConfig::tracked_torrents_cap` (see `run_dht`'s
+// `tracked_torrents_cap` parameter), and every rejection increments
+// `DhtRuntimeStats::tracked_torrents_rejected` in addition to the existing
+// `warn!` log line so the cap being hit is observable without grepping logs.
 const DHT_QUERIED_NODES_PER_INFO_HASH_CAP: usize = 256;
 // Keep the aggregate queried-node history bounded across all tracked
 // torrents. The old per-info-hash limit alone allowed 16,384 torrents to
@@ -41,6 +48,14 @@ const DHT_MAX_DATAGRAM_LEN: usize = 2_048;
 const DHT_MAX_RESPONSE_DATAGRAM_LEN: usize = 1_024;
 const DHT_TOKEN_ROTATION: Duration = Duration::from_secs(5 * 60);
 const DHT_TOKEN_ACCEPTANCE: Duration = Duration::from_secs(10 * 60);
+const MAX_DHT_BOOTSTRAP_NODES: usize = 256;
+const MAX_DHT_BOOTSTRAP_ADDRESSES: usize = 64;
+const DHT_BOOTSTRAP_DEADLINE: Duration = Duration::from_secs(10);
+const DHT_BOOTSTRAP_NODE_TIMEOUT: Duration = Duration::from_secs(5);
+// A failed bootstrap is retried by the periodic tick. Do not repeat the DNS
+// deadline once per torrent while a large registration burst is being drained.
+const DHT_BOOTSTRAP_RETRY: Duration = Duration::from_secs(30);
+const DHT_ENGINE_READY_SEND_TIMEOUT: Duration = Duration::from_millis(500);
 
 // The node ID is sent in ordinary DHT responses and therefore cannot be used
 // as an announce-token secret. Keep rotating unpredictable secrets for the
@@ -212,6 +227,15 @@ pub struct DhtRuntimeStats {
     pub announced_peer_sets: u64,
     pub announced_peers: u64,
     pub tracked_torrents: u64,
+    /// The configured admission cap `tracked_torrents` is measured against
+    /// (`DhtConfig::tracked_torrents_cap`). Exposed alongside
+    /// `tracked_torrents` so a dashboard/alert can compute saturation
+    /// without hardcoding the limit.
+    pub tracked_torrents_cap: u64,
+    /// Cumulative count of `AddTorrent` commands rejected because
+    /// `tracked_torrents` was already at `tracked_torrents_cap`. Nonzero
+    /// means DHT peer discovery is unavailable for at least one torrent.
+    pub tracked_torrents_rejected: u64,
     pub outstanding_requests: u64,
     pub queried_nodes: u64,
 }
@@ -220,7 +244,10 @@ pub async fn run_dht(
     port: u16,
     listen_port: u16,
     bootstrap_nodes: Vec<String>,
-    mut cmd_rx: mpsc::Receiver<DhtCommand>,
+    tracked_torrents_cap: usize,
+    cmd_rx: &mut mpsc::Receiver<DhtCommand>,
+    mut pending_commands: VecDeque<DhtCommand>,
+    engine_tx: &mpsc::Sender<EngineCmd>,
 ) -> anyhow::Result<()> {
     let local_id = NodeId::random();
     let socket = UdpSocket::bind(("0.0.0.0", port))
@@ -234,6 +261,29 @@ pub async fn run_dht(
         node_id = %local_id,
         "DHT UDP socket bound"
     );
+    match timeout(
+        DHT_ENGINE_READY_SEND_TIMEOUT,
+        engine_tx.send(EngineCmd::DhtTaskReady),
+    )
+    .await
+    {
+        Ok(Ok(())) => {}
+        Ok(Err(_)) => {
+            // The engine command receiver is gone, so there is no owner left
+            // to consume DHT work or join this service. Let the supervisor
+            // finish naturally after the socket is dropped.
+            return Ok(());
+        }
+        Err(_) => {
+            warn!(
+                component = "dht",
+                operation = "ready_notification",
+                result = "timeout",
+                timeout_ms = DHT_ENGINE_READY_SEND_TIMEOUT.as_millis() as u64,
+                "DHT task bound its UDP socket but could not notify the engine before the deadline"
+            );
+        }
+    }
 
     // TNG-019: previously always started at 1 and incremented sequentially,
     // meaning transaction ids were fully predictable across every daemon
@@ -253,16 +303,22 @@ pub async fn run_dht(
         socket,
         listen_port,
         bootstrap_nodes,
+        tracked_torrents_cap,
+        tracked_torrents_rejected: 0,
         next_tx: random_tx_seed,
         outstanding: HashMap::new(),
         queried_nodes: HashMap::new(),
+        queried_node_count: 0,
         torrents: HashMap::new(),
         generations: HashMap::new(),
         announced_peers: HashMap::new(),
+        announced_peer_count: 0,
         last_full_lookup: HashMap::new(),
         pending_peer_forwards: HashMap::new(),
+        pending_peer_count: 0,
+        last_bootstrap_at: None,
     };
-    task.bootstrap().await;
+    task.bootstrap_if_due().await;
 
     let mut ingress_budget = DhtIngressBudget::new(Instant::now());
     let mut bootstrap_tick = interval(Duration::from_secs(300));
@@ -276,6 +332,22 @@ pub async fn run_dht(
     let mut buf = vec![0u8; DHT_MAX_DATAGRAM_LEN.saturating_add(1)];
     let mut shutdown_reply = None;
     loop {
+        if let Some(cmd) = pending_commands.pop_front() {
+            if let DhtCommand::Shutdown { reply } = cmd {
+                info!(
+                    component = "dht",
+                    operation = "shutdown",
+                    result = "ok",
+                    "DHT task shutting down"
+                );
+                shutdown_reply = Some(reply);
+                break;
+            }
+            if !task.handle_command(cmd).await {
+                break;
+            }
+            continue;
+        }
         tokio::select! {
             command = cmd_rx.recv() => {
                 let Some(cmd) = command else {
@@ -303,7 +375,7 @@ pub async fn run_dht(
             }
             _ = bootstrap_tick.tick() => {
                 if task.table.total_nodes() < K {
-                    task.bootstrap().await;
+                    task.bootstrap_if_due().await;
                 }
             }
             _ = search_tick.tick() => {
@@ -315,6 +387,7 @@ pub async fn run_dht(
                 }
             }
             _ = pending_forward_tick.tick() => {
+                task.prune_closed_torrents();
                 task.flush_pending_peer_forwards();
             }
             recv = task.socket.recv_from(&mut buf) => {
@@ -363,17 +436,36 @@ struct DhtTask {
     socket: UdpSocket,
     listen_port: u16,
     bootstrap_nodes: Vec<String>,
+    /// Maximum number of torrents concurrently tracked for DHT peer
+    /// discovery. Sourced from `rt_config::DhtConfig::tracked_torrents_cap`;
+    /// see the comment above `DHT_QUERIED_NODES_PER_INFO_HASH_CAP` for why
+    /// this moved from a hardcoded constant to a runtime config value.
+    tracked_torrents_cap: usize,
+    /// Cumulative `AddTorrent` rejections caused by `tracked_torrents_cap`.
+    /// Surfaced via `runtime_stats()` -> `DhtRuntimeStats::tracked_torrents_rejected`.
+    tracked_torrents_rejected: u64,
     next_tx: u16,
     outstanding: HashMap<Vec<u8>, OutstandingQuery>,
     queried_nodes: HashMap<[u8; 20], HashSet<SocketAddrV4>>,
+    /// Aggregate count for queried-node history. Lookup admission and stats
+    /// must not rescan every tracked torrent on each query.
+    queried_node_count: usize,
     torrents: HashMap<[u8; 20], mpsc::Sender<TorrentCmd>>,
     /// Last accepted engine command generation, including removed torrents.
     /// Retaining bounded tombstones prevents a delayed Add from resurrecting
     /// a torrent after a later Remove was delivered first.
     generations: HashMap<[u8; 20], u64>,
     announced_peers: HashMap<[u8; 20], Vec<SocketAddr>>,
+    /// Aggregate count for the announced-peer cache. Keeping this alongside
+    /// the map avoids rescanning every peer list for each announce_peer.
+    announced_peer_count: usize,
     last_full_lookup: HashMap<[u8; 20], Instant>,
     pending_peer_forwards: HashMap<[u8; 20], PendingPeerForward>,
+    /// Aggregate count for peer batches waiting on torrent mailboxes. This
+    /// keeps DHT retry admission O(1) instead of recounting every stalled
+    /// torrent on each response.
+    pending_peer_count: usize,
+    last_bootstrap_at: Option<Instant>,
 }
 
 struct PendingPeerForward {
@@ -410,6 +502,13 @@ struct OutstandingQuery {
 const OUTSTANDING_QUERY_TTL: Duration = Duration::from_secs(30);
 
 impl DhtTask {
+    fn bootstrap_attempt_is_due(last_attempt: Option<Instant>, now: Instant) -> bool {
+        !last_attempt.is_some_and(|last| {
+            now.checked_duration_since(last)
+                .is_some_and(|elapsed| elapsed < DHT_BOOTSTRAP_RETRY)
+        })
+    }
+
     fn accept_generation(&mut self, info_hash: [u8; 20], generation: u64) -> bool {
         if self
             .generations
@@ -419,7 +518,7 @@ impl DhtTask {
             return false;
         }
         if !self.generations.contains_key(&info_hash)
-            && self.generations.len() >= DHT_COMMAND_GENERATION_CAP
+            && self.generations.len() >= self.tracked_torrents_cap.saturating_mul(2)
         {
             let evictable = self
                 .generations
@@ -442,23 +541,56 @@ impl DhtTask {
         self.outstanding.retain(|_, query| {
             !matches!(query.request, DhtRequest::GetPeers(candidate) if candidate == info_hash)
         });
-        self.queried_nodes.remove(&info_hash);
+        if let Some(nodes) = self.queried_nodes.remove(&info_hash) {
+            self.queried_node_count = self.queried_node_count.saturating_sub(nodes.len());
+        }
         self.last_full_lookup.remove(&info_hash);
+    }
+
+    /// A removal command can be discarded when the bounded retry budget is
+    /// exhausted. The torrent task still owns the receiving half of its
+    /// mailbox until shutdown completes, so the DHT sender becomes closed
+    /// eventually even in that case. Reconcile those registrations here so a
+    /// dropped removal cannot leave lookup, announce, or pending-forward state
+    /// behind forever.
+    fn remove_torrent_state(&mut self, info_hash: [u8; 20]) {
+        self.torrents.remove(&info_hash);
+        self.clear_torrent_lookup_state(info_hash);
+        if let Some(peers) = self.announced_peers.remove(&info_hash) {
+            self.announced_peer_count = self.announced_peer_count.saturating_sub(peers.len());
+        }
+        if let Some(pending) = self.pending_peer_forwards.remove(&info_hash) {
+            self.pending_peer_count = self.pending_peer_count.saturating_sub(pending.peers.len());
+        }
+    }
+
+    fn prune_closed_torrents(&mut self) {
+        let closed = self
+            .torrents
+            .iter()
+            .filter_map(|(info_hash, cmd_tx)| cmd_tx.is_closed().then_some(*info_hash))
+            .collect::<Vec<_>>();
+        for info_hash in closed {
+            self.remove_torrent_state(info_hash);
+        }
     }
 
     async fn handle_command(&mut self, cmd: DhtCommand) -> bool {
         match cmd {
             DhtCommand::AddTorrent(torrent) => {
                 if !self.torrents.contains_key(&torrent.info_hash)
-                    && self.torrents.len() >= DHT_TRACKED_TORRENTS_CAP
+                    && self.torrents.len() >= self.tracked_torrents_cap
                 {
+                    self.tracked_torrents_rejected =
+                        self.tracked_torrents_rejected.saturating_add(1);
                     warn!(
                         component = "dht",
                         operation = "track_torrent",
                         result = "rejected",
                         reason = "tracked torrent cap exceeded",
-                        cap = DHT_TRACKED_TORRENTS_CAP,
-                        "DHT tracking admission cap exceeded"
+                        cap = self.tracked_torrents_cap,
+                        rejected_total = self.tracked_torrents_rejected,
+                        "DHT tracking admission cap exceeded; this torrent will not receive DHT-discovered peers"
                     );
                     return true;
                 }
@@ -471,7 +603,10 @@ impl DhtTask {
                     return true;
                 }
                 self.clear_torrent_lookup_state(torrent.info_hash);
-                self.pending_peer_forwards.remove(&torrent.info_hash);
+                if let Some(pending) = self.pending_peer_forwards.remove(&torrent.info_hash) {
+                    self.pending_peer_count =
+                        self.pending_peer_count.saturating_sub(pending.peers.len());
+                }
                 self.torrents.insert(torrent.info_hash, torrent.cmd_tx);
                 self.search_torrent(torrent.info_hash, true).await;
             }
@@ -482,10 +617,7 @@ impl DhtTask {
                 if !self.accept_generation(info_hash, generation) {
                     return true;
                 }
-                self.torrents.remove(&info_hash);
-                self.clear_torrent_lookup_state(info_hash);
-                self.announced_peers.remove(&info_hash);
-                self.pending_peer_forwards.remove(&info_hash);
+                self.remove_torrent_state(info_hash);
             }
             DhtCommand::GetStats { reply } => {
                 let _ = reply.send(self.runtime_stats());
@@ -505,11 +637,26 @@ impl DhtTask {
     }
 
     async fn bootstrap(&mut self) {
-        for node in self.bootstrap_nodes.clone() {
+        let node_count = self.bootstrap_nodes.len().min(MAX_DHT_BOOTSTRAP_NODES);
+        let deadline = Instant::now() + DHT_BOOTSTRAP_DEADLINE;
+        for node_index in 0..node_count {
+            let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+                warn!(
+                    component = "dht",
+                    operation = "bootstrap_resolve",
+                    result = "deadline_exceeded",
+                    deadline_secs = DHT_BOOTSTRAP_DEADLINE.as_secs(),
+                    "DHT bootstrap deadline exceeded"
+                );
+                break;
+            };
+            if remaining.is_zero() {
+                break;
+            }
+            let node = self.bootstrap_nodes[node_index].clone();
+            let resolve_timeout = remaining.min(DHT_BOOTSTRAP_NODE_TIMEOUT);
             let addrs =
-                match tokio::time::timeout(Duration::from_secs(5), tokio::net::lookup_host(&node))
-                    .await
-                {
+                match tokio::time::timeout(resolve_timeout, tokio::net::lookup_host(&node)).await {
                     Ok(Ok(addrs)) => addrs,
                     Ok(Err(e)) => {
                         warn!(
@@ -533,7 +680,24 @@ impl DhtTask {
                         continue;
                     }
                 };
+            let addrs = addrs
+                .take(MAX_DHT_BOOTSTRAP_ADDRESSES.saturating_add(1))
+                .collect::<Vec<_>>();
+            if addrs.len() > MAX_DHT_BOOTSTRAP_ADDRESSES {
+                warn!(
+                    component = "dht",
+                    operation = "bootstrap_resolve",
+                    node = %node,
+                    result = "rejected",
+                    address_cap = MAX_DHT_BOOTSTRAP_ADDRESSES,
+                    "DHT bootstrap returned too many addresses"
+                );
+                continue;
+            }
             for addr in addrs {
+                if deadline.checked_duration_since(Instant::now()).is_none() {
+                    break;
+                }
                 if !addr.is_ipv4() {
                     continue;
                 }
@@ -568,6 +732,19 @@ impl DhtTask {
                 }
             }
         }
+    }
+
+    async fn bootstrap_if_due(&mut self) {
+        let now = Instant::now();
+        if !Self::bootstrap_attempt_is_due(self.last_bootstrap_at, now) {
+            return;
+        }
+        // Record the attempt before resolving. This is deliberately a
+        // cooldown, not an in-flight flag: the DHT actor is single-threaded,
+        // so no second bootstrap can overlap this one, while repeated Add
+        // commands must not each pay the same failed DNS deadline.
+        self.last_bootstrap_at = Some(now);
+        self.bootstrap().await;
     }
 
     async fn handle_packet(&mut self, packet: &[u8], addr: SocketAddr) {
@@ -787,7 +964,12 @@ impl DhtTask {
         } else {
             socket_addr_with_port(addr, port)
         };
-        remember_announced_peer_in_map(&mut self.announced_peers, info_hash, peer);
+        remember_announced_peer_in_map(
+            &mut self.announced_peers,
+            &mut self.announced_peer_count,
+            info_hash,
+            peer,
+        );
         KrpcMessage::Response {
             transaction_id,
             response: DhtResponse::new(self.local_id),
@@ -843,7 +1025,7 @@ impl DhtTask {
             .map(|node| SocketAddr::V4(node.addr))
             .collect();
         if nodes.is_empty() {
-            self.bootstrap().await;
+            self.bootstrap_if_due().await;
             return query_budget;
         }
         for addr in nodes {
@@ -867,7 +1049,9 @@ impl DhtTask {
                 .map(|last| now.duration_since(*last) >= DHT_LOOKUP_RESTART_AFTER)
                 .unwrap_or(true);
         if should_restart {
-            self.queried_nodes.remove(&info_hash);
+            if let Some(nodes) = self.queried_nodes.remove(&info_hash) {
+                self.queried_node_count = self.queried_node_count.saturating_sub(nodes.len());
+            }
             self.last_full_lookup.insert(info_hash, now);
         }
     }
@@ -909,11 +1093,7 @@ impl DhtTask {
     }
 
     fn remaining_queried_node_budget(&self) -> usize {
-        let used = self
-            .queried_nodes
-            .values()
-            .fold(0usize, |total, nodes| total.saturating_add(nodes.len()));
-        DHT_QUERIED_NODES_GLOBAL_CAP.saturating_sub(used)
+        DHT_QUERIED_NODES_GLOBAL_CAP.saturating_sub(self.queried_node_count)
     }
 
     async fn send_get_peers(
@@ -941,6 +1121,7 @@ impl DhtTask {
         if !self.queried_nodes.entry(info_hash).or_default().insert(v4) {
             return false;
         }
+        self.queried_node_count = self.queried_node_count.saturating_add(1);
         let tx = self.transaction_id();
         let msg = KrpcMessage::Query {
             transaction_id: tx.clone(),
@@ -957,27 +1138,25 @@ impl DhtTask {
                 sent_at: Instant::now(),
             },
         ) {
-            let empty = if let Some(queried) = self.queried_nodes.get_mut(&info_hash) {
-                queried.remove(&v4);
-                queried.is_empty()
-            } else {
-                false
-            };
-            if empty {
-                self.queried_nodes.remove(&info_hash);
+            if let Some(queried) = self.queried_nodes.get_mut(&info_hash) {
+                if queried.remove(&v4) {
+                    self.queried_node_count = self.queried_node_count.saturating_sub(1);
+                }
+                if queried.is_empty() {
+                    self.queried_nodes.remove(&info_hash);
+                }
             }
             return false;
         }
         if let Err(e) = self.socket.send_to(&msg.encode(), addr).await {
             self.outstanding.remove(&tx);
-            let empty = if let Some(queried) = self.queried_nodes.get_mut(&info_hash) {
-                queried.remove(&v4);
-                queried.is_empty()
-            } else {
-                false
-            };
-            if empty {
-                self.queried_nodes.remove(&info_hash);
+            if let Some(queried) = self.queried_nodes.get_mut(&info_hash) {
+                if queried.remove(&v4) {
+                    self.queried_node_count = self.queried_node_count.saturating_sub(1);
+                }
+                if queried.is_empty() {
+                    self.queried_nodes.remove(&info_hash);
+                }
             }
             warn!(
                 component = "dht",
@@ -1062,7 +1241,7 @@ impl DhtTask {
         match tx.try_send(TorrentCmd::NewPeers(peers)) {
             Ok(()) => {}
             Err(mpsc::error::TrySendError::Closed(_)) => {
-                self.torrents.remove(&info_hash);
+                self.remove_torrent_state(info_hash);
             }
             Err(mpsc::error::TrySendError::Full(TorrentCmd::NewPeers(peers))) => {
                 self.queue_pending_peer_forward(info_hash, tx, peers);
@@ -1079,14 +1258,8 @@ impl DhtTask {
         cmd_tx: mpsc::Sender<TorrentCmd>,
         peers: Vec<SocketAddr>,
     ) {
-        let mut pending_peer_count = self
-            .pending_peer_forwards
-            .values()
-            .fold(0usize, |total, pending| {
-                total.saturating_add(pending.peers.len())
-            });
         if !self.pending_peer_forwards.contains_key(&info_hash)
-            && pending_peer_count >= DHT_PENDING_FORWARD_PEERS_GLOBAL_CAP
+            && self.pending_peer_count >= DHT_PENDING_FORWARD_PEERS_GLOBAL_CAP
         {
             debug!(
                 component = "dht",
@@ -1131,7 +1304,7 @@ impl DhtTask {
                 );
                 break;
             }
-            if pending_peer_count >= DHT_PENDING_FORWARD_PEERS_GLOBAL_CAP {
+            if self.pending_peer_count >= DHT_PENDING_FORWARD_PEERS_GLOBAL_CAP {
                 debug!(
                     component = "dht",
                     operation = "forward_peers",
@@ -1142,7 +1315,7 @@ impl DhtTask {
                 break;
             }
             pending.peers.push(peer);
-            pending_peer_count = pending_peer_count.saturating_add(1);
+            self.pending_peer_count = self.pending_peer_count.saturating_add(1);
         }
     }
 
@@ -1161,9 +1334,11 @@ impl DhtTask {
         let Some(pending) = self.pending_peer_forwards.remove(&info_hash) else {
             return;
         };
+        self.pending_peer_count = self.pending_peer_count.saturating_sub(pending.peers.len());
         match pending.cmd_tx.try_send(TorrentCmd::NewPeers(pending.peers)) {
             Ok(()) => {}
             Err(mpsc::error::TrySendError::Full(TorrentCmd::NewPeers(peers))) => {
+                self.pending_peer_count = self.pending_peer_count.saturating_add(peers.len());
                 self.pending_peer_forwards.insert(
                     info_hash,
                     PendingPeerForward {
@@ -1173,7 +1348,7 @@ impl DhtTask {
                 );
             }
             Err(mpsc::error::TrySendError::Closed(_)) => {
-                self.torrents.remove(&info_hash);
+                self.remove_torrent_state(info_hash);
             }
             Err(mpsc::error::TrySendError::Full(_)) => {
                 unreachable!("flush_pending_peer_forward only sends TorrentCmd::NewPeers")
@@ -1201,18 +1376,12 @@ impl DhtTask {
         DhtRuntimeStats {
             routing_nodes: self.table.total_nodes() as u64,
             announced_peer_sets: self.announced_peers.len() as u64,
-            announced_peers: self
-                .announced_peers
-                .values()
-                .map(|peers| peers.len() as u64)
-                .sum(),
+            announced_peers: self.announced_peer_count as u64,
             tracked_torrents: self.torrents.len() as u64,
+            tracked_torrents_cap: self.tracked_torrents_cap as u64,
+            tracked_torrents_rejected: self.tracked_torrents_rejected,
             outstanding_requests: self.outstanding.len() as u64,
-            queried_nodes: self
-                .queried_nodes
-                .values()
-                .map(|nodes| nodes.len() as u64)
-                .sum(),
+            queried_nodes: self.queried_node_count as u64,
         }
     }
 
@@ -1336,10 +1505,10 @@ fn remember_announced_peer(peers: &mut Vec<SocketAddr>, peer: SocketAddr, cap: u
 
 fn remember_announced_peer_in_map(
     peers_by_info_hash: &mut HashMap<[u8; 20], Vec<SocketAddr>>,
+    total: &mut usize,
     info_hash: [u8; 20],
     peer: SocketAddr,
 ) -> bool {
-    let total = peers_by_info_hash.values().map(Vec::len).sum::<usize>();
     if let Some(peers) = peers_by_info_hash.get_mut(&info_hash) {
         // A duplicate is already represented and must remain an accepted
         // idempotent announce even when the global cache is full. New peers
@@ -1349,18 +1518,23 @@ fn remember_announced_peer_in_map(
         if peers.contains(&peer) {
             return true;
         }
-        if total >= DHT_ANNOUNCED_PEERS_GLOBAL_CAP {
+        if *total >= DHT_ANNOUNCED_PEERS_GLOBAL_CAP {
             return false;
         }
-        return remember_announced_peer(peers, peer, DHT_ANNOUNCED_PEERS_PER_INFO_HASH_CAP);
+        let inserted = remember_announced_peer(peers, peer, DHT_ANNOUNCED_PEERS_PER_INFO_HASH_CAP);
+        if inserted {
+            *total = total.saturating_add(1);
+        }
+        return inserted;
     }
     if peers_by_info_hash.len() >= DHT_ANNOUNCED_PEER_SET_CAP {
         return false;
     }
-    if total >= DHT_ANNOUNCED_PEERS_GLOBAL_CAP {
+    if *total >= DHT_ANNOUNCED_PEERS_GLOBAL_CAP {
         return false;
     }
     peers_by_info_hash.insert(info_hash, vec![peer]);
+    *total = total.saturating_add(1);
     true
 }
 
@@ -1374,6 +1548,57 @@ fn socket_addr_with_port(addr: SocketAddr, port: u16) -> SocketAddr {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn run_dht_notifies_engine_after_binding() {
+        let (dht_tx, mut dht_rx) = mpsc::channel(4);
+        let (engine_tx, mut engine_rx) = mpsc::channel(4);
+        let task = tokio::spawn(async move {
+            run_dht(
+                0,
+                6881,
+                Vec::new(),
+                16_384,
+                &mut dht_rx,
+                VecDeque::new(),
+                &engine_tx,
+            )
+            .await
+        });
+
+        assert!(matches!(
+            timeout(Duration::from_secs(1), engine_rx.recv())
+                .await
+                .expect("DHT readiness notification timed out"),
+            Some(EngineCmd::DhtTaskReady)
+        ));
+
+        let (reply, reply_rx) = oneshot::channel();
+        dht_tx
+            .send(DhtCommand::Shutdown { reply })
+            .await
+            .expect("DHT command channel should be open");
+        timeout(Duration::from_secs(1), reply_rx)
+            .await
+            .expect("DHT shutdown acknowledgement timed out")
+            .expect("DHT shutdown acknowledgement sender dropped");
+        assert!(task.await.expect("DHT task panicked").is_ok());
+    }
+
+    #[test]
+    fn bootstrap_attempts_are_rate_limited() {
+        let first = Instant::now();
+        assert!(DhtTask::bootstrap_attempt_is_due(None, first));
+        assert!(!DhtTask::bootstrap_attempt_is_due(Some(first), first));
+        assert!(!DhtTask::bootstrap_attempt_is_due(
+            Some(first),
+            first + DHT_BOOTSTRAP_RETRY - Duration::from_nanos(1),
+        ));
+        assert!(DhtTask::bootstrap_attempt_is_due(
+            Some(first),
+            first + DHT_BOOTSTRAP_RETRY,
+        ));
+    }
 
     #[test]
     fn dht_ingress_budget_bounds_each_ip_and_expires_windows() {
@@ -1460,13 +1685,19 @@ mod tests {
             socket,
             listen_port: 6881,
             bootstrap_nodes: Vec::new(),
+            tracked_torrents_cap: 16_384,
+            tracked_torrents_rejected: 0,
             next_tx: u16::MAX,
             outstanding: HashMap::new(),
             queried_nodes: HashMap::new(),
+            queried_node_count: 0,
             torrents: HashMap::new(),
             announced_peers: HashMap::new(),
+            announced_peer_count: 0,
             last_full_lookup: HashMap::new(),
             pending_peer_forwards: HashMap::new(),
+            pending_peer_count: 0,
+            last_bootstrap_at: None,
             generations: HashMap::new(),
         };
 
@@ -1486,13 +1717,19 @@ mod tests {
             socket,
             listen_port: 6881,
             bootstrap_nodes: Vec::new(),
+            tracked_torrents_cap: 16_384,
+            tracked_torrents_rejected: 0,
             next_tx: 1,
             outstanding: HashMap::new(),
             queried_nodes: HashMap::new(),
+            queried_node_count: 0,
             torrents: HashMap::new(),
             announced_peers: HashMap::new(),
+            announced_peer_count: 0,
             last_full_lookup: HashMap::new(),
             pending_peer_forwards: HashMap::new(),
+            pending_peer_count: 0,
+            last_bootstrap_at: None,
             generations: HashMap::new(),
         };
         task.table.insert(KNode {
@@ -1518,13 +1755,19 @@ mod tests {
             socket,
             listen_port: 6881,
             bootstrap_nodes: Vec::new(),
+            tracked_torrents_cap: 16_384,
+            tracked_torrents_rejected: 0,
             next_tx: 1,
             outstanding: HashMap::new(),
             queried_nodes: HashMap::new(),
+            queried_node_count: 0,
             torrents: HashMap::new(),
             announced_peers: HashMap::new(),
+            announced_peer_count: 0,
             last_full_lookup: HashMap::new(),
             pending_peer_forwards: HashMap::new(),
+            pending_peer_count: 0,
+            last_bootstrap_at: None,
             generations: HashMap::new(),
         };
         let addr: SocketAddr = "127.0.0.1:60000".parse().unwrap();
@@ -1546,13 +1789,19 @@ mod tests {
             socket,
             listen_port: 6881,
             bootstrap_nodes: Vec::new(),
+            tracked_torrents_cap: 16_384,
+            tracked_torrents_rejected: 0,
             next_tx: 1,
             outstanding: HashMap::new(),
             queried_nodes: HashMap::new(),
+            queried_node_count: 0,
             torrents: HashMap::new(),
             announced_peers: HashMap::new(),
+            announced_peer_count: 0,
             last_full_lookup: HashMap::new(),
             pending_peer_forwards: HashMap::new(),
+            pending_peer_count: 0,
+            last_bootstrap_at: None,
             generations: HashMap::new(),
         };
         let addr: SocketAddr = "192.0.2.1:60000".parse().unwrap();
@@ -1591,13 +1840,19 @@ mod tests {
             socket,
             listen_port: 6881,
             bootstrap_nodes: Vec::new(),
+            tracked_torrents_cap: 16_384,
+            tracked_torrents_rejected: 0,
             next_tx: 1,
             outstanding: HashMap::new(),
             queried_nodes: HashMap::new(),
+            queried_node_count: 0,
             torrents: HashMap::new(),
             announced_peers: HashMap::new(),
+            announced_peer_count: 0,
             last_full_lookup: HashMap::new(),
             pending_peer_forwards: HashMap::new(),
+            pending_peer_count: 0,
+            last_bootstrap_at: None,
             generations: HashMap::new(),
         };
         let info_hash = [9; 20];
@@ -1625,13 +1880,19 @@ mod tests {
             socket,
             listen_port: 6881,
             bootstrap_nodes: Vec::new(),
+            tracked_torrents_cap: 16_384,
+            tracked_torrents_rejected: 0,
             next_tx: 1,
             outstanding: HashMap::new(),
             queried_nodes: HashMap::new(),
+            queried_node_count: 0,
             torrents: HashMap::new(),
             announced_peers: HashMap::new(),
+            announced_peer_count: 0,
             last_full_lookup: HashMap::new(),
             pending_peer_forwards: HashMap::new(),
+            pending_peer_count: 0,
+            last_bootstrap_at: None,
             generations: HashMap::new(),
         };
         let info_hash = [9; 20];
@@ -1665,11 +1926,13 @@ mod tests {
     #[test]
     fn announced_peer_map_is_bounded_across_info_hashes() {
         let mut peers = HashMap::new();
+        let mut total = 0;
         for index in 0..DHT_ANNOUNCED_PEER_SET_CAP {
             let mut info_hash = [0_u8; 20];
             info_hash[..8].copy_from_slice(&(index as u64).to_be_bytes());
             assert!(remember_announced_peer_in_map(
                 &mut peers,
+                &mut total,
                 info_hash,
                 "198.51.100.1:6881".parse().unwrap(),
             ));
@@ -1678,21 +1941,25 @@ mod tests {
         next_hash[..8].copy_from_slice(&(DHT_ANNOUNCED_PEER_SET_CAP as u64).to_be_bytes());
         assert!(!remember_announced_peer_in_map(
             &mut peers,
+            &mut total,
             next_hash,
             "198.51.100.2:6881".parse().unwrap(),
         ));
         assert_eq!(peers.len(), DHT_ANNOUNCED_PEER_SET_CAP);
+        assert_eq!(total, DHT_ANNOUNCED_PEER_SET_CAP);
     }
 
     #[test]
     fn announced_peer_global_cap_applies_to_existing_info_hashes() {
         let mut peers = HashMap::new();
+        let mut total = 0;
         for index in 0..(DHT_ANNOUNCED_PEERS_GLOBAL_CAP / DHT_ANNOUNCED_PEERS_PER_INFO_HASH_CAP) {
             let mut info_hash = [0_u8; 20];
             info_hash[..8].copy_from_slice(&(index as u64).to_be_bytes());
             for port in 0..DHT_ANNOUNCED_PEERS_PER_INFO_HASH_CAP {
                 assert!(remember_announced_peer_in_map(
                     &mut peers,
+                    &mut total,
                     info_hash,
                     SocketAddr::from(([198, 51, 100, 1], port as u16 + 1)),
                 ));
@@ -1704,11 +1971,13 @@ mod tests {
         let duplicate = SocketAddr::from(([198, 51, 100, 1], 1));
         assert!(remember_announced_peer_in_map(
             &mut peers,
+            &mut total,
             existing_hash,
             duplicate,
         ));
         assert!(!remember_announced_peer_in_map(
             &mut peers,
+            &mut total,
             existing_hash,
             SocketAddr::from(([198, 51, 100, 2], 1)),
         ));
@@ -1716,6 +1985,7 @@ mod tests {
             peers.values().map(Vec::len).sum::<usize>(),
             DHT_ANNOUNCED_PEERS_GLOBAL_CAP
         );
+        assert_eq!(total, DHT_ANNOUNCED_PEERS_GLOBAL_CAP);
     }
 
     #[tokio::test]
@@ -1741,11 +2011,15 @@ mod tests {
             socket,
             listen_port: 6881,
             bootstrap_nodes: Vec::new(),
+            tracked_torrents_cap: 16_384,
+            tracked_torrents_rejected: 0,
             next_tx: 1,
             outstanding: HashMap::new(),
             queried_nodes: HashMap::new(),
+            queried_node_count: 0,
             torrents: HashMap::new(),
             announced_peers: HashMap::new(),
+            announced_peer_count: 0,
             last_full_lookup: HashMap::new(),
             pending_peer_forwards: HashMap::from([
                 (
@@ -1763,6 +2037,8 @@ mod tests {
                     },
                 ),
             ]),
+            pending_peer_count: DHT_PENDING_FORWARD_PEERS_GLOBAL_CAP,
+            last_bootstrap_at: None,
             generations: HashMap::new(),
         };
 
@@ -1771,6 +2047,10 @@ mod tests {
                 .values()
                 .map(|pending| pending.peers.len())
                 .sum::<usize>(),
+            DHT_PENDING_FORWARD_PEERS_GLOBAL_CAP
+        );
+        assert_eq!(
+            task.pending_peer_count,
             DHT_PENDING_FORWARD_PEERS_GLOBAL_CAP
         );
 
@@ -1809,6 +2089,8 @@ mod tests {
             socket,
             listen_port: 6881,
             bootstrap_nodes: Vec::new(),
+            tracked_torrents_cap: 16_384,
+            tracked_torrents_rejected: 0,
             next_tx: 1,
             outstanding: HashMap::from([(
                 b"aa".to_vec(),
@@ -1819,10 +2101,14 @@ mod tests {
                 },
             )]),
             queried_nodes: HashMap::from([(info_hash, HashSet::from([queried]))]),
+            queried_node_count: 1,
             torrents: HashMap::from([(info_hash, cmd_tx)]),
             announced_peers: HashMap::from([(info_hash, vec![announced])]),
+            announced_peer_count: 1,
             last_full_lookup: HashMap::new(),
             pending_peer_forwards: HashMap::new(),
+            pending_peer_count: 0,
+            last_bootstrap_at: None,
             generations: HashMap::new(),
         };
         task.table.insert(KNode {
@@ -1852,13 +2138,19 @@ mod tests {
             socket,
             listen_port: 51413,
             bootstrap_nodes: Vec::new(),
+            tracked_torrents_cap: 16_384,
+            tracked_torrents_rejected: 0,
             next_tx: 7,
             outstanding: HashMap::new(),
             queried_nodes: HashMap::new(),
+            queried_node_count: 0,
             torrents: HashMap::new(),
             announced_peers: HashMap::new(),
+            announced_peer_count: 0,
             last_full_lookup: HashMap::new(),
             pending_peer_forwards: HashMap::new(),
+            pending_peer_count: 0,
+            last_bootstrap_at: None,
             generations: HashMap::new(),
         };
         let token = b"token".to_vec();
@@ -1902,13 +2194,19 @@ mod tests {
             socket,
             listen_port: 6881,
             bootstrap_nodes: Vec::new(),
+            tracked_torrents_cap: 16_384,
+            tracked_torrents_rejected: 0,
             next_tx: 1,
             outstanding: HashMap::new(),
             queried_nodes: HashMap::new(),
+            queried_node_count: 0,
             torrents: HashMap::from([(info_hash, cmd_tx)]),
             announced_peers: HashMap::new(),
+            announced_peer_count: 0,
             last_full_lookup: HashMap::new(),
             pending_peer_forwards: HashMap::new(),
+            pending_peer_count: 0,
+            last_bootstrap_at: None,
             generations: HashMap::new(),
         };
         let first = std::net::SocketAddrV4::new("127.0.0.1".parse().unwrap(), 6001);
@@ -1948,6 +2246,8 @@ mod tests {
             socket,
             listen_port: 6881,
             bootstrap_nodes: Vec::new(),
+            tracked_torrents_cap: 16_384,
+            tracked_torrents_rejected: 0,
             next_tx: 1,
             outstanding: HashMap::from([(
                 b"gp".to_vec(),
@@ -1958,10 +2258,14 @@ mod tests {
                 },
             )]),
             queried_nodes: HashMap::from([(info_hash, HashSet::from([first]))]),
+            queried_node_count: 1,
             torrents: HashMap::from([(info_hash, cmd_tx)]),
             announced_peers: HashMap::new(),
+            announced_peer_count: 0,
             last_full_lookup: HashMap::new(),
             pending_peer_forwards: HashMap::new(),
+            pending_peer_count: 0,
+            last_bootstrap_at: None,
             generations: HashMap::new(),
         };
         task.table.insert(KNode {
@@ -2006,13 +2310,19 @@ mod tests {
             socket,
             listen_port: 6881,
             bootstrap_nodes: Vec::new(),
+            tracked_torrents_cap: 16_384,
+            tracked_torrents_rejected: 0,
             next_tx: 1,
             outstanding: HashMap::new(),
             queried_nodes: HashMap::from([(info_hash, HashSet::from([first]))]),
+            queried_node_count: 1,
             torrents: HashMap::from([(info_hash, cmd_tx)]),
             announced_peers: HashMap::new(),
+            announced_peer_count: 0,
             last_full_lookup: HashMap::new(),
             pending_peer_forwards: HashMap::new(),
+            pending_peer_count: 0,
+            last_bootstrap_at: None,
             generations: HashMap::new(),
         };
         task.table.insert(KNode {
@@ -2028,14 +2338,20 @@ mod tests {
 
     #[tokio::test]
     async fn cap_rejected_add_can_retry_after_capacity_is_freed() {
+        // A small cap here (rather than looping the production default
+        // 131,072 times) both keeps this test fast and, combined with
+        // `admission_cap_is_read_from_config_not_hardcoded` below, confirms
+        // the admission check reads `tracked_torrents_cap` as a field value
+        // rather than a hardcoded constant.
+        const TEST_CAP: usize = 4;
         let socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
         socket.set_nonblocking(true).unwrap();
         let socket = UdpSocket::from_std(socket).unwrap();
         let local_id = NodeId::from_bytes([1; 20]);
         let target = [255; 20];
         let (cmd_tx, _cmd_rx) = mpsc::channel(1);
-        let mut tracked = HashMap::with_capacity(DHT_TRACKED_TORRENTS_CAP);
-        for index in 0..DHT_TRACKED_TORRENTS_CAP {
+        let mut tracked = HashMap::with_capacity(TEST_CAP);
+        for index in 0..TEST_CAP {
             let mut info_hash = [0; 20];
             info_hash[..8].copy_from_slice(&(index as u64).to_be_bytes());
             tracked.insert(info_hash, cmd_tx.clone());
@@ -2046,13 +2362,19 @@ mod tests {
             socket,
             listen_port: 6881,
             bootstrap_nodes: Vec::new(),
+            tracked_torrents_cap: TEST_CAP,
+            tracked_torrents_rejected: 0,
             next_tx: 1,
             outstanding: HashMap::new(),
             queried_nodes: HashMap::new(),
+            queried_node_count: 0,
             torrents: tracked,
             announced_peers: HashMap::new(),
+            announced_peer_count: 0,
             last_full_lookup: HashMap::new(),
             pending_peer_forwards: HashMap::new(),
+            pending_peer_count: 0,
+            last_bootstrap_at: None,
             generations: HashMap::new(),
         };
 
@@ -2064,6 +2386,9 @@ mod tests {
         .await;
         assert!(!task.torrents.contains_key(&target));
         assert!(!task.generations.contains_key(&target));
+        // The rejection is observable via runtime stats, not just a log line.
+        assert_eq!(task.runtime_stats().tracked_torrents_rejected, 1);
+        assert_eq!(task.runtime_stats().tracked_torrents_cap, TEST_CAP as u64);
 
         task.torrents.remove(&[0; 20]);
         task.handle_command(DhtCommand::AddTorrent(DhtTorrent {
@@ -2074,6 +2399,67 @@ mod tests {
         .await;
 
         assert!(task.torrents.contains_key(&target));
+        // No further rejection once capacity was freed.
+        assert_eq!(task.runtime_stats().tracked_torrents_rejected, 1);
+    }
+
+    /// The admission cap must come from `DhtTask::tracked_torrents_cap` (in
+    /// turn sourced from `rt_config::DhtConfig::tracked_torrents_cap`), not
+    /// from a hardcoded constant. Two tasks that differ only in that field
+    /// must admit a different number of torrents.
+    #[tokio::test]
+    async fn admission_cap_is_read_from_config_not_hardcoded() {
+        async fn build_task(cap: usize) -> DhtTask {
+            let socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+            socket.set_nonblocking(true).unwrap();
+            let socket = UdpSocket::from_std(socket).unwrap();
+            let local_id = NodeId::from_bytes([1; 20]);
+            DhtTask {
+                local_id,
+                table: RoutingTable::new(local_id),
+                socket,
+                listen_port: 6881,
+                bootstrap_nodes: Vec::new(),
+                tracked_torrents_cap: cap,
+                tracked_torrents_rejected: 0,
+                next_tx: 1,
+                outstanding: HashMap::new(),
+                queried_nodes: HashMap::new(),
+                queried_node_count: 0,
+                torrents: HashMap::new(),
+                announced_peers: HashMap::new(),
+                announced_peer_count: 0,
+                last_full_lookup: HashMap::new(),
+                pending_peer_forwards: HashMap::new(),
+                pending_peer_count: 0,
+                last_bootstrap_at: None,
+                generations: HashMap::new(),
+            }
+        }
+
+        async fn admit(task: &mut DhtTask, count: usize) {
+            let (cmd_tx, _cmd_rx) = mpsc::channel(1);
+            for index in 0..count {
+                let mut info_hash = [0; 20];
+                info_hash[..8].copy_from_slice(&(index as u64).to_be_bytes());
+                task.handle_command(DhtCommand::AddTorrent(DhtTorrent {
+                    info_hash,
+                    cmd_tx: cmd_tx.clone(),
+                    generation: (index as u64) + 1,
+                }))
+                .await;
+            }
+        }
+
+        let mut small_cap = build_task(2).await;
+        admit(&mut small_cap, 5).await;
+        assert_eq!(small_cap.torrents.len(), 2);
+        assert_eq!(small_cap.runtime_stats().tracked_torrents_rejected, 3);
+
+        let mut larger_cap = build_task(5).await;
+        admit(&mut larger_cap, 5).await;
+        assert_eq!(larger_cap.torrents.len(), 5);
+        assert_eq!(larger_cap.runtime_stats().tracked_torrents_rejected, 0);
     }
 
     #[tokio::test]
@@ -2092,6 +2478,8 @@ mod tests {
             socket,
             listen_port: 6881,
             bootstrap_nodes: Vec::new(),
+            tracked_torrents_cap: 16_384,
+            tracked_torrents_rejected: 0,
             next_tx: 1,
             outstanding: HashMap::from([(
                 b"gp".to_vec(),
@@ -2102,10 +2490,14 @@ mod tests {
                 },
             )]),
             queried_nodes: HashMap::new(),
+            queried_node_count: 0,
             torrents: HashMap::from([(info_hash, cmd_tx)]),
             announced_peers: HashMap::new(),
+            announced_peer_count: 0,
             last_full_lookup: HashMap::new(),
             pending_peer_forwards: HashMap::new(),
+            pending_peer_count: 0,
+            last_bootstrap_at: None,
             generations: HashMap::new(),
         };
         let response = KrpcMessage::Response {
@@ -2150,6 +2542,8 @@ mod tests {
             socket,
             listen_port: 6881,
             bootstrap_nodes: Vec::new(),
+            tracked_torrents_cap: 16_384,
+            tracked_torrents_rejected: 0,
             next_tx: 1,
             outstanding: HashMap::from([(
                 b"gp".to_vec(),
@@ -2160,11 +2554,15 @@ mod tests {
                 },
             )]),
             queried_nodes: HashMap::new(),
+            queried_node_count: 0,
             torrents: HashMap::from([(info_hash, cmd_tx)]),
             announced_peers: HashMap::new(),
+            announced_peer_count: 0,
             last_full_lookup: HashMap::new(),
             generations: HashMap::new(),
             pending_peer_forwards: HashMap::new(),
+            pending_peer_count: 0,
+            last_bootstrap_at: None,
         };
         let response = KrpcMessage::Response {
             transaction_id: b"gp".to_vec(),
@@ -2211,6 +2609,8 @@ mod tests {
             socket,
             listen_port: 6881,
             bootstrap_nodes: Vec::new(),
+            tracked_torrents_cap: 16_384,
+            tracked_torrents_rejected: 0,
             next_tx: 1,
             outstanding: HashMap::from([(
                 b"gp".to_vec(),
@@ -2221,10 +2621,14 @@ mod tests {
                 },
             )]),
             queried_nodes: HashMap::new(),
+            queried_node_count: 0,
             torrents: HashMap::from([(info_hash, cmd_tx)]),
             announced_peers: HashMap::new(),
+            announced_peer_count: 0,
             last_full_lookup: HashMap::new(),
             pending_peer_forwards: HashMap::new(),
+            pending_peer_count: 0,
+            last_bootstrap_at: None,
             generations: HashMap::new(),
         };
         let response = KrpcMessage::Response {
@@ -2268,13 +2672,19 @@ mod tests {
             socket,
             listen_port: 6881,
             bootstrap_nodes: Vec::new(),
+            tracked_torrents_cap: 16_384,
+            tracked_torrents_rejected: 0,
             next_tx: 1,
             outstanding: HashMap::new(),
             queried_nodes: HashMap::new(),
+            queried_node_count: 0,
             torrents: HashMap::new(),
             announced_peers: HashMap::new(),
+            announced_peer_count: 0,
             last_full_lookup: HashMap::new(),
             pending_peer_forwards: HashMap::new(),
+            pending_peer_count: 0,
+            last_bootstrap_at: None,
             generations: HashMap::new(),
         };
         let response = KrpcMessage::Response {
@@ -2311,13 +2721,19 @@ mod tests {
             socket,
             listen_port: 6881,
             bootstrap_nodes: Vec::new(),
+            tracked_torrents_cap: 16_384,
+            tracked_torrents_rejected: 0,
             next_tx: 1,
             outstanding: HashMap::new(),
             queried_nodes: HashMap::new(),
+            queried_node_count: 0,
             torrents: HashMap::new(),
             announced_peers: HashMap::new(),
+            announced_peer_count: 0,
             last_full_lookup: HashMap::new(),
             pending_peer_forwards: HashMap::new(),
+            pending_peer_count: 0,
+            last_bootstrap_at: None,
             generations: HashMap::new(),
         };
 
@@ -2377,6 +2793,8 @@ mod tests {
             socket,
             listen_port: 6881,
             bootstrap_nodes: Vec::new(),
+            tracked_torrents_cap: 16_384,
+            tracked_torrents_rejected: 0,
             next_tx: 1,
             outstanding: HashMap::from([(
                 b"old".to_vec(),
@@ -2387,10 +2805,14 @@ mod tests {
                 },
             )]),
             queried_nodes: HashMap::from([(info_hash, HashSet::from([queried_addr_v4]))]),
+            queried_node_count: 1,
             torrents: HashMap::from([(info_hash, cmd_tx.clone())]),
             announced_peers: HashMap::new(),
+            announced_peer_count: 0,
             last_full_lookup: HashMap::from([(info_hash, Instant::now())]),
             pending_peer_forwards: HashMap::new(),
+            pending_peer_count: 0,
+            last_bootstrap_at: None,
             generations: HashMap::new(),
         };
 
@@ -2421,6 +2843,65 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn closed_torrent_registration_prunes_all_owned_state() {
+        let socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        socket.set_nonblocking(true).unwrap();
+        let socket = UdpSocket::from_std(socket).unwrap();
+        let local_id = NodeId::from_bytes([1; 20]);
+        let info_hash = [9; 20];
+        let queried_addr: SocketAddrV4 = "127.0.0.1:6001".parse().unwrap();
+        let (cmd_tx, cmd_rx) = mpsc::channel(1);
+        drop(cmd_rx);
+        let mut task = DhtTask {
+            local_id,
+            table: RoutingTable::new(local_id),
+            socket,
+            listen_port: 6881,
+            bootstrap_nodes: Vec::new(),
+            tracked_torrents_cap: 16_384,
+            tracked_torrents_rejected: 0,
+            next_tx: 1,
+            outstanding: HashMap::from([(
+                b"lookup".to_vec(),
+                OutstandingQuery {
+                    addr: SocketAddr::V4(queried_addr),
+                    request: DhtRequest::GetPeers(info_hash),
+                    sent_at: Instant::now(),
+                },
+            )]),
+            queried_nodes: HashMap::from([(info_hash, HashSet::from([queried_addr]))]),
+            queried_node_count: 1,
+            torrents: HashMap::from([(info_hash, cmd_tx.clone())]),
+            announced_peers: HashMap::from([(info_hash, vec!["127.0.0.1:51413".parse().unwrap()])]),
+            announced_peer_count: 1,
+            last_full_lookup: HashMap::from([(info_hash, Instant::now())]),
+            pending_peer_forwards: HashMap::from([(
+                info_hash,
+                PendingPeerForward {
+                    cmd_tx,
+                    peers: vec!["127.0.0.1:51414".parse().unwrap()],
+                },
+            )]),
+            pending_peer_count: 1,
+            last_bootstrap_at: None,
+            generations: HashMap::from([(info_hash, 10)]),
+        };
+
+        task.prune_closed_torrents();
+
+        assert!(!task.torrents.contains_key(&info_hash));
+        assert!(task.announced_peers.is_empty());
+        assert_eq!(task.announced_peer_count, 0);
+        assert!(task.pending_peer_forwards.is_empty());
+        assert_eq!(task.pending_peer_count, 0);
+        assert!(task.outstanding.is_empty());
+        assert!(task.queried_nodes.is_empty());
+        assert_eq!(task.queried_node_count, 0);
+        assert!(task.last_full_lookup.is_empty());
+        assert_eq!(task.generations.get(&info_hash), Some(&10));
+    }
+
+    #[tokio::test]
     async fn prune_stale_outstanding_removes_expired_entries_only() {
         let socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
         socket.set_nonblocking(true).unwrap();
@@ -2433,6 +2914,8 @@ mod tests {
             socket,
             listen_port: 6881,
             bootstrap_nodes: Vec::new(),
+            tracked_torrents_cap: 16_384,
+            tracked_torrents_rejected: 0,
             next_tx: 1,
             outstanding: HashMap::from([
                 (
@@ -2453,10 +2936,14 @@ mod tests {
                 ),
             ]),
             queried_nodes: HashMap::new(),
+            queried_node_count: 0,
             torrents: HashMap::new(),
             announced_peers: HashMap::new(),
+            announced_peer_count: 0,
             last_full_lookup: HashMap::new(),
             pending_peer_forwards: HashMap::new(),
+            pending_peer_count: 0,
+            last_bootstrap_at: None,
             generations: HashMap::new(),
         };
 
@@ -2480,13 +2967,19 @@ mod tests {
             socket,
             listen_port: 6881,
             bootstrap_nodes: Vec::new(),
+            tracked_torrents_cap: 16_384,
+            tracked_torrents_rejected: 0,
             next_tx: 1,
             outstanding: HashMap::new(),
             queried_nodes: HashMap::new(),
+            queried_node_count: 0,
             torrents: HashMap::from([(info_hash, cmd_tx)]),
             announced_peers: HashMap::new(),
+            announced_peer_count: 0,
             last_full_lookup: HashMap::new(),
             pending_peer_forwards: HashMap::new(),
+            pending_peer_count: 0,
+            last_bootstrap_at: None,
             generations: HashMap::new(),
         };
 
@@ -2515,6 +3008,7 @@ mod tests {
             .addr;
         task.queried_nodes
             .insert(info_hash, initial.iter().copied().collect());
+        task.queried_node_count = initial.len();
         for (index, addr) in initial.iter().copied().enumerate() {
             task.outstanding.insert(
                 format!("stale-{index}").into_bytes(),

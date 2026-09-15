@@ -3,6 +3,7 @@ use std::{
     net::SocketAddr,
     path::PathBuf,
     sync::atomic::{AtomicUsize, Ordering},
+    time::Instant,
 };
 
 use tokio::sync::{mpsc, oneshot};
@@ -17,12 +18,19 @@ use crate::TorrentActivityTier;
 
 pub type CmdResult<T> = Result<T, String>;
 
-// Raw/parsed metainfo can be retained across a blocking parse, blob staging,
-// and the bounded engine command mailbox. Keep that whole preparation chain
-// bounded so many large add requests cannot accumulate several copies of one
-// torrent while the actor is busy with unrelated work.
+// Add requests can retain raw/parsed metainfo or a large magnet tracker list
+// across the bounded engine command mailbox and asynchronous preparation. Keep
+// that whole admission chain bounded so many large requests cannot accumulate
+// several copies of one torrent while the actor is busy with unrelated work.
 const MAX_ENGINE_ADD_TASKS: usize = 8;
 static ENGINE_ADD_TASKS: AtomicUsize = AtomicUsize::new(0);
+
+// A save-path move retains the durable file projection while it probes every
+// payload path on a blocking worker. Keep those workers bounded separately
+// from the storage executor so concurrent API requests cannot multiply large
+// path/plan allocations before they reach the durable job queue.
+const MAX_ENGINE_STORAGE_PLAN_TASKS: usize = 4;
+static ENGINE_STORAGE_PLAN_TASKS: AtomicUsize = AtomicUsize::new(0);
 
 #[derive(Debug)]
 pub(crate) struct EngineAddTaskGuard;
@@ -46,6 +54,99 @@ pub(crate) fn try_acquire_engine_add_task() -> Option<EngineAddTaskGuard> {
             Ordering::Acquire,
         ) {
             Ok(_) => return Some(EngineAddTaskGuard),
+            Err(observed) => current = observed,
+        }
+    }
+}
+
+// Metadata completions arrive after the original magnet-add request has
+// released its admission guard. Keep parsing, blob staging, and storage-busy
+// retries bounded as one lifecycle so a large set of metadata tasks cannot
+// create an unbounded number of detached workers or retained leases.
+const MAX_ENGINE_MAGNET_COMPLETION_TASKS: usize = 8;
+static ENGINE_MAGNET_COMPLETION_TASKS: AtomicUsize = AtomicUsize::new(0);
+
+#[derive(Debug)]
+pub(crate) struct EngineMagnetCompletionGuard;
+
+impl Drop for EngineMagnetCompletionGuard {
+    fn drop(&mut self) {
+        ENGINE_MAGNET_COMPLETION_TASKS.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+pub(crate) fn try_acquire_engine_magnet_completion_task() -> Option<EngineMagnetCompletionGuard> {
+    let mut current = ENGINE_MAGNET_COMPLETION_TASKS.load(Ordering::Acquire);
+    loop {
+        if current >= MAX_ENGINE_MAGNET_COMPLETION_TASKS {
+            return None;
+        }
+        match ENGINE_MAGNET_COMPLETION_TASKS.compare_exchange_weak(
+            current,
+            current + 1,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => return Some(EngineMagnetCompletionGuard),
+            Err(observed) => current = observed,
+        }
+    }
+}
+
+// Tracker replacements can retain up to the aggregate URL cap while waiting
+// behind the engine actor. Bound those commands before they enter the mailbox.
+const MAX_ENGINE_TRACKER_UPDATE_TASKS: usize = 8;
+static ENGINE_TRACKER_UPDATE_TASKS: AtomicUsize = AtomicUsize::new(0);
+
+#[derive(Debug)]
+pub(crate) struct EngineTrackerUpdateTaskGuard;
+
+impl Drop for EngineTrackerUpdateTaskGuard {
+    fn drop(&mut self) {
+        ENGINE_TRACKER_UPDATE_TASKS.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+pub(crate) fn try_acquire_engine_tracker_update_task() -> Option<EngineTrackerUpdateTaskGuard> {
+    let mut current = ENGINE_TRACKER_UPDATE_TASKS.load(Ordering::Acquire);
+    loop {
+        if current >= MAX_ENGINE_TRACKER_UPDATE_TASKS {
+            return None;
+        }
+        match ENGINE_TRACKER_UPDATE_TASKS.compare_exchange_weak(
+            current,
+            current + 1,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => return Some(EngineTrackerUpdateTaskGuard),
+            Err(observed) => current = observed,
+        }
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct EngineStoragePlanTaskGuard;
+
+impl Drop for EngineStoragePlanTaskGuard {
+    fn drop(&mut self) {
+        ENGINE_STORAGE_PLAN_TASKS.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+pub(crate) fn try_acquire_engine_storage_plan_task() -> Option<EngineStoragePlanTaskGuard> {
+    let mut current = ENGINE_STORAGE_PLAN_TASKS.load(Ordering::Acquire);
+    loop {
+        if current >= MAX_ENGINE_STORAGE_PLAN_TASKS {
+            return None;
+        }
+        match ENGINE_STORAGE_PLAN_TASKS.compare_exchange_weak(
+            current,
+            current + 1,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => return Some(EngineStoragePlanTaskGuard),
             Err(observed) => current = observed,
         }
     }
@@ -83,6 +184,9 @@ pub struct PreparedTorrentTaskData {
     pub save_path: PathBuf,
     pub info_hash: [u8; 20],
     pub is_private: bool,
+    /// Covers the raw file-read/parser overlap until the live task's
+    /// persistent metadata lease has been admitted by the engine actor.
+    pub parse_memory_lease: MemoryLease,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -166,6 +270,12 @@ pub struct EngineStats {
     pub dht_announced_peer_sets: u64,
     pub dht_announced_peers: u64,
     pub dht_tracked_torrents: u64,
+    /// Configured admission cap `dht_tracked_torrents` is measured against
+    /// (`rt_config::DhtConfig::tracked_torrents_cap`).
+    pub dht_tracked_torrents_cap: u64,
+    /// Cumulative DHT `AddTorrent` admissions rejected because
+    /// `dht_tracked_torrents` was already at `dht_tracked_torrents_cap`.
+    pub dht_tracked_torrents_rejected: u64,
     pub dht_outstanding_requests: u64,
     pub dht_queried_nodes: u64,
     pub storage_file_pool_capacity: u64,
@@ -462,12 +572,22 @@ impl EngineStats {
         self.storage_hash_queue_depth = self
             .storage_hash_queue_depth
             .saturating_add(storage.hash_queue_depth as u64);
-        self.storage_device_queue_capacity = self
-            .storage_device_queue_capacity
-            .saturating_add(storage.device_queue_capacity as u64);
-        self.storage_device_queue_available = self
-            .storage_device_queue_available
-            .saturating_add(storage.device_queue_available as u64);
+        let storage_device_id = storage.device_id.clone();
+        let storage_profile = storage_profile_label(&storage.profile).to_string();
+        let shared_device_queue_already_counted =
+            storage_device_id.as_deref().is_some_and(|device_id| {
+                self.storage_device_latencies.iter().any(|device| {
+                    device.device_id == device_id && device.profile == storage_profile
+                })
+            });
+        if !shared_device_queue_already_counted {
+            self.storage_device_queue_capacity = self
+                .storage_device_queue_capacity
+                .saturating_add(storage.device_queue_capacity as u64);
+            self.storage_device_queue_available = self
+                .storage_device_queue_available
+                .saturating_add(storage.device_queue_available as u64);
+        }
         self.storage_queued_disk_bytes = self
             .storage_queued_disk_bytes
             .saturating_add(storage.queued_disk_bytes);
@@ -577,11 +697,8 @@ impl EngineStats {
             &mut self.storage_hash_latency_buckets,
             storage.hash_latency_buckets,
         );
-        let device_id = storage
-            .device_id
-            .clone()
-            .unwrap_or_else(|| "unknown".to_string());
-        let profile = storage_profile_label(&storage.profile).to_string();
+        let device_id = storage_device_id.unwrap_or_else(|| "unknown".to_string());
+        let profile = storage_profile;
         let device = match self
             .storage_device_latencies
             .iter_mut()
@@ -859,6 +976,7 @@ pub struct TorrentDiagnostic {
 pub(crate) enum EngineCmd {
     /// Add a torrent from parsed metainfo. save_path overrides config default.
     AddTorrent {
+        add_guard: EngineAddTaskGuard,
         meta: Box<TorrentMeta>,
         save_path: Option<PathBuf>,
         paused: bool,
@@ -870,7 +988,11 @@ pub(crate) enum EngineCmd {
     /// performed by a detached blocking worker before the engine actor
     /// installs the durable/session projection.
     AddTorrentRaw {
+        add_guard: EngineAddTaskGuard,
         raw: Vec<u8>,
+        /// Covers the raw input while it waits in the engine mailbox and
+        /// through detached parsing.
+        parse_memory_lease: MemoryLease,
         save_path: Option<PathBuf>,
         paused: bool,
         category: Option<String>,
@@ -879,7 +1001,11 @@ pub(crate) enum EngineCmd {
     },
     /// Add a magnet as a metadata-pending entry.
     AddMagnet {
+        add_guard: EngineAddTaskGuard,
         magnet: MagnetLink,
+        /// Covers the caller-owned magnet graph while it waits in the
+        /// engine mailbox and until its fields are compacted or transferred.
+        input_memory_lease: MemoryLease,
         save_path: Option<PathBuf>,
         paused: bool,
         category: Option<String>,
@@ -891,6 +1017,9 @@ pub(crate) enum EngineCmd {
     PreparedTorrentMeta {
         add_guard: EngineAddTaskGuard,
         prepared: CmdResult<Box<TorrentMeta>>,
+        /// Covers the raw input and parser-owned overlap until the actor
+        /// admits the parsed torrent's persistent memory.
+        parse_memory_lease: MemoryLease,
         save_path: Option<PathBuf>,
         paused: bool,
         category: Option<String>,
@@ -903,12 +1032,20 @@ pub(crate) enum EngineCmd {
         add_guard: EngineAddTaskGuard,
         meta: Box<TorrentMeta>,
         staged_blob: CmdResult<PathBuf>,
+        /// Retain the detached parser admission through blob staging and the
+        /// actor's persistent metadata reservation.
+        parse_memory_lease: Option<MemoryLease>,
         save_path: Option<PathBuf>,
         paused: bool,
         category: Option<String>,
         tags: Vec<String>,
         reply: oneshot::Sender<CmdResult<String>>,
     },
+    /// Cleanup notification for a detached torrent-add completion that could
+    /// not reach the actor before its aggregate delivery deadline. The
+    /// staged blob is cleaned by the worker; the actor only releases the
+    /// pending hash admission.
+    TorrentAddDeliveryFailed { info_hash: String, error: String },
     /// Internal completion from the magnet metadata worker. `source` is the
     /// originating metadata-task channel and fences the completion to one
     /// torrent incarnation when an info-hash is removed and later re-added.
@@ -918,6 +1055,15 @@ pub(crate) enum EngineCmd {
         metadata_memory_lease: MemoryLease,
         source: mpsc::Sender<TorrentCmd>,
     },
+    /// Cleanup notification for a detached magnet parser/blob worker whose
+    /// completion could not reach the engine before its aggregate delivery
+    /// deadline. The source channel fences cleanup to the metadata task
+    /// incarnation that produced the completion.
+    MetadataCompletionDeliveryFailed {
+        info_hash: String,
+        source: mpsc::Sender<TorrentCmd>,
+        error: String,
+    },
     /// Internal completion after magnet metainfo parsing has finished on a
     /// blocking worker. The validated blob is handed to a detached writer;
     /// only the durable/session projection remains serialized by the actor.
@@ -926,6 +1072,10 @@ pub(crate) enum EngineCmd {
         raw: Vec<u8>,
         meta: CmdResult<TorrentMeta>,
         metadata_memory_lease: MemoryLease,
+        /// Covers parser-owned overlap until the parsed metadata's persistent
+        /// lease is admitted during completion.
+        parse_memory_lease: MemoryLease,
+        completion_guard: EngineMagnetCompletionGuard,
         source: mpsc::Sender<TorrentCmd>,
     },
     /// Internal completion after the validated magnet blob has been written
@@ -935,6 +1085,10 @@ pub(crate) enum EngineCmd {
         meta: CmdResult<TorrentMeta>,
         blob: CmdResult<Option<PathBuf>>,
         metadata_memory_lease: MemoryLease,
+        /// Retain parser admission through blob staging, retries, and final
+        /// persistent metadata admission.
+        parse_memory_lease: MemoryLease,
+        completion_guard: EngineMagnetCompletionGuard,
         source: mpsc::Sender<TorrentCmd>,
     },
     /// Internal completion from detached DHT-registration metadata parsing.
@@ -945,6 +1099,11 @@ pub(crate) enum EngineCmd {
         info_hash: String,
         info_hash_bytes: [u8; 20],
     },
+    /// Internal notification emitted after the DHT task has (re)bound its
+    /// UDP socket. The engine replays current active-torrent registrations so
+    /// a restarted DHT task does not come back healthy with an empty torrent
+    /// set.
+    DhtTaskReady,
     /// Route a peer whose handshake identified a currently dormant torrent.
     /// The engine promotes the torrent before forwarding this command.
     IncomingPeer {
@@ -1011,17 +1170,51 @@ pub(crate) enum EngineCmd {
     /// Read the persisted raw `.torrent` metainfo bytes for export endpoints.
     GetTorrentBlob {
         info_hash: String,
+        max_bytes: usize,
         reply: oneshot::Sender<CmdResult<Vec<u8>>>,
+    },
+    /// Read the persisted torrent blob length without allocating its bytes.
+    GetTorrentBlobSize {
+        info_hash: String,
+        reply: oneshot::Sender<CmdResult<u64>>,
     },
     /// Read persisted tracker state for compatibility facades.
     GetTorrentTrackers {
         info_hash: String,
         reply: oneshot::Sender<CmdResult<Vec<EngineTrackerSnapshot>>>,
     },
+    /// Read only the primary tracker URL and total tracker count needed by
+    /// compatibility list projections.
+    GetTorrentTrackerProjection {
+        info_hash: String,
+        reply: oneshot::Sender<CmdResult<Option<(String, u32)>>>,
+    },
+    /// Read only tracker URLs needed by compatibility tracker mutations.
+    GetTorrentTrackerUrls {
+        info_hash: String,
+        reply: oneshot::Sender<CmdResult<Vec<String>>>,
+    },
+    /// Read the count and persisted string footprint needed to admit a full
+    /// compatibility tracker snapshot before materializing its rows.
+    GetTorrentTrackerSnapshotSize {
+        info_hash: String,
+        reply: oneshot::Sender<CmdResult<(u64, u64)>>,
+    },
     /// Read a grouped tracker-health snapshot from the normalized database.
     /// The potentially large query runs on a blocking worker.
     GetTrackerHealth {
         reply: oneshot::Sender<CmdResult<Vec<EngineTrackerHealth>>>,
+    },
+    /// Read the grouped tracker-health result footprint before materializing
+    /// the compatibility response.
+    GetTrackerHealthSnapshotSize {
+        reply: oneshot::Sender<CmdResult<(u64, u64)>>,
+    },
+    /// Read the count and hash-string footprint of a tracker filter result
+    /// before the API builds its transient hash set.
+    GetTorrentHashesByTrackerSnapshotSize {
+        tracker: String,
+        reply: oneshot::Sender<CmdResult<(u64, u64)>>,
     },
     /// Find persisted torrent hashes whose normalized tracker URL contains a
     /// literal substring. The query runs off the actor so automation filters
@@ -1103,14 +1296,18 @@ pub(crate) enum EngineCmd {
         reply: oneshot::Sender<CmdResult<Option<String>>>,
     },
     /// Internal completion after filesystem move planning has finished off
-    /// the engine actor. The actor only validates that the request is still
-    /// current, quiesces the torrent, and queues the already-built plan.
+    /// the engine actor. The torrent was quiesced before the planner started,
+    /// so the actor only validates that the request is still current and
+    /// queues the plan without reopening a write race.
     PreparedTorrentFields {
         info_hash: String,
         /// Session identity captured before detached filesystem planning.
         /// The info-hash alone is insufficient because a torrent can be
         /// removed and re-added while the planner is still running.
         torrent_handle: TorrentHandle,
+        /// Whether a live task was quiesced before planning. `None` means the
+        /// torrent was dormant and had no task to freeze.
+        quiesced: Option<bool>,
         name: Option<String>,
         current_name: String,
         current_save_path: PathBuf,
@@ -1129,6 +1326,16 @@ pub(crate) enum EngineCmd {
         /// promotion worker is still finishing.
         torrent_handle: Option<TorrentHandle>,
         prepared: CmdResult<PreparedTorrentTaskData>,
+    },
+    /// Cleanup notification for a promotion completion that could not be
+    /// delivered before the prepared payload's aggregate deadline. This is
+    /// deliberately a small command: the worker may wait for a live actor to
+    /// accept it so pending lifecycle actions are not stranded forever.
+    TorrentPromotionDeliveryFailed {
+        info_hash: String,
+        /// Session identity captured when the promotion worker started.
+        torrent_handle: Option<TorrentHandle>,
+        error: String,
     },
     /// Execute a durable storage plan through the engine job table.
     ExecuteStoragePlan {
@@ -1154,6 +1361,13 @@ pub(crate) enum EngineCmd {
         completed_steps: Vec<usize>,
         completed_byte_offset: Option<i64>,
         requires_manual_recovery: bool,
+        /// Whether this completion still needs to perform the actor-side
+        /// resume. Durable-finalization retries set this to false after the
+        /// first handoff was accepted, preventing a duplicate recheck.
+        resume_torrents: bool,
+        /// Counts actor-side retries after the storage worker has already
+        /// committed the filesystem and only durable job completion remains.
+        retry_attempt: u8,
     },
     /// Internal completion notification for asynchronous torrent payload
     /// deletion. Unlike a generic plan, successful deletion finalizes any
@@ -1171,6 +1385,7 @@ pub(crate) enum EngineCmd {
         /// Identity of the task that was quiesced before deletion, when the
         /// completion belongs to the current process incarnation.
         quiesced_handle: Option<TorrentHandle>,
+        retry_attempt: u8,
     },
     /// Internal completion notification for an asynchronous save-path move.
     StorageMoveFinished {
@@ -1191,17 +1406,31 @@ pub(crate) enum EngineCmd {
         requires_manual_recovery: bool,
         retry_attempt: u8,
     },
+    /// Retry only a failed/cancelled storage job's durable terminal-state
+    /// write. Specialized move/delete completions may already have resumed or
+    /// stopped their torrent task, so replaying those completions would repeat
+    /// lifecycle side effects.
+    StorageTerminalStateRetry {
+        job_id: String,
+        state: String,
+        error: Option<String>,
+        retry_attempt: u8,
+    },
     /// Internal completion notification for a pure-v2 recheck executed off
     /// the engine actor. File-root verification can read a large payload and
     /// must not occupy the command loop until it finishes.
     PureV2RecheckFinished {
         info_hash: String,
         job_id: Option<String>,
+        /// Fences a detached completion to one execution attempt of the
+        /// durable recheck job. The job ID can be reused after pause/resume.
+        run_token: Option<u64>,
         restore_state: Option<TorrentState>,
         total_length: u64,
         total_files: i64,
         done: i64,
         invalid_files: Vec<i64>,
+        amount_left: u64,
         error: Option<String>,
     },
     /// List active durable jobs.
@@ -1214,6 +1443,7 @@ pub(crate) enum EngineCmd {
     },
     /// Replace persisted tracker URLs for a torrent.
     UpdateTorrentTrackers {
+        update_guard: EngineTrackerUpdateTaskGuard,
         info_hash: String,
         trackers: Vec<String>,
         reply: oneshot::Sender<CmdResult<()>>,
@@ -1308,11 +1538,16 @@ pub(crate) enum EngineCmd {
     },
     /// Internal completion from the detached stats collector. The collector
     /// owns all waits on SQLite, DHT, and torrent actors; the engine actor only
-    /// installs the finished immutable snapshot.
-    StatsRefreshComplete { stats: Box<EngineStats> },
+    /// installs the finished immutable snapshot if it is still the current
+    /// refresh.
+    StatsRefreshComplete {
+        started_at: Instant,
+        stats: Box<EngineStats>,
+    },
     /// Internal failure from the detached stats collector. A stale snapshot is
-    /// still served, but the next request may schedule another refresh.
-    StatsRefreshFailed { error: String },
+    /// still served, but the next request may schedule another refresh. The
+    /// refresh token prevents an older failure from cancelling a newer one.
+    StatsRefreshFailed { started_at: Instant, error: String },
     /// Probe engine-owned dependency seams without performing a full stats
     /// collection.
     GetHealth {
@@ -1347,6 +1582,33 @@ pub(crate) enum EngineCmd {
 mod tests {
     use super::*;
     use rt_storage::FilePoolStats;
+
+    #[test]
+    fn large_command_admission_is_bounded() {
+        let add_guards = (0..MAX_ENGINE_ADD_TASKS)
+            .map(|_| try_acquire_engine_add_task())
+            .collect::<Option<Vec<_>>>()
+            .expect("add admission should have capacity");
+        assert!(try_acquire_engine_add_task().is_none());
+        drop(add_guards);
+        assert!(try_acquire_engine_add_task().is_some());
+
+        let tracker_guards = (0..MAX_ENGINE_TRACKER_UPDATE_TASKS)
+            .map(|_| try_acquire_engine_tracker_update_task())
+            .collect::<Option<Vec<_>>>()
+            .expect("tracker update admission should have capacity");
+        assert!(try_acquire_engine_tracker_update_task().is_none());
+        drop(tracker_guards);
+        assert!(try_acquire_engine_tracker_update_task().is_some());
+
+        let magnet_completion_guards = (0..MAX_ENGINE_MAGNET_COMPLETION_TASKS)
+            .map(|_| try_acquire_engine_magnet_completion_task())
+            .collect::<Option<Vec<_>>>()
+            .expect("magnet completion admission should have capacity");
+        assert!(try_acquire_engine_magnet_completion_task().is_none());
+        drop(magnet_completion_guards);
+        assert!(try_acquire_engine_magnet_completion_task().is_some());
+    }
 
     #[test]
     fn engine_stats_accumulates_torrent_runtime_storage_counters() {
@@ -1576,6 +1838,36 @@ mod tests {
             .hot_torrent_memory_top
             .windows(2)
             .all(|window| window[0].estimated_bytes >= window[1].estimated_bytes));
+    }
+
+    #[test]
+    fn engine_stats_does_not_double_count_shared_device_queue() {
+        let storage = StorageIoStats {
+            device_id: Some("nvme0n1".to_string()),
+            profile: rt_path::StorageProfile::Nvme,
+            device_queue_capacity: 32,
+            device_queue_available: 31,
+            ..Default::default()
+        };
+        let mut stats = EngineStats::default();
+
+        stats.add_torrent_runtime(
+            "hash-a".to_string(),
+            TorrentRuntimeStats {
+                storage: storage.clone(),
+                ..Default::default()
+            },
+        );
+        stats.add_torrent_runtime(
+            "hash-b".to_string(),
+            TorrentRuntimeStats {
+                storage,
+                ..Default::default()
+            },
+        );
+
+        assert_eq!(stats.storage_device_queue_capacity, 32);
+        assert_eq!(stats.storage_device_queue_available, 31);
     }
 
     #[test]

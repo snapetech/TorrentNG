@@ -12,9 +12,9 @@ use tokio::sync::oneshot;
 use tracing::warn;
 
 use super::{
-    normalize_storage_plan_targets, CmdResult, Engine, EngineCmd, PureV2RecheckCompletion,
-    StorageDeleteCompletion, StorageJobCompletion, JOB_STATE_QUEUED,
-    STORAGE_JOB_STATE_COMMIT_PENDING,
+    normalize_storage_plan_targets, validate_storage_plan, CmdResult, Engine, EngineCmd,
+    PureV2RecheckCompletion, StorageDeleteCompletion, StorageJobCompletion, JOB_STATE_CANCELLED,
+    JOB_STATE_FAILED, JOB_STATE_PAUSED, JOB_STATE_QUEUED, STORAGE_JOB_STATE_COMMIT_PENDING,
 };
 
 /// Queue a validated storage plan and send the worker completion back through
@@ -29,6 +29,10 @@ pub(super) async fn execute_storage_plan(
     completed_steps: Vec<usize>,
     reply: oneshot::Sender<CmdResult<String>>,
 ) -> bool {
+    if let Err(error) = validate_storage_plan(&plan) {
+        let _ = reply.send(Err(error));
+        return true;
+    }
     let operation = operation.trim().to_ascii_lowercase();
     if plan.dry_run {
         let _ = reply.send(Err(
@@ -47,6 +51,10 @@ pub(super) async fn execute_storage_plan(
             return true;
         }
     };
+    if let Err(error) = engine.ensure_storage_move_not_pending(&affected_torrents) {
+        let _ = reply.send(Err(error));
+        return true;
+    }
     let manual_recovery_torrents = affected_torrents.clone();
     if let Err(error) = engine
         .validate_storage_plan_targets(&operation, &affected_torrents)
@@ -130,7 +138,11 @@ pub(super) async fn execute_storage_plan(
                     .iter()
                     .find(|(hash, _)| hash == &info_hash)
                     .map(|(_, handle)| *handle);
-                super::send_engine_command_until_delivered(
+                // This completion is the only actor-side handoff that
+                // publishes the move and resumes its quiesced task. Storage
+                // admission bounds the retained payload, so do not abandon
+                // it while the actor is processing a long command.
+                super::send_engine_command_until_actor_stops(
                     cmd_tx,
                     EngineCmd::StorageMoveFinished {
                         job_id,
@@ -152,7 +164,10 @@ pub(super) async fn execute_storage_plan(
                 )
                 .await;
             } else {
-                super::send_engine_command_until_delivered(
+                // Failed/cancelled plans still own the quiesce until this
+                // command runs. Keep the bounded completion alive until the
+                // actor accepts it or shuts down.
+                super::send_engine_command_until_actor_stops(
                     cmd_tx,
                     EngineCmd::StoragePlanFinished {
                         job_id,
@@ -165,6 +180,8 @@ pub(super) async fn execute_storage_plan(
                         completed_steps: completion.completed_steps,
                         completed_byte_offset: completion.completed_byte_offset,
                         requires_manual_recovery: completion.requires_manual_recovery,
+                        resume_torrents: true,
+                        retry_attempt: 0,
                     },
                     "storage_plan_completion",
                 )
@@ -193,11 +210,19 @@ pub(super) async fn finish_storage_plan(
     completed_steps: Vec<usize>,
     completed_byte_offset: Option<i64>,
     requires_manual_recovery: bool,
+    resume_torrents: bool,
+    retry_attempt: u8,
 ) {
     // The worker uses queued for shutdown reattachment. The engine is also
     // shutting down, so resuming quiesced torrent tasks here would briefly
     // reopen work that must remain frozen until restart recovery.
     if terminal_state == JOB_STATE_QUEUED {
+        return;
+    }
+    if terminal_state == JOB_STATE_PAUSED {
+        // The torrent was quiesced before the worker touched its payload.
+        // Keep it quiesced while the job is paused; releasing it here would
+        // let a later worker resume race the torrent actor's file I/O.
         return;
     }
     if !succeeded && requires_manual_recovery {
@@ -230,6 +255,20 @@ pub(super) async fn finish_storage_plan(
                 result = "error",
                 error = %persist_error,
                 "failed to persist storage plan manual-recovery marker at completion"
+            );
+            engine.schedule_storage_plan_completion_retry(
+                &job_id,
+                affected_torrents.clone(),
+                affected_torrent_handles.clone(),
+                manual_recovery_torrents.clone(),
+                false,
+                JOB_STATE_FAILED.to_owned(),
+                Some(reason.clone()),
+                completed_steps.clone(),
+                completed_byte_offset,
+                true,
+                false,
+                retry_attempt,
             );
         }
         for info_hash in manual_recovery_torrents {
@@ -280,11 +319,40 @@ pub(super) async fn finish_storage_plan(
             "storage plan finished without a successful commit"
         );
     }
+    let mut persistence_error = None;
+    if !succeeded
+        && !requires_manual_recovery
+        && matches!(
+            terminal_state.as_str(),
+            JOB_STATE_CANCELLED | JOB_STATE_FAILED
+        )
+    {
+        if let Err(persist_error) = engine
+            .update_job_state_async(
+                &job_id,
+                &terminal_state,
+                error.clone(),
+                Some("storage worker completion persisted by engine"),
+            )
+            .await
+        {
+            persistence_error = Some(persist_error.clone());
+            warn!(
+                component = "storage_jobs",
+                operation = "persist_terminal_completion",
+                job_id = %job_id,
+                result = "retry",
+                error = %persist_error,
+                "storage worker terminal state was not durable; scheduled actor retry"
+            );
+        }
+    }
     if succeeded && terminal_state == STORAGE_JOB_STATE_COMMIT_PENDING {
         if let Err(error) = engine
             .complete_storage_plan_job_async(&job_id, &completed_steps, completed_byte_offset)
             .await
         {
+            persistence_error = Some(error.clone());
             warn!(
                 component = "storage_jobs",
                 operation = "complete",
@@ -295,9 +363,54 @@ pub(super) async fn finish_storage_plan(
             );
         }
     }
-    engine
-        .resume_torrents_after_storage_plan(affected_torrents, affected_torrent_handles)
-        .await;
+    let resume_succeeded = if resume_torrents {
+        engine
+            .resume_torrents_after_storage_plan(
+                affected_torrents.clone(),
+                affected_torrent_handles.clone(),
+            )
+            .await
+    } else {
+        true
+    };
+    if let Some(persist_error) = persistence_error {
+        engine.schedule_storage_plan_completion_retry(
+            &job_id,
+            affected_torrents,
+            affected_torrent_handles,
+            manual_recovery_torrents,
+            succeeded,
+            terminal_state,
+            error.or(Some(persist_error)),
+            completed_steps,
+            completed_byte_offset,
+            false,
+            !resume_succeeded,
+            retry_attempt,
+        );
+    } else if !resume_succeeded {
+        engine.schedule_storage_plan_completion_retry(
+            &job_id,
+            affected_torrents,
+            affected_torrent_handles,
+            manual_recovery_torrents,
+            succeeded,
+            terminal_state,
+            error,
+            completed_steps,
+            completed_byte_offset,
+            false,
+            true,
+            retry_attempt,
+        );
+        warn!(
+            component = "storage_jobs",
+            operation = "resume_after_storage_plan",
+            job_id = %job_id,
+            result = "retry",
+            "storage plan durable completion was recorded but torrent resume was not accepted"
+        );
+    }
 }
 
 pub(super) async fn finish_storage_delete(

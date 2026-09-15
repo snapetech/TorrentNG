@@ -13,6 +13,7 @@ use rt_tracker::{
     to_http_scrape_url,
     udp::{UdpAnnounceRequest, UdpAnnounceResponse, UdpConnectRequest, UdpConnectResponse},
     AnnounceRequest, AnnounceResponse, InfoHash, ScrapeStats, TrackerError, TrackerEvent,
+    MAX_TRACKER_PEERS, MAX_TRACKER_STATE_ID_BYTES, MAX_TRACKER_STATE_TEXT_BYTES,
 };
 use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
@@ -25,6 +26,11 @@ const MAX_TRACKER_RESPONSE_BYTES: usize = 4 * 1024 * 1024;
 pub(crate) const MAX_TRACKER_UDP_RESPONSE_BYTES: usize = 64 * 1024;
 pub(crate) const MAX_TRACKER_ANNOUNCES_IN_FLIGHT: usize = 8;
 pub(crate) const STOPPED_TRACKER_ANNOUNCE_DEADLINE: Duration = Duration::from_secs(10);
+// A parsed compact response can grow its peer vector once more when a
+// response contains both `peers` and `peers6`; the actor then materializes a
+// second address-only vector before connecting. Reserve for that peak while
+// retaining the response across the bounded worker-result channel.
+const TRACKER_RESPONSE_PEER_VECTOR_CAPACITY_MULTIPLIER: usize = 2;
 
 pub(crate) type TrackerKey = (usize, usize);
 
@@ -37,10 +43,10 @@ pub(crate) fn is_udp_tracker_url(tracker_url: &str) -> bool {
         .is_some_and(|prefix| prefix.eq_ignore_ascii_case("udp://"))
 }
 
-/// Encode the daemon's platform-sized peer ceiling in the tracker protocol's
+/// Encode the daemon's bounded tracker peer ceiling in the tracker protocol's
 /// fixed-width field without allowing a 64-bit value to wrap on the wire.
 pub(crate) fn protocol_numwant(max_peers: usize) -> u32 {
-    u32::try_from(max_peers).unwrap_or(u32::MAX)
+    u32::try_from(max_peers.min(MAX_TRACKER_PEERS)).unwrap_or(u32::MAX)
 }
 
 #[derive(Clone)]
@@ -71,6 +77,12 @@ pub(crate) struct TrackerAnnounceResult {
     pub(crate) event: TrackerEvent,
     pub(crate) response: Result<AnnounceResponse, TrackerError>,
     pub(crate) scrape: Option<ScrapeStats>,
+    pub(crate) _response_memory_lease: Option<MemoryLease>,
+}
+
+pub(crate) struct LeasedAnnounceResponse {
+    pub(crate) response: AnnounceResponse,
+    pub(crate) _memory_lease: MemoryLease,
 }
 
 /// Owns detached announce/scrape futures for one torrent actor.
@@ -139,6 +151,10 @@ impl TrackerWorkers {
                 } else {
                     None
                 };
+                let (response, response_memory_lease) = match response {
+                    Ok(response) => (Ok(response.response), Some(response._memory_lease)),
+                    Err(error) => (Err(error), None),
+                };
                 if result_tx
                     .send(TrackerAnnounceResult {
                         key,
@@ -147,6 +163,7 @@ impl TrackerWorkers {
                         event,
                         response,
                         scrape,
+                        _response_memory_lease: response_memory_lease,
                     })
                     .await
                     .is_err()
@@ -207,7 +224,7 @@ pub(crate) async fn announce_tracker(
     tracker_url: &str,
     event: TrackerEvent,
     tracker_id: Option<&[u8]>,
-) -> Result<AnnounceResponse, TrackerError> {
+) -> Result<LeasedAnnounceResponse, TrackerError> {
     if is_udp_tracker_url(tracker_url) {
         announce_udp(context, tracker_url, event).await
     } else {
@@ -220,7 +237,7 @@ async fn announce_http(
     tracker_url: &str,
     event: TrackerEvent,
     tracker_id: Option<&[u8]>,
-) -> Result<AnnounceResponse, TrackerError> {
+) -> Result<LeasedAnnounceResponse, TrackerError> {
     let tracker =
         Url::parse(tracker_url).map_err(|error| TrackerError::InvalidUrl(error.to_string()))?;
     let user_agent = crate::peer_id::user_agent();
@@ -259,17 +276,26 @@ async fn announce_http(
             status: response.status().as_u16(),
         });
     }
-    let body =
-        bounded_response_body_with_memory(response, MAX_TRACKER_RESPONSE_BYTES, &context.resources)
-            .await?;
-    AnnounceResponse::parse_with_peer_limit(&body.bytes, context.numwant as usize)
+    let body = bounded_response_body_with_memory_and_extra(
+        response,
+        MAX_TRACKER_RESPONSE_BYTES,
+        tracker_response_output_memory_bytes(tracker_peer_limit(context)),
+        &context.resources,
+    )
+    .await?;
+    let response =
+        AnnounceResponse::parse_with_peer_limit(&body.bytes, tracker_peer_limit(context))?;
+    Ok(LeasedAnnounceResponse {
+        response,
+        _memory_lease: body._lease,
+    })
 }
 
 async fn announce_udp(
     context: &TrackerAnnounceContext,
     tracker_url: &str,
     event: TrackerEvent,
-) -> Result<AnnounceResponse, TrackerError> {
+) -> Result<LeasedAnnounceResponse, TrackerError> {
     let url = Url::parse(tracker_url).map_err(|e| TrackerError::InvalidUrl(e.to_string()))?;
     let mut addrs = context
         .egress_policy
@@ -300,8 +326,12 @@ async fn announce_udp(
         .await
         .map_err(|e| TrackerError::Network(e.to_string()))?;
 
-    let _response_lease =
-        reserve_tracker_response_bytes(&context.resources, MAX_TRACKER_UDP_RESPONSE_BYTES)?;
+    let response_lease = reserve_tracker_response_bytes(
+        &context.resources,
+        MAX_TRACKER_UDP_RESPONSE_BYTES.saturating_add(tracker_response_output_memory_bytes(
+            tracker_peer_limit(context),
+        )),
+    )?;
     let mut buf = vec![0u8; MAX_TRACKER_UDP_RESPONSE_BYTES];
     let n = tokio::time::timeout(context.udp_timeout, socket.recv(&mut buf))
         .await
@@ -335,20 +365,37 @@ async fn announce_udp(
         .map_err(|_| TrackerError::Timeout)?
         .map_err(|e| TrackerError::Network(e.to_string()))?;
     let announce_resp =
-        UdpAnnounceResponse::parse_with_peer_limit(&buf[..n], context.numwant as usize)?;
+        UdpAnnounceResponse::parse_with_peer_limit(&buf[..n], tracker_peer_limit(context))?;
     if announce_resp.transaction_id != announce.transaction_id {
         return Err(TrackerError::Udp("announce transaction id mismatch".into()));
     }
 
-    Ok(AnnounceResponse {
-        interval: announce_resp.interval,
-        min_interval: None,
-        peers: announce_resp.peers,
-        tracker_id: None,
-        warning_message: None,
-        complete: Some(announce_resp.seeders),
-        incomplete: Some(announce_resp.leechers),
+    Ok(LeasedAnnounceResponse {
+        response: AnnounceResponse {
+            interval: announce_resp.interval,
+            min_interval: None,
+            peers: announce_resp.peers,
+            tracker_id: None,
+            warning_message: None,
+            complete: Some(announce_resp.seeders),
+            incomplete: Some(announce_resp.leechers),
+        },
+        _memory_lease: response_lease,
     })
+}
+
+fn tracker_peer_limit(context: &TrackerAnnounceContext) -> usize {
+    (context.numwant as usize).min(MAX_TRACKER_PEERS)
+}
+
+pub(crate) fn tracker_response_output_memory_bytes(max_peers: usize) -> usize {
+    let peer_bytes = std::mem::size_of::<rt_tracker::Peer>()
+        .saturating_mul(TRACKER_RESPONSE_PEER_VECTOR_CAPACITY_MULTIPLIER)
+        .saturating_add(std::mem::size_of::<std::net::SocketAddr>());
+    max_peers
+        .saturating_mul(peer_bytes)
+        .saturating_add(MAX_TRACKER_STATE_ID_BYTES)
+        .saturating_add(MAX_TRACKER_STATE_TEXT_BYTES)
 }
 
 async fn scrape_tracker(
@@ -408,6 +455,15 @@ pub(crate) async fn bounded_response_body_with_memory(
     max_bytes: usize,
     resources: &ResourceGovernor,
 ) -> Result<LeasedResponseBody, TrackerError> {
+    bounded_response_body_with_memory_and_extra(response, max_bytes, 0, resources).await
+}
+
+pub(crate) async fn bounded_response_body_with_memory_and_extra(
+    response: reqwest::Response,
+    max_bytes: usize,
+    extra_bytes: usize,
+    resources: &ResourceGovernor,
+) -> Result<LeasedResponseBody, TrackerError> {
     if response
         .content_length()
         .is_some_and(|length| length > max_bytes as u64)
@@ -420,7 +476,9 @@ pub(crate) async fn bounded_response_body_with_memory(
     // can omit or misstate that header, while the streaming reader still
     // permits any body up to `max_bytes`; the lease must cover that worst
     // case so the governor cannot be bypassed by an inconsistent response.
-    let lease = reserve_tracker_response_bytes(resources, max_bytes)?;
+    // `extra_bytes` covers bounded parser/consumer output that must overlap
+    // the body while the response is being decoded.
+    let lease = reserve_tracker_response_bytes(resources, max_bytes.saturating_add(extra_bytes))?;
     let bytes = bounded_response_body(response, max_bytes).await?;
     Ok(LeasedResponseBody {
         bytes,
@@ -469,6 +527,7 @@ mod tests {
         MAX_TRACKER_ANNOUNCES_IN_FLIGHT,
     };
     use rt_metrics::{MemoryClass, ResourceGovernor, ResourceGovernorConfig, MEMORY_CLASS_COUNT};
+    use rt_tracker::MAX_TRACKER_PEERS;
 
     #[test]
     fn tracker_scheme_dispatch_is_case_insensitive() {
@@ -491,7 +550,7 @@ mod tests {
     #[test]
     fn protocol_peer_limit_does_not_wrap() {
         assert_eq!(protocol_numwant(200), 200);
-        assert_eq!(protocol_numwant(usize::MAX), u32::MAX);
+        assert_eq!(protocol_numwant(usize::MAX), MAX_TRACKER_PEERS as u32);
     }
 
     #[test]

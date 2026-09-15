@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::Context;
 use rt_peer_wire::handshake::{Handshake, HANDSHAKE_LEN};
-use rt_utp::{UtpEndpoint, UtpStream};
+use rt_utp::{UtpEndpoint, UtpError, UtpStream};
 use tokio::io::AsyncReadExt;
 use tokio::net::TcpListener;
 use tokio::sync::{mpsc, watch, Notify, OwnedSemaphorePermit};
@@ -199,6 +199,17 @@ pub(crate) async fn run(
                             error = %error,
                             "uTP accept failed"
                         );
+                        if utp_accept_failure_is_fatal(&error) {
+                            // A failed endpoint receive loop is terminal for
+                            // this listener incarnation. Continuing here
+                            // would repeatedly observe `Closed` from the
+                            // endpoint while the shared health flag stayed
+                            // true because only the TCP branch updates it.
+                            // Fail closed so readiness and metrics cannot
+                            // claim that incoming peer work is available.
+                            context.healthy.store(false, Ordering::Release);
+                            break;
+                        }
                         if !backoff_or_stop(&mut stop).await {
                             break;
                         }
@@ -295,7 +306,7 @@ async fn handle_incoming(
 
 async fn accept_utp_peer(
     endpoint: Option<&UtpEndpoint>,
-) -> anyhow::Result<(UtpStream, SocketAddr)> {
+) -> Result<(UtpStream, SocketAddr), UtpError> {
     let Some(endpoint) = endpoint else {
         std::future::pending::<()>().await;
         unreachable!("pending future never resolves");
@@ -303,6 +314,10 @@ async fn accept_utp_peer(
     let stream = endpoint.accept().await?;
     let peer_addr = stream.peer_addr();
     Ok((stream, peer_addr))
+}
+
+fn utp_accept_failure_is_fatal(error: &UtpError) -> bool {
+    matches!(error, UtpError::Closed | UtpError::Io(_))
 }
 
 async fn handle_incoming_utp(
@@ -385,5 +400,20 @@ mod tests {
                 .expect("listener shutdown waiter timed out")
                 .expect("listener shutdown waiter panicked"));
         }
+    }
+
+    #[test]
+    fn fatal_utp_accept_failures_are_distinguished_from_peer_rejections() {
+        assert!(utp_accept_failure_is_fatal(&UtpError::Closed));
+        assert!(utp_accept_failure_is_fatal(&UtpError::Io(
+            "socket".to_owned()
+        )));
+        assert!(!utp_accept_failure_is_fatal(&UtpError::Timeout));
+        assert!(!utp_accept_failure_is_fatal(
+            &UtpError::InvalidStatePacket {
+                state: rt_utp::ConnectionState::SynReceived,
+                packet_type: rt_utp::PacketType::Data,
+            }
+        ));
     }
 }

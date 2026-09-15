@@ -24,9 +24,21 @@ const DB_QUEUE_CAPACITY: usize = 128;
 const DB_SEND_TIMEOUT: Duration = Duration::from_millis(500);
 const DB_SEND_RETRY: Duration = Duration::from_millis(2);
 const DB_REPLY_TIMEOUT: Duration = Duration::from_secs(30);
+const DB_STARTUP_TIMEOUT: Duration = Duration::from_secs(5);
+/// Upper bound on how many `ExecuteBatched` jobs one shared transaction
+/// covers. Bounds worst-case commit latency for the job at the front of a
+/// very long batch, and bounds how much work a single `catch_unwind`/commit
+/// pass does, without capping throughput at realistic per-torrent-tick
+/// queue depths (tens of thousands of torrents ticking every few seconds
+/// still arrive in small bursts per 50ms worker poll).
+const DB_BATCH_MAX: usize = 256;
 
 type ErasedValue = Box<dyn Any + Send>;
 type DbOperation = Box<dyn FnOnce(&mut Connection) -> Result<ErasedValue, String> + Send>;
+/// A job that runs inside a transaction the worker already opened, shared
+/// with other jobs in the same batch — unlike [`DbOperation`], it must not
+/// open or commit its own transaction.
+type DbTxOperation = Box<dyn FnOnce(&rusqlite::Transaction<'_>) -> Result<ErasedValue, String> + Send>;
 type DbResult = Result<ErasedValue, String>;
 
 enum DbReply {
@@ -39,6 +51,18 @@ enum DbRequest {
     Execute {
         operation: &'static str,
         job: DbOperation,
+        cancelled: Arc<AtomicBool>,
+        reply: DbReply,
+    },
+    /// Like `Execute`, but coalescable: the worker may run several queued
+    /// `ExecuteBatched` jobs inside one shared transaction instead of one
+    /// transaction per job. Used for high-frequency, single-statement,
+    /// mutually-independent writes (e.g. per-torrent progress persistence)
+    /// where many small independent commits are the actual throughput
+    /// ceiling at high torrent counts.
+    ExecuteBatched {
+        operation: &'static str,
+        job: DbTxOperation,
         cancelled: Arc<AtomicBool>,
         reply: DbReply,
     },
@@ -106,6 +130,34 @@ impl DbExecutor {
         }
     }
 
+    /// Like [`run`](Self::run), but the job runs inside a transaction the
+    /// executor may share with other queued `run_batched` jobs instead of
+    /// opening one transaction per call. The job must not open or commit
+    /// its own transaction — it only sees the shared one.
+    pub(crate) async fn run_batched<T, F>(&self, operation: &'static str, job: F) -> Result<T, String>
+    where
+        T: Send + 'static,
+        F: FnOnce(&rusqlite::Transaction<'_>) -> Result<T, String> + Send + 'static,
+    {
+        match self {
+            #[cfg(not(test))]
+            Self::Worker(worker) => worker.run_batched(operation, job).await,
+            #[cfg(test)]
+            Self::Direct(db) => {
+                let mut db = db
+                    .lock()
+                    .map_err(|_| format!("database mutex poisoned during {operation}"))?;
+                let tx = db.transaction().map_err(|error| {
+                    format!("database worker could not open a transaction: {error}")
+                })?;
+                let result = job(&tx)?;
+                tx.commit()
+                    .map_err(|error| format!("batched transaction failed to commit: {error}"))?;
+                Ok(result)
+            }
+        }
+    }
+
     pub(crate) fn run_blocking<T, F>(&self, operation: &'static str, job: F) -> Result<T, String>
     where
         T: Send + 'static,
@@ -136,6 +188,7 @@ impl DbWorker {
         let worker_healthy = Arc::clone(&healthy);
         let force_stop = Arc::new(AtomicBool::new(false));
         let worker_force_stop = Arc::clone(&force_stop);
+        let (ready_tx, ready_rx) = mpsc::sync_channel(1);
         let thread = thread_builder().spawn(move || {
             let mut db = match Connection::open(&db_path) {
                 Ok(db) => db,
@@ -149,9 +202,41 @@ impl DbWorker {
                         path = %db_path.display(),
                         "engine database worker could not open its connection"
                     );
+                    let _ = ready_tx.send(false);
                     return;
                 }
             };
+            if let Err(error) = db.execute_batch("PRAGMA foreign_keys = ON;") {
+                worker_healthy.store(false, Ordering::Release);
+                warn!(
+                    component = "db",
+                    operation = "configure_worker_connection",
+                    result = "error",
+                    error = %error,
+                    "engine database worker could not enable foreign-key enforcement"
+                );
+                let _ = ready_tx.send(false);
+                return;
+            }
+            // `synchronous` is a per-connection SQLite pragma, unlike
+            // `journal_mode = WAL` which is sticky in the database file.
+            // rt_db::schema::migrate() only sets it on first-ever creation
+            // (schema version 0), so every subsequent process start against
+            // an existing database must re-apply it here or this connection
+            // silently reverts to SQLite's default `synchronous = FULL`,
+            // fsyncing on every commit instead of every WAL checkpoint.
+            if let Err(error) = db.execute_batch("PRAGMA synchronous = NORMAL;") {
+                worker_healthy.store(false, Ordering::Release);
+                warn!(
+                    component = "db",
+                    operation = "configure_worker_connection",
+                    result = "error",
+                    error = %error,
+                    "engine database worker could not configure synchronous mode"
+                );
+                let _ = ready_tx.send(false);
+                return;
+            }
             if let Err(error) = db.busy_timeout(Duration::from_secs(5)) {
                 worker_healthy.store(false, Ordering::Release);
                 warn!(
@@ -161,19 +246,31 @@ impl DbWorker {
                     error = %error,
                     "engine database worker could not configure its connection"
                 );
+                let _ = ready_tx.send(false);
                 return;
             }
+            let _ = ready_tx.send(true);
 
+            // Holds a request drained from the queue while probing for more
+            // `ExecuteBatched` jobs to coalesce, when that request turns out
+            // not to belong to the current batch. Processed first on the
+            // next iteration instead of being lost or reordered — the same
+            // hold-for-next-turn shape used for interrupted lifecycle
+            // commands elsewhere in this actor's task loop.
+            let mut pending_request: Option<DbRequest> = None;
             loop {
-                let request = match rx.recv_timeout(Duration::from_millis(50)) {
-                    Ok(request) => request,
-                    Err(mpsc::RecvTimeoutError::Timeout) => {
-                        if worker_force_stop.load(Ordering::Acquire) {
-                            break;
+                let request = match pending_request.take() {
+                    Some(request) => request,
+                    None => match rx.recv_timeout(Duration::from_millis(50)) {
+                        Ok(request) => request,
+                        Err(mpsc::RecvTimeoutError::Timeout) => {
+                            if worker_force_stop.load(Ordering::Acquire) {
+                                break;
+                            }
+                            continue;
                         }
-                        continue;
-                    }
-                    Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                        Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                    },
                 };
                 if worker_force_stop.load(Ordering::Acquire) {
                     break;
@@ -218,6 +315,108 @@ impl DbWorker {
                             break;
                         }
                     }
+                    DbRequest::ExecuteBatched {
+                        operation,
+                        job,
+                        cancelled,
+                        reply,
+                    } => {
+                        let mut batch = vec![(operation, job, cancelled, reply)];
+                        while batch.len() < DB_BATCH_MAX {
+                            match rx.try_recv() {
+                                Ok(DbRequest::ExecuteBatched {
+                                    operation,
+                                    job,
+                                    cancelled,
+                                    reply,
+                                }) => batch.push((operation, job, cancelled, reply)),
+                                Ok(other) => {
+                                    pending_request = Some(other);
+                                    break;
+                                }
+                                Err(_) => break,
+                            }
+                        }
+                        match db.transaction() {
+                            Ok(tx) => {
+                                // Run every job first, but hold each reply
+                                // until the shared transaction is known to
+                                // have committed — a job must never be told
+                                // it succeeded before its data is actually
+                                // durable, even though other jobs in the
+                                // same batch already ran against `tx`.
+                                let mut outcomes: Vec<(DbReply, DbResult)> =
+                                    Vec::with_capacity(batch.len());
+                                for (operation, job, cancelled, reply) in batch {
+                                    if cancelled.load(Ordering::Acquire)
+                                        || matches!(&reply, DbReply::Async(r) if r.is_closed())
+                                    {
+                                        continue;
+                                    }
+                                    let result = catch_unwind(AssertUnwindSafe(|| job(&tx)))
+                                        .map_err(|_| {
+                                            format!("database operation panicked: {operation}")
+                                        })
+                                        .and_then(|result| result);
+                                    if result.is_err() {
+                                        debug!(
+                                            component = "db",
+                                            operation,
+                                            result = "error",
+                                            "database operation failed"
+                                        );
+                                    }
+                                    outcomes.push((reply, result));
+                                }
+                                let commit_result = tx.commit();
+                                if let Err(error) = &commit_result {
+                                    warn!(
+                                        component = "db",
+                                        operation = "batch_commit",
+                                        result = "error",
+                                        error = %error,
+                                        "engine database worker failed to commit a batched transaction"
+                                    );
+                                }
+                                for (reply, result) in outcomes {
+                                    let result = match &commit_result {
+                                        Ok(()) => result,
+                                        Err(error) => Err(format!(
+                                            "batched transaction failed to commit: {error}"
+                                        )),
+                                    };
+                                    match reply {
+                                        DbReply::Async(reply) => {
+                                            let _ = reply.send(result);
+                                        }
+                                        #[cfg(not(test))]
+                                        DbReply::Blocking(reply) => {
+                                            let _ = reply.send(result);
+                                        }
+                                    }
+                                }
+                            }
+                            Err(error) => {
+                                let message = format!(
+                                    "database worker could not open a transaction: {error}"
+                                );
+                                for (_, _, _, reply) in batch {
+                                    match reply {
+                                        DbReply::Async(reply) => {
+                                            let _ = reply.send(Err(message.clone()));
+                                        }
+                                        #[cfg(not(test))]
+                                        DbReply::Blocking(reply) => {
+                                            let _ = reply.send(Err(message.clone()));
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        if worker_force_stop.load(Ordering::Acquire) {
+                            break;
+                        }
+                    }
                     DbRequest::Shutdown { reply } => {
                         let _ = reply.send(());
                         break;
@@ -234,7 +433,22 @@ impl DbWorker {
         });
 
         let thread = match thread {
-            Ok(thread) => Some(thread),
+            Ok(thread) => match ready_rx.recv_timeout(DB_STARTUP_TIMEOUT) {
+                Ok(true) => Some(thread),
+                Ok(false) => Some(thread),
+                Err(error) => {
+                    healthy.store(false, Ordering::Release);
+                    force_stop.store(true, Ordering::Release);
+                    warn!(
+                        component = "db",
+                        operation = "start_worker",
+                        result = "timeout",
+                        error = %error,
+                        "engine database worker did not report startup before the deadline"
+                    );
+                    Some(thread)
+                }
+            },
             Err(error) => {
                 healthy.store(false, Ordering::Release);
                 warn!(
@@ -328,6 +542,48 @@ impl DbWorker {
     {
         self.run_with_reply_timeout(operation, job, DB_REPLY_TIMEOUT)
             .await
+    }
+
+    /// Like [`run`](Self::run), but the worker may run this job inside a
+    /// transaction shared with other `run_batched` jobs already queued,
+    /// instead of opening and committing a transaction per call. `job` must
+    /// not open or commit its own transaction; it only ever sees the one
+    /// the worker already opened for the batch it landed in — even a batch
+    /// of one still runs through this same shared-transaction path.
+    pub(crate) async fn run_batched<T, F>(&self, operation: &'static str, job: F) -> Result<T, String>
+    where
+        T: Send + 'static,
+        F: FnOnce(&rusqlite::Transaction<'_>) -> Result<T, String> + Send + 'static,
+    {
+        if !self.is_healthy() {
+            return Err("engine database worker is unavailable".to_owned());
+        }
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let _cancellation_guard = CancellationGuard(Arc::clone(&cancelled));
+        let (reply, response) = oneshot::channel();
+        let request = DbRequest::ExecuteBatched {
+            operation,
+            job: Box::new(move |tx| job(tx).map(|value| Box::new(value) as ErasedValue)),
+            cancelled,
+            reply: DbReply::Async(reply),
+        };
+        self.enqueue(request, operation).await?;
+        let value = match timeout(DB_REPLY_TIMEOUT, response).await {
+            Ok(response) => response.map_err(|_| {
+                self.healthy.store(false, Ordering::Release);
+                self.force_stop();
+                "engine database worker dropped its reply".to_owned()
+            })??,
+            Err(_) => {
+                self.healthy.store(false, Ordering::Release);
+                self.force_stop();
+                return Err(format!("database worker operation timed out: {operation}"));
+            }
+        };
+        value
+            .downcast::<T>()
+            .map(|value| *value)
+            .map_err(|_| format!("database worker returned an invalid result for {operation}"))
     }
 
     async fn run_with_reply_timeout<T, F>(
@@ -548,6 +804,22 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn startup_failure_is_reported_before_requests_are_accepted() {
+        let temp = tempfile::tempdir().expect("temporary directory");
+        let worker = DbWorker::new(temp.path().join("missing").join("state.db"));
+
+        assert!(!worker.is_healthy());
+        assert_eq!(
+            worker
+                .run("after_startup_failure", |_| Ok::<_, String>(()))
+                .await
+                .expect_err("requests must fail after worker startup failure"),
+            "engine database worker is unavailable"
+        );
+        worker.shutdown(Duration::from_secs(1)).await;
+    }
+
+    #[tokio::test]
     async fn operations_are_serial_and_worker_survives_errors_and_panics() {
         let worker = worker();
         let order = Arc::new(AtomicUsize::new(0));
@@ -630,6 +902,159 @@ mod tests {
             })
             .expect("read persisted worker row");
         assert_eq!(value, "owned-by-worker");
+    }
+
+    #[tokio::test]
+    async fn worker_enables_foreign_key_enforcement() {
+        let worker = worker();
+        let foreign_keys: i64 = worker
+            .run("foreign_keys", |db| {
+                db.query_row("PRAGMA foreign_keys", [], |row| row.get(0))
+                    .map_err(|error| error.to_string())
+            })
+            .await
+            .expect("read worker foreign-key setting");
+
+        assert_eq!(foreign_keys, 1);
+        worker.shutdown(Duration::from_secs(1)).await;
+    }
+
+    #[tokio::test]
+    async fn run_batched_persists_a_single_job_like_run_does() {
+        let worker = worker();
+        worker
+            .run("create_probe", |db| {
+                db.execute_batch(
+                    "CREATE TABLE batch_probe (id INTEGER PRIMARY KEY, value TEXT NOT NULL);",
+                )
+                .map_err(|error| error.to_string())
+            })
+            .await
+            .expect("create probe table");
+
+        worker
+            .run_batched("insert_via_batch", |tx| {
+                tx.execute(
+                    "INSERT INTO batch_probe (value) VALUES (?1)",
+                    ["solo-batched-job"],
+                )
+                .map(|_| ())
+                .map_err(|error| error.to_string())
+            })
+            .await
+            .expect("batched insert");
+
+        let value: String = worker
+            .run("read_probe", |db| {
+                db.query_row("SELECT value FROM batch_probe WHERE id = 1", [], |row| {
+                    row.get(0)
+                })
+                .map_err(|error| error.to_string())
+            })
+            .await
+            .expect("read batched row");
+        assert_eq!(value, "solo-batched-job");
+        worker.shutdown(Duration::from_secs(1)).await;
+    }
+
+    #[tokio::test]
+    async fn run_batched_panic_is_contained_and_worker_survives() {
+        let worker = worker();
+        let panic = worker
+            .run_batched::<(), _>("expected_batched_panic", |_tx| {
+                panic!("synthetic batched panic")
+            })
+            .await
+            .expect_err("panic should be contained by the worker");
+        assert!(panic.contains("panicked"));
+
+        // The worker must still be usable after a panic inside a batch.
+        let value = worker
+            .run_batched("after_batched_panic", |_tx| Ok::<_, String>(9_u32))
+            .await
+            .expect("worker keeps serving batched jobs after a panic");
+        assert_eq!(value, 9);
+        assert!(worker.is_healthy());
+        worker.shutdown(Duration::from_secs(1)).await;
+    }
+
+    #[tokio::test]
+    async fn one_erroring_batched_job_does_not_lose_concurrent_siblings() {
+        let worker = worker();
+        worker
+            .run("create_probe", |db| {
+                db.execute_batch(
+                    "CREATE TABLE concurrent_batch_probe (id INTEGER PRIMARY KEY, tag INTEGER NOT NULL);",
+                )
+                .map_err(|error| error.to_string())
+            })
+            .await
+            .expect("create probe table");
+
+        // Fire several batched writes and one deliberately-erroring batched
+        // job concurrently, without awaiting between sends, so the worker
+        // has a real chance to coalesce them into one shared transaction.
+        // Every successful job must still see its own row persisted, and
+        // the erroring job must not silently swallow or corrupt siblings'
+        // results even if they land in the same transaction.
+        let worker_ref = &worker;
+        let error_job = worker_ref.run_batched::<(), _>("erroring_sibling", |_tx| {
+            Err("synthetic sibling failure".to_owned())
+        });
+        let writes = (0..8i64).map(|tag| {
+            worker_ref.run_batched("ok_sibling", move |tx| {
+                tx.execute(
+                    "INSERT INTO concurrent_batch_probe (tag) VALUES (?1)",
+                    [tag],
+                )
+                .map(|_| ())
+                .map_err(|error| error.to_string())
+            })
+        });
+        let (error_result, write_results) =
+            tokio::join!(error_job, futures::future::join_all(writes));
+
+        assert_eq!(
+            error_result.expect_err("erroring job must report its own error"),
+            "synthetic sibling failure"
+        );
+        for result in write_results {
+            result.expect("sibling write must succeed independently of the erroring job");
+        }
+
+        let count: i64 = worker
+            .run("count_probe", |db| {
+                db.query_row("SELECT COUNT(*) FROM concurrent_batch_probe", [], |row| {
+                    row.get(0)
+                })
+                .map_err(|error| error.to_string())
+            })
+            .await
+            .expect("count persisted rows");
+        assert_eq!(count, 8);
+        worker.shutdown(Duration::from_secs(1)).await;
+    }
+
+    #[tokio::test]
+    async fn mixed_execute_and_execute_batched_requests_all_complete_correctly() {
+        let worker = worker();
+        let worker_ref = &worker;
+        // A plain `Execute` job queued alongside several `ExecuteBatched`
+        // jobs must be handled correctly by the drain loop's
+        // not-part-of-this-batch hold-for-next-turn path, without being
+        // lost, duplicated, or corrupting the batch it interrupted.
+        let plain = worker_ref.run("plain_job", |_db| Ok::<_, String>("plain".to_owned()));
+        let batched = (0..5u32).map(|n| worker_ref.run_batched("batched_job", move |_tx| Ok::<_, String>(n)));
+        let (plain_result, batched_results) = tokio::join!(plain, futures::future::join_all(batched));
+
+        assert_eq!(plain_result.expect("plain job"), "plain");
+        let mut values: Vec<u32> = batched_results
+            .into_iter()
+            .map(|result| result.expect("batched job"))
+            .collect();
+        values.sort_unstable();
+        assert_eq!(values, vec![0, 1, 2, 3, 4]);
+        worker.shutdown(Duration::from_secs(1)).await;
     }
 
     #[tokio::test]
@@ -885,7 +1310,7 @@ mod tests {
                             release_for_job.wait();
                             Ok::<_, String>(())
                         },
-                        Duration::from_millis(25),
+                        Duration::from_millis(100),
                     )
                     .await
             }

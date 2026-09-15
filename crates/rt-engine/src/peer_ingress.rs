@@ -83,7 +83,6 @@ impl PeerIngressBudget {
         peer_addr: SocketAddr,
         now: Instant,
     ) -> Result<PeerIngressPermit, PeerIngressReject> {
-        self.prune_ip_window(peer_addr.ip(), now);
         let reservation_id = self.next_reservation_id.fetch_add(1, Ordering::Relaxed);
         if !self.reserve_ip_slot(peer_addr.ip(), now, reservation_id) {
             self.rejected_ip_budget.fetch_add(1, Ordering::Relaxed);
@@ -120,11 +119,15 @@ impl PeerIngressBudget {
         }
     }
 
-    fn prune_ip_window(&self, ip: IpAddr, now: Instant) {
+    fn reserve_ip_slot(&self, ip: IpAddr, now: Instant, reservation_id: u64) -> bool {
         let mut per_ip = self
             .per_ip
             .lock()
             .expect("peer ingress budget mutex poisoned");
+
+        // Prune the requested IP while holding the same lock used for the
+        // admission check. This avoids a second lock acquisition and keeps
+        // the check-and-reserve operation atomic under reconnect bursts.
         if let Some(events) = per_ip.get_mut(&ip) {
             while events.front().copied().is_some_and(|event| {
                 now.saturating_duration_since(event.admitted_at) >= self.config.per_ip_window
@@ -135,13 +138,7 @@ impl PeerIngressBudget {
                 per_ip.remove(&ip);
             }
         }
-    }
 
-    fn reserve_ip_slot(&self, ip: IpAddr, now: Instant, reservation_id: u64) -> bool {
-        let mut per_ip = self
-            .per_ip
-            .lock()
-            .expect("peer ingress budget mutex poisoned");
         if !per_ip.contains_key(&ip) && per_ip.len() >= MAX_TRACKED_PEER_INGRESS_IPS {
             // An IP that never reconnects cannot trigger the normal per-IP
             // pruning path. Without sweeping here, the bounded map becomes

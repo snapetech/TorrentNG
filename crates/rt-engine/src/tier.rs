@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::hash::Hash;
 use std::time::{Duration, Instant};
 
@@ -350,6 +350,10 @@ where
         self.tracker_checks.pop_due(now)
     }
 
+    pub fn pop_due_tracker_checks_limited(&mut self, now: Instant, limit: usize) -> Vec<K> {
+        self.tracker_checks.pop_due_limited(now, limit)
+    }
+
     pub fn apply_input(&mut self, key: K, input: TierInput) -> TierDecision {
         let decision = self.policy.decide(input);
         self.record_decision(key, input.now, decision);
@@ -377,6 +381,10 @@ where
 
     pub fn pop_due_idle_checks(&mut self, now: Instant) -> Vec<K> {
         self.idle_checks.pop_due(now)
+    }
+
+    pub fn pop_due_idle_checks_limited(&mut self, now: Instant, limit: usize) -> Vec<K> {
+        self.idle_checks.pop_due_limited(now, limit)
     }
 
     /// Put a due activity check back on the wheel when the engine deliberately
@@ -487,7 +495,7 @@ impl TierScaleSnapshot {
 
 #[derive(Debug, Clone)]
 pub struct ActivityTimerWheel<K> {
-    deadlines: BTreeMap<Instant, Vec<K>>,
+    deadlines: BTreeMap<Instant, VecDeque<K>>,
     scheduled: HashMap<K, Instant>,
 }
 
@@ -520,7 +528,7 @@ where
         self.deadlines
             .entry(deadline)
             .or_default()
-            .push(key.clone());
+            .push_back(key.clone());
         self.scheduled.insert(key, deadline);
     }
 
@@ -546,17 +554,42 @@ where
     }
 
     pub fn pop_due(&mut self, now: Instant) -> Vec<K> {
-        let due_deadlines: Vec<Instant> = self.deadlines.range(..=now).map(|(t, _)| *t).collect();
-        let mut due = Vec::new();
-        for deadline in due_deadlines {
-            let Some(keys) = self.deadlines.remove(&deadline) else {
+        self.pop_due_limited(now, usize::MAX)
+    }
+
+    /// Pop at most `limit` live entries whose deadlines have elapsed. Older
+    /// implementations first collected every due deadline and then removed
+    /// every key, so a clock jump or restart could turn one timer tick into a
+    /// large allocation and a long engine-actor pause. Leave the remaining
+    /// due entries in the wheel for a later bounded pass.
+    pub fn pop_due_limited(&mut self, now: Instant, limit: usize) -> Vec<K> {
+        let mut due = Vec::with_capacity(limit.min(self.scheduled.len()));
+        while due.len() < limit {
+            let Some(deadline) = self.deadlines.keys().next().copied() else {
+                break;
+            };
+            if deadline > now {
+                break;
+            }
+
+            let key = self
+                .deadlines
+                .get_mut(&deadline)
+                .and_then(|keys| keys.pop_front());
+            let Some(key) = key else {
+                self.deadlines.remove(&deadline);
                 continue;
             };
-            for key in keys {
-                if self.scheduled.get(&key).copied() == Some(deadline) {
-                    self.scheduled.remove(&key);
-                    due.push(key);
-                }
+            if self
+                .deadlines
+                .get(&deadline)
+                .is_some_and(VecDeque::is_empty)
+            {
+                self.deadlines.remove(&deadline);
+            }
+            if self.scheduled.get(&key).copied() == Some(deadline) {
+                self.scheduled.remove(&key);
+                due.push(key);
             }
         }
         due
@@ -747,6 +780,21 @@ mod tests {
 
         assert!(wheel.cancel(&torrent));
         assert!(wheel.pop_due(now + Duration::from_secs(30)).is_empty());
+        assert!(wheel.is_empty());
+    }
+
+    #[test]
+    fn timer_wheel_limited_pop_leaves_due_entries_for_a_later_pass() {
+        let now = Instant::now();
+        let mut wheel = ActivityTimerWheel::<String>::default();
+        for index in 0..5 {
+            wheel.schedule(format!("{index}"), now);
+        }
+
+        assert_eq!(wheel.pop_due_limited(now, 2), vec!["0", "1"]);
+        assert_eq!(wheel.len(), 3);
+        assert_eq!(wheel.pop_due_limited(now, 2), vec!["2", "3"]);
+        assert_eq!(wheel.pop_due_limited(now, 2), vec!["4"]);
         assert!(wheel.is_empty());
     }
 
