@@ -22,7 +22,16 @@ Use TorrentNG to:
 - move between clients with migration and export tools instead of locking your
   data into one ecosystem.
 
-![TorrentNG WebUI using the Sietch Neon theme while downloading Linux ISO test data](docs/assets/torrentng-sietch-neon-linux-isos.png)
+![TorrentNG WebUI in the default dark theme with official Debian, Fedora, and Ubuntu Linux ISO torrent metadata paused](docs/assets/torrentng-default-dark-linux-isos.png)
+
+![TorrentNG Appearance settings showing the default TorrentNG dark palette](docs/assets/torrentng-default-dark-linux-isos-settings.png)
+
+These screenshots use the default TorrentNG dark palette and real torrent
+metadata from [Debian](https://www.debian.org/CD/torrent-cd/),
+[Ubuntu](https://releases.ubuntu.com/24.04/), and
+[Fedora](https://torrent.fedoraproject.org/torrents/). The captures were made
+with all transfers paused in an isolated local session; no ISO payload was
+downloaded or uploaded.
 
 ## Keep your client. Or run ours.
 
