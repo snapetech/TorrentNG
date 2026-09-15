@@ -40,6 +40,7 @@ pub const STORAGE_LATENCY_BUCKETS_NS: [u64; 8] = [
 pub const STORAGE_LATENCY_BUCKET_COUNT: usize = STORAGE_LATENCY_BUCKETS_NS.len();
 
 const QUEUED_DISK_JOB_OVERHEAD_BYTES: u64 = 1024;
+const MAX_HASH_QUEUE_RETRIES: usize = 10_000;
 
 /// A pending read or write operation against a storage root.
 #[derive(Debug)]
@@ -319,10 +320,67 @@ enum OpenMode {
     Write,
 }
 
+/// Identity of the filesystem object behind a cached descriptor.
+///
+/// Storage moves and payload cleanup run through a separate plan executor and
+/// can unlink or replace a path while this process still has the old
+/// descriptor open. Comparing the path's current identity before reusing a
+/// cached handle prevents a later torrent from writing to an unlinked inode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct FileIdentity {
+    #[cfg(unix)]
+    device: u64,
+    #[cfg(unix)]
+    inode: u64,
+    #[cfg(windows)]
+    volume_serial: u32,
+    #[cfg(windows)]
+    file_index: u64,
+}
+
+fn file_identity(file: &File) -> io::Result<FileIdentity> {
+    metadata_identity(&file.metadata()?)
+}
+
+fn path_identity(path: &Path) -> io::Result<FileIdentity> {
+    // Do not follow a final symlink here. Runtime opens reject symlinks, and a
+    // symlink replacing a cached regular file must force a fresh safe open.
+    metadata_identity(&std::fs::symlink_metadata(path)?)
+}
+
+fn metadata_identity(metadata: &std::fs::Metadata) -> io::Result<FileIdentity> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+
+        Ok(FileIdentity {
+            device: metadata.dev(),
+            inode: metadata.ino(),
+        })
+    }
+
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+
+        return Ok(FileIdentity {
+            volume_serial: metadata.volume_serial_number().unwrap_or_default(),
+            file_index: metadata.file_index().unwrap_or_default(),
+        });
+    }
+
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = metadata;
+        Ok(FileIdentity {})
+    }
+}
+
 #[derive(Debug)]
 struct CachedFile {
     file: Arc<File>,
     mode: OpenMode,
+    identity: FileIdentity,
     last_used: Instant,
     sequence: u64,
 }
@@ -361,7 +419,7 @@ impl FilePool {
         let mut entries = self.entries.lock().expect("file pool mutex poisoned");
         self.sweep_idle_locked(&mut entries, now);
         if let Some(entry) = entries.get_mut(&key) {
-            if entry.mode == mode {
+            if entry.mode == mode && path_identity(&key).ok() == Some(entry.identity) {
                 entry.last_used = now;
                 entry.sequence = seq;
                 self.counters.hits.fetch_add(1, Ordering::Relaxed);
@@ -376,11 +434,13 @@ impl FilePool {
             open_path_no_follow(&key, mode == OpenMode::Write, create)
                 .map_err(|e| StorageError::io(&path_str, e))?,
         );
+        let identity = file_identity(&file).map_err(|e| StorageError::io(&path_str, e))?;
         entries.insert(
             key,
             CachedFile {
                 file: file.clone(),
                 mode,
+                identity,
                 last_used: now,
                 sequence: seq,
             },
@@ -393,11 +453,18 @@ impl FilePool {
         let key = normalized_key(path);
         let path_str = key.display().to_string();
         let file = {
-            let entries = self.entries.lock().expect("file pool mutex poisoned");
-            entries
+            let mut entries = self.entries.lock().expect("file pool mutex poisoned");
+            let file = entries
                 .get(&key)
-                .filter(|entry| entry.mode == OpenMode::Write)
-                .map(|entry| entry.file.clone())
+                .filter(|entry| {
+                    entry.mode == OpenMode::Write
+                        && path_identity(&key).ok() == Some(entry.identity)
+                })
+                .map(|entry| entry.file.clone());
+            if file.is_none() && entries.remove(&key).is_some() {
+                self.counters.evictions.fetch_add(1, Ordering::Relaxed);
+            }
+            file
         };
         match file {
             Some(file) => Ok(file),
@@ -409,7 +476,19 @@ impl FilePool {
     }
 
     fn write_handles(&self) -> Vec<(PathBuf, Arc<File>)> {
-        let entries = self.entries.lock().expect("file pool mutex poisoned");
+        let mut entries = self.entries.lock().expect("file pool mutex poisoned");
+        let stale: Vec<PathBuf> = entries
+            .iter()
+            .filter(|(path, entry)| {
+                entry.mode == OpenMode::Write && path_identity(path).ok() != Some(entry.identity)
+            })
+            .map(|(path, _)| path.clone())
+            .collect();
+        for path in stale {
+            if entries.remove(&path).is_some() {
+                self.counters.evictions.fetch_add(1, Ordering::Relaxed);
+            }
+        }
         entries
             .iter()
             .filter(|(_, entry)| entry.mode == OpenMode::Write)
@@ -498,26 +577,44 @@ impl BlockingPool {
         let (sender, receiver) = mpsc::sync_channel::<BlockingJob>(queue_depth.max(1));
         let receiver = Arc::new(Mutex::new(receiver));
         let queued = Arc::new(AtomicUsize::new(0));
-        for index in 0..worker_threads.max(1) {
+        let requested_workers = worker_threads.max(1);
+        let mut started_workers = 0;
+        for index in 0..requested_workers {
             let receiver = receiver.clone();
             let queued = queued.clone();
             let name = format!("{name_prefix}-{index}");
-            std::thread::Builder::new()
-                .name(name)
-                .spawn(move || loop {
-                    let job = {
-                        let rx = receiver.lock().expect("I/O pool mutex poisoned");
-                        rx.recv()
-                    };
-                    match job {
-                        Ok(job) => {
-                            queued.fetch_sub(1, Ordering::Relaxed);
-                            job();
-                        }
-                        Err(_) => break,
+            match std::thread::Builder::new().name(name).spawn(move || loop {
+                let job = {
+                    let rx = receiver.lock().expect("I/O pool mutex poisoned");
+                    rx.recv()
+                };
+                match job {
+                    Ok(job) => {
+                        queued.fetch_sub(1, Ordering::Relaxed);
+                        job();
                     }
-                })
-                .expect("failed to spawn storage I/O worker");
+                    Err(_) => break,
+                }
+            }) {
+                Ok(_) => started_workers += 1,
+                Err(error) => {
+                    tracing::error!(
+                        component = "storage",
+                        operation = "spawn_blocking_workers",
+                        pool = name_prefix,
+                        requested_workers,
+                        started_workers,
+                        result = if started_workers == 0 {
+                            "unavailable"
+                        } else {
+                            "degraded"
+                        },
+                        error = %error,
+                        "storage blocking pool started with fewer workers"
+                    );
+                    break;
+                }
+            }
         }
         Self {
             queue_name: name_prefix,
@@ -710,6 +807,7 @@ pub struct MountScheduler {
     peer_read_cache_epoch: Arc<AtomicU64>,
     peer_read_elevator: Arc<Mutex<Option<PeerReadElevator>>>,
     peer_read_limit: usize,
+    recheck_limit: usize,
     peer_read_elevator_enabled: bool,
     peer_read_elevator_queue_depth: usize,
     device_id: Option<String>,
@@ -799,6 +897,7 @@ impl Default for StorageCounters {
 
 #[derive(Debug)]
 struct PeerReadCacheEntry {
+    identity: FileIdentity,
     offset: u64,
     data: bytes::Bytes,
     last_used: Instant,
@@ -860,7 +959,15 @@ impl QueuedDiskBytes {
         bytes: u64,
         mount: impl Into<String>,
     ) -> Result<Self, StorageError> {
-        let bytes = queued_disk_charge(bytes);
+        Self::reserve_charged(counters, resources, queued_disk_charge(bytes), mount)
+    }
+
+    fn reserve_charged(
+        counters: Arc<StorageCounters>,
+        resources: Option<&ResourceGovernor>,
+        bytes: u64,
+        mount: impl Into<String>,
+    ) -> Result<Self, StorageError> {
         let lease = if let Some(resources) = resources {
             let Some(lease) = resources.try_acquire(MemoryClass::QueuedDisk, bytes) else {
                 counters.queue_full.fetch_add(1, Ordering::Relaxed);
@@ -904,6 +1011,31 @@ async fn await_backend_io<T>(
     rx: oneshot::Receiver<io::Result<T>>,
 ) -> Result<T, StorageError> {
     await_backend_io_with_expected(path, rx, None).await
+}
+
+/// Keep cache invalidation attached to the backend operation rather than to
+/// the caller waiting for it. A cancelled writer can drop its receive future
+/// while the dedicated disk worker is still completing the syscall; without
+/// this watcher a concurrent peer read may publish pre-write bytes back into
+/// the cache after the writer's initial invalidation.
+fn backend_write_completion_with_cache_invalidation(
+    rx: oneshot::Receiver<io::Result<()>>,
+    cache: Arc<Mutex<HashMap<PathBuf, PeerReadCacheEntry>>>,
+    epoch: Arc<AtomicU64>,
+    key: PathBuf,
+) -> oneshot::Receiver<io::Result<()>> {
+    let (completion_tx, completion_rx) = oneshot::channel();
+    tokio::spawn(async move {
+        let result = rx.await.unwrap_or_else(|_| {
+            Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "storage backend completion channel closed",
+            ))
+        });
+        peer_read_cache_invalidate(&cache, &epoch, &key);
+        let _ = completion_tx.send(result);
+    });
+    completion_rx
 }
 
 async fn await_backend_io_with_expected<T>(
@@ -1479,6 +1611,7 @@ impl MountScheduler {
             peer_read_cache_epoch: Arc::new(AtomicU64::new(0)),
             peer_read_elevator,
             peer_read_limit,
+            recheck_limit,
             peer_read_elevator_enabled,
             peer_read_elevator_queue_depth,
             device_id,
@@ -1631,6 +1764,21 @@ impl MountScheduler {
             IoClass::Metadata => &self.metadata_sem,
         };
         sem.clone().try_acquire_owned().ok()
+    }
+
+    /// Configured concurrency budget for the `IoClass::Recheck` lane on this
+    /// mount: `SchedulerConfig::recheck_concurrency` when set explicitly, or
+    /// the profile default (`IoClass::Recheck::{ssd,hdd}_concurrency`)
+    /// otherwise. This is the same limit that sizes `recheck_sem`, i.e. the
+    /// number of recheck reads the elevator already allows in flight at
+    /// once on this mount.
+    ///
+    /// Recheck/import/migration verification pipelines that parallelize
+    /// across pieces or files should size their in-flight batch to this
+    /// value so they share the existing recheck lane budget instead of
+    /// introducing a second, independent concurrency limit.
+    pub fn recheck_concurrency(&self) -> usize {
+        self.recheck_limit
     }
 
     pub fn available_permits(&self, class: IoClass) -> usize {
@@ -1787,12 +1935,13 @@ impl MountScheduler {
             .run(move || {
                 let key = normalized_key(&path);
                 let path_str = key.display().to_string();
+                let file = pool.get_or_open(&key, OpenMode::Read, false)?;
                 if class == IoClass::PeerRead
                     && readahead_bytes > len
                     && readahead_cache_entries > 0
                 {
                     if let Some(bytes) =
-                        peer_read_cache_hit(&preparation_peer_read_cache, &key, offset, len)
+                        peer_read_cache_hit(&preparation_peer_read_cache, &key, &file, offset, len)
                     {
                         preparation_counters
                             .peer_read_cache_hits
@@ -1814,7 +1963,6 @@ impl MountScheduler {
                         .peer_read_cache_misses
                         .fetch_add(1, Ordering::Relaxed);
                 }
-                let file = pool.get_or_open(&key, OpenMode::Read, false)?;
                 let read_len = if class == IoClass::PeerRead
                     && readahead_bytes > len
                     && readahead_cache_entries > 0
@@ -1852,6 +2000,20 @@ impl MountScheduler {
                 file,
                 read_len,
             } => {
+                let requested_charge = queued_disk_charge(len as u64);
+                let read_buffer_charge = queued_disk_charge(read_len as u64);
+                let _read_buffer_queued_bytes = read_buffer_charge
+                    .checked_sub(requested_charge)
+                    .filter(|bytes| *bytes > 0)
+                    .map(|bytes| {
+                        QueuedDiskBytes::reserve_charged(
+                            counters.clone(),
+                            self.resources.as_ref(),
+                            bytes,
+                            format!("storage-root-{}-readahead", self.storage_root.0),
+                        )
+                    })
+                    .transpose()?;
                 let frame = global_frame_pool().try_acquire(read_len).ok_or_else(|| {
                     StorageError::QueueFull {
                         mount: "scheduler-read-frame".to_string(),
@@ -1888,12 +2050,15 @@ impl MountScheduler {
                 if class == IoClass::PeerRead && read_len > len && readahead_cache_entries > 0 {
                     let bytes = frame.into_bytes();
                     let exact = bytes.slice(..len);
-                    self.peer_read_cache_store(
-                        cache_generation.expect("peer-read cache generation is set"),
-                        key,
-                        offset,
-                        bytes,
-                    );
+                    if let Ok(identity) = file_identity(&file) {
+                        self.peer_read_cache_store(
+                            cache_generation.expect("peer-read cache generation is set"),
+                            key,
+                            identity,
+                            offset,
+                            bytes,
+                        );
+                    }
                     Ok(StorageRead::Bytes(exact))
                 } else {
                     Ok(StorageRead::Frame(frame))
@@ -1906,6 +2071,7 @@ impl MountScheduler {
         &self,
         generation: u64,
         key: PathBuf,
+        identity: FileIdentity,
         offset: u64,
         data: bytes::Bytes,
     ) {
@@ -1948,6 +2114,7 @@ impl MountScheduler {
         cache.insert(
             key,
             PeerReadCacheEntry {
+                identity,
                 offset,
                 data,
                 last_used: Instant::now(),
@@ -2002,7 +2169,12 @@ impl MountScheduler {
         let written = data.len();
         let result = await_backend_io_with_expected(
             &key,
-            disk_backend.pwrite(file.clone(), data, offset),
+            backend_write_completion_with_cache_invalidation(
+                disk_backend.pwrite(file.clone(), data, offset),
+                peer_read_cache.clone(),
+                peer_read_cache_epoch.clone(),
+                key.clone(),
+            ),
             Some(written),
         )
         .await;
@@ -2309,6 +2481,75 @@ impl MountScheduler {
         result
     }
 
+    /// Hash an input while retrying transient hash-queue pressure.
+    ///
+    /// The ordinary [`Self::hash_sha1`] operation remains fail-fast so
+    /// callers that use `QueueFull` as backpressure keep that behavior. A
+    /// caller that retains a correctness-critical input, such as a complete
+    /// peer piece assembled in memory, can use this bounded retry path
+    /// instead of discarding valid data because another hash is briefly
+    /// occupying the dedicated pool.
+    pub async fn hash_sha1_retry_queue_full(
+        &self,
+        data: bytes::Bytes,
+    ) -> Result<[u8; 20], StorageError> {
+        let mut attempts = 0;
+        loop {
+            match self.hash_sha1(data.clone()).await {
+                Err(StorageError::QueueFull { .. }) if attempts < MAX_HASH_QUEUE_RETRIES => {
+                    attempts += 1;
+                    if attempts.is_multiple_of(16) {
+                        tokio::time::sleep(Duration::from_millis(1)).await;
+                    } else {
+                        tokio::task::yield_now().await;
+                    }
+                }
+                result => return result,
+            }
+        }
+    }
+
+    /// Apply one bounded chunk to a SHA-1 state on the dedicated hash pool.
+    ///
+    /// Recheck deliberately streams large pieces instead of retaining the
+    /// whole piece in memory. Keep the state cloneable at this boundary so a
+    /// queue-full rejection leaves the caller's current state intact and can
+    /// be retried without losing already-hashed chunks.
+    pub(crate) async fn hash_sha1_update(
+        &self,
+        hasher: &Sha1,
+        data: bytes::Bytes,
+    ) -> Result<Sha1, StorageError> {
+        let counters = self.counters.clone();
+        let started = Instant::now();
+        let queued_bytes = QueuedDiskBytes::reserve(
+            counters.clone(),
+            self.resources.as_ref(),
+            data.len() as u64,
+            "rt-storage-hash",
+        )?;
+        let next_hasher = hasher.clone();
+        let result = self
+            .hash_pool
+            .run(move || {
+                let _queued_bytes = queued_bytes;
+                let mut next_hasher = next_hasher;
+                next_hasher.update(&data);
+                counters.hash_ops.fetch_add(1, Ordering::Relaxed);
+                let latency_ns = latency_ns_since(started);
+                counters
+                    .hash_latency_ns
+                    .fetch_add(latency_ns, Ordering::Relaxed);
+                record_latency_bucket(&counters.hash_latency_buckets, latency_ns);
+                Ok(next_hasher)
+            })
+            .await;
+        if matches!(result, Err(StorageError::QueueFull { .. })) {
+            self.counters.queue_full.fetch_add(1, Ordering::Relaxed);
+        }
+        result
+    }
+
     pub async fn hash_v2_leaf(&self, data: bytes::Bytes) -> Result<[u8; 32], StorageError> {
         let counters = self.counters.clone();
         let started = Instant::now();
@@ -2442,10 +2683,19 @@ fn record_sync_completion(counters: &StorageCounters, started: Instant) {
 fn peer_read_cache_hit(
     cache: &Mutex<HashMap<PathBuf, PeerReadCacheEntry>>,
     key: &Path,
+    file: &File,
     offset: u64,
     len: usize,
 ) -> Option<bytes::Bytes> {
+    let identity = file_identity(file).ok()?;
     let mut cache = cache.lock().expect("peer read cache mutex poisoned");
+    if cache
+        .get(key)
+        .is_some_and(|entry| entry.identity != identity)
+    {
+        cache.remove(key);
+        return None;
+    }
     let entry = cache.get_mut(key)?;
     let relative = offset.checked_sub(entry.offset)? as usize;
     let end = relative.checked_add(len)?;
@@ -2679,7 +2929,10 @@ mod tests {
 
     use super::*;
     use crate::elevator::DeviceId;
+    use crate::verify::{PieceVerifier, VerifyResult};
+    use rt_path::SafeRelPath;
     use rt_path::StorageRootId;
+    use rt_piece_map::{FileSpan, PieceMap};
 
     fn hdd_scheduler() -> MountScheduler {
         MountScheduler::new(
@@ -2771,6 +3024,25 @@ mod tests {
             Err(StorageError::QueueFull { mount }) if mount == "test-blocking-pool"
         ));
         assert_eq!(pool.queued(), 1);
+    }
+
+    #[tokio::test]
+    async fn blocking_pool_closed_queue_fails_closed() {
+        let (sender, receiver) = mpsc::sync_channel::<BlockingJob>(1);
+        drop(receiver);
+        let pool = BlockingPool {
+            queue_name: "test-closed-blocking-pool",
+            sender,
+            queued: Arc::new(AtomicUsize::new(0)),
+        };
+
+        let result = pool.run(|| Ok::<_, StorageError>(())).await;
+
+        assert!(matches!(
+            result,
+            Err(StorageError::QueueFull { mount }) if mount == "test-closed-blocking-pool"
+        ));
+        assert_eq!(pool.queued(), 0);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -3195,6 +3467,64 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn file_pool_reopens_a_path_after_unlink_and_recreate() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("replaced.bin");
+        std::fs::write(&path, b"old payload").unwrap();
+        let sched = hdd_scheduler();
+
+        assert_eq!(
+            scheduled_read(&sched, IoClass::Foreground, &path, 0, 11)
+                .await
+                .unwrap(),
+            bytes::Bytes::from_static(b"old payload")
+        );
+        std::fs::remove_file(&path).unwrap();
+        std::fs::write(&path, b"new payload").unwrap();
+
+        assert_eq!(
+            scheduled_read(&sched, IoClass::Foreground, &path, 0, 11)
+                .await
+                .unwrap(),
+            bytes::Bytes::from_static(b"new payload")
+        );
+    }
+
+    #[tokio::test]
+    async fn file_pool_writes_to_the_recreated_path_not_the_unlinked_inode() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("replaced-write.bin");
+        std::fs::write(&path, b"old payload").unwrap();
+        let sched = hdd_scheduler();
+
+        scheduled_write(
+            &sched,
+            IoClass::PeerWrite,
+            &path,
+            0,
+            bytes::Bytes::from_static(b"old payload"),
+            false,
+        )
+        .await
+        .unwrap();
+        std::fs::remove_file(&path).unwrap();
+        std::fs::write(&path, b"new payload").unwrap();
+
+        scheduled_write(
+            &sched,
+            IoClass::PeerWrite,
+            &path,
+            0,
+            bytes::Bytes::from_static(b"fresh data!"),
+            false,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(std::fs::read(&path).unwrap(), b"fresh data!");
+    }
+
+    #[tokio::test]
     async fn large_peer_and_recheck_reads_emit_page_cache_advice() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("large.bin");
@@ -3396,6 +3726,114 @@ mod tests {
         assert_eq!(stats.dirty_files, 0);
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn verifier_retries_transient_hash_queue_full() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("hash-queue.bin");
+        let content = vec![0x5au8; 1024 * 1024];
+        std::fs::write(&path, &content).unwrap();
+
+        let sched = MountScheduler::new(
+            StorageRootId::new(),
+            &SchedulerConfig {
+                profile: StorageProfile::Ssd,
+                storage_io: StorageIoConfig {
+                    file_pool_size: 3,
+                    idle_file_ttl_secs: 3601,
+                    io_worker_threads: 2,
+                    io_queue_depth: 8,
+                    hash_worker_threads: 1,
+                    hash_queue_depth: 1,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        );
+
+        let (first_started_tx, first_started_rx) = std::sync::mpsc::channel();
+        let (first_release_tx, first_release_rx) = std::sync::mpsc::channel();
+        let first = tokio::spawn({
+            let pool = sched.hash_pool.clone();
+            async move {
+                pool.run(move || {
+                    first_started_tx.send(()).unwrap();
+                    first_release_rx.recv().unwrap();
+                    Ok::<(), StorageError>(())
+                })
+                .await
+            }
+        });
+        first_started_rx
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap();
+
+        let (second_started_tx, second_started_rx) = std::sync::mpsc::channel();
+        let (second_release_tx, second_release_rx) = std::sync::mpsc::channel();
+        let second = tokio::spawn({
+            let pool = sched.hash_pool.clone();
+            async move {
+                pool.run(move || {
+                    second_started_tx.send(()).unwrap();
+                    second_release_rx.recv().unwrap();
+                    Ok::<(), StorageError>(())
+                })
+                .await
+            }
+        });
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while sched.hash_pool.queued() != 1 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("hash worker queue was not saturated");
+
+        let expected_hash: [u8; 20] = Sha1::digest(&content).into();
+        let complete_piece_hash = tokio::spawn({
+            let sched = sched.clone();
+            let data = bytes::Bytes::from(content.clone());
+            async move { sched.hash_sha1_retry_queue_full(data).await }
+        });
+
+        let piece_map = PieceMap::new(
+            content.len() as u64,
+            vec![FileSpan {
+                file_index: 0,
+                path: SafeRelPath::from_name("hash-queue.bin", false).unwrap(),
+                content_offset: 0,
+                length: content.len() as u64,
+            }],
+        )
+        .unwrap();
+        let storage_root = dir.path().to_path_buf();
+        let verify_task = tokio::spawn({
+            let sched = sched.clone();
+            async move {
+                let expected = [expected_hash];
+                let verifier = PieceVerifier::new(&storage_root, &sched, &piece_map, &expected);
+                verifier.verify_piece(0).await
+            }
+        });
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while sched.stats().queue_full == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("verification did not observe the saturated hash queue");
+
+        first_release_tx.send(()).unwrap();
+        first.await.unwrap().unwrap();
+        second_started_rx
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap();
+        second_release_tx.send(()).unwrap();
+        second.await.unwrap().unwrap();
+
+        assert_eq!(complete_piece_hash.await.unwrap().unwrap(), expected_hash);
+        assert_eq!(verify_task.await.unwrap(), VerifyResult::Valid);
+    }
+
     #[tokio::test]
     async fn sync_all_open_files_syncs_dirty_paths_after_fd_eviction() {
         let dir = tempfile::tempdir().unwrap();
@@ -3446,6 +3884,26 @@ mod tests {
         let after_sync = sched.stats();
         assert_eq!(after_sync.dirty_files, 0);
         assert_eq!(after_sync.sync_ops, 1);
+    }
+
+    #[test]
+    fn write_handle_snapshot_drops_replaced_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("replaced.bin");
+        std::fs::write(&path, b"old").unwrap();
+        let pool = FilePool::new(16, Duration::from_secs(30));
+
+        let old = pool.get_or_open(&path, OpenMode::Write, false).unwrap();
+        std::fs::remove_file(&path).unwrap();
+        std::fs::write(&path, b"new-content").unwrap();
+
+        assert!(pool.write_handles().is_empty());
+        let current = pool.open_for_sync(&path).unwrap();
+        assert_ne!(
+            file_identity(&old).unwrap(),
+            file_identity(&current).unwrap()
+        );
+        assert_eq!(current.metadata().unwrap().len(), 11);
     }
 
     #[test]
@@ -3541,6 +3999,44 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn peer_read_readahead_is_admitted_for_actual_backend_buffer() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("readahead-cap.bin");
+        std::fs::write(&path, vec![0xABu8; 2048]).unwrap();
+        let mut caps = [1024 * 1024; rt_metrics::MEMORY_CLASS_COUNT];
+        caps[MemoryClass::QueuedDisk as usize] = 1024;
+        let resources = ResourceGovernor::new(rt_metrics::ResourceGovernorConfig {
+            total_cap_bytes: 1024 * 1024,
+            class_caps_bytes: caps,
+            ..Default::default()
+        });
+        let sched = MountScheduler::new(
+            StorageRootId::new(),
+            &SchedulerConfig {
+                profile: StorageProfile::Ssd,
+                resources: Some(resources.clone()),
+                storage_io: StorageIoConfig {
+                    peer_read_readahead_bytes: 2048,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        );
+
+        let result = sched.read_at(IoClass::PeerRead, &path, 0, 4).await;
+
+        assert!(matches!(
+            result,
+            Err(StorageError::QueueFull { mount }) if mount.ends_with("-readahead")
+        ));
+        assert_eq!(sched.stats().queued_disk_bytes, 0);
+        assert_eq!(
+            resources.snapshot().classes[MemoryClass::QueuedDisk as usize].denied_allocations,
+            1
+        );
+    }
+
+    #[tokio::test]
     async fn peer_read_readahead_cache_is_invalidated_by_writes() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("coherent.bin");
@@ -3577,6 +4073,80 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(&after_write[..], b"new");
+        assert_eq!(sched.stats().peer_read_cache_hits, 0);
+    }
+
+    #[tokio::test]
+    async fn dropped_write_waiter_invalidates_cache_after_backend_completion() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cancelled-write.bin");
+        std::fs::write(&path, b"payload").unwrap();
+        let file = File::open(&path).unwrap();
+        let key = path.clone();
+        let cache = Arc::new(Mutex::new(HashMap::from([(
+            key.clone(),
+            PeerReadCacheEntry {
+                identity: file_identity(&file).unwrap(),
+                offset: 0,
+                data: bytes::Bytes::from_static(b"stale"),
+                last_used: Instant::now(),
+                _lease: None,
+            },
+        )])));
+        let epoch = Arc::new(AtomicU64::new(0));
+        let (backend_tx, backend_rx) = oneshot::channel();
+
+        let completion = backend_write_completion_with_cache_invalidation(
+            backend_rx,
+            Arc::clone(&cache),
+            Arc::clone(&epoch),
+            key.clone(),
+        );
+        // Simulate the writer task being cancelled while the backend still
+        // owns and completes its syscall.
+        drop(completion);
+        backend_tx.send(Ok(())).unwrap();
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while epoch.load(Ordering::Acquire) == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("backend completion watcher did not invalidate the cache");
+        assert!(!cache.lock().unwrap().contains_key(&key));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn peer_read_readahead_cache_reopens_a_replaced_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("replaced.bin");
+        std::fs::write(&path, b"old-data").unwrap();
+        let sched = MountScheduler::new(
+            StorageRootId::new(),
+            &SchedulerConfig {
+                profile: StorageProfile::Hdd,
+                storage_io: StorageIoConfig {
+                    peer_read_readahead_bytes: 8,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        );
+
+        let first = scheduled_read(&sched, IoClass::PeerRead, &path, 0, 3)
+            .await
+            .unwrap();
+        assert_eq!(&first[..], b"old");
+
+        std::fs::remove_file(&path).unwrap();
+        std::fs::write(&path, b"new-data").unwrap();
+
+        let replaced = scheduled_read(&sched, IoClass::PeerRead, &path, 0, 3)
+            .await
+            .unwrap();
+        assert_eq!(&replaced[..], b"new");
         assert_eq!(sched.stats().peer_read_cache_hits, 0);
     }
 

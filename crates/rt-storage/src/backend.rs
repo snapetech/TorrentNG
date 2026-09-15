@@ -19,7 +19,7 @@ use std::io;
 #[cfg(all(unix, not(target_os = "linux")))]
 use std::os::unix::fs::FileExt;
 #[cfg(target_os = "linux")]
-use std::os::unix::fs::{FileExt, MetadataExt};
+use std::os::unix::fs::FileExt;
 #[cfg(target_os = "linux")]
 use std::os::unix::io::AsRawFd;
 #[cfg(windows)]
@@ -173,14 +173,21 @@ impl SelectedDiskBackend {
                 queue_depth,
                 "forced by storage backend configuration".to_string(),
             ),
-            BackendRequest::Auto => Self::pread(
-                requested,
-                threads,
-                queue_depth,
-                "auto uses pread baseline; request io_uring explicitly after correctness benchmarks"
-                    .to_string(),
-            ),
-            BackendRequest::Uring => match UringBackend::probe() {
+            // `Auto` now takes the identical probe-and-fallback path as an
+            // explicit `Uring` request: probe, use io_uring when the probe
+            // reports it usable, otherwise fall back to the portable pread
+            // pool. This reuses the same tested fallback logic that the
+            // explicit request already exercised, so a kernel/container
+            // where the probe fails (old kernel, io_uring disabled, no
+            // registered-file support) is unaffected either way. Validated
+            // via the `rt-storage` backend test suite plus a real-device
+            // NVMe/btrfs roundtrip and throughput comparison (see
+            // `scripts/storage_real_device_benchmark.sh`); this is
+            // functional-correctness and parity evidence on the hardware
+            // available in-repo, not the broader target-hardware fleet soak
+            // `docs/STORAGE_NG.md` originally described — operators who need
+            // the conservative baseline can still force `pread` explicitly.
+            BackendRequest::Auto | BackendRequest::Uring => match UringBackend::probe() {
                 Ok(probe) if probe.usable => {
                     #[cfg(not(target_os = "linux"))]
                     {
@@ -215,6 +222,22 @@ impl SelectedDiskBackend {
         queue_depth: usize,
         reason: String,
     ) -> Self {
+        let (backend, reason) = match PreadBackend::try_new_with_queue_depth(threads, queue_depth) {
+            Ok(backend) => (backend, reason),
+            Err(error) => {
+                tracing::error!(
+                    component = "storage",
+                    operation = "spawn_pread_workers",
+                    result = "degraded",
+                    error = %error,
+                    "pread worker startup failed; storage operations will fail closed"
+                );
+                (
+                    PreadBackend::unavailable(),
+                    format!("{reason}; pread worker startup failed: {error}"),
+                )
+            }
+        };
         let selection = BackendSelection {
             requested,
             selected: BackendKind::Pread,
@@ -222,10 +245,7 @@ impl SelectedDiskBackend {
         };
         Self {
             selection,
-            inner: SelectedDiskBackendInner::Pread(PreadBackend::new_with_queue_depth(
-                threads,
-                queue_depth,
-            )),
+            inner: SelectedDiskBackendInner::Pread(backend),
         }
     }
 
@@ -368,31 +388,55 @@ impl UringBackend {
         let rx = Arc::new(Mutex::new(rx));
         let registered_files_supported = Arc::new(AtomicBool::new(false));
         let fixed_buffers_supported = Arc::new(AtomicBool::new(false));
-        let mut workers = Vec::with_capacity(threads);
+        let mut workers: Vec<thread::JoinHandle<()>> = Vec::with_capacity(threads);
         for i in 0..threads {
             let rx = Arc::clone(&rx);
             let registered_files_supported = Arc::clone(&registered_files_supported);
             let fixed_buffers_supported = Arc::clone(&fixed_buffers_supported);
             let (ready_tx, ready_rx) = mpsc::channel();
-            let handle = thread::Builder::new()
-                .name(format!("tng-uring-{i}"))
-                .spawn(move || {
-                    match UringWorker::new(rx, registered_files_supported, fixed_buffers_supported)
-                    {
-                        Ok(worker) => {
-                            let _ = ready_tx.send(Ok(()));
-                            worker.run();
+            let handle =
+                match thread::Builder::new()
+                    .name(format!("tng-uring-{i}"))
+                    .spawn(move || {
+                        match UringWorker::new(
+                            rx,
+                            registered_files_supported,
+                            fixed_buffers_supported,
+                        ) {
+                            Ok(worker) => {
+                                let _ = ready_tx.send(Ok(()));
+                                worker.run();
+                            }
+                            Err(error) => {
+                                let _ = ready_tx.send(Err(error));
+                            }
                         }
-                        Err(error) => {
-                            let _ = ready_tx.send(Err(error));
+                    }) {
+                    Ok(handle) => handle,
+                    Err(error) => {
+                        drop(tx);
+                        for worker in workers {
+                            let _ = worker.join();
                         }
+                        return Err(error);
                     }
-                })
-                .expect("spawn io_uring worker");
+                };
             match ready_rx.recv() {
                 Ok(Ok(())) => {}
-                Ok(Err(error)) => return Err(error),
+                Ok(Err(error)) => {
+                    drop(tx);
+                    let _ = handle.join();
+                    for worker in workers {
+                        let _ = worker.join();
+                    }
+                    return Err(error);
+                }
                 Err(_) => {
+                    drop(tx);
+                    let _ = handle.join();
+                    for worker in workers {
+                        let _ = worker.join();
+                    }
                     return Err(io::Error::new(
                         io::ErrorKind::BrokenPipe,
                         "io_uring worker exited during startup",
@@ -574,30 +618,34 @@ struct UringWorker {
     registered_files: bool,
     file_slots: HashMap<FileIdentity, u32>,
     slot_files: Vec<Option<FileIdentity>>,
+    file_slot_refs: Vec<usize>,
     pending: HashMap<u64, PendingUring>,
 }
 
 #[cfg(target_os = "linux")]
-#[derive(Debug, Clone, Hash, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Hash, PartialEq, Eq)]
 struct FileIdentity {
-    dev: u64,
-    ino: u64,
+    // The handle cache keeps a read-only and a read/write descriptor for the
+    // same path. io_uring's fixed-file table preserves the descriptor's access
+    // mode, so inode-only identity could route a write through a read-only
+    // descriptor and fail with EBADF.
+    //
+    // A descriptor remains live while its slot is referenced by `pending`, so
+    // its number cannot be reused until the slot is released.
+    fd: i32,
 }
 
 #[cfg(target_os = "linux")]
 #[derive(Debug, Clone, Copy)]
 struct RegisteredFileSlot {
     index: u32,
-    newly_registered: bool,
 }
 
 #[cfg(target_os = "linux")]
-fn file_identity(file: &File) -> Option<FileIdentity> {
-    let metadata = file.metadata().ok()?;
-    Some(FileIdentity {
-        dev: metadata.dev(),
-        ino: metadata.ino(),
-    })
+fn file_identity(file: &File) -> FileIdentity {
+    FileIdentity {
+        fd: file.as_raw_fd(),
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -607,17 +655,20 @@ enum PendingUring {
         frame: Frame,
         expected: usize,
         fixed_slot: Option<RegisteredFrameSlot>,
-        reply: oneshot::Sender<io::Result<Frame>>,
+        file_slot: Option<RegisteredFileSlot>,
+        reply: Option<oneshot::Sender<io::Result<Frame>>>,
     },
     Write {
         file: Arc<File>,
         data: bytes::Bytes,
         expected: usize,
-        reply: oneshot::Sender<io::Result<()>>,
+        file_slot: Option<RegisteredFileSlot>,
+        reply: Option<oneshot::Sender<io::Result<()>>>,
     },
     Sync {
         file: Arc<File>,
-        reply: oneshot::Sender<io::Result<()>>,
+        file_slot: Option<RegisteredFileSlot>,
+        reply: Option<oneshot::Sender<io::Result<()>>>,
     },
 }
 
@@ -673,6 +724,7 @@ impl UringWorker {
             registered_files,
             file_slots: HashMap::new(),
             slot_files: vec![None; URING_FILE_SLOTS as usize],
+            file_slot_refs: vec![0; URING_FILE_SLOTS as usize],
             pending: HashMap::new(),
         })
     }
@@ -702,7 +754,7 @@ impl UringWorker {
                     Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
                     Err(e) => {
                         self.fail_all(e);
-                        break;
+                        return;
                     }
                 }
             }
@@ -782,7 +834,8 @@ impl UringWorker {
                         frame,
                         expected: len,
                         fixed_slot,
-                        reply,
+                        file_slot,
+                        reply: Some(reply),
                     },
                 );
             }
@@ -813,7 +866,8 @@ impl UringWorker {
                         file,
                         data,
                         expected: len,
-                        reply,
+                        file_slot,
+                        reply: Some(reply),
                     },
                 );
             }
@@ -831,7 +885,14 @@ impl UringWorker {
                     let _ = reply.send(Err(io::Error::new(e.kind(), e.to_string())));
                     return Err(e);
                 }
-                self.pending.insert(id, PendingUring::Sync { file, reply });
+                self.pending.insert(
+                    id,
+                    PendingUring::Sync {
+                        file,
+                        file_slot,
+                        reply: Some(reply),
+                    },
+                );
             }
         }
         Ok(())
@@ -841,12 +902,10 @@ impl UringWorker {
         if !self.registered_files {
             return None;
         }
-        let identity = file_identity(file)?;
+        let identity = file_identity(file);
         if let Some(slot) = self.file_slots.get(&identity) {
-            return Some(RegisteredFileSlot {
-                index: *slot,
-                newly_registered: false,
-            });
+            self.file_slot_refs[*slot as usize] += 1;
+            return Some(RegisteredFileSlot { index: *slot });
         }
         let slot = self.slot_files.iter().position(Option::is_none)? as u32;
         match self
@@ -855,12 +914,10 @@ impl UringWorker {
             .register_files_update(slot, &[file.as_raw_fd()])
         {
             Ok(1) => {
-                self.slot_files[slot as usize] = Some(identity.clone());
+                self.slot_files[slot as usize] = Some(identity);
                 self.file_slots.insert(identity, slot);
-                Some(RegisteredFileSlot {
-                    index: slot,
-                    newly_registered: true,
-                })
+                self.file_slot_refs[slot as usize] = 1;
+                Some(RegisteredFileSlot { index: slot })
             }
             Ok(_) => None,
             Err(e) => {
@@ -883,17 +940,35 @@ impl UringWorker {
         fixed_slot: Option<RegisteredFrameSlot>,
     ) {
         drop(fixed_slot);
-        let Some(file_slot) = file_slot.filter(|slot| slot.newly_registered) else {
+        self.release_file_slot(file_slot);
+    }
+
+    fn release_file_slot(&mut self, file_slot: Option<RegisteredFileSlot>) {
+        let Some(file_slot) = file_slot else {
             return;
         };
         let index = file_slot.index as usize;
+        let Some(refs) = self.file_slot_refs.get_mut(index) else {
+            return;
+        };
+        debug_assert!(*refs > 0);
+        if *refs == 0 {
+            return;
+        }
+        *refs -= 1;
+        if *refs != 0 {
+            return;
+        }
         let Some(identity) = self.slot_files.get_mut(index).and_then(Option::take) else {
             return;
         };
-        self.file_slots.remove(&identity);
-        // `push_entry` failed, so no SQE can reference this slot. Clear the
-        // sparse entry as well as the worker bookkeeping so a transient full
-        // submission queue cannot consume the finite fixed-file table.
+        if self.file_slots.get(&identity).copied() == Some(file_slot.index) {
+            self.file_slots.remove(&identity);
+        }
+        // The operation no longer has an SQE that can reference this slot.
+        // Clear the sparse entry as well as the worker bookkeeping so
+        // completed operations, inode reuse, and a transient full submission
+        // queue cannot consume or misdirect the finite fixed-file table.
         if let Err(error) = self
             .ring
             .submitter()
@@ -905,7 +980,7 @@ impl UringWorker {
                 result = "error",
                 slot = file_slot.index,
                 error = %error,
-                "io_uring fixed-file slot could not be cleared after a rejected submission"
+                    "io_uring fixed-file slot could not be cleared after operation release"
             );
         }
     }
@@ -934,70 +1009,88 @@ impl UringWorker {
                     frame,
                     expected,
                     fixed_slot,
+                    file_slot,
                     reply,
                 } => {
                     let _keepalive = file;
-                    let _ = reply.send(match uring_result(result) {
-                        Ok(n) if n == expected => {
-                            if let Some(slot) = fixed_slot {
-                                Ok(frame.into_registered_slot(slot))
-                            } else {
-                                Ok(frame)
+                    if let Some(reply) = reply {
+                        let _ = reply.send(match uring_result(result) {
+                            Ok(n) if n == expected => {
+                                if let Some(slot) = fixed_slot {
+                                    Ok(frame.into_registered_slot(slot))
+                                } else {
+                                    Ok(frame)
+                                }
                             }
-                        }
-                        Ok(_) => Err(io::Error::new(
-                            io::ErrorKind::UnexpectedEof,
-                            "short io_uring read",
-                        )),
-                        Err(e) => Err(e),
-                    });
+                            Ok(_) => Err(io::Error::new(
+                                io::ErrorKind::UnexpectedEof,
+                                "short io_uring read",
+                            )),
+                            Err(e) => Err(e),
+                        });
+                    }
+                    self.release_file_slot(file_slot);
                 }
                 PendingUring::Write {
                     file,
                     data,
                     expected,
+                    file_slot,
                     reply,
                 } => {
                     let _keepalive_file = file;
                     let _keepalive = data;
-                    let _ = reply.send(match uring_result(result) {
-                        Ok(n) if n == expected => Ok(()),
-                        Ok(_) => Err(io::Error::new(
-                            io::ErrorKind::WriteZero,
-                            "short io_uring write",
-                        )),
-                        Err(e) => Err(e),
-                    });
+                    if let Some(reply) = reply {
+                        let _ = reply.send(match uring_result(result) {
+                            Ok(n) if n == expected => Ok(()),
+                            Ok(_) => Err(io::Error::new(
+                                io::ErrorKind::WriteZero,
+                                "short io_uring write",
+                            )),
+                            Err(e) => Err(e),
+                        });
+                    }
+                    self.release_file_slot(file_slot);
                 }
-                PendingUring::Sync { file, reply } => {
+                PendingUring::Sync {
+                    file,
+                    file_slot,
+                    reply,
+                } => {
                     let _keepalive = file;
-                    let _ = reply.send(uring_result(result).map(|_| ()));
+                    if let Some(reply) = reply {
+                        let _ = reply.send(uring_result(result).map(|_| ()));
+                    }
+                    self.release_file_slot(file_slot);
                 }
             }
         }
     }
 
     fn fail_all(&mut self, err: io::Error) {
+        // A submission failure does not prove that the kernel has stopped
+        // consuming the SQEs already published to the ring. Keep every
+        // PendingUring value in place until `UringWorker` drops the ring; its
+        // buffers, payloads, and file descriptors must remain valid for that
+        // whole interval. The worker exits immediately after this method.
         let message = err.to_string();
-        let pending = self
-            .pending
-            .drain()
-            .map(|(_, pending)| pending)
-            .collect::<Vec<_>>();
-        for pending in pending {
+        for pending in self.pending.values_mut() {
             let e = || io::Error::new(err.kind(), message.clone());
             match pending {
-                PendingUring::Read {
-                    reply, fixed_slot, ..
-                } => {
-                    drop(fixed_slot);
-                    let _ = reply.send(Err(e()));
+                PendingUring::Read { reply, .. } => {
+                    if let Some(reply) = reply.take() {
+                        let _ = reply.send(Err(e()));
+                    }
                 }
                 PendingUring::Write { reply, .. } => {
-                    let _ = reply.send(Err(e()));
+                    if let Some(reply) = reply.take() {
+                        let _ = reply.send(Err(e()));
+                    }
                 }
                 PendingUring::Sync { reply, .. } => {
-                    let _ = reply.send(Err(e()));
+                    if let Some(reply) = reply.take() {
+                        let _ = reply.send(Err(e()));
+                    }
                 }
             }
         }
@@ -1163,21 +1256,55 @@ impl PreadBackend {
     }
 
     pub fn new_with_queue_depth(threads: usize, queue_depth: usize) -> Self {
+        match Self::try_new_with_queue_depth(threads, queue_depth) {
+            Ok(backend) => backend,
+            Err(error) => {
+                tracing::error!(
+                    component = "storage",
+                    operation = "spawn_pread_workers",
+                    result = "degraded",
+                    error = %error,
+                    "pread worker startup failed; storage operations will fail closed"
+                );
+                Self::unavailable()
+            }
+        }
+    }
+
+    pub fn try_new_with_queue_depth(threads: usize, queue_depth: usize) -> io::Result<Self> {
         let threads = threads.max(1);
         let (tx, rx) = mpsc::sync_channel::<Job>(queue_depth.max(1));
         let rx = Arc::new(Mutex::new(rx));
-        let mut workers = Vec::with_capacity(threads);
+        let mut workers: Vec<thread::JoinHandle<()>> = Vec::with_capacity(threads);
         for i in 0..threads {
             let rx = Arc::clone(&rx);
-            let handle = thread::Builder::new()
+            let handle = match thread::Builder::new()
                 .name(format!("tng-disk-{i}"))
                 .spawn(move || Self::worker(rx))
-                .expect("spawn disk worker");
+            {
+                Ok(handle) => handle,
+                Err(error) => {
+                    drop(tx);
+                    for worker in workers {
+                        let _ = worker.join();
+                    }
+                    return Err(error);
+                }
+            };
             workers.push(handle);
         }
-        PreadBackend {
+        Ok(PreadBackend {
             tx,
             _workers: workers,
+        })
+    }
+
+    fn unavailable() -> Self {
+        let (tx, rx) = mpsc::sync_channel(1);
+        drop(rx);
+        PreadBackend {
+            tx,
+            _workers: Vec::new(),
         }
     }
 
@@ -1383,6 +1510,22 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn unavailable_pread_backend_fails_closed_without_workers() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("unavailable.bin");
+        std::fs::write(&path, vec![0u8; 16]).unwrap();
+        let backend = PreadBackend::unavailable();
+        let file = Arc::new(File::open(&path).unwrap());
+
+        let error = backend
+            .pwrite(file, bytes::Bytes::from_static(b"fail"), 0)
+            .await
+            .unwrap()
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::BrokenPipe);
+    }
+
+    #[tokio::test]
     async fn pread_backend_queue_fails_closed_when_full() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("queued.bin");
@@ -1497,6 +1640,26 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
+    fn fixed_file_identity_keeps_read_and_write_descriptors_separate() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("access-mode.bin");
+        std::fs::write(&path, b"data").unwrap();
+        let read_file = File::open(&path).unwrap();
+        let write_file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .unwrap();
+
+        assert_ne!(
+            file_identity(&read_file),
+            file_identity(&write_file),
+            "io_uring fixed-file slots must not alias handles with different access modes"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
     fn uring_fixed_buffer_registration_budget_stays_below_common_memlock_limit() {
         const {
             assert!(URING_FIXED_BUFFER_SLOTS < URING_BATCH_LIMIT);
@@ -1550,6 +1713,108 @@ mod tests {
         );
         assert!(worker.file_slots.is_empty());
         assert!(worker.slot_files.iter().all(Option::is_none));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn uring_completed_operations_release_shared_fixed_file_slot() {
+        let probe = UringBackend::probe().unwrap();
+        if !probe.usable || !probe.registered_files {
+            return;
+        }
+        let (_tx, rx) = mpsc::sync_channel(1);
+        let registered_files_supported = Arc::new(AtomicBool::new(false));
+        let fixed_buffers_supported = Arc::new(AtomicBool::new(false));
+        let Ok(mut worker) = UringWorker::new(
+            Arc::new(Mutex::new(rx)),
+            registered_files_supported,
+            fixed_buffers_supported,
+        ) else {
+            return;
+        };
+        if !worker.registered_files {
+            return;
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("uring-complete.bin");
+        std::fs::write(&path, vec![0u8; 16]).unwrap();
+        let file = Arc::new(File::open(&path).unwrap());
+        let (reply_a, response_a) = oneshot::channel();
+        let (reply_b, response_b) = oneshot::channel();
+
+        worker
+            .submit_job(Job::Sync {
+                file: file.clone(),
+                reply: reply_a,
+            })
+            .unwrap();
+        worker
+            .submit_job(Job::Sync {
+                file,
+                reply: reply_b,
+            })
+            .unwrap();
+        assert_eq!(worker.file_slots.len(), 1);
+        assert_eq!(worker.file_slot_refs[0], 2);
+
+        worker.ring.submit_and_wait(2).unwrap();
+        worker.complete_ready();
+        assert!(response_a.await.unwrap().is_ok());
+        assert!(response_b.await.unwrap().is_ok());
+        assert!(worker.file_slots.is_empty());
+        assert!(worker.slot_files.iter().all(Option::is_none));
+        assert!(worker.file_slot_refs.iter().all(|refs| *refs == 0));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn uring_fatal_submission_preserves_pending_io_lifetimes() {
+        let probe = UringBackend::probe().unwrap();
+        if !probe.usable {
+            return;
+        }
+        let (_tx, rx) = mpsc::sync_channel(1);
+        let registered_files_supported = Arc::new(AtomicBool::new(false));
+        let fixed_buffers_supported = Arc::new(AtomicBool::new(false));
+        let Ok(mut worker) = UringWorker::new(
+            Arc::new(Mutex::new(rx)),
+            registered_files_supported,
+            fixed_buffers_supported,
+        ) else {
+            return;
+        };
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("uring-fatal.bin");
+        std::fs::write(&path, vec![0u8; 16]).unwrap();
+        let file = Arc::new(File::open(&path).unwrap());
+        let frame = FramePool::new(1 << 20).try_acquire(16).unwrap();
+        let (reply, response) = oneshot::channel();
+
+        worker
+            .submit_job(Job::Read {
+                file,
+                frame,
+                offset: 0,
+                reply,
+            })
+            .unwrap();
+        assert_eq!(worker.pending.len(), 1);
+
+        worker.fail_all(io::Error::new(
+            io::ErrorKind::BrokenPipe,
+            "simulated io_uring submission failure",
+        ));
+        assert_eq!(worker.pending.len(), 1);
+        assert_eq!(
+            response.await.unwrap().unwrap_err().kind(),
+            io::ErrorKind::BrokenPipe
+        );
+
+        // The worker must be dropped only after the ring has stopped seeing
+        // the SQE's buffer and file references.
+        drop(worker);
     }
 
     #[test]

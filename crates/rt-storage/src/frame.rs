@@ -157,6 +157,15 @@ pub fn global_frame_pool() -> &'static FramePool {
     })
 }
 
+/// Return the process-wide frame pool without initializing it.
+///
+/// Observability paths use this accessor so asking for engine stats cannot
+/// freeze the environment/default cap before the daemon has configured its
+/// storage pool.
+pub fn try_global_frame_pool() -> Option<&'static FramePool> {
+    GLOBAL_FRAME_POOL.get()
+}
+
 /// Configure the process-wide frame-pool cap before the daemon starts using
 /// storage. Standalone storage users that do not call this function retain
 /// the environment-variable/default initialization in [`global_frame_pool`].

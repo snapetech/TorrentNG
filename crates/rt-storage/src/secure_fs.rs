@@ -96,6 +96,7 @@ pub(crate) fn step_is_applied(
     plan: &StoragePlan,
     index: usize,
     roots: &[PathBuf],
+    checkpointed: bool,
 ) -> Result<bool, StorageError> {
     let step = &plan.steps[index];
     match step.action {
@@ -115,6 +116,30 @@ pub(crate) fn step_is_applied(
                 ));
             }
             if source_state.is_none() && destination_state.is_some() {
+                if checkpointed {
+                    if destination_state.is_some_and(EntryType::is_symlink) {
+                        return Err(staged_uncertain(
+                            "reconcile",
+                            format!(
+                                "checkpointed rename destination is a symlink: {}",
+                                destination.display()
+                            ),
+                        ));
+                    }
+                    verify_checkpointed_length(
+                        destination,
+                        step.bytes,
+                        roots,
+                        "reconcile-destination",
+                    )?;
+                    // A durable checkpoint is written only after the rename
+                    // syscall returns. Once the source is gone, the
+                    // checkpoint is the only proof available that this
+                    // destructive step was the operation that published the
+                    // destination. Do not demand the now-deleted source or
+                    // repeat the rename against a newly-created source.
+                    return Ok(true);
+                }
                 let Some(previous) = index
                     .checked_sub(1)
                     .and_then(|previous| plan.steps.get(previous))
@@ -146,6 +171,16 @@ pub(crate) fn step_is_applied(
                 reconcile_content(previous_source, destination, roots)?;
                 return Ok(true);
             }
+            if checkpointed {
+                return Err(staged_uncertain(
+                    "reconcile",
+                    format!(
+                        "checkpointed rename is not in its committed state: {} -> {}",
+                        source.display(),
+                        destination.display()
+                    ),
+                ));
+            }
             Ok(false)
         }
         PlannedStorageAction::CopyVerifyRename | PlannedStorageAction::ImportExisting => {
@@ -167,13 +202,50 @@ pub(crate) fn step_is_applied(
             reconcile_content(source, destination, roots)?;
             Ok(true)
         }
-        PlannedStorageAction::SafeDelete
-        | PlannedStorageAction::SafeDeleteIfPresent
-        | PlannedStorageAction::PruneEmptyDirs => Ok(entry_state(
+        PlannedStorageAction::SafeDelete | PlannedStorageAction::SafeDeleteIfPresent => {
+            let source = required_path(step.source.as_ref(), "reconcile-source")?;
+            let source_exists = entry_state(source, roots)?.is_some();
+            if checkpointed && source_exists {
+                return Err(staged_uncertain(
+                    "reconcile",
+                    format!(
+                        "checkpointed delete target reappeared and will not be deleted again: {}",
+                        source.display()
+                    ),
+                ));
+            }
+            Ok(!source_exists)
+        }
+        PlannedStorageAction::PruneEmptyDirs => Ok(entry_state(
             required_path(step.source.as_ref(), "reconcile-source")?,
             roots,
         )?
         .is_none()),
+    }
+}
+
+fn verify_checkpointed_length(
+    path: &Path,
+    expected_bytes: u64,
+    roots: &[PathBuf],
+    step: &'static str,
+) -> Result<(), StorageError> {
+    if expected_bytes == u64::MAX {
+        return Ok(());
+    }
+    let (parent, name) = open_parent(path, roots, false, step)?;
+    let no_control = || Ok(());
+    let actual = content_len_at(&parent, &name, path, &no_control)?;
+    if actual == expected_bytes {
+        Ok(())
+    } else {
+        Err(staged_uncertain(
+            step,
+            format!(
+                "checkpointed destination has {actual} bytes, expected {expected_bytes}: {}",
+                path.display()
+            ),
+        ))
     }
 }
 

@@ -24,7 +24,10 @@ pub use elevator::{
     elevator_class_weight, DeviceElevator, DeviceId, ElevatorDispatch, FileKey, IoKind, IoOp,
 };
 pub use error::StorageError;
-pub use frame::{configure_global_frame_cap, global_frame_pool, FramePool, DEFAULT_FRAME_CAP_MB};
+pub use frame::{
+    configure_global_frame_cap, global_frame_pool, try_global_frame_pool, FramePool,
+    DEFAULT_FRAME_CAP_MB,
+};
 pub use io_class::IoClass;
 pub use open::{
     create_dir_all_no_follow, metadata_no_follow, read_file_no_follow_limited,

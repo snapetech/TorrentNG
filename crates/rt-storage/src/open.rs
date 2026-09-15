@@ -53,6 +53,45 @@ fn ensure_regular_file(file: File) -> io::Result<File> {
     }
 }
 
+/// Check whether an open descriptor still refers to the object currently
+/// named by `path`.
+///
+/// A path-backed cache can retain a descriptor after a storage move, cleanup,
+/// or external unlink/recreate. The descriptor remains usable in that case,
+/// but it no longer represents the path the caller authorized. Final
+/// symlinks are inspected without following them so replacing a regular file
+/// with a symlink cannot make a cached entry look valid.
+pub(crate) fn file_matches_path(file: &File, path: &Path) -> io::Result<bool> {
+    let file_metadata = file.metadata()?;
+    let path_metadata = std::fs::symlink_metadata(path)?;
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+
+        Ok(
+            file_metadata.dev() == path_metadata.dev()
+                && file_metadata.ino() == path_metadata.ino(),
+        )
+    }
+
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+
+        return Ok(
+            file_metadata.volume_serial_number() == path_metadata.volume_serial_number()
+                && file_metadata.file_index() == path_metadata.file_index(),
+        );
+    }
+
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = (file_metadata, path_metadata);
+        Ok(true)
+    }
+}
+
 /// Create a directory tree without following an ancestor symlink.
 ///
 /// On Unix, each component is opened relative to the descriptor for the
@@ -101,13 +140,18 @@ pub fn read_file_no_follow_limited(path: &Path, max_bytes: usize) -> io::Result<
         .unwrap_or(max_bytes)
         .min(max_bytes);
     let mut bytes = Vec::with_capacity(capacity);
-    let mut limited = file.take(max_bytes.saturating_add(1) as u64);
+    // Read only the length observed on the opened descriptor. Reading up to
+    // `max_bytes + 1` allows a concurrently growing file to force an
+    // allocation far beyond the size that callers preflighted. The final
+    // descriptor check still rejects that growth, but the allocation must be
+    // bounded before the check runs.
+    let mut limited = (&file).take(file_len);
     limited.read_to_end(&mut bytes)?;
-    if bytes.len() > max_bytes {
+    if bytes.len() > max_bytes || file.metadata()?.len() > file_len {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             format!(
-                "runtime file {} grew beyond the {max_bytes} byte limit",
+                "runtime file {} grew while it was being read",
                 path.display()
             ),
         ));

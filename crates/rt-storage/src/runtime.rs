@@ -63,7 +63,7 @@ impl StorageRuntime {
         // Background idle-handle sweeper. A plain OS thread so it works
         // regardless of whether a Tokio runtime exists at init time.
         let sweep_handles = handles.clone();
-        std::thread::Builder::new()
+        if let Err(error) = std::thread::Builder::new()
             .name("tng-handle-sweep".to_string())
             .spawn(move || loop {
                 std::thread::sleep(SWEEP_INTERVAL);
@@ -78,7 +78,15 @@ impl StorageRuntime {
                     );
                 }
             })
-            .expect("spawn handle sweeper");
+        {
+            tracing::error!(
+                component = "storage",
+                operation = "spawn_handle_sweeper",
+                result = "degraded",
+                error = %error,
+                "idle file-handle sweeper unavailable; LRU capacity eviction remains active"
+            );
+        }
 
         tracing::info!(
             component = "storage",

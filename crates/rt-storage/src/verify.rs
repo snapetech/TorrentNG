@@ -1,6 +1,9 @@
 use std::path::Path;
 
+use futures::future;
+use rt_hash::MerkleAccumulator;
 use rt_path::SafeRelPath;
+use sha1::{Digest as Sha1Digest, Sha1};
 use tracing::instrument;
 
 use rt_piece_map::{FileRegion, PieceMap};
@@ -10,6 +13,8 @@ use crate::{
     io_class::IoClass,
     scheduler::{scheduled_read_owned, MountScheduler},
 };
+
+const VERIFY_READ_CHUNK_BYTES: u64 = 1024 * 1024;
 
 /// Result of verifying a single piece.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -55,6 +60,14 @@ impl<'a> PieceVerifier<'a> {
     }
 
     /// Verify a single piece. Reads all file regions that compose the piece.
+    ///
+    /// Chunk reads and chunk hashing are pipelined (double-buffered): while
+    /// chunk N is being hashed on the dedicated hash pool, chunk N+1 is
+    /// already being read from disk, so the wall-clock cost of a piece is
+    /// closer to `max(read_time, hash_time)` than `sum(read_time, hash_time)`.
+    /// The very first read and the very last hash are not overlapped with
+    /// anything (pipeline prologue/epilogue), which is the normal shape of
+    /// software pipelining.
     #[instrument(skip(self), fields(piece))]
     pub async fn verify_piece(&self, piece: u32) -> VerifyResult {
         let regions = match self.piece_map.piece_to_file_regions(piece) {
@@ -77,46 +90,99 @@ impl<'a> PieceVerifier<'a> {
             }
         };
 
-        let total_len = regions
-            .iter()
-            .map(|region| region.length as usize)
-            .sum::<usize>();
-        let mut piece_data = Vec::with_capacity(total_len);
+        // Flatten the piece's file regions into a fixed read-chunk plan up
+        // front (region index, file offset, length) so the pipeline below
+        // can look one chunk ahead, including across a file-region boundary.
+        let mut chunks: Vec<(usize, u64, u64)> = Vec::new();
+        for (region_index, region) in regions.iter().enumerate() {
+            let mut region_offset = 0u64;
+            while region_offset < region.length {
+                let len = (region.length - region_offset).min(VERIFY_READ_CHUNK_BYTES);
+                let file_offset = match region.file_offset.checked_add(region_offset) {
+                    Some(offset) => offset,
+                    None => {
+                        return VerifyResult::Missing {
+                            file_index: region.file_index,
+                            reason: "piece region offset overflow".to_owned(),
+                        };
+                    }
+                };
+                chunks.push((region_index, file_offset, len));
+                region_offset += len;
+            }
+        }
 
-        for region in &regions {
-            match self.read_region(region).await {
-                Ok(data) => piece_data.extend_from_slice(&data),
-                Err(e) => {
-                    tracing::warn!(
-                        component = "storage",
-                        operation = "verify_piece",
-                        piece,
-                        file_index = region.file_index,
-                        result = "error",
-                        error = %e,
-                        "file read failed during verify"
-                    );
-                    return VerifyResult::Missing {
-                        file_index: region.file_index,
-                        reason: e.to_string(),
+        let mut hasher = Sha1::new();
+
+        // Prologue: start the first chunk's read. There is nothing to
+        // overlap it with yet.
+        let mut pending = match chunks.first() {
+            Some(&(region_index, file_offset, len)) => {
+                let region = &regions[region_index];
+                match self.read_region_chunk(region, file_offset, len).await {
+                    Ok(data) => Some(data),
+                    Err(e) => {
+                        self.log_chunk_read_failure(piece, region.file_index, &e);
+                        return VerifyResult::Missing {
+                            file_index: region.file_index,
+                            reason: e.to_string(),
+                        };
+                    }
+                }
+            }
+            None => None,
+        };
+
+        for (i, &(region_index, _, _)) in chunks.iter().enumerate() {
+            let data = pending
+                .take()
+                .expect("verify pipeline lost its buffered chunk");
+            match chunks.get(i + 1) {
+                Some(&(next_region_index, next_offset, next_len)) => {
+                    // Steady state: hash the chunk in hand while prefetching
+                    // the next one. Both futures are polled concurrently by
+                    // `future::join`, so the next chunk's disk read overlaps
+                    // the current chunk's SHA-1 update on the hash pool.
+                    let next_region = &regions[next_region_index];
+                    let hash_fut = recheck_hash_sha1_update(self.scheduler, &hasher, &data);
+                    let read_fut = self.read_region_chunk(next_region, next_offset, next_len);
+                    let (hash_result, read_result) = future::join(hash_fut, read_fut).await;
+                    hasher = match hash_result {
+                        Ok(updated) => updated,
+                        Err(e) => {
+                            return VerifyResult::Missing {
+                                file_index: regions[region_index].file_index,
+                                reason: e.to_string(),
+                            };
+                        }
                     };
+                    pending = match read_result {
+                        Ok(data) => Some(data),
+                        Err(e) => {
+                            self.log_chunk_read_failure(piece, next_region.file_index, &e);
+                            return VerifyResult::Missing {
+                                file_index: next_region.file_index,
+                                reason: e.to_string(),
+                            };
+                        }
+                    };
+                }
+                None => {
+                    // Epilogue: the last chunk has nothing left to prefetch.
+                    match recheck_hash_sha1_update(self.scheduler, &hasher, &data).await {
+                        Ok(updated) => hasher = updated,
+                        Err(e) => {
+                            return VerifyResult::Missing {
+                                file_index: regions[region_index].file_index,
+                                reason: e.to_string(),
+                            };
+                        }
+                    }
                 }
             }
         }
 
-        let actual = match self
-            .scheduler
-            .hash_sha1(bytes::Bytes::from(piece_data))
-            .await
-        {
-            Ok(hash) => hash,
-            Err(e) => {
-                return VerifyResult::Missing {
-                    file_index: 0,
-                    reason: e.to_string(),
-                }
-            }
-        };
+        let actual: [u8; 20] = hasher.finalize().into();
         if &actual == expected {
             tracing::debug!(
                 component = "storage",
@@ -166,15 +232,26 @@ impl<'a> PieceVerifier<'a> {
         Ok(results)
     }
 
-    async fn read_region(&self, region: &FileRegion) -> Result<bytes::Bytes, StorageError> {
+    async fn read_region_chunk(
+        &self,
+        region: &FileRegion,
+        file_offset: u64,
+        len: u64,
+    ) -> Result<bytes::Bytes, StorageError> {
         let file_path = region.path.resolve(self.storage_root);
-        read_sparse_range(
-            self.scheduler,
-            &file_path,
-            region.file_offset,
-            region.length,
-        )
-        .await
+        read_sparse_range(self.scheduler, &file_path, file_offset, len).await
+    }
+
+    fn log_chunk_read_failure(&self, piece: u32, file_index: u32, error: &StorageError) {
+        tracing::warn!(
+            component = "storage",
+            operation = "verify_piece",
+            piece,
+            file_index,
+            result = "error",
+            error = %error,
+            "file read failed during verify"
+        );
     }
 }
 
@@ -248,18 +325,25 @@ impl<'a> V2FileVerifier<'a> {
 
     async fn file_root(&self, file: &V2FileHash) -> Result<[u8; 32], StorageError> {
         let path = file.path.resolve(self.storage_root);
-        let mut leaves = Vec::with_capacity((file.length as usize).div_ceil(Self::LEAF_SIZE));
+        if file.length == 0 {
+            // Empty BEP 52 files omit `pieces root`, but the payload path must
+            // still exist. A zero-length scheduled read validates that the
+            // path can be opened without allocating a data buffer.
+            let _ = recheck_read_owned(self.scheduler, &path, 0, 0).await?;
+        }
+        let mut accumulator = MerkleAccumulator::new();
         let mut offset = 0u64;
         while offset < file.length {
             let len = (file.length - offset).min(Self::LEAF_SIZE as u64) as usize;
             let data = read_sparse_range(self.scheduler, &path, offset, len as u64).await?;
-            leaves.push(self.scheduler.hash_v2_leaf(data).await?);
+            accumulator.push(recheck_hash_v2_leaf(self.scheduler, &data).await?);
             offset += len as u64;
         }
-        if leaves.is_empty() {
-            leaves.push(self.scheduler.hash_v2_leaf(bytes::Bytes::new()).await?);
+        if file.length == 0 {
+            let empty = bytes::Bytes::new();
+            accumulator.push(recheck_hash_v2_leaf(self.scheduler, &empty).await?);
         }
-        self.scheduler.hash_v2_root(leaves).await
+        Ok(accumulator.finish())
     }
 }
 
@@ -310,17 +394,66 @@ async fn recheck_read_owned(
     loop {
         match scheduled_read_owned(scheduler, IoClass::Recheck, path, offset, len).await {
             Ok(read) => return Ok(read.into_bytes()),
-            Err(StorageError::QueueFull { .. }) if attempts < 10_000 => {
-                attempts += 1;
-                if attempts % 16 == 0 {
-                    tokio::time::sleep(std::time::Duration::from_millis(1)).await;
-                } else {
-                    tokio::task::yield_now().await;
+            Err(error @ StorageError::QueueFull { .. }) => {
+                if !retry_recheck_queue_full(&mut attempts).await {
+                    return Err(error);
                 }
             }
             Err(err) => return Err(err),
         }
     }
+}
+
+async fn recheck_hash_sha1_update(
+    scheduler: &MountScheduler,
+    hasher: &Sha1,
+    data: &bytes::Bytes,
+) -> Result<Sha1, StorageError> {
+    let mut attempts = 0;
+    loop {
+        match scheduler.hash_sha1_update(hasher, data.clone()).await {
+            Ok(updated) => return Ok(updated),
+            Err(error @ StorageError::QueueFull { .. }) => {
+                if !retry_recheck_queue_full(&mut attempts).await {
+                    return Err(error);
+                }
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+async fn recheck_hash_v2_leaf(
+    scheduler: &MountScheduler,
+    data: &bytes::Bytes,
+) -> Result<[u8; 32], StorageError> {
+    let mut attempts = 0;
+    loop {
+        match scheduler.hash_v2_leaf(data.clone()).await {
+            Ok(hash) => return Ok(hash),
+            Err(error @ StorageError::QueueFull { .. }) => {
+                if !retry_recheck_queue_full(&mut attempts).await {
+                    return Err(error);
+                }
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+const MAX_RECHECK_QUEUE_RETRIES: usize = 10_000;
+
+async fn retry_recheck_queue_full(attempts: &mut usize) -> bool {
+    if *attempts >= MAX_RECHECK_QUEUE_RETRIES {
+        return false;
+    }
+    *attempts += 1;
+    if (*attempts).is_multiple_of(16) {
+        tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+    } else {
+        tokio::task::yield_now().await;
+    }
+    true
 }
 
 async fn recheck_data_extents(
@@ -333,12 +466,9 @@ async fn recheck_data_extents(
     loop {
         match scheduler.data_extents(path, offset, len).await {
             Ok(extents) => return Ok(extents),
-            Err(StorageError::QueueFull { .. }) if attempts < 10_000 => {
-                attempts += 1;
-                if attempts % 16 == 0 {
-                    tokio::time::sleep(std::time::Duration::from_millis(1)).await;
-                } else {
-                    tokio::task::yield_now().await;
+            Err(error @ StorageError::QueueFull { .. }) => {
+                if !retry_recheck_queue_full(&mut attempts).await {
+                    return Err(error);
                 }
             }
             Err(err) => return Err(err),
@@ -439,6 +569,38 @@ mod tests {
             length: piece_len as u64,
         }];
         let pm = PieceMap::new(piece_len as u64, files).unwrap();
+        let sched = ssd_scheduler();
+        let hashes = [hash];
+        let verifier = PieceVerifier::new(dir.path(), &sched, &pm, &hashes);
+
+        assert_eq!(verifier.verify_piece(0).await, VerifyResult::Valid);
+    }
+
+    #[tokio::test]
+    async fn verify_piece_streams_large_piece() {
+        let dir = tempfile::tempdir().unwrap();
+        let fname = "large-sparse.bin";
+        let piece_len = VERIFY_READ_CHUNK_BYTES * 2 + 17;
+        let file = std::fs::File::create(dir.path().join(fname)).unwrap();
+        file.set_len(piece_len).unwrap();
+        drop(file);
+
+        let zero_chunk = [0u8; 4096];
+        let mut expected_hasher = Sha1::new();
+        let mut remaining = piece_len;
+        while remaining > 0 {
+            let len = remaining.min(zero_chunk.len() as u64) as usize;
+            expected_hasher.update(&zero_chunk[..len]);
+            remaining -= len as u64;
+        }
+        let hash: [u8; 20] = expected_hasher.finalize().into();
+        let files = vec![FileSpan {
+            file_index: 0,
+            path: SafeRelPath::from_name(fname, false).unwrap(),
+            content_offset: 0,
+            length: piece_len,
+        }];
+        let pm = PieceMap::new(piece_len, files).unwrap();
         let sched = ssd_scheduler();
         let hashes = [hash];
         let verifier = PieceVerifier::new(dir.path(), &sched, &pm, &hashes);
@@ -688,5 +850,23 @@ mod tests {
         let verifier = V2FileVerifier::new(dir.path(), &sched, std::slice::from_ref(&file));
 
         assert_eq!(verifier.verify_file(&file).await, VerifyResult::Valid);
+    }
+
+    #[tokio::test]
+    async fn v2_file_verify_rejects_missing_empty_file_without_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = V2FileHash {
+            file_index: 3,
+            path: SafeRelPath::from_name("missing-empty.bin", false).unwrap(),
+            length: 0,
+            pieces_root: None,
+        };
+        let sched = ssd_scheduler();
+        let verifier = V2FileVerifier::new(dir.path(), &sched, std::slice::from_ref(&file));
+
+        assert!(matches!(
+            verifier.verify_file(&file).await,
+            VerifyResult::Missing { file_index: 3, .. }
+        ));
     }
 }

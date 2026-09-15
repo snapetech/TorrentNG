@@ -18,7 +18,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use crate::open::open_path_no_follow;
+use crate::open::{file_matches_path, open_path_no_follow};
 
 /// Whether the cached handle is read-only or read+write. A path may have
 /// one of each (a reader and a writer fd) live simultaneously.
@@ -127,7 +127,12 @@ impl HandleCache {
         let mut inner = self.inner.lock().expect("handle cache poisoned");
         // Another thread may have inserted the same key meanwhile.
         if let Some(existing) = inner.map.get(&key) {
-            return Ok(Arc::clone(&existing.handle));
+            if file_matches_path(&existing.handle.file, &key.0).unwrap_or(false) {
+                return Ok(Arc::clone(&existing.handle));
+            }
+        }
+        if let Some(existing) = inner.map.remove(&key) {
+            inner.lru.remove(&existing.tick);
         }
         let tick = inner.next_tick;
         inner.next_tick += 1;
@@ -146,6 +151,16 @@ impl HandleCache {
 
     fn touch(&self, key: &Key) -> Option<Arc<OpenFile>> {
         let mut inner = self.inner.lock().expect("handle cache poisoned");
+        let current = inner
+            .map
+            .get(key)
+            .is_some_and(|entry| file_matches_path(&entry.handle.file, &key.0).unwrap_or(false));
+        if !current {
+            if let Some(entry) = inner.map.remove(key) {
+                inner.lru.remove(&entry.tick);
+            }
+            return None;
+        }
         let new_tick = inner.next_tick;
         let entry = inner.map.get_mut(key)?;
         let old_tick = entry.tick;
@@ -212,6 +227,21 @@ mod tests {
         let h2 = cache.get_or_open(&p, false, false).unwrap();
         assert!(Arc::ptr_eq(&h1, &h2));
         assert_eq!(cache.len(), 1);
+    }
+
+    #[test]
+    fn reopens_path_after_unlink_and_recreate() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = tmp_file(dir.path(), "replaced.bin", b"old");
+        let cache = HandleCache::new(16, Duration::from_secs(30));
+
+        let old = cache.get_or_open(&p, false, false).unwrap();
+        std::fs::remove_file(&p).unwrap();
+        std::fs::write(&p, b"new").unwrap();
+
+        let new = cache.get_or_open(&p, false, false).unwrap();
+
+        assert!(!Arc::ptr_eq(&old, &new));
     }
 
     #[test]
