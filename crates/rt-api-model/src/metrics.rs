@@ -1,6 +1,8 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
+const MAX_SSE_CLIENTS: u64 = 128;
+
 /// Cross-facade counters for the bounded snapshot and SSE paths. TorrentNG and
 /// qBittorrent routers can share one instance in the daemon, so the metrics
 /// endpoint reports the combined API pressure instead of whichever facade
@@ -72,9 +74,29 @@ impl ApiRuntimeMetrics {
     }
 
     pub fn register_sse_client(self: &Arc<Self>) -> ApiSseClientGuard {
-        self.sse_clients.fetch_add(1, Ordering::Relaxed);
-        ApiSseClientGuard {
-            metrics: Arc::clone(self),
+        self.try_register_sse_client()
+            .expect("SSE client capacity exhausted")
+    }
+
+    pub fn try_register_sse_client(self: &Arc<Self>) -> Option<ApiSseClientGuard> {
+        let mut current = self.sse_clients.load(Ordering::Relaxed);
+        loop {
+            if current >= MAX_SSE_CLIENTS {
+                return None;
+            }
+            match self.sse_clients.compare_exchange_weak(
+                current,
+                current + 1,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => {
+                    return Some(ApiSseClientGuard {
+                        metrics: Arc::clone(self),
+                    });
+                }
+                Err(observed) => current = observed,
+            }
         }
     }
 
@@ -148,5 +170,23 @@ mod tests {
         assert_eq!(snapshot.sse_lagged_total, 1);
         assert_eq!(snapshot.sse_disconnects_total, 1);
         assert_eq!(snapshot.sse_clients, 0);
+    }
+
+    #[test]
+    fn sse_client_admission_is_bounded() {
+        let metrics = ApiRuntimeMetrics::new();
+        let mut clients = (0..MAX_SSE_CLIENTS)
+            .map(|_| {
+                metrics
+                    .try_register_sse_client()
+                    .expect("SSE slot should be available")
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(metrics.snapshot().sse_clients, MAX_SSE_CLIENTS);
+        assert!(metrics.try_register_sse_client().is_none());
+
+        drop(clients.pop());
+        assert!(metrics.try_register_sse_client().is_some());
+        drop(clients);
     }
 }

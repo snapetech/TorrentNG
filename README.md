@@ -23,16 +23,17 @@ Use TorrentNG to:
 - move between clients with migration and export tools instead of locking your
   data into one ecosystem.
 
-![TorrentNG WebUI in the default dark theme with official Debian, Fedora, and Ubuntu Linux ISO torrent metadata paused](docs/assets/torrentng-default-dark-linux-isos.png)
+![TorrentNG WebUI in the default dark theme with official Debian, Fedora, and Ubuntu Linux ISO torrents and a live Fedora transfer](docs/assets/torrentng-default-dark-linux-isos.png)
 
 ![TorrentNG Appearance settings showing the default TorrentNG dark palette](docs/assets/torrentng-default-dark-linux-isos-settings.png)
 
 These screenshots use the default TorrentNG dark palette and real torrent
 metadata from [Debian](https://www.debian.org/CD/torrent-cd/),
 [Ubuntu](https://releases.ubuntu.com/24.04/), and
-[Fedora](https://torrent.fedoraproject.org/torrents/). The captures were made
-with all transfers paused in an isolated local session; no ISO payload was
-downloaded or uploaded.
+[Fedora](https://torrent.fedoraproject.org/torrents/). The dashboard capture
+shows a live Fedora transfer with real accumulated traffic in an isolated,
+loopback-only daemon session; the settings capture shows the default palette.
+Only public Linux ISO examples appear in the captures.
 
 ## Keep your client. Or run ours.
 
@@ -101,11 +102,12 @@ the operation and publishes state; database and storage workers perform the
 blocking persistence or filesystem work. This distinction is visible through
 `/api/v1/jobs` and the storage metrics.
 
-Pure-v2 transfer and tracker lifecycle are not implemented. Pure-v2 parsing,
-identity, storage-root verification, and compatibility projections exist, but
-pure-v2 metadata completion and peer transfer remain explicit unsupported
-capabilities. v1 and hybrid torrents are the supported transfer paths. See
-[ENGINE.md](docs/ENGINE.md) for the protocol boundary.
+Complete pure-v2 metainfo supports storage-root verification, partial resume,
+BEP 52 TCP/uTP peer transfer, and tracker lifecycle. Pure-v2 `btmh` magnet
+metadata completion remains unsupported because the current metadata exchange
+path does not acquire the v2 file tree and piece layers. Public-network
+interoperability remains an evidence gate. See [ENGINE.md](docs/ENGINE.md)
+for the protocol boundary.
 
 ## Universal WebUI and automation interface
 

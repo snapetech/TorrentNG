@@ -38,7 +38,8 @@ type DbOperation = Box<dyn FnOnce(&mut Connection) -> Result<ErasedValue, String
 /// A job that runs inside a transaction the worker already opened, shared
 /// with other jobs in the same batch — unlike [`DbOperation`], it must not
 /// open or commit its own transaction.
-type DbTxOperation = Box<dyn FnOnce(&rusqlite::Transaction<'_>) -> Result<ErasedValue, String> + Send>;
+type DbTxOperation =
+    Box<dyn FnOnce(&rusqlite::Transaction<'_>) -> Result<ErasedValue, String> + Send>;
 type DbResult = Result<ErasedValue, String>;
 
 enum DbReply {
@@ -134,7 +135,11 @@ impl DbExecutor {
     /// executor may share with other queued `run_batched` jobs instead of
     /// opening one transaction per call. The job must not open or commit
     /// its own transaction — it only sees the shared one.
-    pub(crate) async fn run_batched<T, F>(&self, operation: &'static str, job: F) -> Result<T, String>
+    pub(crate) async fn run_batched<T, F>(
+        &self,
+        operation: &'static str,
+        job: F,
+    ) -> Result<T, String>
     where
         T: Send + 'static,
         F: FnOnce(&rusqlite::Transaction<'_>) -> Result<T, String> + Send + 'static,
@@ -550,7 +555,11 @@ impl DbWorker {
     /// not open or commit its own transaction; it only ever sees the one
     /// the worker already opened for the batch it landed in — even a batch
     /// of one still runs through this same shared-transaction path.
-    pub(crate) async fn run_batched<T, F>(&self, operation: &'static str, job: F) -> Result<T, String>
+    pub(crate) async fn run_batched<T, F>(
+        &self,
+        operation: &'static str,
+        job: F,
+    ) -> Result<T, String>
     where
         T: Send + 'static,
         F: FnOnce(&rusqlite::Transaction<'_>) -> Result<T, String> + Send + 'static,
@@ -1044,8 +1053,10 @@ mod tests {
         // not-part-of-this-batch hold-for-next-turn path, without being
         // lost, duplicated, or corrupting the batch it interrupted.
         let plain = worker_ref.run("plain_job", |_db| Ok::<_, String>("plain".to_owned()));
-        let batched = (0..5u32).map(|n| worker_ref.run_batched("batched_job", move |_tx| Ok::<_, String>(n)));
-        let (plain_result, batched_results) = tokio::join!(plain, futures::future::join_all(batched));
+        let batched =
+            (0..5u32).map(|n| worker_ref.run_batched("batched_job", move |_tx| Ok::<_, String>(n)));
+        let (plain_result, batched_results) =
+            tokio::join!(plain, futures::future::join_all(batched));
 
         assert_eq!(plain_result.expect("plain job"), "plain");
         let mut values: Vec<u32> = batched_results

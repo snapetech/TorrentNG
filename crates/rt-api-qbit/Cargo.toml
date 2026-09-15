@@ -23,10 +23,10 @@ rt-db = { path = "../rt-db" }
 rt-metainfo = { path = "../rt-metainfo" }
 rt-metrics = { path = "../rt-metrics" }
 rt-session = { path = "../rt-session" }
+tower.workspace = true
 
 [dev-dependencies]
 rusqlite.workspace = true
 rt-config = { path = "../rt-config" }
 tempfile.workspace = true
 tokio = { version = "1", features = ["full"] }
-tower.workspace = true

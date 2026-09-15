@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use rt_path::SafeRelPath;
 
 /// Top-level torrent identity. V2 and Hybrid are first-class BEP 52 metadata.
@@ -156,6 +158,9 @@ pub struct TorrentMetaV2 {
     /// Piece length must be a power of two, minimum 16 KiB.
     pub piece_length: u64,
     pub files: Vec<TorrentFileV2>,
+    /// BEP 52 piece-layer hashes keyed by the corresponding file pieces root.
+    /// Files no larger than one piece do not need an entry.
+    pub piece_layers: HashMap<[u8; 32], Vec<[u8; 32]>>,
     pub private: bool,
     pub raw: Vec<u8>,
 }
@@ -172,6 +177,24 @@ pub struct MagnetLink {
 impl TorrentMetaV2 {
     pub fn total_length(&self) -> u64 {
         self.files.iter().map(|f| f.length).sum()
+    }
+
+    /// Logical BEP 52 address-space length, including alignment gaps between
+    /// files but excluding a trailing gap after the final file.
+    pub fn logical_length(&self) -> u64 {
+        self.files
+            .iter()
+            .filter_map(|file| file.piece_offset.checked_add(file.length))
+            .max()
+            .unwrap_or(0)
+    }
+
+    /// Number of piece indices addressable by the v2 logical piece map.
+    pub fn piece_count(&self) -> u32 {
+        self.logical_length()
+            .div_ceil(self.piece_length)
+            .try_into()
+            .unwrap_or(u32::MAX)
     }
 
     pub fn all_trackers(&self) -> Vec<String> {
@@ -200,6 +223,10 @@ pub struct TorrentFileV2 {
     pub length: u64,
     pub path: SafeRelPath,
     pub offset: u64,
+    /// Logical BEP 52 offset. Every non-empty file starts on a piece
+    /// boundary; this differs from `offset` when prior files leave alignment
+    /// gaps in the v2 address space.
+    pub piece_offset: u64,
     /// SHA-256 merkle root of this file's 16 KiB leaf hashes. BEP 52 omits
     /// this field for empty files.
     pub pieces_root: Option<[u8; 32]>,

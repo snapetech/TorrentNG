@@ -531,13 +531,15 @@ it was not.
 ### Pure-v2 boundary
 
 Pure-v2 torrents are an explicit partial-support boundary, not a hidden
-capability claim. TorrentNG-client parsing, storage projection, file-root recheck, and
-metadata placeholders are supported. Pure-v2 metadata completion, peer
-transfer, and tracker lifecycle are not implemented and return explicit
-unsupported errors (HTTP maps these to `501 Not Implemented` where the
-operation is exposed). The TorrentNG-client capability manifest reports completion and
-transfer as unsupported. This remains intentional until there is a complete
-v2 piece-transfer, peer-wire, and tracker design with independent evidence.
+capability claim. TorrentNG-client parsing, storage projection, file-root
+recheck, live BEP 52 TCP/uTP peer transfer, tracker announce state, tracker
+updates, and reannounce are implemented for complete `.torrent` or raw
+metainfo. Pure-v2 metadata completion from a `btmh` magnet remains
+unsupported because the metadata exchange path does not yet acquire the v2
+file tree and piece layers. The capability manifest reports metadata
+completion as unsupported and pure-v2 transfer as implemented; public-network
+and target-hardware interoperability remain evidence gates rather than local
+capability claims.
 
 The rTorrent facade follows the same boundary and is a library-only entry
 point; see [RTORRENT_LIBRARY_API.md](RTORRENT_LIBRARY_API.md).

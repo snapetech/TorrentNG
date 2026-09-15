@@ -1,7 +1,7 @@
-# torrentngd
+# TorrentNG Engine (`torrentngd`)
 
-TorrentNG's first-party BitTorrent client daemon. Wires the client engine crates,
-handles signals, startup, and shutdown.
+The TorrentNG Engine is TorrentNG's built-in native Rust BitTorrent client. It
+wires the client engine crates, handles signals, startup, and shutdown.
 
 ## Status: Implemented — first-party client in active hardening
 

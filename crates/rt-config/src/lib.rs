@@ -47,6 +47,18 @@ const MAX_SEMAPHORE_PERMITS: usize = usize::MAX >> 3;
 const MAX_STORAGE_WORKER_THREADS: usize = 64;
 const MAX_STORAGE_QUEUE_DEPTH: usize = 16_384;
 const MAX_STORAGE_FILE_POOL_SIZE: usize = 65_536;
+const MAX_DHT_BOOTSTRAP_NODES: usize = 256;
+const MAX_DHT_BOOTSTRAP_NODE_BYTES: usize = 256;
+const MAX_DHT_BOOTSTRAP_BYTES: usize = 64 * 1024;
+/// Default admission cap for `DhtConfig::tracked_torrents_cap`. Chosen to sit
+/// comfortably above this project's stated 10k-100k torrent scale target
+/// (see docs/ENGINE.md and CLAUDE.md) rather than silently stranding DHT
+/// discovery for torrents beyond an old, much lower hardcoded limit.
+const DEFAULT_DHT_TRACKED_TORRENTS_CAP: usize = 131_072;
+/// Sanity ceiling on the configured cap. This is a safety net against a
+/// misconfigured value producing runaway memory use, not a realistic
+/// deployment target -- it is far above the 100k top-end scale target.
+const MAX_DHT_TRACKED_TORRENTS_CAP: usize = 1_000_000;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -127,6 +139,8 @@ pub struct MemoryConfig {
     pub storage_frame_cap_mb: u64,
     pub queued_disk_cap_mb: u64,
     pub piece_assembly_cap_mb: u64,
+    /// Persistent per-torrent piece picker and availability index cap.
+    pub piece_index_cap_mb: u64,
     pub peer_buffer_cap_mb: u64,
     pub metadata_cap_mb: u64,
     pub pressure_constrained_pct: u8,
@@ -172,6 +186,16 @@ pub struct DhtConfig {
     pub port: u16,
     /// Bootstrap nodes as "host:port" strings.
     pub bootstrap_nodes: Vec<String>,
+    /// Maximum number of torrents the DHT task will concurrently track for
+    /// peer discovery. Torrents beyond this cap are still transferred and
+    /// tracker-announced normally; they simply do not get DHT-sourced peers.
+    ///
+    /// This used to be a hardcoded 16,384 constant, which silently stranded
+    /// DHT discovery for the majority of torrents at this project's stated
+    /// 10k-100k torrent scale target. The default here (131,072) sits
+    /// comfortably above the top of that range; lower it as a safety valve
+    /// on memory- or CPU-constrained deployments.
+    pub tracked_torrents_cap: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -257,6 +281,7 @@ impl Default for MemoryConfig {
             storage_frame_cap_mb: 128,
             queued_disk_cap_mb: 64,
             piece_assembly_cap_mb: 128,
+            piece_index_cap_mb: 128,
             peer_buffer_cap_mb: 128,
             metadata_cap_mb: 32,
             pressure_constrained_pct: 75,
@@ -305,6 +330,7 @@ impl Default for DhtConfig {
                 "router.bittorrent.com:6881".to_owned(),
                 "router.utorrent.com:6881".to_owned(),
             ],
+            tracked_torrents_cap: DEFAULT_DHT_TRACKED_TORRENTS_CAP,
         }
     }
 }
@@ -473,6 +499,7 @@ impl Config {
                 "memory.piece_assembly_cap_mb",
                 self.memory.piece_assembly_cap_mb,
             ),
+            ("memory.piece_index_cap_mb", self.memory.piece_index_cap_mb),
             ("memory.peer_buffer_cap_mb", self.memory.peer_buffer_cap_mb),
             ("memory.metadata_cap_mb", self.memory.metadata_cap_mb),
         ] {
@@ -498,6 +525,37 @@ impl Config {
         require(
             self.tracker.allow_http_webseeds || self.tracker.allow_https_webseeds,
             "at least one webseed scheme must be enabled",
+        )?;
+        require(
+            self.dht.bootstrap_nodes.len() <= MAX_DHT_BOOTSTRAP_NODES,
+            format!("dht.bootstrap_nodes must contain <= {MAX_DHT_BOOTSTRAP_NODES} entries"),
+        )?;
+        let mut bootstrap_bytes = 0usize;
+        for (index, node) in self.dht.bootstrap_nodes.iter().enumerate() {
+            let node = node.trim();
+            require(
+                !node.is_empty(),
+                format!("dht.bootstrap_nodes[{index}] must not be empty"),
+            )?;
+            require(
+                node.len() <= MAX_DHT_BOOTSTRAP_NODE_BYTES,
+                format!(
+                    "dht.bootstrap_nodes[{index}] must be <= {MAX_DHT_BOOTSTRAP_NODE_BYTES} bytes"
+                ),
+            )?;
+            bootstrap_bytes = bootstrap_bytes.saturating_add(node.len());
+        }
+        require(
+            bootstrap_bytes <= MAX_DHT_BOOTSTRAP_BYTES,
+            format!("dht.bootstrap_nodes must contain <= {MAX_DHT_BOOTSTRAP_BYTES} bytes"),
+        )?;
+        require(
+            self.dht.tracked_torrents_cap > 0,
+            "dht.tracked_torrents_cap must be greater than zero",
+        )?;
+        require(
+            self.dht.tracked_torrents_cap <= MAX_DHT_TRACKED_TORRENTS_CAP,
+            format!("dht.tracked_torrents_cap must be <= {MAX_DHT_TRACKED_TORRENTS_CAP}"),
         )?;
         require(
             self.db.wal_checkpoint_pages > 0,
@@ -684,6 +742,7 @@ mod tests {
         assert_eq!(c.memory.total_cap_mb, 512);
         assert_eq!(c.memory.storage_frame_cap_mb, 128);
         assert_eq!(c.memory.queued_disk_cap_mb, 64);
+        assert_eq!(c.memory.piece_index_cap_mb, 128);
         assert!(c.runtime.torrent_tiers_enabled);
         assert_eq!(c.runtime.tier_hot_idle_secs, 120);
         assert_eq!(c.runtime.tier_warm_idle_secs, 1_800);
@@ -707,6 +766,17 @@ mod tests {
         let c = Config::default();
         let p = c.db_path();
         assert!(p.ends_with("state.db"));
+    }
+
+    #[test]
+    fn dht_tracked_torrents_cap_default_covers_stated_scale_target() {
+        // This project's own stated scale target is 10k-100k torrents (see
+        // CLAUDE.md / docs/ENGINE.md). The default DHT admission cap must not
+        // silently strand DHT discovery for torrents at the top of that
+        // range, as the old hardcoded 16,384 constant did.
+        let c = Config::default();
+        assert!(c.dht.tracked_torrents_cap >= 100_000);
+        assert!(c.validate().is_ok());
     }
 
     #[test]
@@ -766,6 +836,14 @@ mod tests {
         assert!(matches!(c.validate(), Err(ConfigError::Validation(_))));
 
         let mut c = Config::default();
+        c.dht.tracked_torrents_cap = 0;
+        assert!(matches!(c.validate(), Err(ConfigError::Validation(_))));
+
+        let mut c = Config::default();
+        c.dht.tracked_torrents_cap = MAX_DHT_TRACKED_TORRENTS_CAP + 1;
+        assert!(matches!(c.validate(), Err(ConfigError::Validation(_))));
+
+        let mut c = Config::default();
         c.runtime.tier_hot_idle_secs = 0;
         assert!(matches!(c.validate(), Err(ConfigError::Validation(_))));
 
@@ -794,6 +872,10 @@ mod tests {
         c.tracker.allow_http_trackers = false;
         c.tracker.allow_https_trackers = false;
         c.tracker.allow_udp_trackers = false;
+        assert!(matches!(c.validate(), Err(ConfigError::Validation(_))));
+
+        let mut c = Config::default();
+        c.dht.bootstrap_nodes = vec!["x".repeat(MAX_DHT_BOOTSTRAP_NODE_BYTES + 1)];
         assert!(matches!(c.validate(), Err(ConfigError::Validation(_))));
     }
 

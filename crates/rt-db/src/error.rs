@@ -13,4 +13,11 @@ pub enum DbError {
 
     #[error("record not found: {0}")]
     NotFound(String),
+
+    #[error("{field} is {len} bytes; maximum is {max}")]
+    ValueTooLarge {
+        field: &'static str,
+        len: u64,
+        max: u64,
+    },
 }

@@ -1,11 +1,15 @@
 /// BEP 3 peer wire messages.
 use crate::error::WireError;
+use bytes::Bytes;
 
 /// Hard cap: 2 MiB per message (largest legal piece block is 16 KiB, but allow some headroom).
 pub const MAX_MESSAGE_LEN: u32 = 2 * 1024 * 1024;
 
 /// Maximum block size a peer may request from us (BEP 3).
 pub const MAX_BLOCK_SIZE: u32 = 16 * 1024;
+
+/// BEP 52's fixed hash-request header, excluding the peer-wire message id.
+const HASH_EXCHANGE_HEADER_LEN: usize = 32 + (4 * 4);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Message {
@@ -26,18 +30,85 @@ pub enum Message {
     /// id=6: piece, begin, length.
     Request { piece: u32, begin: u32, length: u32 },
     /// id=7: piece index, begin offset, data block.
-    Piece {
-        piece: u32,
-        begin: u32,
-        data: Vec<u8>,
-    },
+    ///
+    /// `data` is `Bytes` rather than `Vec<u8>` so a block read from storage
+    /// (already `Bytes`) can be moved/cloned onto the wire with a cheap
+    /// refcount bump instead of a full memory copy on the seeding hot path.
+    Piece { piece: u32, begin: u32, data: Bytes },
     /// id=8: cancel a pending request.
     Cancel { piece: u32, begin: u32, length: u32 },
+    /// id=16: BEP 6 Fast extension — reject a request that cannot be served.
+    Reject { piece: u32, begin: u32, length: u32 },
+    /// id=14 (0x0E): BEP 6 Fast extension — sender has every piece. Sent in
+    /// place of a full `Bitfield` when the local peer is complete and the
+    /// remote negotiated the Fast extension in the handshake.
+    HaveAll,
+    /// id=15 (0x0F): BEP 6 Fast extension — sender has no pieces. Sent in
+    /// place of an empty/omitted `Bitfield` when the remote negotiated the
+    /// Fast extension in the handshake.
+    HaveNone,
     /// id=20: BEP 10 extended message.
     Extended { ext_id: u8, payload: Vec<u8> },
+    /// id=21: BEP 52 hash request.
+    HashRequest {
+        pieces_root: [u8; 32],
+        base_layer: u32,
+        index: u32,
+        length: u32,
+        proof_layers: u32,
+    },
+    /// id=22: BEP 52 hashes response.
+    Hashes {
+        pieces_root: [u8; 32],
+        base_layer: u32,
+        index: u32,
+        length: u32,
+        proof_layers: u32,
+        hashes: Vec<[u8; 32]>,
+    },
+    /// id=23: BEP 52 hash request rejection.
+    HashReject {
+        pieces_root: [u8; 32],
+        base_layer: u32,
+        index: u32,
+        length: u32,
+        proof_layers: u32,
+    },
 }
 
 impl Message {
+    /// Return the complete length of the encoded message, including its
+    /// four-byte length prefix. `None` means the message cannot be represented
+    /// as a legal peer-wire frame.
+    pub fn encoded_len(&self) -> Option<usize> {
+        let message_len = match self {
+            Message::KeepAlive => 0,
+            Message::Choke
+            | Message::Unchoke
+            | Message::Interested
+            | Message::NotInterested
+            | Message::HaveAll
+            | Message::HaveNone => 1,
+            Message::Have(_) => 5,
+            Message::Bitfield(bits) => 1usize.checked_add(bits.len())?,
+            Message::Request { .. } | Message::Cancel { .. } | Message::Reject { .. } => 13,
+            Message::Piece { data, .. } => 9usize.checked_add(data.len())?,
+            Message::Extended { payload, .. } => 2usize.checked_add(payload.len())?,
+            Message::HashRequest { index, length, .. }
+            | Message::HashReject { index, length, .. } => {
+                let _ = (index, length);
+                1usize.checked_add(HASH_EXCHANGE_HEADER_LEN)?
+            }
+            Message::Hashes { hashes, .. } => 1usize
+                .checked_add(HASH_EXCHANGE_HEADER_LEN)?
+                .checked_add(hashes.len().checked_mul(32)?)?,
+        };
+        if message_len > MAX_MESSAGE_LEN as usize {
+            return None;
+        }
+        4usize.checked_add(message_len)
+    }
+
     /// Encode into length-prefixed wire format.
     pub fn encode(&self) -> Vec<u8> {
         match self {
@@ -75,6 +146,13 @@ impl Message {
                 begin,
                 length,
             } => encode_fixed(8, &encode_3u32(*piece, *begin, *length)),
+            Message::Reject {
+                piece,
+                begin,
+                length,
+            } => encode_fixed(16, &encode_3u32(*piece, *begin, *length)),
+            Message::HaveAll => encode_fixed(14, &[]),
+            Message::HaveNone => encode_fixed(15, &[]),
             Message::Extended { ext_id, payload } => {
                 let len = (1 + 1 + payload.len()) as u32;
                 let mut v = Vec::with_capacity(4 + 1 + 1 + payload.len());
@@ -84,6 +162,58 @@ impl Message {
                 v.extend_from_slice(payload);
                 v
             }
+            Message::HashRequest {
+                pieces_root,
+                base_layer,
+                index,
+                length,
+                proof_layers,
+            } => encode_hash_exchange(
+                21,
+                pieces_root,
+                *base_layer,
+                *index,
+                *length,
+                *proof_layers,
+                &[],
+            ),
+            Message::Hashes {
+                pieces_root,
+                base_layer,
+                index,
+                length,
+                proof_layers,
+                hashes,
+            } => {
+                let mut hash_bytes = Vec::with_capacity(hashes.len().saturating_mul(32));
+                for hash in hashes {
+                    hash_bytes.extend_from_slice(hash);
+                }
+                encode_hash_exchange(
+                    22,
+                    pieces_root,
+                    *base_layer,
+                    *index,
+                    *length,
+                    *proof_layers,
+                    &hash_bytes,
+                )
+            }
+            Message::HashReject {
+                pieces_root,
+                base_layer,
+                index,
+                length,
+                proof_layers,
+            } => encode_hash_exchange(
+                23,
+                pieces_root,
+                *base_layer,
+                *index,
+                *length,
+                *proof_layers,
+                &[],
+            ),
         }
     }
 
@@ -135,14 +265,14 @@ impl Message {
                 }
                 let piece = u32::from_be_bytes(body[..4].try_into().unwrap());
                 let begin = u32::from_be_bytes(body[4..8].try_into().unwrap());
-                let data = body[8..].to_vec();
-                if data.len() as u32 > MAX_BLOCK_SIZE {
+                let data_len = body.len() - 8;
+                if data_len as u32 > MAX_BLOCK_SIZE {
                     return Err(WireError::InvalidMessage(format!(
                         "Piece block {} bytes exceeds MAX_BLOCK_SIZE {}",
-                        data.len(),
-                        MAX_BLOCK_SIZE
+                        data_len, MAX_BLOCK_SIZE
                     )));
                 }
+                let data = Bytes::copy_from_slice(&body[8..]);
                 Ok(Message::Piece { piece, begin, data })
             }
             8 => {
@@ -153,6 +283,24 @@ impl Message {
                     begin,
                     length,
                 })
+            }
+            16 => {
+                expect_len(body, 12, "Reject")?;
+                let (piece, begin, length) = parse_3u32(body);
+                validate_request(length)?;
+                Ok(Message::Reject {
+                    piece,
+                    begin,
+                    length,
+                })
+            }
+            14 => {
+                expect_len(body, 0, "HaveAll")?;
+                Ok(Message::HaveAll)
+            }
+            15 => {
+                expect_len(body, 0, "HaveNone")?;
+                Ok(Message::HaveNone)
             }
             20 => {
                 if body.is_empty() {
@@ -165,9 +313,102 @@ impl Message {
                     payload: body[1..].to_vec(),
                 })
             }
+            21 => {
+                let (pieces_root, base_layer, index, length, proof_layers, hashes) =
+                    parse_hash_exchange(body, false)?;
+                debug_assert!(hashes.is_empty());
+                Ok(Message::HashRequest {
+                    pieces_root,
+                    base_layer,
+                    index,
+                    length,
+                    proof_layers,
+                })
+            }
+            22 => {
+                let (pieces_root, base_layer, index, length, proof_layers, hashes) =
+                    parse_hash_exchange(body, true)?;
+                Ok(Message::Hashes {
+                    pieces_root,
+                    base_layer,
+                    index,
+                    length,
+                    proof_layers,
+                    hashes,
+                })
+            }
+            23 => {
+                let (pieces_root, base_layer, index, length, proof_layers, hashes) =
+                    parse_hash_exchange(body, false)?;
+                debug_assert!(hashes.is_empty());
+                Ok(Message::HashReject {
+                    pieces_root,
+                    base_layer,
+                    index,
+                    length,
+                    proof_layers,
+                })
+            }
             _ => Err(WireError::UnknownMessageId(id)),
         }
     }
+}
+
+fn encode_hash_exchange(
+    id: u8,
+    pieces_root: &[u8; 32],
+    base_layer: u32,
+    index: u32,
+    length: u32,
+    proof_layers: u32,
+    hashes: &[u8],
+) -> Vec<u8> {
+    let message_len = 1usize
+        .saturating_add(HASH_EXCHANGE_HEADER_LEN)
+        .saturating_add(hashes.len());
+    let mut out = Vec::with_capacity(4usize.saturating_add(message_len));
+    out.extend_from_slice(&(message_len as u32).to_be_bytes());
+    out.push(id);
+    out.extend_from_slice(pieces_root);
+    out.extend_from_slice(&base_layer.to_be_bytes());
+    out.extend_from_slice(&index.to_be_bytes());
+    out.extend_from_slice(&length.to_be_bytes());
+    out.extend_from_slice(&proof_layers.to_be_bytes());
+    out.extend_from_slice(hashes);
+    out
+}
+
+type HashExchange = ([u8; 32], u32, u32, u32, u32, Vec<[u8; 32]>);
+
+fn parse_hash_exchange(body: &[u8], with_hashes: bool) -> Result<HashExchange, WireError> {
+    if body.len() < HASH_EXCHANGE_HEADER_LEN {
+        return Err(WireError::InvalidMessage(format!(
+            "BEP 52 hash message expected at least {HASH_EXCHANGE_HEADER_LEN} body bytes, got {}",
+            body.len()
+        )));
+    }
+    if !with_hashes && body.len() != HASH_EXCHANGE_HEADER_LEN {
+        return Err(WireError::InvalidMessage(format!(
+            "BEP 52 hash request/reject expected {HASH_EXCHANGE_HEADER_LEN} body bytes, got {}",
+            body.len()
+        )));
+    }
+    let hash_bytes = &body[HASH_EXCHANGE_HEADER_LEN..];
+    if !hash_bytes.len().is_multiple_of(32) {
+        return Err(WireError::InvalidMessage(
+            "BEP 52 hashes payload is not a multiple of 32 bytes".into(),
+        ));
+    }
+    let mut pieces_root = [0u8; 32];
+    pieces_root.copy_from_slice(&body[..32]);
+    let base_layer = u32::from_be_bytes(body[32..36].try_into().unwrap());
+    let index = u32::from_be_bytes(body[36..40].try_into().unwrap());
+    let length = u32::from_be_bytes(body[40..44].try_into().unwrap());
+    let proof_layers = u32::from_be_bytes(body[44..48].try_into().unwrap());
+    let (hash_chunks, remainder) = hash_bytes.as_chunks::<32>();
+    debug_assert!(remainder.is_empty());
+    let hashes = hash_chunks.to_vec();
+    Ok((pieces_root, base_layer, index, length, proof_layers, hashes))
 }
 
 fn validate_request(length: u32) -> Result<(), WireError> {
@@ -300,7 +541,7 @@ mod tests {
 
     #[test]
     fn piece_roundtrip() {
-        let data = vec![0xABu8; 1024];
+        let data = Bytes::from(vec![0xABu8; 1024]);
         let msg = Message::Piece {
             piece: 3,
             begin: 16384,
@@ -314,6 +555,23 @@ mod tests {
                 data
             }
         );
+    }
+
+    #[test]
+    fn piece_data_is_bytes_and_clones_cheaply() {
+        // The whole point of carrying `Bytes` instead of `Vec<u8>` on the
+        // wire type is that a clone is a refcount bump over the same
+        // backing allocation, not a memory copy.
+        let data = Bytes::from(vec![0x11u8; 4096]);
+        let msg = Message::Piece {
+            piece: 0,
+            begin: 0,
+            data: data.clone(),
+        };
+        let Message::Piece { data: msg_data, .. } = msg else {
+            unreachable!()
+        };
+        assert_eq!(data.as_ptr(), msg_data.as_ptr());
     }
 
     #[test]
@@ -336,6 +594,51 @@ mod tests {
     }
 
     #[test]
+    fn reject_roundtrip() {
+        let msg = Message::Reject {
+            piece: 2,
+            begin: 16384,
+            length: 8192,
+        };
+        assert_eq!(roundtrip(msg.clone()), msg);
+        assert_eq!(&msg.encode()[4..5], &[16]);
+    }
+
+    #[test]
+    fn reject_rejects_invalid_length() {
+        let mut payload = vec![16u8];
+        payload.extend_from_slice(&encode_3u32(0, 0, MAX_BLOCK_SIZE + 1));
+        assert!(Message::parse(&payload).is_err());
+    }
+
+    #[test]
+    fn have_all_roundtrip() {
+        assert_eq!(roundtrip(Message::HaveAll), Message::HaveAll);
+        let encoded = Message::HaveAll.encode();
+        // length prefix = 1 (id byte only, zero payload)
+        let len = u32::from_be_bytes(encoded[..4].try_into().unwrap());
+        assert_eq!(len, 1);
+        assert_eq!(encoded[4], 14);
+        assert_eq!(encoded.len(), 5);
+    }
+
+    #[test]
+    fn have_none_roundtrip() {
+        assert_eq!(roundtrip(Message::HaveNone), Message::HaveNone);
+        let encoded = Message::HaveNone.encode();
+        let len = u32::from_be_bytes(encoded[..4].try_into().unwrap());
+        assert_eq!(len, 1);
+        assert_eq!(encoded[4], 15);
+        assert_eq!(encoded.len(), 5);
+    }
+
+    #[test]
+    fn have_all_and_have_none_reject_nonempty_body() {
+        assert!(Message::parse(&[14u8, 0u8]).is_err());
+        assert!(Message::parse(&[15u8, 0u8]).is_err());
+    }
+
+    #[test]
     fn extended_roundtrip() {
         let msg = Message::Extended {
             ext_id: 3,
@@ -352,6 +655,79 @@ mod tests {
     #[test]
     fn extended_rejects_missing_extension_id() {
         assert!(Message::parse(&[20u8]).is_err());
+    }
+
+    #[test]
+    fn bep52_hash_request_roundtrip() {
+        let message = Message::HashRequest {
+            pieces_root: [0x11; 32],
+            base_layer: 4,
+            index: 8,
+            length: 4,
+            proof_layers: 2,
+        };
+        assert_eq!(
+            message.encoded_len(),
+            Some(4 + 1 + HASH_EXCHANGE_HEADER_LEN)
+        );
+        assert_eq!(roundtrip(message.clone()), message);
+        assert_eq!(&message.encode()[4..5], &[21]);
+    }
+
+    #[test]
+    fn bep52_hashes_roundtrip() {
+        let message = Message::Hashes {
+            pieces_root: [0x22; 32],
+            base_layer: 1,
+            index: 0,
+            length: 2,
+            proof_layers: 0,
+            hashes: vec![[0x33; 32], [0x44; 32], [0x55; 32]],
+        };
+        assert_eq!(roundtrip(message.clone()), message);
+        assert_eq!(&message.encode()[4..5], &[22]);
+    }
+
+    #[test]
+    fn bep52_hash_reject_roundtrip() {
+        let message = Message::HashReject {
+            pieces_root: [0x66; 32],
+            base_layer: 0,
+            index: 16,
+            length: 16,
+            proof_layers: 3,
+        };
+        assert_eq!(roundtrip(message.clone()), message);
+        assert_eq!(&message.encode()[4..5], &[23]);
+    }
+
+    #[test]
+    fn bep52_hash_coordinates_are_deferred_to_torrent_validation() {
+        for (index, length) in [(0u32, 0u32), (0, 1), (0, 3), (1, 2), (4, 8)] {
+            let mut payload = vec![21u8];
+            payload.extend_from_slice(&[0; 32]);
+            payload.extend_from_slice(&0u32.to_be_bytes());
+            payload.extend_from_slice(&index.to_be_bytes());
+            payload.extend_from_slice(&length.to_be_bytes());
+            payload.extend_from_slice(&0u32.to_be_bytes());
+            assert!(matches!(
+                Message::parse(&payload),
+                Ok(Message::HashRequest { index: parsed_index, length: parsed_length, .. })
+                    if parsed_index == index && parsed_length == length
+            ));
+        }
+    }
+
+    #[test]
+    fn bep52_hash_response_rejects_partial_hash() {
+        let mut payload = vec![22u8];
+        payload.extend_from_slice(&[0; 32]);
+        payload.extend_from_slice(&0u32.to_be_bytes());
+        payload.extend_from_slice(&0u32.to_be_bytes());
+        payload.extend_from_slice(&2u32.to_be_bytes());
+        payload.extend_from_slice(&0u32.to_be_bytes());
+        payload.push(1);
+        assert!(Message::parse(&payload).is_err());
     }
 
     #[test]

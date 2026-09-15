@@ -1,8 +1,128 @@
-use std::collections::HashSet;
+use std::{collections::HashMap, marker::PhantomData};
 
-use serde::{Deserialize, Serialize};
+use serde::{
+    de::{self, SeqAccess, Visitor},
+    Deserialize, Deserializer, Serialize,
+};
 
 pub const FASTRESUME_VERSION: u32 = 1;
+pub const MAX_FASTRESUME_PIECES: usize = 16_000_000;
+pub const MAX_FASTRESUME_PARTIAL_PIECES: usize = 16_384;
+pub const MAX_FASTRESUME_BLOCKS_PER_PARTIAL_PIECE: usize = 16_384;
+pub const MAX_FASTRESUME_FILE_HINTS: usize = 100_000;
+pub const MAX_FASTRESUME_DIRTY_PIECES: usize = MAX_FASTRESUME_PIECES;
+
+fn deserialize_bounded_vec<'de, D, T>(
+    deserializer: D,
+    maximum: usize,
+    field: &'static str,
+) -> Result<Vec<T>, D::Error>
+where
+    D: Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    struct BoundedVecVisitor<T> {
+        maximum: usize,
+        field: &'static str,
+        marker: PhantomData<fn() -> T>,
+    }
+
+    impl<'de, T> Visitor<'de> for BoundedVecVisitor<T>
+    where
+        T: Deserialize<'de>,
+    {
+        type Value = Vec<T>;
+
+        fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(
+                formatter,
+                "a {} array with at most {} items",
+                self.field, self.maximum
+            )
+        }
+
+        fn visit_seq<A>(self, mut sequence: A) -> Result<Self::Value, A::Error>
+        where
+            A: SeqAccess<'de>,
+        {
+            if sequence.size_hint().is_some_and(|size| size > self.maximum) {
+                return Err(de::Error::custom(format!(
+                    "{} exceeds the maximum of {} items",
+                    self.field, self.maximum
+                )));
+            }
+            let mut values =
+                Vec::with_capacity(sequence.size_hint().unwrap_or_default().min(self.maximum));
+            while let Some(value) = sequence.next_element()? {
+                if values.len() >= self.maximum {
+                    return Err(de::Error::custom(format!(
+                        "{} exceeds the maximum of {} items",
+                        self.field, self.maximum
+                    )));
+                }
+                values.push(value);
+            }
+            Ok(values)
+        }
+    }
+
+    deserializer.deserialize_seq(BoundedVecVisitor {
+        maximum,
+        field,
+        marker: PhantomData,
+    })
+}
+
+fn deserialize_piece_states<'de, D>(deserializer: D) -> Result<Vec<PieceState>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    deserialize_bounded_vec(deserializer, MAX_FASTRESUME_PIECES, "fastresume pieces")
+}
+
+fn deserialize_partial_pieces<'de, D>(deserializer: D) -> Result<Vec<PartialPieceState>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    deserialize_bounded_vec(
+        deserializer,
+        MAX_FASTRESUME_PARTIAL_PIECES,
+        "fastresume partial pieces",
+    )
+}
+
+fn deserialize_file_hints<'de, D>(deserializer: D) -> Result<Vec<FileHint>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    deserialize_bounded_vec(
+        deserializer,
+        MAX_FASTRESUME_FILE_HINTS,
+        "fastresume file hints",
+    )
+}
+
+fn deserialize_dirty_pieces<'de, D>(deserializer: D) -> Result<Vec<u32>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    deserialize_bounded_vec(
+        deserializer,
+        MAX_FASTRESUME_DIRTY_PIECES,
+        "fastresume dirty pieces",
+    )
+}
+
+fn deserialize_received_blocks<'de, D>(deserializer: D) -> Result<Vec<u32>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    deserialize_bounded_vec(
+        deserializer,
+        MAX_FASTRESUME_BLOCKS_PER_PARTIAL_PIECE,
+        "fastresume partial-piece blocks",
+    )
+}
 
 /// What we know about a single piece.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -34,6 +154,7 @@ pub struct FileHint {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PartialPieceState {
     pub piece: u32,
+    #[serde(deserialize_with = "deserialize_received_blocks")]
     pub received_blocks: Vec<u32>,
 }
 
@@ -47,6 +168,7 @@ pub struct DurabilityWatermark {
     /// process crashes before a barrier completes, only these pieces need to be
     /// downgraded for bounded recheck.
     #[serde(default)]
+    #[serde(deserialize_with = "deserialize_dirty_pieces")]
     pub dirty_pieces_since_barrier: Vec<u32>,
 }
 
@@ -74,11 +196,14 @@ pub struct FastresumeState {
     /// Generation counter — incremented on each clean save.
     pub session_generation: u64,
     /// Per-piece verification state. Index = piece index.
+    #[serde(deserialize_with = "deserialize_piece_states")]
     pub pieces: Vec<PieceState>,
     /// Received-but-not-yet-verified block indexes for partial pieces.
     #[serde(default)]
+    #[serde(deserialize_with = "deserialize_partial_pieces")]
     pub partial_pieces: Vec<PartialPieceState>,
     /// Per-file hints for fast re-validation.
+    #[serde(deserialize_with = "deserialize_file_hints")]
     pub file_hints: Vec<FileHint>,
     /// Unix timestamp of last full verification (0 = never).
     pub last_full_verify: u64,
@@ -146,33 +271,10 @@ impl FastresumeState {
     ///
     /// Returns the count of pieces reset to Unknown.
     pub fn invalidate_file(&mut self, file_index: u32, piece_map: &rt_piece_map::PieceMap) -> u32 {
-        let affected_pieces = (0..piece_map.piece_count)
-            .filter(|piece| {
-                piece_map
-                    .piece_to_file_regions(*piece)
-                    .map(|regions| regions.iter().any(|region| region.file_index == file_index))
-                    .unwrap_or(false)
-            })
-            .collect::<HashSet<_>>();
-        let mut count = 0u32;
-        for piece in &affected_pieces {
-            if self.pieces.get_mut(*piece as usize).is_some_and(|state| {
-                if *state == PieceState::Valid {
-                    *state = PieceState::Unknown;
-                    true
-                } else {
-                    false
-                }
-            }) {
-                count += 1;
-            }
-        }
-        // A partial piece is also tied to the bytes in this file. Keeping its
-        // block indexes after a replacement or disappearance would make the
-        // next run trust bytes that were never verified against the new file.
-        self.partial_pieces
-            .retain(|partial| !affected_pieces.contains(&partial.piece));
-        count
+        let ranges = piece_map
+            .piece_ranges_for_file_indices(&[file_index])
+            .unwrap_or_default();
+        self.invalidate_piece_ranges(&ranges)
     }
 
     /// Update file hints. If a hint has changed, invalidate affected pieces.
@@ -181,19 +283,27 @@ impl FastresumeState {
         new_hints: Vec<FileHint>,
         piece_map: &rt_piece_map::PieceMap,
     ) -> u32 {
-        let mut invalidated = 0u32;
-        let file_indices = self
-            .file_hints
-            .iter()
-            .map(|hint| hint.file_index)
-            .chain(new_hints.iter().map(|hint| hint.file_index))
-            .collect::<HashSet<_>>();
+        let mut old_by_file = HashMap::with_capacity(self.file_hints.len());
+        for hint in &self.file_hints {
+            old_by_file.entry(hint.file_index).or_insert(hint);
+        }
+        let mut new_by_file = HashMap::with_capacity(new_hints.len());
+        for hint in &new_hints {
+            new_by_file.entry(hint.file_index).or_insert(hint);
+        }
+
+        let mut file_indices = old_by_file
+            .keys()
+            .copied()
+            .chain(new_by_file.keys().copied())
+            .collect::<Vec<_>>();
+        file_indices.sort_unstable();
+        file_indices.dedup();
+
+        let mut changed_file_indices = Vec::new();
         for file_index in file_indices {
-            let old = self
-                .file_hints
-                .iter()
-                .find(|hint| hint.file_index == file_index);
-            let new = new_hints.iter().find(|hint| hint.file_index == file_index);
+            let old = old_by_file.get(&file_index).copied();
+            let new = new_by_file.get(&file_index).copied();
             let changed = match (old, new) {
                 (Some(old), Some(new)) => {
                     old.size != new.size
@@ -207,11 +317,42 @@ impl FastresumeState {
             };
 
             if changed {
-                invalidated += self.invalidate_file(file_index, piece_map);
+                changed_file_indices.push(file_index);
             }
         }
+        let ranges = piece_map
+            .piece_ranges_for_file_indices(&changed_file_indices)
+            .unwrap_or_default();
+        let ranges = merge_piece_ranges(ranges);
+        let invalidated = self.invalidate_piece_ranges(&ranges);
         self.file_hints = new_hints;
         invalidated
+    }
+
+    fn invalidate_piece_ranges(&mut self, ranges: &[(u32, u32)]) -> u32 {
+        let mut count = 0u32;
+        for &(first, last) in ranges {
+            for piece in first..last {
+                if self.pieces.get_mut(piece as usize).is_some_and(|state| {
+                    if *state == PieceState::Valid {
+                        *state = PieceState::Unknown;
+                        true
+                    } else {
+                        false
+                    }
+                }) {
+                    count = count.saturating_add(1);
+                }
+            }
+        }
+
+        // A partial piece is also tied to the bytes in a changed file. Keeping
+        // its block indexes after a replacement or disappearance would make
+        // the next run trust bytes that were never verified against the new
+        // file. The ranges are sorted and merged, so membership is logarithmic.
+        self.partial_pieces
+            .retain(|partial| !piece_in_ranges(ranges, partial.piece));
+        count
     }
 
     pub fn piece_count(&self) -> u32 {
@@ -260,6 +401,11 @@ impl FastresumeState {
         if self.durability.dirty_pieces_since_barrier.is_empty() {
             return None;
         }
+        // Fastresume input is bounded but not necessarily canonical. Sort and
+        // deduplicate once so filtering partial records below remains
+        // logarithmic instead of doing a full dirty-list scan per record.
+        self.durability.dirty_pieces_since_barrier.sort_unstable();
+        self.durability.dirty_pieces_since_barrier.dedup();
         let mut downgraded = 0;
         for piece in self.durability.dirty_pieces_since_barrier.iter().copied() {
             let Some(state) = self.pieces.get_mut(piece as usize) else {
@@ -274,12 +420,42 @@ impl FastresumeState {
             !self
                 .durability
                 .dirty_pieces_since_barrier
-                .contains(&partial.piece)
+                .binary_search(&partial.piece)
+                .is_ok()
         });
         self.clean_shutdown = true;
         self.durability.dirty_pieces_since_barrier.clear();
         Some(downgraded)
     }
+}
+
+fn merge_piece_ranges(mut ranges: Vec<(u32, u32)>) -> Vec<(u32, u32)> {
+    ranges.sort_unstable();
+    let mut merged = Vec::with_capacity(ranges.len());
+    for (first, last) in ranges {
+        if let Some((_, current_last)) = merged.last_mut() {
+            if first <= *current_last {
+                *current_last = (*current_last).max(last);
+                continue;
+            }
+        }
+        merged.push((first, last));
+    }
+    merged
+}
+
+fn piece_in_ranges(ranges: &[(u32, u32)], piece: u32) -> bool {
+    ranges
+        .binary_search_by(|(first, last)| {
+            if piece < *first {
+                std::cmp::Ordering::Greater
+            } else if piece >= *last {
+                std::cmp::Ordering::Less
+            } else {
+                std::cmp::Ordering::Equal
+            }
+        })
+        .is_ok()
 }
 
 #[cfg(test)]
@@ -352,6 +528,31 @@ mod tests {
             result,
             Err(crate::error::FastresumeError::PieceCountMismatch { .. })
         ));
+    }
+
+    #[test]
+    fn deserialization_rejects_oversized_partial_piece_block_arrays() {
+        let partial = PartialPieceState {
+            piece: 0,
+            received_blocks: (0..=MAX_FASTRESUME_BLOCKS_PER_PARTIAL_PIECE as u32).collect(),
+        };
+        let encoded = serde_json::to_vec(&partial).unwrap();
+
+        assert!(serde_json::from_slice::<PartialPieceState>(&encoded).is_err());
+    }
+
+    #[test]
+    fn deserialization_rejects_oversized_partial_piece_arrays() {
+        let mut state = FastresumeState::new_empty(&test_hash(), 1, ImportPolicy::TrustHints);
+        state.partial_pieces = (0..=MAX_FASTRESUME_PARTIAL_PIECES)
+            .map(|piece| PartialPieceState {
+                piece: u32::try_from(piece).unwrap(),
+                received_blocks: vec![0],
+            })
+            .collect();
+        let encoded = serde_json::to_vec(&state).unwrap();
+
+        assert!(serde_json::from_slice::<FastresumeState>(&encoded).is_err());
     }
 
     #[test]
@@ -523,5 +724,36 @@ mod tests {
         state.pieces = vec![PieceState::Valid, PieceState::Valid];
         state.clean_shutdown = false;
         assert_eq!(state.apply_unclean_shutdown_watermark(), None);
+    }
+
+    #[test]
+    fn unclean_watermark_canonicalizes_loaded_dirty_piece_order() {
+        let mut state =
+            FastresumeState::new_empty(&test_hash(), 5, ImportPolicy::RequireVerification);
+        state.pieces.fill(PieceState::Valid);
+        state.partial_pieces = vec![
+            PartialPieceState {
+                piece: 1,
+                received_blocks: vec![0],
+            },
+            PartialPieceState {
+                piece: 4,
+                received_blocks: vec![0],
+            },
+        ];
+        state.durability.dirty_pieces_since_barrier = vec![4, 1, 4, 99, 1];
+
+        assert_eq!(state.apply_unclean_shutdown_watermark(), Some(2));
+        assert_eq!(
+            state.durability.dirty_pieces_since_barrier,
+            Vec::<u32>::new()
+        );
+        assert!(state.partial_pieces.is_empty());
+        assert_eq!(state.pieces[1], PieceState::Unknown);
+        assert_eq!(state.pieces[4], PieceState::Unknown);
+        assert!(state.pieces[0..1]
+            .iter()
+            .chain(state.pieces[2..4].iter())
+            .all(|piece| *piece == PieceState::Valid));
     }
 }

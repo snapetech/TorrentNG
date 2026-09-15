@@ -8,7 +8,7 @@ use std::{
 
 use tokio::sync::{mpsc, oneshot};
 
-use rt_metainfo::{MagnetLink, TorrentMeta, TorrentMetaV1};
+use rt_metainfo::{MagnetLink, TorrentMeta};
 use rt_metrics::{MemoryClass, MemoryLease, ResourceSnapshot};
 use rt_session::{TorrentHandle, TorrentState};
 use rt_storage::{StorageIoStats, StoragePlan, STORAGE_LATENCY_BUCKET_COUNT};
@@ -180,7 +180,7 @@ pub enum TorrentPromotionAction {
 
 #[derive(Debug)]
 pub struct PreparedTorrentTaskData {
-    pub meta: TorrentMetaV1,
+    pub meta: TorrentMeta,
     pub save_path: PathBuf,
     pub info_hash: [u8; 20],
     pub is_private: bool,

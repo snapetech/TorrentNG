@@ -48,7 +48,7 @@ futures = "0.3"
 # web framework
 axum = { version = "0.7", features = ["ws", "macros"] }
 http = "1"
-tower = { version = "0.4", features = ["util"] }
+tower = { version = "0.4", features = ["util", "limit"] }
 tower-http = { version = "0.5", features = ["cors", "trace", "fs"] }
 
 # serialization

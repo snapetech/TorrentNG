@@ -113,13 +113,13 @@ jobs:
             copr-cli modify torrentng \
               --chroot fedora-43-x86_64 \
               --chroot fedora-rawhide-x86_64 \
-              --description "TorrentNG RPM builds" \
+              --description "TorrentNG Engine RPMs: native Rust BitTorrent client with the shared WebUI/API." \
               --instructions "dnf copr enable slskdn/torrentng && dnf install torrentngd"
           else
             copr-cli create torrentng \
               --chroot fedora-43-x86_64 \
               --chroot fedora-rawhide-x86_64 \
-              --description "TorrentNG RPM builds" \
+              --description "TorrentNG Engine RPMs: native Rust BitTorrent client with the shared WebUI/API." \
               --instructions "dnf copr enable slskdn/torrentng && dnf install torrentngd"
           fi
 

@@ -202,6 +202,7 @@ impl TorrentEntry {
             (TorrentState::Checking, TorrentState::Downloading) => true,
             (TorrentState::Checking, TorrentState::Paused) => true,
             (TorrentState::Checking, TorrentState::Stopped) => true,
+            (TorrentState::Checking, TorrentState::Queued) => true,
             (TorrentState::Checking, TorrentState::Error) => true,
             (TorrentState::Downloading, TorrentState::Checking) => true,
             (TorrentState::Downloading, TorrentState::Seeding) => true,
@@ -337,6 +338,8 @@ mod tests {
 
         e.transition(TorrentState::Checking).unwrap();
         assert_eq!(e.state, TorrentState::Checking);
+        e.transition(TorrentState::Queued).unwrap();
+        assert_eq!(e.state, TorrentState::Queued);
     }
 
     #[test]

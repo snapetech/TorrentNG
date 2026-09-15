@@ -3,7 +3,10 @@ use rusqlite::{params, Connection, OptionalExtension};
 use std::{
     collections::{BTreeMap, HashSet},
     path::Path,
-    sync::{Arc, Mutex, OnceLock},
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc, Mutex, MutexGuard, OnceLock,
+    },
     time::{SystemTime, UNIX_EPOCH},
 };
 use tokio::sync::Semaphore;
@@ -15,6 +18,14 @@ pub(crate) const CACHE_REVISION_KEY: &str = "cache_revision";
 pub(crate) const CACHE_REVISION_FLOOR_KEY: &str = "cache_revision_floor";
 pub(crate) const MAX_REMOVED_TORRENT_TOMBSTONES: i64 = 100_000;
 const MAX_BLOCKING_DB_READS: usize = 8;
+/// Number of standing read-only connections kept open beside the single
+/// writer connection. SQLite's WAL mode lets any number of reader
+/// connections run concurrently with the one writer connection without
+/// blocking each other, as long as each side has its own `Connection`
+/// handle; this pool exists purely so reads stop serializing behind the
+/// writer's mutex. Kept small and fixed-size -- this is a read cache in
+/// front of a poll loop, not a general-purpose connection pool.
+const READ_POOL_SIZE: usize = 4;
 static BLOCKING_DB_READ_GATE: OnceLock<Arc<Semaphore>> = OnceLock::new();
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -57,8 +68,71 @@ pub struct AppEventRow {
     pub payload: String,
 }
 
+/// Shared state behind `Db`: one dedicated writer connection (mutex-guarded,
+/// matching SQLite/WAL's single-writer model) and a small pool of read-only
+/// connections that can run concurrently with the writer and with each
+/// other.
+struct Inner {
+    writer: Mutex<Connection>,
+    readers: ReadPool,
+}
+
+/// A small fixed-size, round-robin pool of read-only SQLite connections.
+///
+/// Checkout tries each connection starting from a rotating index and takes
+/// the first one that isn't currently busy, so concurrent readers spread
+/// across the pool instead of queuing on a single slot; if every connection
+/// is busy, the caller blocks on its assigned slot rather than spinning.
+struct ReadPool {
+    conns: Vec<Mutex<Connection>>,
+    next: AtomicUsize,
+}
+
+impl ReadPool {
+    fn open(path: &Path, size: usize) -> Result<Self> {
+        let mut conns = Vec::with_capacity(size);
+        for _ in 0..size {
+            let conn = Connection::open(path)
+                .with_context(|| format!("open sqlite read connection {}", path.display()))?;
+            apply_pragmas(&conn)?;
+            // Reader connections exist only to run SELECTs concurrently
+            // with the writer; refuse any accidental write outright rather
+            // than letting one silently succeed outside the writer's
+            // serialization point.
+            conn.execute_batch("PRAGMA query_only=ON;")?;
+            register_media_type_function(&conn)?;
+            conns.push(Mutex::new(conn));
+        }
+        Ok(Self {
+            conns,
+            next: AtomicUsize::new(0),
+        })
+    }
+
+    fn checkout(&self) -> MutexGuard<'_, Connection> {
+        let len = self.conns.len();
+        let start = self.next.fetch_add(1, Ordering::Relaxed) % len;
+        for offset in 0..len {
+            let idx = (start + offset) % len;
+            if let Ok(guard) = self.conns[idx].try_lock() {
+                return guard;
+            }
+        }
+        // Every connection is currently busy: block on the assigned slot
+        // instead of spinning across all of them.
+        self.conns[start].lock().expect("read pool mutex poisoned")
+    }
+}
+
+fn apply_pragmas(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        "PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; PRAGMA foreign_keys=ON;",
+    )?;
+    Ok(())
+}
+
 #[derive(Clone)]
-pub struct Db(pub(crate) Arc<Mutex<Connection>>);
+pub struct Db(Arc<Inner>);
 
 impl Db {
     pub fn open(path: &Path) -> Result<Self> {
@@ -67,27 +141,46 @@ impl Db {
                 .with_context(|| format!("create cache dir {}", parent.display()))?;
         }
 
-        let mut conn =
+        let mut writer_conn =
             Connection::open(path).with_context(|| format!("open sqlite {}", path.display()))?;
 
-        conn.execute_batch(
-            "PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; PRAGMA foreign_keys=ON;",
-        )?;
+        apply_pragmas(&writer_conn)?;
 
-        register_media_type_function(&conn)?;
-        migrate(&mut conn)?;
+        register_media_type_function(&writer_conn)?;
+        migrate(&mut writer_conn)?;
 
-        Ok(Self(Arc::new(Mutex::new(conn))))
+        // Open the read pool only after migration has run so every reader
+        // sees the final schema; opening against the same path picks up the
+        // WAL mode the writer just enabled.
+        let readers = ReadPool::open(path, READ_POOL_SIZE)
+            .with_context(|| format!("open sqlite read pool {}", path.display()))?;
+
+        Ok(Self(Arc::new(Inner {
+            writer: Mutex::new(writer_conn),
+            readers,
+        })))
     }
 
-    fn conn(&self) -> std::sync::MutexGuard<'_, Connection> {
-        self.0.lock().expect("db mutex poisoned")
+    /// Acquire the dedicated writer connection. Every mutation must go
+    /// through this so writes stay serialized -- WAL allows exactly one
+    /// writer connection at a time.
+    pub(crate) fn conn(&self) -> MutexGuard<'_, Connection> {
+        self.0.writer.lock().expect("db writer mutex poisoned")
     }
 
-    /// Execute a cache operation on Tokio's blocking pool. The cache uses a
-    /// synchronous rusqlite connection behind a mutex; calling it directly
-    /// from an async HTTP handler lets a slow SQLite read occupy an executor
-    /// worker and amplifies latency for unrelated requests.
+    /// Check out a connection from the read-only pool. Safe to call
+    /// concurrently with other reads and with an in-progress write: WAL lets
+    /// readers proceed against the last-committed snapshot without blocking
+    /// on, or being blocked by, the writer.
+    pub(crate) fn read(&self) -> MutexGuard<'_, Connection> {
+        self.0.readers.checkout()
+    }
+
+    /// Execute a cache operation on Tokio's blocking pool. The cache is
+    /// synchronous rusqlite underneath (one writer connection plus a small
+    /// read-only connection pool); calling it directly from an async HTTP
+    /// handler lets a slow SQLite call occupy an executor worker and
+    /// amplifies latency for unrelated requests.
     pub async fn run_blocking<T, F>(&self, operation: &'static str, f: F) -> Result<T>
     where
         T: Send + 'static,
@@ -332,7 +425,7 @@ impl Db {
     /// intentionally independent from `TorrentRow::updated_at`, which is a
     /// wall-clock freshness value and is not a safe change cursor.
     pub fn current_revision(&self) -> Result<i64> {
-        current_revision_locked(&self.conn())
+        current_revision_locked(&self.read())
     }
 
     pub fn append_app_event(&self, event: &AppEventRow, retention: usize) -> Result<i64> {
@@ -366,7 +459,7 @@ impl Db {
         levels: &[&str],
         last_known_id: Option<i64>,
     ) -> Result<Vec<AppEventRow>> {
-        let conn = self.conn();
+        let conn = self.read();
         let limit = limit.max(1) as i64;
         let mut sql = "SELECT event_id, occurred_at, level, kind, message, payload
              FROM app_events"
@@ -426,7 +519,7 @@ impl Db {
 
     pub fn get_kv(&self, key: &str) -> Result<Option<String>> {
         Ok(self
-            .conn()
+            .read()
             .query_row("SELECT value FROM kv WHERE key=?1", params![key], |r| {
                 r.get(0)
             })
@@ -449,7 +542,7 @@ impl Db {
     }
 
     pub fn exists(&self, hash: &str) -> Result<bool> {
-        let exists: i64 = self.conn().query_row(
+        let exists: i64 = self.read().query_row(
             "SELECT EXISTS(SELECT 1 FROM torrents WHERE hash=?1 COLLATE NOCASE)",
             params![hash],
             |r| r.get(0),
@@ -465,13 +558,13 @@ impl Db {
     /// backend; otherwise a backend that treats an unknown id as a no-op can
     /// make a successful HTTP response lie about the requested torrent.
     pub fn canonical_hash(&self, hash: &str) -> Result<Option<String>> {
-        let conn = self.conn();
+        let conn = self.read();
         canonical_hash(&conn, hash)
     }
 
     pub fn count(&self) -> Result<i64> {
         let n: i64 = self
-            .conn()
+            .read()
             .query_row("SELECT COUNT(*) FROM torrents", [], |r| r.get(0))?;
         Ok(n)
     }
@@ -483,7 +576,7 @@ impl Db {
     /// they were library totals. Keep the aggregation in SQLite and run it at
     /// the end of a complete sync cycle.
     pub fn sync_counts(&self) -> Result<(i64, i64, i64, i64, i64)> {
-        Ok(self.conn().query_row(
+        Ok(self.read().query_row(
             "SELECT
                 COALESCE(SUM(CASE
                     WHEN state = 3 THEN 1 ELSE 0 END), 0),
@@ -514,7 +607,7 @@ impl Db {
     }
 
     pub fn all_hashes(&self) -> Result<HashSet<String>> {
-        let conn = self.conn();
+        let conn = self.read();
         let mut stmt = conn.prepare("SELECT hash FROM torrents")?;
         let hashes = stmt
             .query_map([], |r| r.get(0))?
@@ -859,6 +952,97 @@ fn prune_app_events_locked(conn: &Connection, retention: usize) -> Result<()> {
 mod tests {
     use super::*;
     use crate::cache::query::ListParams;
+
+    /// TEMP tables are connection-local in SQLite -- a `CREATE TEMP TABLE`
+    /// on one `Connection` is invisible to every other `Connection`, even
+    /// against the same file. Creating one on the writer and failing to
+    /// see it from a checked-out read-pool connection proves `read()`
+    /// hands out a genuinely separate connection, not the writer's
+    /// connection wrapped behind a second accessor.
+    #[test]
+    fn read_pool_connections_are_independent_from_the_writer() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("cache.db")).unwrap();
+
+        db.conn()
+            .execute_batch("CREATE TEMP TABLE writer_only(x INTEGER);")
+            .unwrap();
+
+        let visible: i64 = db
+            .read()
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_temp_master WHERE name='writer_only'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            visible, 0,
+            "a read-pool connection must not share the writer's connection"
+        );
+    }
+
+    /// Demonstrates the actual point of the read pool: two reads issued at
+    /// the same time run concurrently instead of queuing behind one shared
+    /// connection/mutex. Each thread holds a `read()` guard for a fixed
+    /// sleep; if reads serialized (the old single-`Mutex<Connection>`
+    /// behavior), total wall time would be roughly additive (~2x one
+    /// sleep). With independent pooled connections it should be roughly
+    /// one sleep.
+    #[test]
+    fn concurrent_reads_overlap_instead_of_serializing() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("cache.db")).unwrap();
+        let hold_for = std::time::Duration::from_millis(200);
+
+        let start = std::time::Instant::now();
+        std::thread::scope(|scope| {
+            for _ in 0..2 {
+                let db = db.clone();
+                scope.spawn(move || {
+                    let _guard = db.read();
+                    std::thread::sleep(hold_for);
+                });
+            }
+        });
+        let elapsed = start.elapsed();
+
+        assert!(
+            elapsed < hold_for * 2,
+            "two concurrent reads took {elapsed:?}; expected them to overlap \
+             (~{hold_for:?}) instead of serializing to ~{:?}",
+            hold_for * 2
+        );
+    }
+
+    /// The writer stays a single serialized connection (WAL allows exactly
+    /// one writer): concurrent writers must not lose updates to each
+    /// other. This is distinct from the read-pool tests above and guards
+    /// against accidentally routing a write through `read()`.
+    #[test]
+    fn concurrent_writes_via_conn_do_not_lose_updates() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("cache.db")).unwrap();
+        let start = Arc::new(std::sync::Barrier::new(8));
+
+        std::thread::scope(|scope| {
+            for i in 0..8 {
+                let db = db.clone();
+                let start = Arc::clone(&start);
+                scope.spawn(move || {
+                    start.wait();
+                    db.set_kv(&format!("key-{i}"), "value").unwrap();
+                });
+            }
+        });
+
+        for i in 0..8 {
+            assert_eq!(
+                db.get_kv(&format!("key-{i}")).unwrap().as_deref(),
+                Some("value")
+            );
+        }
+    }
 
     #[test]
     fn app_events_insert_list_and_prune() {

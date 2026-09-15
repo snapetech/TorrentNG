@@ -19,8 +19,12 @@ use tokio::{
 use crate::{
     error::UtpError,
     packet::{PacketType, UtpPacket},
-    state::{InboundAction, UtpConnection, DEFAULT_MTU_PAYLOAD_BYTES},
+    state::{
+        InboundAction, UtpConnection, DEFAULT_INITIAL_WINDOW_BYTES, DEFAULT_MTU_PAYLOAD_BYTES,
+    },
 };
+
+const MAX_RECEIVE_BUFFER_BYTES: usize = DEFAULT_INITIAL_WINDOW_BYTES as usize;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct UtpTransportConfig {
@@ -557,7 +561,7 @@ impl UtpStream {
             }
         }
         let packet = packet.ok_or(UtpError::Timeout)?;
-        conn.on_inbound(&packet)?;
+        conn.on_inbound(&packet, now_us())?;
         observe_connection(&conn);
         if !conn.is_established() {
             return Err(UtpError::InvalidStatePacket {
@@ -588,7 +592,28 @@ impl UtpStream {
     }
 
     pub async fn send(&mut self, payload: &[u8]) -> Result<(), UtpError> {
-        for chunk in payload.chunks(DEFAULT_MTU_PAYLOAD_BYTES) {
+        let mut offset = 0;
+        while offset < payload.len() {
+            // BEP 29's advertised receive window is a byte budget, not just
+            // telemetry.  A peer can advertise less than one MTU (or zero)
+            // while its application is back-pressured.  Do not build a DATA
+            // packet larger than the currently available remote/congestion
+            // window; waiting for a STATE update is preferable to sending
+            // bytes the peer explicitly cannot accept.
+            let chunk_len = loop {
+                let available =
+                    usize::try_from(self.conn.available_send_window()).unwrap_or(usize::MAX);
+                let chunk_len = (payload.len() - offset)
+                    .min(DEFAULT_MTU_PAYLOAD_BYTES)
+                    .min(available);
+                if chunk_len > 0 {
+                    break chunk_len;
+                }
+
+                let packet = self.recv_packet(self.config.io_timeout).await?;
+                self.handle_inbound_during_send(packet).await?;
+            };
+            let chunk = &payload[offset..offset + chunk_len];
             let packet = self.conn.build_data(
                 now_us(),
                 timestamp_diff_us(self.last_remote_timestamp_us),
@@ -612,24 +637,24 @@ impl UtpStream {
                         Err(err) => return Err(err),
                     };
                     self.last_remote_timestamp_us = ack.header.timestamp_us;
-                    let action = self.conn.on_inbound(&ack)?;
+                    let action = self.conn.on_inbound(&ack, now_us())?;
                     match action {
                         InboundAction::DeliverPayload => {
+                            self.buffer_inbound_payload(&ack.payload)?;
                             let response = self
                                 .conn
                                 .build_state(now_us(), timestamp_diff_us(ack.header.timestamp_us));
                             self.send_packet(&response).await?;
-                            self.read_buf.extend_from_slice(&ack.payload);
-                            UTP_BYTES_RECEIVED
-                                .fetch_add(ack.payload.len() as u64, Ordering::Relaxed);
                         }
                         InboundAction::SendState => {
+                            self.update_receive_window();
                             let response = self
                                 .conn
                                 .build_state(now_us(), timestamp_diff_us(ack.header.timestamp_us));
                             self.send_packet(&response).await?;
                         }
                         InboundAction::Close => {
+                            self.update_receive_window();
                             let response = self
                                 .conn
                                 .build_state(now_us(), timestamp_diff_us(ack.header.timestamp_us));
@@ -657,7 +682,45 @@ impl UtpStream {
                 UTP_SEND_TIMEOUTS.fetch_add(1, Ordering::Relaxed);
                 return Err(UtpError::Timeout);
             }
+            offset += chunk_len;
         }
+        Ok(())
+    }
+
+    async fn handle_inbound_during_send(&mut self, packet: UtpPacket) -> Result<(), UtpError> {
+        self.last_remote_timestamp_us = packet.header.timestamp_us;
+        let action = self.conn.on_inbound(&packet, now_us())?;
+        match action {
+            InboundAction::DeliverPayload => {
+                self.buffer_inbound_payload(&packet.payload)?;
+                let response = self
+                    .conn
+                    .build_state(now_us(), timestamp_diff_us(packet.header.timestamp_us));
+                self.send_packet(&response).await?;
+            }
+            InboundAction::SendState => {
+                self.update_receive_window();
+                let response = self
+                    .conn
+                    .build_state(now_us(), timestamp_diff_us(packet.header.timestamp_us));
+                self.send_packet(&response).await?;
+            }
+            InboundAction::Close => {
+                self.update_receive_window();
+                let response = self
+                    .conn
+                    .build_state(now_us(), timestamp_diff_us(packet.header.timestamp_us));
+                self.send_packet(&response).await?;
+                self.conn.mark_closed();
+                return Err(UtpError::Closed);
+            }
+            InboundAction::Reset => {
+                self.conn.mark_closed();
+                return Err(UtpError::Closed);
+            }
+            InboundAction::None => {}
+        }
+        observe_connection(&self.conn);
         Ok(())
     }
 
@@ -673,15 +736,13 @@ impl UtpStream {
     pub async fn read_exact(&mut self, out: &mut [u8]) -> Result<(), UtpError> {
         let mut filled = 0;
         while filled < out.len() {
-            if self.read_buf.is_empty() {
-                self.read_buf = self.recv().await?;
-                if self.read_buf.is_empty() {
-                    return Err(UtpError::Closed);
-                }
+            if self.read_buf.is_empty() && !self.receive_into_buffer().await? {
+                return Err(UtpError::Closed);
             }
             let n = (out.len() - filled).min(self.read_buf.len());
             out[filled..filled + n].copy_from_slice(&self.read_buf[..n]);
             self.read_buf.drain(..n);
+            self.advertise_receive_window().await?;
             filled += n;
         }
         Ok(())
@@ -689,8 +750,15 @@ impl UtpStream {
 
     pub async fn recv(&mut self) -> Result<Vec<u8>, UtpError> {
         if !self.read_buf.is_empty() {
-            return Ok(std::mem::take(&mut self.read_buf));
+            return self.release_read_buffer().await;
         }
+        if !self.receive_into_buffer().await? {
+            return Ok(Vec::new());
+        }
+        self.release_read_buffer().await
+    }
+
+    async fn receive_into_buffer(&mut self) -> Result<bool, UtpError> {
         loop {
             let packet = self.recv_packet(self.config.io_timeout).await?;
             self.last_remote_timestamp_us = packet.header.timestamp_us;
@@ -702,30 +770,32 @@ impl UtpStream {
                     continue;
                 }
             }
-            let action = self.conn.on_inbound(&packet)?;
+            let action = self.conn.on_inbound(&packet, now_us())?;
             observe_connection(&self.conn);
             match action {
                 InboundAction::DeliverPayload => {
+                    self.buffer_inbound_payload(&packet.payload)?;
                     let ack = self
                         .conn
                         .build_state(now_us(), timestamp_diff_us(packet.header.timestamp_us));
                     self.send_packet(&ack).await?;
-                    UTP_BYTES_RECEIVED.fetch_add(packet.payload.len() as u64, Ordering::Relaxed);
-                    return Ok(packet.payload);
+                    return Ok(true);
                 }
                 InboundAction::Close => {
+                    self.update_receive_window();
                     let ack = self
                         .conn
                         .build_state(now_us(), timestamp_diff_us(packet.header.timestamp_us));
                     self.send_packet(&ack).await?;
                     self.conn.mark_closed();
-                    return Ok(Vec::new());
+                    return Ok(false);
                 }
                 InboundAction::Reset => {
                     self.conn.mark_closed();
-                    return Ok(Vec::new());
+                    return Ok(false);
                 }
                 InboundAction::SendState => {
+                    self.update_receive_window();
                     let ack = self
                         .conn
                         .build_state(now_us(), timestamp_diff_us(packet.header.timestamp_us));
@@ -734,6 +804,62 @@ impl UtpStream {
                 InboundAction::None => {}
             }
         }
+    }
+
+    fn buffer_inbound_payload(&mut self, payload: &[u8]) -> Result<(), UtpError> {
+        let actual = self.read_buf.len().saturating_add(payload.len());
+        if actual > MAX_RECEIVE_BUFFER_BYTES {
+            self.conn.set_local_window_bytes(0);
+            return Err(UtpError::ReceiveBufferFull {
+                max: MAX_RECEIVE_BUFFER_BYTES,
+                actual,
+            });
+        }
+        self.read_buf.extend_from_slice(payload);
+        self.update_receive_window();
+        UTP_BYTES_RECEIVED.fetch_add(payload.len() as u64, Ordering::Relaxed);
+        Ok(())
+    }
+
+    fn update_receive_window(&mut self) {
+        let available = MAX_RECEIVE_BUFFER_BYTES.saturating_sub(self.read_buf.len());
+        self.conn
+            .set_local_window_bytes(u32::try_from(available).unwrap_or(u32::MAX));
+    }
+
+    async fn advertise_receive_window(&mut self) -> Result<(), UtpError> {
+        self.update_receive_window();
+        if matches!(
+            self.conn.state(),
+            crate::state::ConnectionState::Closed | crate::state::ConnectionState::Reset
+        ) {
+            return Ok(());
+        }
+        let state = self
+            .conn
+            .build_state(now_us(), timestamp_diff_us(self.last_remote_timestamp_us));
+        self.send_packet(&state).await
+    }
+
+    async fn release_read_buffer(&mut self) -> Result<Vec<u8>, UtpError> {
+        let payload = std::mem::take(&mut self.read_buf);
+        self.update_receive_window();
+        if payload.is_empty() {
+            return Ok(payload);
+        }
+
+        let mut guard = ReadBufferReleaseGuard {
+            stream: self,
+            payload: Some(payload),
+        };
+        let state = guard.stream.conn.build_state(
+            now_us(),
+            timestamp_diff_us(guard.stream.last_remote_timestamp_us),
+        );
+        guard.stream.send_packet(&state).await?;
+        let payload = guard.payload.take().expect("release guard owns payload");
+        drop(guard);
+        Ok(payload)
     }
 
     pub async fn close(&mut self) -> Result<(), UtpError> {
@@ -758,24 +884,24 @@ impl UtpStream {
                     Err(err) => return Err(err),
                 };
                 self.last_remote_timestamp_us = received.header.timestamp_us;
-                let action = self.conn.on_inbound(&received)?;
+                let action = self.conn.on_inbound(&received, now_us())?;
                 match action {
                     InboundAction::DeliverPayload => {
+                        self.buffer_inbound_payload(&received.payload)?;
                         let ack = self
                             .conn
                             .build_state(now_us(), timestamp_diff_us(received.header.timestamp_us));
                         self.send_packet(&ack).await?;
-                        self.read_buf.extend_from_slice(&received.payload);
-                        UTP_BYTES_RECEIVED
-                            .fetch_add(received.payload.len() as u64, Ordering::Relaxed);
                     }
                     InboundAction::SendState => {
+                        self.update_receive_window();
                         let ack = self
                             .conn
                             .build_state(now_us(), timestamp_diff_us(received.header.timestamp_us));
                         self.send_packet(&ack).await?;
                     }
                     InboundAction::Close => {
+                        self.update_receive_window();
                         let ack = self
                             .conn
                             .build_state(now_us(), timestamp_diff_us(received.header.timestamp_us));
@@ -822,6 +948,20 @@ impl UtpStream {
                 .ok_or(UtpError::Closed)
         } else {
             recv_packet(&self.socket, wait, self.config.max_datagram_len).await
+        }
+    }
+}
+
+struct ReadBufferReleaseGuard<'a> {
+    stream: &'a mut UtpStream,
+    payload: Option<Vec<u8>>,
+}
+
+impl Drop for ReadBufferReleaseGuard<'_> {
+    fn drop(&mut self) {
+        if let Some(payload) = self.payload.take() {
+            self.stream.read_buf = payload;
+            self.stream.update_receive_window();
         }
     }
 }
@@ -1023,6 +1163,109 @@ mod tests {
             .expect("simultaneous uTP send timed out")
             .unwrap();
         assert_eq!(server.recv().await.unwrap(), b"client-to-server");
+    }
+
+    #[tokio::test]
+    async fn utp_stream_splits_data_to_fit_a_small_remote_window() {
+        let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let addr = socket.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let mut buf = [0u8; 2048];
+            let (len, peer) = socket.recv_from(&mut buf).await.unwrap();
+            let syn = UtpPacket::parse(&buf[..len]).unwrap();
+            assert_eq!(syn.header.packet_type, PacketType::Syn);
+
+            let state = UtpPacket {
+                header: crate::packet::UtpHeader {
+                    packet_type: PacketType::State,
+                    version: 1,
+                    extension: 0,
+                    connection_id: syn.header.connection_id.wrapping_add(1),
+                    timestamp_us: 1,
+                    timestamp_diff: 0,
+                    wnd_size: 1,
+                    seq_nr: 100,
+                    ack_nr: syn.header.seq_nr,
+                },
+                extensions: Vec::new(),
+                payload: Vec::new(),
+            };
+            socket
+                .send_to(&state.encode().unwrap(), peer)
+                .await
+                .unwrap();
+
+            let mut received = Vec::new();
+            while received.len() < 2 {
+                let (len, next_peer) = timeout(Duration::from_secs(1), socket.recv_from(&mut buf))
+                    .await
+                    .unwrap()
+                    .unwrap();
+                let packet = UtpPacket::parse(&buf[..len]).unwrap();
+                if packet.header.packet_type != PacketType::Data {
+                    continue;
+                }
+                assert_eq!(packet.payload.len(), 1);
+                received.extend_from_slice(&packet.payload);
+                let ack = UtpPacket {
+                    header: crate::packet::UtpHeader {
+                        packet_type: PacketType::State,
+                        version: 1,
+                        extension: 0,
+                        connection_id: syn.header.connection_id.wrapping_add(1),
+                        timestamp_us: 2,
+                        timestamp_diff: 0,
+                        wnd_size: 1,
+                        seq_nr: 100,
+                        ack_nr: packet.header.seq_nr,
+                    },
+                    extensions: Vec::new(),
+                    payload: Vec::new(),
+                };
+                socket
+                    .send_to(&ack.encode().unwrap(), next_peer)
+                    .await
+                    .unwrap();
+            }
+            received
+        });
+
+        let mut client = UtpStream::connect_with_config(addr, test_config())
+            .await
+            .unwrap();
+        client.send(b"ab").await.unwrap();
+        assert_eq!(server.await.unwrap(), b"ab");
+    }
+
+    #[tokio::test]
+    async fn utp_receive_buffer_is_bounded_and_advertises_remaining_space() {
+        let socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let mut stream = UtpStream {
+            socket,
+            peer: "127.0.0.1:1".parse().unwrap(),
+            conn: UtpConnection::connect(1, 1),
+            config: test_config(),
+            last_remote_timestamp_us: 0,
+            read_buf: Vec::new(),
+            routed_rx: None,
+            handshake_state: None,
+            route: None,
+        };
+
+        stream
+            .buffer_inbound_payload(&vec![0; MAX_RECEIVE_BUFFER_BYTES - 1])
+            .unwrap();
+        let state = stream.conn.build_state(1, 0);
+        assert_eq!(state.header.wnd_size, 1);
+
+        let error = stream.buffer_inbound_payload(&[1, 2]).unwrap_err();
+        assert!(matches!(
+            error,
+            UtpError::ReceiveBufferFull { max, actual }
+                if max == MAX_RECEIVE_BUFFER_BYTES && actual == MAX_RECEIVE_BUFFER_BYTES + 1
+        ));
+        let state = stream.conn.build_state(2, 0);
+        assert_eq!(state.header.wnd_size, 0);
     }
 
     #[tokio::test]

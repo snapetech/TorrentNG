@@ -86,6 +86,17 @@ fn estimate_rtorrent_multicall_snapshot_bytes(torrent_count: usize, command_coun
     8 * 1024 + (torrent_count as u64).saturating_mul(512 + commands.saturating_mul(160))
 }
 
+fn estimate_rtorrent_tracker_snapshot_bytes(
+    tracker_count: u64,
+    tracker_bytes: u64,
+    command_count: usize,
+) -> u64 {
+    let commands = command_count.max(1) as u64;
+    16 * 1024
+        + tracker_count.saturating_mul(1024 + commands.saturating_mul(160))
+        + tracker_bytes.saturating_mul(4)
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum RtValue {
     Int(i64),
@@ -443,6 +454,23 @@ async fn tracker_multicall(state: &AppState, params: &[RtValue]) -> Result<RtVal
         return Ok(RtValue::Array(Vec::new()));
     };
     if let Some(engine) = &state.engine {
+        let (tracker_count, tracker_bytes) = engine
+            .torrent_tracker_snapshot_size(entry.info_hash.clone())
+            .await
+            .map_err(|error| error.to_string())?;
+        let _lease = if tracker_count > 0 {
+            reserve_rtorrent_api_snapshot(
+                state,
+                estimate_rtorrent_tracker_snapshot_bytes(
+                    tracker_count,
+                    tracker_bytes,
+                    commands.len(),
+                ),
+            )
+            .await?
+        } else {
+            None
+        };
         let trackers = engine
             .torrent_trackers(entry.info_hash.clone())
             .await

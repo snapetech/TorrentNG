@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2021"
 rust-version = "1.97"
 license = "AGPL-3.0-or-later OR LicenseRef-Commercial"
+description = "TorrentNG compatible-client WebUI/API service for existing torrent clients"
 
 [lib]
 name = "torrentng"

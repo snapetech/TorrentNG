@@ -19,6 +19,7 @@ total_cap_mb = 512
 storage_frame_cap_mb = 128
 queued_disk_cap_mb = 64
 piece_assembly_cap_mb = 128
+piece_index_cap_mb = 128
 peer_buffer_cap_mb = 128
 metadata_cap_mb = 32
 pressure_constrained_pct = 75

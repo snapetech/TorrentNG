@@ -212,7 +212,7 @@ byte_offset (resumable)
 verified_bytes
 invalid_pieces
 started_at / updated_at
-state: queued | running | paused | commit_pending | cancelled | completed
+state: queued | running | paused | cancelling | commit_pending | cancelled | completed
 
 `commit_pending` is normally the storage-move boundary after filesystem work
 has committed but before the engine has durably published the new save path.
@@ -266,16 +266,16 @@ Moving 200+ TB is a database migration, not a file copy:
 | BEP 11 | PEX | compatibility policy present; private torrents disable peer discovery by default |
 | BEP 12 | Multitracker | implemented |
 | BEP 14 | LSD | private torrents disable local discovery by default |
-| BEP 15 | UDP trackers | implemented for v1; v2 UDP announces are rejected explicitly |
+| BEP 15 | UDP trackers | implemented for v1 and pure-v2 announces using the truncated v2 infohash |
 | BEP 23 | Compact peer list | implemented |
 | BEP 27 | Private torrents | implemented |
 | BEP 29 | uTP | implemented for packet/state/UDP stream primitives plus opt-in engine peer-wire and metadata paths; public interop remains release evidence |
-| BEP 32 | IPv6 | partial: tracker compact IPv6 peers and DHT compact IPv6 peer values are parsed/forwarded; live DHT routing nodes remain IPv4-only |
-| BEP 52 | BitTorrent v2 / hybrid | implemented for parsing, identity, metadata projection, storage root verification, fastresume, and compatibility projections; pure-v2 peer transfer/tracker lifecycle is explicitly unsupported |
+| BEP 32 | IPv6 | implemented for tracker compact IPv6 peers and live DHT bind/routing, with the same bounded source validation and peer admission policy |
+| BEP 52 | BitTorrent v2 / hybrid | implemented for parsing, identity, metadata projection, storage root verification, fastresume, pure-v2 TCP/uTP peer transfer, hash exchange, and tracker lifecycle; pure-v2 magnet metadata completion remains unsupported |
 
-DHT is implemented in Phase 10 within the current IPv4 live-routing scope.
-Private-tracker profiles disable DHT/PEX/LSD by default; do not infer IPv6
-DHT support from the parser's ability to represent IPv6 peer values.
+DHT is implemented in Phase 10 for IPv4 and IPv6 live routing. Private-tracker
+profiles disable DHT/PEX/LSD by default; this policy is independent of the
+address-family support.
 
 ---
 

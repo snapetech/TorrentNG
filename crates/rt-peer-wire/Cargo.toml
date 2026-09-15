@@ -12,6 +12,7 @@ tokio.workspace = true
 tokio-util.workspace = true
 bytes.workspace = true
 rt-bencode = { path = "../rt-bencode" }
+rt-metrics = { path = "../rt-metrics" }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full"] }

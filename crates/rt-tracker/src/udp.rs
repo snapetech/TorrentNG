@@ -5,7 +5,10 @@
 use rand::RngExt;
 
 use crate::{
-    error::TrackerError, peer::parse_compact_peers_v4_with_limit, request::AnnounceRequest, Peer,
+    error::TrackerError,
+    peer::{parse_compact_peers_v4_with_limit, MAX_TRACKER_PEERS},
+    request::AnnounceRequest,
+    Peer,
 };
 
 pub const PROTOCOL_MAGIC: u64 = 0x41727101980;
@@ -144,7 +147,7 @@ pub struct UdpAnnounceResponse {
 impl UdpAnnounceResponse {
     /// Parse a UDP announce response. Minimum 20 bytes header + compact peers.
     pub fn parse(buf: &[u8]) -> Result<Self, TrackerError> {
-        Self::parse_with_peer_limit(buf, usize::MAX)
+        Self::parse_with_peer_limit(buf, MAX_TRACKER_PEERS)
     }
 
     /// Parse a UDP announce response while bounding peer output.
@@ -277,6 +280,16 @@ mod tests {
 
         assert_eq!(response.peers.len(), 1);
         assert_eq!(response.peers[0].addr, "10.0.0.1:6881".parse().unwrap());
+    }
+
+    #[test]
+    fn convenience_parser_caps_peer_materialization() {
+        let mut buf = vec![0u8; 20 + (MAX_TRACKER_PEERS + 1) * 6];
+        buf[0..4].copy_from_slice(&ACTION_ANNOUNCE.to_be_bytes());
+
+        let response = UdpAnnounceResponse::parse(&buf).unwrap();
+
+        assert_eq!(response.peers.len(), MAX_TRACKER_PEERS);
     }
 
     #[test]

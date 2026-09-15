@@ -93,7 +93,7 @@ impl JobState {
     pub fn is_active(&self) -> bool {
         matches!(
             self,
-            JobState::Queued | JobState::Running | JobState::Paused
+            JobState::Queued | JobState::Running | JobState::Paused | JobState::Cancelling
         )
     }
 }
@@ -248,6 +248,12 @@ mod tests {
         job.cancel();
         assert_eq!(job.state, JobState::Cancelled);
         assert!(job.state.is_terminal());
+    }
+
+    #[test]
+    fn cancelling_job_is_active_until_terminal() {
+        assert!(JobState::Cancelling.is_active());
+        assert!(!JobState::Cancelling.is_terminal());
     }
 
     #[test]

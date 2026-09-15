@@ -12,6 +12,7 @@ pub mod storage_authority;
 pub(crate) mod storage_jobs;
 pub mod tier;
 pub mod torrent_task;
+pub(crate) mod torrent_task_v2;
 pub(crate) mod tracker_runtime;
 
 pub use command::{

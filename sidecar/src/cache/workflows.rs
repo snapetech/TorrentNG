@@ -64,7 +64,7 @@ pub struct RssRuleMatch {
 
 impl Db {
     pub fn list_workflow_rules(&self) -> Result<Vec<WorkflowRule>> {
-        let conn = self.0.lock().expect("db");
+        let conn = self.read();
         let raw: Option<String> = conn
             .query_row("SELECT value FROM kv WHERE key=?1", params![KEY], |r| {
                 r.get(0)
@@ -97,7 +97,7 @@ impl Db {
     }
 
     pub fn workflow_hashes(&self, rule: &WorkflowRule) -> Result<Vec<String>> {
-        let conn = self.0.lock().expect("db");
+        let conn = self.read();
         let mut clauses = Vec::new();
         let mut args = Vec::new();
 
@@ -140,7 +140,7 @@ impl Db {
     }
 
     pub fn list_workflow_runs(&self) -> Result<Vec<WorkflowRun>> {
-        let conn = self.0.lock().expect("db");
+        let conn = self.read();
         let raw: Option<String> = conn
             .query_row(
                 "SELECT value FROM kv WHERE key=?1",
@@ -175,7 +175,7 @@ impl Db {
     }
 
     pub fn list_rss_rules(&self) -> Result<Vec<RssRule>> {
-        let conn = self.0.lock().expect("db");
+        let conn = self.read();
         let raw: Option<String> = conn
             .query_row("SELECT value FROM kv WHERE key=?1", params![RSS_KEY], |r| {
                 r.get(0)
@@ -276,7 +276,7 @@ impl Db {
     where
         F: FnOnce(&mut Vec<WorkflowRule>),
     {
-        let mut conn = self.0.lock().expect("db");
+        let mut conn = self.conn();
         let tx = conn.transaction()?;
         let raw: Option<String> = tx
             .query_row("SELECT value FROM kv WHERE key=?1", params![KEY], |r| {
@@ -298,7 +298,7 @@ impl Db {
     where
         F: FnOnce(&mut Vec<WorkflowRun>),
     {
-        let mut conn = self.0.lock().expect("db");
+        let mut conn = self.conn();
         let tx = conn.transaction()?;
         let raw: Option<String> = tx
             .query_row(
@@ -328,7 +328,7 @@ impl Db {
     where
         F: FnOnce(&mut Vec<RssRule>),
     {
-        let mut conn = self.0.lock().expect("db");
+        let mut conn = self.conn();
         let tx = conn.transaction()?;
         let raw: Option<String> = tx
             .query_row("SELECT value FROM kv WHERE key=?1", params![RSS_KEY], |r| {

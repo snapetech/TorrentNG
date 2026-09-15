@@ -19,14 +19,17 @@
 
 use std::collections::BTreeMap;
 use std::fs::File;
-use std::io::Read;
+use std::io::{BufWriter, Read, Write};
 use std::path::Path;
 
 use rt_db::{DbError, TorrentFileRow, TorrentRow, TorrentTrackerRow};
 use rt_fastresume::{FastresumeStore, PieceState};
 use rt_metainfo::{parse_torrent, TorrentMeta, MAX_TORRENT_BYTES};
+use serde::ser::{SerializeSeq, Serializer};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
+
+const MAX_EXPORT_MATERIALIZED_BYTES: usize = 512 * 1024 * 1024;
 
 #[derive(Debug, Error)]
 pub enum ExportError {
@@ -172,6 +175,7 @@ pub fn gather(
     let store = FastresumeStore::new(fastresume_dir.to_path_buf());
     let mut torrents = Vec::new();
     let mut skipped = Vec::new();
+    let mut materialized_bytes = 0usize;
 
     for row in rows {
         if !valid_info_hash(&row.info_hash) {
@@ -237,7 +241,7 @@ pub fn gather(
             ),
         };
 
-        torrents.push(ExportTorrent {
+        let torrent = ExportTorrent {
             info_hash: row.info_hash.clone(),
             raw_torrent,
             row,
@@ -247,7 +251,19 @@ pub fn gather(
             partials,
             uploaded,
             downloaded,
-        });
+        };
+        let item_bytes = estimate_export_torrent_bytes(&torrent);
+        if !admit_export_bytes(&mut materialized_bytes, item_bytes) {
+            skipped.push(SkippedExport {
+                info_hash: torrent.info_hash.clone(),
+                reason: format!(
+                    "skipped because retained export state would exceed the {} byte budget",
+                    MAX_EXPORT_MATERIALIZED_BYTES
+                ),
+            });
+            continue;
+        }
+        torrents.push(torrent);
     }
 
     torrents.sort_by(|a, b| a.info_hash.cmp(&b.info_hash));
@@ -320,47 +336,23 @@ impl ExportPlan {
     pub fn write(&self, out_dir: &Path) -> Result<ExportSummary, ExportError> {
         std::fs::create_dir_all(out_dir)?;
         let mut files_written = 0usize;
-        let mut aggregate: Vec<(Vec<u8>, Ben)> = Vec::new();
 
         for t in &self.torrents {
-            files_written += self.write_one(t, out_dir, &mut aggregate)?;
+            files_written += self.write_one(t, out_dir)?;
         }
 
-        if self.format.is_aggregate() && !aggregate.is_empty() {
-            aggregate.sort_by(|a, b| a.0.cmp(&b.0));
+        if self.format.is_aggregate() && !self.torrents.is_empty() {
             let name = match self.format {
                 ExportFormat::Utorrent => "resume.dat",
                 ExportFormat::Biglybt => "downloads.config",
                 _ => unreachable!(),
             };
-            std::fs::write(out_dir.join(name), encode_ben(&Ben::D(aggregate)))?;
+            self.write_aggregate(&out_dir.join(name))?;
             files_written += 1;
         }
 
         if self.format == ExportFormat::Generic {
-            let manifest = self
-                .torrents
-                .iter()
-                .map(|t| {
-                    serde_json::json!({
-                        "info_hash": t.info_hash,
-                        "name": t.row.name,
-                        "save_path": t.row.save_path,
-                        "category": t.row.category,
-                        "tags": t.row.tags,
-                        "trackers": t.row.trackers,
-                        "uploaded": t.uploaded,
-                        "downloaded": t.downloaded,
-                        "complete": t.is_complete(),
-                        "have_pieces": t.have.as_ref().map(|h| h.iter().filter(|b| **b).count()),
-                        "total_pieces": t.row.piece_count,
-                    })
-                })
-                .collect::<Vec<_>>();
-            std::fs::write(
-                out_dir.join("manifest.json"),
-                serde_json::to_vec_pretty(&manifest)?,
-            )?;
+            self.write_generic_manifest(&out_dir.join("manifest.json"))?;
             files_written += 1;
         }
 
@@ -371,12 +363,7 @@ impl ExportPlan {
         })
     }
 
-    fn write_one(
-        &self,
-        t: &ExportTorrent,
-        out_dir: &Path,
-        aggregate: &mut Vec<(Vec<u8>, Ben)>,
-    ) -> Result<usize, ExportError> {
+    fn write_one(&self, t: &ExportTorrent, out_dir: &Path) -> Result<usize, ExportError> {
         let hash = &t.info_hash;
         if !valid_info_hash(hash) {
             return Err(ExportError::InvalidInfoHash(hash.clone()));
@@ -416,15 +403,63 @@ impl ExportPlan {
             }
             ExportFormat::Utorrent => {
                 std::fs::write(out_dir.join(format!("{hash}.torrent")), &t.raw_torrent)?;
-                aggregate.push((hash.clone().into_bytes(), self.utorrent_entry(t)));
                 Ok(1)
             }
             ExportFormat::Biglybt => {
                 std::fs::write(out_dir.join(format!("{hash}.torrent")), &t.raw_torrent)?;
-                aggregate.push((hash.clone().into_bytes(), self.biglybt_entry(t)));
                 Ok(1)
             }
         }
+    }
+
+    fn write_aggregate(&self, path: &Path) -> Result<(), ExportError> {
+        let file = File::create(path)?;
+        let mut writer = BufWriter::new(file);
+        writer.write_all(b"d")?;
+
+        let mut torrents = self.torrents.iter().collect::<Vec<_>>();
+        torrents.sort_unstable_by(|left, right| left.info_hash.cmp(&right.info_hash));
+        for torrent in torrents {
+            let key = torrent.info_hash.as_bytes();
+            write_bencoded_bytes(&mut writer, key)?;
+            let entry = match self.format {
+                ExportFormat::Utorrent => self.utorrent_entry(torrent),
+                ExportFormat::Biglybt => self.biglybt_entry(torrent),
+                _ => unreachable!(),
+            };
+            encode_ben_to_writer(&entry, &mut writer)?;
+        }
+        writer.write_all(b"e")?;
+        writer.flush()?;
+        Ok(())
+    }
+
+    fn write_generic_manifest(&self, path: &Path) -> Result<(), ExportError> {
+        let file = File::create(path)?;
+        let mut writer = BufWriter::new(file);
+        let mut serializer = serde_json::Serializer::pretty(&mut writer);
+        let mut sequence = serializer.serialize_seq(None)?;
+        for torrent in &self.torrents {
+            sequence.serialize_element(&serde_json::json!({
+                "info_hash": torrent.info_hash,
+                "name": torrent.row.name,
+                "save_path": torrent.row.save_path,
+                "category": torrent.row.category,
+                "tags": torrent.row.tags,
+                "trackers": torrent.row.trackers,
+                "uploaded": torrent.uploaded,
+                "downloaded": torrent.downloaded,
+                "complete": torrent.is_complete(),
+                "have_pieces": torrent
+                    .have
+                    .as_ref()
+                    .map(|have| have.iter().filter(|piece| **piece).count()),
+                "total_pieces": torrent.row.piece_count,
+            }))?;
+        }
+        sequence.end()?;
+        writer.flush()?;
+        Ok(())
     }
 
     fn tracker_tiers(&self, t: &ExportTorrent) -> Ben {
@@ -590,6 +625,41 @@ fn encode_ben(value: &Ben) -> Vec<u8> {
     out
 }
 
+fn encode_ben_to_writer<W: Write>(value: &Ben, writer: &mut W) -> std::io::Result<()> {
+    match value {
+        Ben::I(n) => {
+            writer.write_all(b"i")?;
+            writer.write_all(n.to_string().as_bytes())?;
+            writer.write_all(b"e")?;
+        }
+        Ben::B(bytes) => write_bencoded_bytes(writer, bytes)?,
+        Ben::L(items) => {
+            writer.write_all(b"l")?;
+            for item in items {
+                encode_ben_to_writer(item, writer)?;
+            }
+            writer.write_all(b"e")?;
+        }
+        Ben::D(pairs) => {
+            let mut pairs = pairs.clone();
+            pairs.sort_by(|left, right| left.0.cmp(&right.0));
+            writer.write_all(b"d")?;
+            for (key, value) in &pairs {
+                write_bencoded_bytes(writer, key)?;
+                encode_ben_to_writer(value, writer)?;
+            }
+            writer.write_all(b"e")?;
+        }
+    }
+    Ok(())
+}
+
+fn write_bencoded_bytes<W: Write>(writer: &mut W, bytes: &[u8]) -> std::io::Result<()> {
+    writer.write_all(bytes.len().to_string().as_bytes())?;
+    writer.write_all(b":")?;
+    writer.write_all(bytes)
+}
+
 fn enc(value: &Ben, out: &mut Vec<u8>) {
     match value {
         Ben::I(n) => {
@@ -673,6 +743,75 @@ fn read_torrent_blob(path: &Path) -> std::io::Result<Vec<u8>> {
         ));
     }
     Ok(bytes)
+}
+
+fn estimate_export_torrent_bytes(torrent: &ExportTorrent) -> usize {
+    let row_bytes = torrent
+        .row
+        .info_hash
+        .len()
+        .saturating_add(torrent.row.name.len())
+        .saturating_add(torrent.row.save_path.len())
+        .saturating_add(torrent.row.category.as_ref().map_or(0, String::len))
+        .saturating_add(
+            torrent
+                .row
+                .tags
+                .iter()
+                .map(String::len)
+                .fold(0usize, usize::saturating_add),
+        )
+        .saturating_add(
+            torrent
+                .row
+                .trackers
+                .iter()
+                .map(String::len)
+                .fold(0usize, usize::saturating_add),
+        );
+    let file_bytes = torrent
+        .files
+        .iter()
+        .map(|file| file.info_hash.len().saturating_add(file.path.len()))
+        .fold(0usize, usize::saturating_add);
+    let tracker_bytes = torrent
+        .trackers
+        .iter()
+        .map(|tracker| {
+            tracker
+                .info_hash
+                .len()
+                .saturating_add(tracker.url.len())
+                .saturating_add(tracker.status.len())
+                .saturating_add(tracker.failure_reason.as_ref().map_or(0, String::len))
+                .saturating_add(tracker.warning_message.as_ref().map_or(0, String::len))
+                .saturating_add(tracker.tracker_id.as_ref().map_or(0, Vec::len))
+        })
+        .fold(0usize, usize::saturating_add);
+    let partial_bytes = torrent
+        .partials
+        .iter()
+        .map(|(_, blocks)| std::mem::size_of::<u32>().saturating_mul(blocks.len()))
+        .fold(0usize, usize::saturating_add);
+    torrent
+        .raw_torrent
+        .len()
+        .saturating_add(row_bytes)
+        .saturating_add(file_bytes)
+        .saturating_add(tracker_bytes)
+        .saturating_add(torrent.have.as_ref().map_or(0, Vec::len))
+        .saturating_add(partial_bytes)
+}
+
+fn admit_export_bytes(total: &mut usize, item_bytes: usize) -> bool {
+    let Some(next) = total.checked_add(item_bytes) else {
+        return false;
+    };
+    if next > MAX_EXPORT_MATERIALIZED_BYTES {
+        return false;
+    }
+    *total = next;
+    true
 }
 
 fn validate_torrent_blob(info_hash: &str, raw: &[u8]) -> Result<(), String> {
@@ -959,6 +1098,20 @@ mod tests {
         assert_eq!(plan.torrent_count(), 0);
         assert_eq!(plan.skipped.len(), 1);
         assert!(plan.skipped[0].reason.contains("maximum"));
+    }
+
+    #[test]
+    fn export_materialized_byte_admission_is_bounded() {
+        let mut total = 0;
+        assert!(admit_export_bytes(
+            &mut total,
+            MAX_EXPORT_MATERIALIZED_BYTES - 1
+        ));
+        assert_eq!(total, MAX_EXPORT_MATERIALIZED_BYTES - 1);
+        assert!(!admit_export_bytes(&mut total, 2));
+        assert_eq!(total, MAX_EXPORT_MATERIALIZED_BYTES - 1);
+        let mut overflowing_total = usize::MAX;
+        assert!(!admit_export_bytes(&mut overflowing_total, 1));
     }
 
     #[test]

@@ -4,7 +4,10 @@ use rt_bencode::{BValue, Decoder};
 
 use crate::{
     error::TrackerError,
-    peer::{parse_compact_peers_v4_with_limit, parse_compact_peers_v6_with_limit, Peer},
+    peer::{
+        parse_compact_peers_v4_with_limit, parse_compact_peers_v6_with_limit, Peer,
+        MAX_TRACKER_PEERS,
+    },
 };
 
 // Tracker response bodies are byte-bounded by the engine, but a bencoded
@@ -12,12 +15,59 @@ use crate::{
 // large number of tiny nested lists/dictionaries. Keep parser allocations
 // bounded independently of the peer-vector limit.
 const MAX_TRACKER_RESPONSE_NODES: usize = 16 * 1024;
+// These fields are copied into long-lived tracker state. A valid response can
+// be several MiB because of its peer list, but retaining a multi-MiB warning,
+// failure reason, or opaque tracker ID per torrent would turn a transient
+// response into durable memory pressure.
+const MAX_TRACKER_TEXT_BYTES: usize = 16 * 1024;
+const MAX_TRACKER_ID_BYTES: usize = 16 * 1024;
 
 fn decode_tracker_response(bytes: &[u8]) -> Result<BValue<'_>, TrackerError> {
     Decoder::new(bytes)
         .with_max_nodes(MAX_TRACKER_RESPONSE_NODES)
         .decode()
         .map_err(|error| TrackerError::ParseError(error.to_string()))
+}
+
+fn bounded_tracker_text(
+    value: Option<&BValue<'_>>,
+    field: &'static str,
+) -> Result<Option<String>, TrackerError> {
+    let Some(bytes) = value.and_then(BValue::as_bytes) else {
+        return Ok(None);
+    };
+    if bytes.len() > MAX_TRACKER_TEXT_BYTES {
+        return Err(TrackerError::ParseError(format!(
+            "{field} exceeds {MAX_TRACKER_TEXT_BYTES} byte limit"
+        )));
+    }
+    Ok(std::str::from_utf8(bytes).ok().map(ToOwned::to_owned))
+}
+
+fn bounded_tracker_failure_reason(value: Option<&BValue<'_>>) -> Result<String, TrackerError> {
+    let Some(bytes) = value.and_then(BValue::as_bytes) else {
+        return Ok("unknown failure".to_owned());
+    };
+    if bytes.len() > MAX_TRACKER_TEXT_BYTES {
+        return Err(TrackerError::ParseError(format!(
+            "failure reason exceeds {MAX_TRACKER_TEXT_BYTES} byte limit"
+        )));
+    }
+    Ok(std::str::from_utf8(bytes)
+        .unwrap_or("unknown failure")
+        .to_owned())
+}
+
+fn bounded_tracker_id(value: Option<&BValue<'_>>) -> Result<Option<Vec<u8>>, TrackerError> {
+    let Some(bytes) = value.and_then(BValue::as_bytes) else {
+        return Ok(None);
+    };
+    if bytes.len() > MAX_TRACKER_ID_BYTES {
+        return Err(TrackerError::ParseError(format!(
+            "tracker id exceeds {MAX_TRACKER_ID_BYTES} byte limit"
+        )));
+    }
+    Ok(Some(bytes.to_owned()))
 }
 
 /// Current status of a tracker.
@@ -72,11 +122,7 @@ impl ScrapeStats {
     pub fn parse(bytes: &[u8], info_hash: &[u8]) -> Result<Self, TrackerError> {
         let val = decode_tracker_response(bytes)?;
         if let Some(reason) = val.get(b"failure reason") {
-            let msg = reason
-                .as_bytes()
-                .and_then(|b| std::str::from_utf8(b).ok())
-                .unwrap_or("unknown failure")
-                .to_owned();
+            let msg = bounded_tracker_failure_reason(Some(reason))?;
             return Err(TrackerError::FailureReason(msg));
         }
         let files = val
@@ -114,7 +160,7 @@ fn scrape_int(entry: &BValue<'_>, key: &[u8]) -> Result<u32, TrackerError> {
 impl AnnounceResponse {
     /// Parse a bencoded HTTP announce response.
     pub fn parse(bytes: &[u8]) -> Result<Self, TrackerError> {
-        Self::parse_with_peer_limit(bytes, usize::MAX)
+        Self::parse_with_peer_limit(bytes, MAX_TRACKER_PEERS)
     }
 
     /// Parse a bencoded HTTP announce response while bounding peer output.
@@ -128,11 +174,7 @@ impl AnnounceResponse {
 
         // Check for failure reason first
         if let Some(reason) = val.get(b"failure reason") {
-            let msg = reason
-                .as_bytes()
-                .and_then(|b| std::str::from_utf8(b).ok())
-                .unwrap_or("unknown failure")
-                .to_owned();
+            let msg = bounded_tracker_failure_reason(Some(reason))?;
             return Err(TrackerError::FailureReason(msg));
         }
 
@@ -160,16 +202,9 @@ impl AnnounceResponse {
             .and_then(|v| v.as_int())
             .and_then(|i| u32::try_from(i).ok());
 
-        let warning_message = val
-            .get(b"warning message")
-            .and_then(|v| v.as_bytes())
-            .and_then(|b| std::str::from_utf8(b).ok())
-            .map(|s| s.to_owned());
+        let warning_message = bounded_tracker_text(val.get(b"warning message"), "warning message")?;
 
-        let tracker_id = val
-            .get(b"tracker id")
-            .and_then(|v| v.as_bytes())
-            .map(ToOwned::to_owned);
+        let tracker_id = bounded_tracker_id(val.get(b"tracker id"))?;
 
         let complete = val
             .get(b"complete")
@@ -313,6 +348,16 @@ mod tests {
     }
 
     #[test]
+    fn convenience_parser_caps_peer_materialization() {
+        let peer_bytes = vec![0u8; (MAX_TRACKER_PEERS + 1) * 6];
+        let raw = make_response(1800, Some(&peer_bytes), None);
+
+        let response = AnnounceResponse::parse(&raw).unwrap();
+
+        assert_eq!(response.peers.len(), MAX_TRACKER_PEERS);
+    }
+
+    #[test]
     fn parse_peer_limit_applies_across_ipv4_and_ipv6_fields() {
         let mut peers6 = [0u8; 18];
         peers6[..16].copy_from_slice(&std::net::Ipv6Addr::LOCALHOST.octets());
@@ -334,6 +379,21 @@ mod tests {
         let raw = make_response(0, None, Some("unregistered torrent"));
         let err = AnnounceResponse::parse(&raw).unwrap_err();
         assert!(matches!(err, TrackerError::FailureReason(ref s) if s.contains("unregistered")));
+    }
+
+    #[test]
+    fn parse_rejects_oversized_failure_reason() {
+        let failure = vec![b'x'; MAX_TRACKER_TEXT_BYTES + 1];
+        let raw = encode(&BValue::Dict(vec![(
+            b"failure reason".as_ref(),
+            BValue::Bytes(failure.as_slice()),
+        )]));
+
+        let err = AnnounceResponse::parse(&raw).unwrap_err();
+
+        assert!(
+            matches!(err, TrackerError::ParseError(message) if message.contains("failure reason"))
+        );
     }
 
     #[test]
@@ -478,6 +538,20 @@ mod tests {
     }
 
     #[test]
+    fn parse_rejects_oversized_tracker_id() {
+        let tracker_id = vec![0xabu8; MAX_TRACKER_ID_BYTES + 1];
+        let raw = encode(&BValue::Dict(vec![
+            (b"interval".as_ref(), BValue::Int(1800)),
+            (b"peers".as_ref(), BValue::Bytes(b"")),
+            (b"tracker id".as_ref(), BValue::Bytes(tracker_id.as_slice())),
+        ]));
+
+        let err = AnnounceResponse::parse(&raw).unwrap_err();
+
+        assert!(matches!(err, TrackerError::ParseError(message) if message.contains("tracker id")));
+    }
+
+    #[test]
     fn parse_scrape_rejects_missing_info_hash() {
         let requested = [0x33u8; 20];
         let other = [0x44u8; 20];
@@ -521,6 +595,25 @@ mod tests {
         let raw = encode(&BValue::Dict(pairs));
         let resp = AnnounceResponse::parse(&raw).unwrap();
         assert_eq!(resp.warning_message.as_deref(), Some("low peers"));
+    }
+
+    #[test]
+    fn parse_rejects_oversized_warning_message() {
+        let warning = vec![b'w'; MAX_TRACKER_TEXT_BYTES + 1];
+        let raw = encode(&BValue::Dict(vec![
+            (b"interval".as_ref(), BValue::Int(1800)),
+            (b"peers".as_ref(), BValue::Bytes(b"")),
+            (
+                b"warning message".as_ref(),
+                BValue::Bytes(warning.as_slice()),
+            ),
+        ]));
+
+        let err = AnnounceResponse::parse(&raw).unwrap_err();
+
+        assert!(
+            matches!(err, TrackerError::ParseError(message) if message.contains("warning message"))
+        );
     }
 
     #[test]

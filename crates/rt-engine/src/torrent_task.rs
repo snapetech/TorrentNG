@@ -812,7 +812,7 @@ fn stricter_limit(torrent_limit: Option<u64>, global_limit: Option<u64>) -> Opti
     }
 }
 
-fn tracker_peer_cache_cap(max_peers: usize) -> usize {
+pub(crate) fn tracker_peer_cache_cap(max_peers: usize) -> usize {
     max_peers
         .saturating_mul(TRACKER_PEER_CACHE_MULTIPLIER)
         .clamp(TRACKER_PEER_CACHE_MIN, MAX_TRACKER_PEERS)
@@ -937,7 +937,7 @@ fn reserve_piece_assembly_bytes(
         .ok_or_else(|| anyhow::anyhow!("piece assembly allocation of {bytes} bytes denied"))
 }
 
-fn prepare_tracker_peer_cache(
+pub(crate) fn prepare_tracker_peer_cache(
     resources: &ResourceGovernor,
     max_peers: usize,
 ) -> (HashSet<SocketAddr>, Option<MemoryLease>) {
@@ -1140,6 +1140,11 @@ enum PeerEvent {
         block: BlockEvent,
         _memory_lease: Option<MemoryLease>,
     },
+    RequestRejected {
+        peer: SocketAddr,
+        id: PeerId,
+        rejected: BlockRequest,
+    },
     Uploaded {
         peer: SocketAddr,
         id: PeerId,
@@ -1181,6 +1186,7 @@ impl PeerEvent {
             | Self::Interested { peer, id }
             | Self::NotInterested { peer, id }
             | Self::Piece { peer, id, .. }
+            | Self::RequestRejected { peer, id, .. }
             | Self::Uploaded { peer, id, .. }
             | Self::Disconnected { peer, id, .. }
             | Self::RequestTimedOut { peer, id, .. }
@@ -2096,7 +2102,6 @@ impl TorrentTask {
                         }
                         TorrentCmd::PriorityPeers(addrs) => {
                             if !self.paused {
-                                self.remember_tracker_peers(&addrs);
                                 self.connect_priority_peers(addrs).await;
                             }
                         }
@@ -3386,7 +3391,11 @@ impl TorrentTask {
             );
             return None;
         };
-        if !self.try_consume_download_tokens(req.length) {
+        // Check the local bucket before starting the request, but do not
+        // debit it yet. The HTTP operation can fail or be cancelled by a
+        // lifecycle command; neither case transferred any payload bytes and
+        // must not consume a full protocol block's allowance.
+        if !self.download_tokens_available(req.length) {
             self.picker.cancel_request(req.piece as usize, req.begin);
             return None;
         }
@@ -3437,6 +3446,24 @@ impl TorrentTask {
                 Ok(data) => {
                     let elapsed = started.elapsed().as_secs_f64().max(0.001);
                     let rate = (data.len() as f64 / elapsed).round() as i64;
+                    // Charge the aggregate budget for bytes actually
+                    // received. Failed seeds and short/error responses do
+                    // not consume the process-wide download allowance.
+                    self.network_budget
+                        .download()
+                        .acquire(data.len() as u64)
+                        .await;
+                    // `fetch_webseed_block` validates the exact block length,
+                    // and the global budget wait has completed. Commit the
+                    // local budget at the final handoff point so a lifecycle
+                    // cancellation during either operation charges no bytes
+                    // that were not delivered to the torrent task.
+                    debug_assert!(self.try_consume_download_tokens(req.length));
+                    // Keep the local success projection behind both budget
+                    // waits. The outer actor can cancel this operation while
+                    // it waits for the aggregate bucket; committing it before
+                    // that handoff would rotate/reset seed state for a block
+                    // that was never delivered.
                     self.webseed_next_index = (idx + 1) % seed_count;
                     if let Some(failures) = self.webseed_failures.get_mut(idx) {
                         *failures = 0;
@@ -3450,13 +3477,6 @@ impl TorrentTask {
                     if let Some(last_success) = self.webseed_last_success.get_mut(idx) {
                         *last_success = Some(Instant::now());
                     }
-                    // Charge the aggregate budget for bytes actually
-                    // received. Failed seeds and short/error responses do
-                    // not consume the process-wide download allowance.
-                    self.network_budget
-                        .download()
-                        .acquire(data.len() as u64)
-                        .await;
                     return Some(BlockEvent {
                         piece: req.piece,
                         offset: req.begin,
@@ -3649,6 +3669,15 @@ impl TorrentTask {
                 remove_requested_block(&mut handle.requested, block.piece, block.offset);
                 record_peer_transfer(handle, false, block.data.len() as u64);
                 self.handle_block(block).await;
+                self.refill_peer_requests(peer).await;
+            }
+            PeerEvent::RequestRejected { peer, rejected, .. } => {
+                if let Some(handle) = self.active_peers.get_mut(&peer) {
+                    handle.outstanding = handle.outstanding.saturating_sub(1);
+                    remove_requested_block(&mut handle.requested, rejected.piece, rejected.begin);
+                }
+                self.picker
+                    .cancel_request(rejected.piece as usize, rejected.begin);
                 self.refill_peer_requests(peer).await;
             }
             PeerEvent::Uploaded { peer, bytes, .. } => {
@@ -4196,6 +4225,14 @@ impl TorrentTask {
             }
         }
         requests
+    }
+
+    fn download_tokens_available(&mut self, bytes: u32) -> bool {
+        self.refill_download_tokens();
+        if self.download_limit_bytes_per_sec.is_none() {
+            return true;
+        }
+        self.download_tokens >= u64::from(bytes)
     }
 
     fn try_consume_download_tokens(&mut self, bytes: u32) -> bool {
@@ -6111,7 +6148,7 @@ fn reset_webseed_sleep(sleep: &mut Pin<Box<Sleep>>, delay: Duration) {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum OutgoingTransportPolicy {
+pub(crate) enum OutgoingTransportPolicy {
     Auto,
     TcpOnly,
     PreferUtp,
@@ -6119,14 +6156,14 @@ enum OutgoingTransportPolicy {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum PeerSource {
+pub(crate) enum PeerSource {
     Tracker,
     Dht,
     PeerExchange,
     Manual,
 }
 
-fn outgoing_transport_policy_configured() -> OutgoingTransportPolicy {
+pub(crate) fn outgoing_transport_policy_configured() -> OutgoingTransportPolicy {
     if let Ok(value) = std::env::var("TNG_UTP_OUTGOING") {
         return parse_outgoing_transport_policy(&value);
     }
@@ -6148,7 +6185,7 @@ fn parse_outgoing_transport_policy(value: &str) -> OutgoingTransportPolicy {
     }
 }
 
-fn outgoing_transport_policy_for_peer(
+pub(crate) fn outgoing_transport_policy_for_peer(
     configured: OutgoingTransportPolicy,
     source: PeerSource,
     private: bool,
@@ -6250,7 +6287,7 @@ fn tracker_tiers_from_meta(meta: &TorrentMetaV1) -> Vec<Vec<TrackerState>> {
     tiers
 }
 
-fn tracker_tiers_from_urls(urls: &[String]) -> Vec<Vec<TrackerState>> {
+pub(crate) fn tracker_tiers_from_urls(urls: &[String]) -> Vec<Vec<TrackerState>> {
     let mut seen = HashSet::new();
     let trackers = urls
         .iter()
@@ -6275,7 +6312,7 @@ fn tracker_tiers_from_urls(urls: &[String]) -> Vec<Vec<TrackerState>> {
 /// session. A persisted next deadline is restored as well so startup does
 /// not create an announce storm for every resumed torrent. The query itself
 /// is issued through `DbExecutor` before this pure projection runs.
-fn restore_tracker_state_from_rows(
+pub(crate) fn restore_tracker_state_from_rows(
     tiers: &mut [Vec<TrackerState>],
     rows: &[rt_db::TorrentTrackerRow],
 ) {
@@ -6299,7 +6336,7 @@ fn restore_tracker_state_from_rows(
     }
 }
 
-fn private_peer_source_allowed(
+pub(crate) fn private_peer_source_allowed(
     is_private: bool,
     allowed_private_peers: &HashSet<SocketAddr>,
     peer: SocketAddr,
@@ -6312,7 +6349,7 @@ fn private_peer_source_allowed(
                 .any(|allowed| allowed.ip() == peer.ip()))
 }
 
-fn private_peer_port_fallback_allowed(ip: IpAddr) -> bool {
+pub(crate) fn private_peer_port_fallback_allowed(ip: IpAddr) -> bool {
     match ip {
         IpAddr::V4(ip) => ip.is_loopback() || ip.is_private() || ip.is_link_local(),
         IpAddr::V6(ip) => {
@@ -7017,18 +7054,18 @@ async fn run_incoming_utp_peer(
     .await)
 }
 
-enum PeerIo {
+pub(crate) enum PeerIo {
     Tcp(Framed<TcpStream, PeerCodec>),
     Utp(Box<UtpPeerIo>),
 }
 
-struct UtpPeerIo {
+pub(crate) struct UtpPeerIo {
     stream: UtpStream,
     decoder: UtpFrameDecoder,
 }
 
 impl UtpPeerIo {
-    fn new(stream: UtpStream, resources: ResourceGovernor) -> Self {
+    pub(crate) fn new(stream: UtpStream, resources: ResourceGovernor) -> Self {
         Self {
             stream,
             decoder: UtpFrameDecoder::new(resources),
@@ -7037,7 +7074,7 @@ impl UtpPeerIo {
 }
 
 impl PeerIo {
-    async fn send(&mut self, msg: Message) -> anyhow::Result<()> {
+    pub(crate) async fn send(&mut self, msg: Message) -> anyhow::Result<()> {
         timeout(PEER_SOCKET_WRITE_TIMEOUT, async {
             match self {
                 PeerIo::Tcp(framed) => framed.send(msg).await.map_err(Into::into),
@@ -7048,7 +7085,7 @@ impl PeerIo {
         .map_err(|_| anyhow::anyhow!("peer socket write timed out"))?
     }
 
-    async fn next(&mut self) -> anyhow::Result<Option<Message>> {
+    pub(crate) async fn next(&mut self) -> anyhow::Result<Option<Message>> {
         match self {
             PeerIo::Tcp(framed) => match framed.next().await {
                 Some(result) => result.map(Some).map_err(Into::into),
@@ -7637,6 +7674,44 @@ async fn run_peer_loop(
                                 length: data_len,
                             }));
                             break; // torrent task gone
+                        }
+                    }
+                    Message::Reject {
+                        piece,
+                        begin,
+                        length,
+                    } => {
+                        let rejected = BlockRequest {
+                            piece,
+                            begin,
+                            length,
+                        };
+                        if !take_matching_outstanding(&mut outstanding, piece, begin, length) {
+                            debug!(
+                                component = "peer",
+                                operation = "handle_reject",
+                                peer = %addr,
+                                piece,
+                                begin,
+                                length,
+                                result = "ignored",
+                                reason = "unsolicited",
+                                "ignoring reject for a request that is not outstanding"
+                            );
+                            continue;
+                        }
+                        if !send_peer_event(
+                            &peer_event_tx,
+                            PeerEvent::RequestRejected {
+                                peer: addr,
+                                id: peer_id,
+                                rejected,
+                            },
+                        )
+                        .await
+                        {
+                            outstanding.push(OutstandingRequest::new(rejected));
+                            break;
                         }
                     }
                     Message::Unchoke => {
@@ -11425,6 +11500,21 @@ mod tests {
                 .unwrap(),
             Ok(())
         );
+
+        let (webseed_reply, webseed_result) = oneshot::channel();
+        cmd_tx
+            .send(TorrentCmd::GetWebseeds {
+                reply: webseed_reply,
+            })
+            .await
+            .unwrap();
+        let snapshots = timeout(Duration::from_secs(1), webseed_result)
+            .await
+            .expect("webseed snapshot query should complete after pause")
+            .unwrap();
+        assert_eq!(snapshots.len(), 1);
+        assert!(!snapshots[0].is_downloading);
+        assert_eq!(snapshots[0].download_rate, 0);
 
         cmd_tx.send(TorrentCmd::Shutdown).await.unwrap();
         timeout(Duration::from_secs(1), task)

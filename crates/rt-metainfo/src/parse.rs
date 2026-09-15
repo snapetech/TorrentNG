@@ -1,7 +1,10 @@
+use std::collections::HashMap;
+
 use sha1::{Digest as Sha1Digest, Sha1};
 use sha2::{Digest as Sha2Digest, Sha256};
 
 use rt_bencode::{decode_torrent_info_span, BValue};
+use rt_hash::merkle_root;
 use rt_path::SafeRelPath;
 
 use crate::{
@@ -15,10 +18,17 @@ const MAX_PATH_COMPONENTS: usize = 256;
 const MAX_TRACKER_URLS: usize = 4096;
 const MAX_TRACKER_TIERS: usize = 256;
 const MAX_TRACKER_URL_BYTES: usize = 8192;
+const MAX_TRACKER_URL_TOTAL_BYTES: usize = 4 * 1024 * 1024;
 const MAX_WEBSEED_URLS: usize = 4096;
 const MAX_WEBSEED_URL_BYTES: usize = 8192;
 const MAX_PIECES: usize = 16_000_000;
 const MAX_NAME_BYTES: usize = 4096;
+const MAX_PATH_COMPONENT_BYTES: usize = 4096;
+// Optional top-level text is copied into owned metadata and can be retained
+// by every active API projection. Keep it useful for ordinary comments while
+// preventing the decoder's much larger generic string limit from multiplying
+// across concurrent engine preparations.
+const MAX_METADATA_TEXT_BYTES: usize = 256 * 1024;
 
 /// Parse a `.torrent` file from raw bytes. Handles v1, v2 (BEP 52), and hybrid.
 pub fn parse_torrent(raw: &[u8]) -> Result<TorrentMeta, MetainfoError> {
@@ -78,21 +88,19 @@ pub fn parse_torrent(raw: &[u8]) -> Result<TorrentMeta, MetainfoError> {
     let is_v2 = meta_version == Some(2) && has_file_tree;
 
     let announce = parse_announce(root)?;
-    let announce_list = parse_announce_list(root)?;
+    let announce_list = parse_announce_list(
+        root,
+        usize::from(announce.is_some()),
+        announce.as_deref().map_or(0, str::len),
+    )?;
     let webseeds = parse_webseeds(root)?;
-    let comment = parse_optional_string(root, b"comment");
-    let created_by = parse_optional_string(root, b"created by");
+    let comment = parse_optional_string(root, b"comment")?;
+    let created_by = parse_optional_string(root, b"created by")?;
     let creation_date = root.get(b"creation date").and_then(|v| v.as_int());
 
-    let name = get_string(info, b"name", "name")?;
+    let name = get_string(info, b"name", "name", MAX_NAME_BYTES)?;
     if name.is_empty() {
         return Err(MetainfoError::ZeroLengthName);
-    }
-    if name.len() > MAX_NAME_BYTES {
-        return Err(MetainfoError::LimitExceeded {
-            field: "name bytes",
-            limit: MAX_NAME_BYTES,
-        });
     }
 
     let piece_length = get_positive_u64(info, b"piece length", "piece length")?;
@@ -124,7 +132,8 @@ pub fn parse_torrent(raw: &[u8]) -> Result<TorrentMeta, MetainfoError> {
 
         let pieces = parse_piece_hashes(info)?;
         let files_v1 = parse_files_v1(info, &name)?;
-        let files_v2 = parse_file_tree(info)?;
+        let files_v2 = parse_file_tree(info, piece_length)?;
+        let piece_layers = parse_piece_layers(root, &files_v2, piece_length)?;
         validate_piece_count(&pieces, &files_v1, piece_length)?;
 
         return Ok(TorrentMeta::Hybrid(
@@ -154,6 +163,7 @@ pub fn parse_torrent(raw: &[u8]) -> Result<TorrentMeta, MetainfoError> {
                 name,
                 piece_length,
                 files: files_v2,
+                piece_layers,
                 private,
                 raw: raw.to_vec(),
             },
@@ -167,7 +177,8 @@ pub fn parse_torrent(raw: &[u8]) -> Result<TorrentMeta, MetainfoError> {
             h.update(info_bytes);
             h.finalize().into()
         };
-        let files_v2 = parse_file_tree(info)?;
+        let files_v2 = parse_file_tree(info, piece_length)?;
+        let piece_layers = parse_piece_layers(root, &files_v2, piece_length)?;
         return Ok(TorrentMeta::V2(TorrentMetaV2 {
             info_hash_v2,
             announce,
@@ -179,6 +190,7 @@ pub fn parse_torrent(raw: &[u8]) -> Result<TorrentMeta, MetainfoError> {
             name,
             piece_length,
             files: files_v2,
+            piece_layers,
             private,
             raw: raw.to_vec(),
         }));
@@ -221,17 +233,28 @@ pub fn torrent_info_bytes(raw: &[u8]) -> Result<Vec<u8>, MetainfoError> {
 
 /// Parse a v2 `file tree` dict into a flat list of files.
 /// BEP 52 file tree: nested dicts where leaves have `{"": {"length": N, "pieces root": <bytes>}}`.
-fn parse_file_tree(info: &BValue<'_>) -> Result<Vec<TorrentFileV2>, MetainfoError> {
+fn parse_file_tree(
+    info: &BValue<'_>,
+    piece_length: u64,
+) -> Result<Vec<TorrentFileV2>, MetainfoError> {
     let file_tree = info
         .get(b"file tree")
         .ok_or(MetainfoError::MissingField("file tree"))?;
 
     let mut files = Vec::new();
     let mut offset = 0u64;
+    let mut piece_offset = 0u64;
     // `name` is advisory in BEP 52. The tree itself is rootless and may
     // optionally contain a directory with the same name; adding `name`
     // unconditionally turns a standard single-file tree into a wrong path.
-    walk_file_tree(file_tree, &[], &mut files, &mut offset)?;
+    walk_file_tree(
+        file_tree,
+        &[],
+        &mut files,
+        &mut offset,
+        &mut piece_offset,
+        piece_length,
+    )?;
 
     if files.is_empty() {
         return Err(MetainfoError::MissingField("file tree (empty)"));
@@ -244,6 +267,8 @@ fn walk_file_tree<'a>(
     path_components: &[&str],
     out: &mut Vec<TorrentFileV2>,
     offset: &mut u64,
+    piece_offset: &mut u64,
+    piece_length: u64,
 ) -> Result<(), MetainfoError> {
     if out.len() >= MAX_FILES {
         return Err(MetainfoError::LimitExceeded {
@@ -294,15 +319,22 @@ fn walk_file_tree<'a>(
         let path = SafeRelPath::from_components(&components, false)?;
 
         let index = out.len() as u32;
+        let file_piece_offset = align_piece_offset(*piece_offset, piece_length)?;
         out.push(TorrentFileV2 {
             index,
             length,
             path,
             offset: *offset,
+            piece_offset: file_piece_offset,
             pieces_root,
             pad: is_pad_attr(leaf),
         });
         add_offset(offset, length, "file tree offset")?;
+        if length > 0 {
+            *piece_offset = file_piece_offset
+                .checked_add(length)
+                .ok_or(MetainfoError::IntegerOverflow("file tree piece offset"))?;
+        }
         return Ok(());
     }
 
@@ -311,13 +343,124 @@ fn walk_file_tree<'a>(
         if key.is_empty() {
             continue;
         }
+        if key.len() > MAX_PATH_COMPONENT_BYTES {
+            return Err(MetainfoError::LimitExceeded {
+                field: "path component bytes",
+                limit: MAX_PATH_COMPONENT_BYTES,
+            });
+        }
         let component =
             std::str::from_utf8(key).map_err(|_| MetainfoError::InvalidUtf8("file tree key"))?;
         let mut new_path: Vec<&str> = path_components.to_vec();
         new_path.push(component);
-        walk_file_tree(child, &new_path, out, offset)?;
+        walk_file_tree(child, &new_path, out, offset, piece_offset, piece_length)?;
     }
     Ok(())
+}
+
+fn align_piece_offset(offset: u64, piece_length: u64) -> Result<u64, MetainfoError> {
+    let remainder = offset % piece_length;
+    if remainder == 0 {
+        return Ok(offset);
+    }
+    offset
+        .checked_add(piece_length - remainder)
+        .ok_or(MetainfoError::IntegerOverflow("file tree piece alignment"))
+}
+
+/// Parse and authenticate the top-level BEP 52 piece layers dictionary.
+/// Piece-layer entries are required exactly for non-empty files larger than a
+/// piece; their roots must reconstruct the corresponding file-tree `pieces
+/// root`. This catches malformed metadata before it reaches storage or peer
+/// transfer code.
+fn parse_piece_layers(
+    root: &BValue<'_>,
+    files: &[TorrentFileV2],
+    piece_length: u64,
+) -> Result<HashMap<[u8; 32], Vec<[u8; 32]>>, MetainfoError> {
+    let mut required = HashMap::<[u8; 32], usize>::new();
+    for file in files {
+        if file.length <= piece_length {
+            continue;
+        }
+        let pieces_root = file
+            .pieces_root
+            .ok_or(MetainfoError::MissingField("pieces root"))?;
+        let count = file
+            .length
+            .checked_add(piece_length - 1)
+            .ok_or(MetainfoError::IntegerOverflow("piece layer count"))?
+            / piece_length;
+        let count = usize::try_from(count)
+            .map_err(|_| MetainfoError::IntegerOverflow("piece layer count"))?;
+        if count > MAX_PIECES {
+            return Err(MetainfoError::LimitExceeded {
+                field: "piece layers",
+                limit: MAX_PIECES,
+            });
+        }
+        if required.insert(pieces_root, count).is_some() {
+            return Err(MetainfoError::InvalidPieceLayer(
+                "duplicate pieces root across layered files",
+            ));
+        }
+    }
+
+    let Some(value) = root.get(b"piece layers") else {
+        if required.is_empty() {
+            return Ok(HashMap::new());
+        }
+        return Err(MetainfoError::MissingField("piece layers"));
+    };
+    let BValue::Dict(entries) = value else {
+        return Err(MetainfoError::InvalidFieldType("piece layers"));
+    };
+    let mut layers = HashMap::with_capacity(entries.len().min(required.len()));
+    for (key, value) in entries {
+        if key.len() != 32 {
+            return Err(MetainfoError::InvalidPieceLayer(
+                "piece-layer key must be a 32-byte pieces root",
+            ));
+        }
+        let pieces_root: [u8; 32] = (*key).try_into().expect("length checked");
+        let Some(&expected_count) = required.get(&pieces_root) else {
+            return Err(MetainfoError::InvalidPieceLayer(
+                "piece-layer key has no matching layered file",
+            ));
+        };
+        let bytes = value
+            .as_bytes()
+            .ok_or(MetainfoError::InvalidFieldType("piece layer"))?;
+        if bytes.len() % 32 != 0 {
+            return Err(MetainfoError::InvalidPieceLayer(
+                "piece-layer bytes are not a multiple of 32",
+            ));
+        }
+        let actual_count = bytes.len() / 32;
+        if actual_count != expected_count {
+            return Err(MetainfoError::InvalidPieceLayerCount {
+                expected: expected_count,
+                actual: actual_count,
+            });
+        }
+        let (hash_chunks, remainder) = bytes.as_chunks::<32>();
+        debug_assert!(remainder.is_empty());
+        let hashes = hash_chunks.to_vec();
+        if merkle_root(&hashes) != pieces_root {
+            return Err(MetainfoError::PieceLayerRootMismatch);
+        }
+        if layers.insert(pieces_root, hashes).is_some() {
+            return Err(MetainfoError::InvalidPieceLayer(
+                "duplicate piece-layer key",
+            ));
+        }
+    }
+    if layers.len() != required.len() {
+        return Err(MetainfoError::InvalidPieceLayer(
+            "missing piece layer for a layered file",
+        ));
+    }
+    Ok(layers)
 }
 
 fn parse_announce(root: &BValue<'_>) -> Result<Option<String>, MetainfoError> {
@@ -340,13 +483,24 @@ fn parse_announce(root: &BValue<'_>) -> Result<Option<String>, MetainfoError> {
         .map(ToOwned::to_owned))
 }
 
-fn parse_optional_string(root: &BValue<'_>, key: &[u8]) -> Option<String> {
-    root.get(key)
-        .and_then(|v| v.as_bytes())
-        .and_then(|b| std::str::from_utf8(b).ok())
+fn parse_optional_string(
+    root: &BValue<'_>,
+    key: &'static [u8],
+) -> Result<Option<String>, MetainfoError> {
+    let Some(bytes) = root.get(key).and_then(|v| v.as_bytes()) else {
+        return Ok(None);
+    };
+    if bytes.len() > MAX_METADATA_TEXT_BYTES {
+        return Err(MetainfoError::LimitExceeded {
+            field: "metadata text bytes",
+            limit: MAX_METADATA_TEXT_BYTES,
+        });
+    }
+    Ok(std::str::from_utf8(bytes)
+        .ok()
         .map(str::trim)
         .filter(|s| !s.is_empty())
-        .map(ToOwned::to_owned)
+        .map(ToOwned::to_owned))
 }
 
 fn parse_files_v1(info: &BValue<'_>, name: &str) -> Result<Vec<TorrentFileV1>, MetainfoError> {
@@ -376,9 +530,17 @@ fn parse_files_v1(info: &BValue<'_>, name: &str) -> Result<Vec<TorrentFileV1>, M
                 let mut components: Vec<String> = vec![name.to_owned()];
                 for part in path_list {
                     let s = match part {
-                        BValue::Bytes(b) => std::str::from_utf8(b)
-                            .map_err(|_| MetainfoError::InvalidUtf8("path component"))?
-                            .to_owned(),
+                        BValue::Bytes(b) => {
+                            if b.len() > MAX_PATH_COMPONENT_BYTES {
+                                return Err(MetainfoError::LimitExceeded {
+                                    field: "path component bytes",
+                                    limit: MAX_PATH_COMPONENT_BYTES,
+                                });
+                            }
+                            std::str::from_utf8(b)
+                                .map_err(|_| MetainfoError::InvalidUtf8("path component"))?
+                                .to_owned()
+                        }
                         _ => return Err(MetainfoError::InvalidFieldType("path component")),
                     };
                     // Some (old, real-world) torrent creation tools emit a
@@ -423,7 +585,11 @@ fn parse_files_v1(info: &BValue<'_>, name: &str) -> Result<Vec<TorrentFileV1>, M
     }
 }
 
-fn parse_announce_list(root: &BValue<'_>) -> Result<Vec<Vec<String>>, MetainfoError> {
+fn parse_announce_list(
+    root: &BValue<'_>,
+    initial_tracker_count: usize,
+    initial_tracker_bytes: usize,
+) -> Result<Vec<Vec<String>>, MetainfoError> {
     let Some(BValue::List(tiers)) = root.get(b"announce-list") else {
         return Ok(Vec::new());
     };
@@ -433,7 +599,8 @@ fn parse_announce_list(root: &BValue<'_>) -> Result<Vec<Vec<String>>, MetainfoEr
             limit: MAX_TRACKER_TIERS,
         });
     }
-    let mut total = 0usize;
+    let mut total = initial_tracker_count;
+    let mut total_bytes = initial_tracker_bytes;
     let mut out = Vec::new();
     for tier in tiers {
         let BValue::List(urls) = tier else {
@@ -460,6 +627,13 @@ fn parse_announce_list(root: &BValue<'_>) -> Result<Vec<Vec<String>>, MetainfoEr
                 return Err(MetainfoError::LimitExceeded {
                     field: "tracker urls",
                     limit: MAX_TRACKER_URLS,
+                });
+            }
+            total_bytes = total_bytes.saturating_add(url.len());
+            if total_bytes > MAX_TRACKER_URL_TOTAL_BYTES {
+                return Err(MetainfoError::LimitExceeded {
+                    field: "tracker url total bytes",
+                    limit: MAX_TRACKER_URL_TOTAL_BYTES,
                 });
             }
             tier_urls.push(url.to_owned());
@@ -585,8 +759,19 @@ fn get_bytes<'a>(
     }
 }
 
-fn get_string(dict: &BValue<'_>, key: &[u8], field: &'static str) -> Result<String, MetainfoError> {
+fn get_string(
+    dict: &BValue<'_>,
+    key: &[u8],
+    field: &'static str,
+    max_bytes: usize,
+) -> Result<String, MetainfoError> {
     let b = get_bytes(dict, key, field)?;
+    if b.len() > max_bytes {
+        return Err(MetainfoError::LimitExceeded {
+            field: "name bytes",
+            limit: max_bytes,
+        });
+    }
     std::str::from_utf8(b)
         .map(|s| s.to_owned())
         .map_err(|_| MetainfoError::InvalidUtf8(field))
@@ -1116,7 +1301,19 @@ mod tests {
         meta_version: i64,
         include_pieces_root: bool,
     ) -> Vec<u8> {
-        let pieces_root = vec![0xABu8; 32];
+        let layer_count = if length > piece_length && piece_length > 0 {
+            usize::try_from((length as u64).div_ceil(piece_length as u64)).unwrap()
+        } else {
+            0
+        };
+        let layer_hashes = (0..layer_count)
+            .map(|index| rt_hash::BlockHash::of(&index.to_be_bytes()).0)
+            .collect::<Vec<_>>();
+        let pieces_root = if layer_count > 0 {
+            rt_hash::merkle_root(&layer_hashes).to_vec()
+        } else {
+            vec![0xABu8; 32]
+        };
         let mut leaf_pairs: Vec<(&[u8], BValue<'_>)> = vec![(b"length", BValue::Int(length))];
         if include_pieces_root {
             leaf_pairs.push((b"pieces root", BValue::Bytes(&pieces_root)));
@@ -1137,10 +1334,20 @@ mod tests {
         ];
         info_pairs.sort_by(|a, b| a.0.cmp(b.0));
 
+        let mut layer_bytes = Vec::with_capacity(layer_hashes.len() * 32);
+        for hash in &layer_hashes {
+            layer_bytes.extend_from_slice(hash);
+        }
         let mut root: Vec<(&[u8], BValue<'_>)> = vec![
             (b"announce", BValue::Bytes(b"http://t.example/a")),
             (b"info", BValue::Dict(info_pairs)),
         ];
+        if layer_count > 0 && include_pieces_root {
+            root.push((
+                b"piece layers",
+                BValue::Dict(vec![(pieces_root.as_slice(), BValue::Bytes(&layer_bytes))]),
+            ));
+        }
         root.sort_by(|a, b| a.0.cmp(b.0));
         encode(&BValue::Dict(root))
     }
@@ -1413,6 +1620,90 @@ mod tests {
             Err(MetainfoError::LimitExceeded {
                 field: "tracker url bytes",
                 limit: MAX_TRACKER_URL_BYTES
+            })
+        ));
+    }
+
+    #[test]
+    fn reject_tracker_url_total_before_retaining_unbounded_tiers() {
+        let tracker = vec![b'x'; MAX_TRACKER_URL_BYTES];
+        let urls = (0..=MAX_TRACKER_URL_TOTAL_BYTES / MAX_TRACKER_URL_BYTES)
+            .map(|_| BValue::Bytes(tracker.as_slice()))
+            .collect();
+        let root = BValue::Dict(vec![(
+            b"announce-list".as_ref(),
+            BValue::List(vec![BValue::List(urls)]),
+        )]);
+
+        assert!(matches!(
+            parse_announce_list(&root, 0, 0),
+            Err(MetainfoError::LimitExceeded {
+                field: "tracker url total bytes",
+                limit: MAX_TRACKER_URL_TOTAL_BYTES,
+            })
+        ));
+    }
+
+    #[test]
+    fn reject_oversized_name_before_copying_it() {
+        let pieces = make_pieces(1);
+        let name = vec![b'n'; MAX_NAME_BYTES + 1];
+        let mut info_pairs: Vec<(&[u8], BValue<'_>)> = vec![
+            (b"length", BValue::Int(1)),
+            (b"name", BValue::Bytes(&name)),
+            (b"piece length", BValue::Int(512 * 1024)),
+            (b"pieces", BValue::Bytes(&pieces)),
+        ];
+        info_pairs.sort_by(|a, b| a.0.cmp(b.0));
+        let raw = encode(&BValue::Dict(vec![(
+            b"info".as_ref(),
+            BValue::Dict(info_pairs),
+        )]));
+
+        assert!(matches!(
+            parse_torrent(&raw),
+            Err(MetainfoError::LimitExceeded {
+                field: "name bytes",
+                limit: MAX_NAME_BYTES
+            })
+        ));
+    }
+
+    #[test]
+    fn reject_oversized_path_component_before_copying_it() {
+        let path_component = "p".repeat(MAX_PATH_COMPONENT_BYTES + 1);
+        let raw = multi_file_torrent("dir", &[(&path_component, 1)]);
+
+        assert!(matches!(
+            parse_torrent(&raw),
+            Err(MetainfoError::LimitExceeded {
+                field: "path component bytes",
+                limit: MAX_PATH_COMPONENT_BYTES
+            })
+        ));
+    }
+
+    #[test]
+    fn reject_oversized_optional_metadata_text() {
+        let pieces = make_pieces(1);
+        let mut info_pairs: Vec<(&[u8], BValue<'_>)> = vec![
+            (b"length", BValue::Int(1)),
+            (b"name", BValue::Bytes(b"data.bin")),
+            (b"piece length", BValue::Int(512 * 1024)),
+            (b"pieces", BValue::Bytes(&pieces)),
+        ];
+        info_pairs.sort_by(|a, b| a.0.cmp(b.0));
+        let comment = vec![b'c'; MAX_METADATA_TEXT_BYTES + 1];
+        let raw = encode(&BValue::Dict(vec![
+            (b"comment".as_ref(), BValue::Bytes(&comment)),
+            (b"info".as_ref(), BValue::Dict(info_pairs)),
+        ]));
+
+        assert!(matches!(
+            parse_torrent(&raw),
+            Err(MetainfoError::LimitExceeded {
+                field: "metadata text bytes",
+                limit: MAX_METADATA_TEXT_BYTES
             })
         ));
     }

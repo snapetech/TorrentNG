@@ -324,6 +324,14 @@ fn estimate_transmission_torrent_get_snapshot_bytes(
     16 * 1024 + (torrent_count as u64).saturating_mul(1024 + fields.saturating_mul(384))
 }
 
+fn estimate_transmission_tracker_snapshot_bytes(tracker_count: u64, tracker_bytes: u64) -> u64 {
+    // The engine query owns the durable strings, the compatibility projection
+    // clones them into a response value, and JSON encoding adds another byte
+    // view. Reserve for the measured durable footprint before loading any
+    // tracker rows for a legacy full-list response.
+    16 * 1024 + tracker_count.saturating_mul(1024) + tracker_bytes.saturating_mul(4)
+}
+
 fn transmission_engine(state: &AppState) -> Result<&EngineHandle, String> {
     state
         .engine
@@ -405,6 +413,29 @@ async fn load_transmission_runtime_projections(
         }
     }
     Ok(projections)
+}
+
+async fn load_transmission_tracker_snapshot_size(
+    engine: &EngineHandle,
+    hashes: &[String],
+) -> Result<(u64, u64), String> {
+    let mut total_count = 0u64;
+    let mut total_bytes = 0u64;
+    for batch in hashes.chunks(TRANSMISSION_RUNTIME_PROJECTION_CONCURRENCY) {
+        let mut tasks = JoinSet::new();
+        for info_hash in batch {
+            let engine = engine.clone();
+            let info_hash = info_hash.clone();
+            tasks.spawn(async move { engine.torrent_tracker_snapshot_size(info_hash).await });
+        }
+        while let Some(result) = tasks.join_next().await {
+            let (count, bytes) = result
+                .map_err(|error| format!("Transmission tracker size task failed: {error}"))??;
+            total_count = total_count.saturating_add(count);
+            total_bytes = total_bytes.saturating_add(bytes);
+        }
+    }
+    Ok((total_count, total_bytes))
 }
 
 fn merge_transmission_runtime_projections(
@@ -1861,14 +1892,32 @@ async fn torrent_get(state: &AppState, args: &Value) -> Result<Value, String> {
             entries.len()
         ));
     }
+    let need_trackers = fields
+        .iter()
+        .any(|field| transmission_field_needs_trackers(field));
+    let (tracker_count, tracker_bytes) = if need_trackers {
+        if let Some(engine) = &state.engine {
+            let hashes = entries
+                .iter()
+                .map(|entry| entry.info_hash.clone())
+                .collect::<Vec<_>>();
+            load_transmission_tracker_snapshot_size(engine, &hashes).await?
+        } else {
+            (0, 0)
+        }
+    } else {
+        (0, 0)
+    };
+    let estimate = estimate_transmission_torrent_get_snapshot_bytes(entries.len(), fields.len())
+        .saturating_add(estimate_transmission_tracker_snapshot_bytes(
+            tracker_count,
+            tracker_bytes,
+        ));
     let _lease = if state.engine.is_some() {
         Some(
-            reserve_transmission_api_snapshot(
-                state,
-                estimate_transmission_torrent_get_snapshot_bytes(entries.len(), fields.len()),
-            )
-            .await?
-            .ok_or_else(|| "api snapshot memory budget exhausted".to_owned())?,
+            reserve_transmission_api_snapshot(state, estimate)
+                .await?
+                .ok_or_else(|| "api snapshot memory budget exhausted".to_owned())?,
         )
     } else {
         None
@@ -1891,9 +1940,6 @@ async fn torrent_get(state: &AppState, args: &Value) -> Result<Value, String> {
     let need_peers = fields
         .iter()
         .any(|field| transmission_field_needs_peers(field));
-    let need_trackers = fields
-        .iter()
-        .any(|field| transmission_field_needs_trackers(field));
     let need_webseeds = fields
         .iter()
         .any(|field| transmission_field_needs_webseeds(field));

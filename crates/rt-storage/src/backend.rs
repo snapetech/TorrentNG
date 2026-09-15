@@ -730,8 +730,7 @@ impl UringWorker {
     }
 
     fn run(mut self) {
-        while let Some(first) = self.recv_job() {
-            let jobs = self.recv_batch(first);
+        while let Some(jobs) = self.recv_batch() {
             let mut submitted = 0;
             for job in jobs {
                 match self.submit_job(job) {
@@ -762,22 +761,17 @@ impl UringWorker {
         }
     }
 
-    fn recv_job(&self) -> Option<Job> {
+    fn recv_batch(&self) -> Option<Vec<Job>> {
         let guard = self.rx.lock().expect("uring job queue poisoned");
-        guard.recv().ok()
-    }
-
-    fn recv_batch(&self, first: Job) -> Vec<Job> {
         let mut jobs = Vec::with_capacity(URING_BATCH_LIMIT);
-        jobs.push(first);
-        let guard = self.rx.lock().expect("uring job queue poisoned");
+        jobs.push(guard.recv().ok()?);
         while jobs.len() < URING_BATCH_LIMIT {
             match guard.try_recv() {
                 Ok(job) => jobs.push(job),
                 Err(mpsc::TryRecvError::Empty) | Err(mpsc::TryRecvError::Disconnected) => break,
             }
         }
-        jobs
+        Some(jobs)
     }
 
     fn submit_job(&mut self, job: Job) -> io::Result<()> {
@@ -1577,7 +1571,39 @@ mod tests {
         let frame = pool.try_acquire(7).unwrap();
         let frame = backend.pread(file, frame, 16).await.unwrap().unwrap();
         assert_eq!(frame.as_slice(), b"backend");
-        assert!(!backend.fixed_buffer_strategy().uses_frame_pool_slots());
+        assert_eq!(
+            backend.fixed_buffer_strategy().uses_frame_pool_slots(),
+            backend.kind() == BackendKind::Uring && backend.supports_fixed_buffers()
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn forced_uring_read_only_roundtrip() {
+        let probe = UringBackend::probe().unwrap();
+        if !probe.usable {
+            return;
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("uring-read-only.bin");
+        std::fs::write(&path, vec![0_u8; 16 * 1024]).unwrap();
+        let backend = SelectedDiskBackend::select(BackendRequest::Uring, 2);
+        if backend.kind() != BackendKind::Uring {
+            return;
+        }
+        let pool = FramePool::new(1 << 20);
+        let file = Arc::new(crate::open::open_path_no_follow(&path, false, false).unwrap());
+        let frame = pool.try_acquire(16 * 1024).unwrap();
+        let frame = tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            backend.pread(file, frame, 0),
+        )
+        .await
+        .expect("io_uring read-only request timed out")
+        .unwrap()
+        .unwrap();
+        assert_eq!(frame.as_slice(), vec![0_u8; 16 * 1024].as_slice());
     }
 
     #[cfg(target_os = "linux")]

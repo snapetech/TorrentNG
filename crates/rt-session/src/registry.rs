@@ -68,7 +68,23 @@ pub struct SessionRegistry {
     /// this when the guard is actually dereferenced mutably; callers therefore
     /// cannot publish a snapshot that predates a completed update, while
     /// read-only borrows do not churn the journal.
+    ///
+    /// This stays a single global counter deliberately: `changes_since` and
+    /// every external cursor (`SessionSnapshot::revision`, the API-layer
+    /// `TorrentSnapshot`) depend on one totally-ordered sequence to compute
+    /// deltas. Sharding lives one level down, in `shard_revisions`, purely to
+    /// bound the cost of *this registry's own* projection cache below.
     revision: u64,
+    /// Per-shard companion to `revision`. A torrent's shard is
+    /// `snapshot_shard(info_hash)`; mutating one torrent advances only its
+    /// own shard's counter here (in lockstep with the global `revision`),
+    /// which lets `snapshot()` rebuild just the shards a mutation actually
+    /// touched instead of materializing every torrent on every call.
+    shard_revisions: Vec<u64>,
+    /// Handles grouped by `snapshot_shard(info_hash)`, maintained incrementally
+    /// on insert/remove so a shard rebuild can iterate exactly its own
+    /// members instead of filtering the whole `entries` map.
+    shard_members: Vec<HashSet<TorrentHandle>>,
     changes: VecDeque<RegistryChange>,
     stats: SessionRegistryStats,
     active_count: usize,
@@ -80,12 +96,49 @@ pub struct SessionRegistry {
     banned_peers: HashSet<SocketAddr>,
     change_notify: Arc<Notify>,
     snapshot_cache: SnapshotCache,
+    /// Per-shard projection cache backing `snapshot()`. Each slot caches the
+    /// sorted `TorrentEntry` projection for exactly one shard, tagged with
+    /// the `shard_revisions` value it was built from. A `snapshot()` call
+    /// reuses a slot via `Arc::clone` when its shard hasn't advanced and
+    /// rebuilds only the slots that have.
+    shard_snapshot_cache: Vec<SnapshotCache>,
 }
 
 type SnapshotCache = Mutex<Option<(u64, Arc<Vec<TorrentEntry>>)>>;
 
 const CHANGE_LOG_CAPACITY: usize = 16_384;
 pub const MAX_BANNED_PEERS: usize = 65_536;
+
+/// Number of independent revision/cache shards `SessionRegistry` partitions
+/// torrents into (see `shard_revisions` and `shard_snapshot_cache`).
+///
+/// Chosen for the project's documented 10k-100k torrent scale target: at
+/// 100k torrents that's ~1,562 torrents/shard, so one torrent's mutation
+/// forces re-materializing ~1.6% of the registry's projection cache instead
+/// of 100% of it, while 64 mutexes and two 64-entry `Vec`s of bookkeeping
+/// are negligible next to a registry holding tens of thousands of torrents.
+/// A larger shard count shrinks the blast radius further but buys
+/// diminishing returns once shards are already small relative to typical
+/// per-tick churn; a smaller one gives up most of the benefit under the
+/// "thousands of torrents ticking continuously" workload this exists for.
+/// Kept a power of two so shard assignment is a cheap mask instead of a
+/// modulo.
+const SNAPSHOT_SHARDS: usize = 64;
+
+/// Deterministic, stable shard assignment for a canonical info hash. Uses an
+/// explicit FNV-1a instead of `std`'s `DefaultHasher` because shard
+/// assignment must stay stable for the registry's whole lifetime (the same
+/// hash must always land in the same shard); the standard library only
+/// promises that within one `RandomState` instance, not as a general
+/// hashing contract.
+fn snapshot_shard(info_hash: &str) -> usize {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in info_hash.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    (hash as usize) & (SNAPSHOT_SHARDS - 1)
+}
 
 /// A compact mutation record for incremental API/SSE consumers.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -258,6 +311,7 @@ pub struct SessionRegistryEntryMut<'a> {
     entry: &'a mut TorrentEntry,
     aggregate: &'a mut SessionRegistryStats,
     revision: &'a mut u64,
+    shard_revision: &'a mut u64,
     changes: &'a mut VecDeque<RegistryChange>,
     change_notify: &'a Notify,
     snapshot_cache: &'a SnapshotCache,
@@ -294,6 +348,7 @@ impl Drop for SessionRegistryEntryMut<'_> {
         let after = EntryContribution::from_entry(self.entry);
         self.aggregate.apply_delta(self.before, after);
         *self.revision = self.revision.wrapping_add(1);
+        *self.shard_revision = self.shard_revision.wrapping_add(1);
         self.changes.push_back(RegistryChange {
             revision: *self.revision,
             info_hash: self.info_hash.clone(),
@@ -320,6 +375,8 @@ impl SessionRegistry {
             by_hash: HashMap::new(),
             entries: HashMap::new(),
             revision: 0,
+            shard_revisions: vec![0; SNAPSHOT_SHARDS],
+            shard_members: (0..SNAPSHOT_SHARDS).map(|_| HashSet::new()).collect(),
             changes: VecDeque::new(),
             stats: SessionRegistryStats::default(),
             active_count: 0,
@@ -327,6 +384,7 @@ impl SessionRegistry {
             banned_peers: HashSet::new(),
             change_notify: Arc::new(Notify::new()),
             snapshot_cache: Mutex::new(None),
+            shard_snapshot_cache: (0..SNAPSHOT_SHARDS).map(|_| Mutex::new(None)).collect(),
         }
     }
 
@@ -368,6 +426,7 @@ impl SessionRegistry {
             RegistryRecord::Dormant(_) => self.dormant_count += 1,
         }
         self.entries.insert(handle, record);
+        self.shard_members[snapshot_shard(&info_hash)].insert(handle);
         self.bump_revision(info_hash, false);
         Ok(handle)
     }
@@ -386,6 +445,7 @@ impl SessionRegistry {
             RegistryRecord::Active(_) => self.active_count -= 1,
             RegistryRecord::Dormant(_) => self.dormant_count -= 1,
         }
+        self.shard_members[snapshot_shard(&info_hash)].remove(&handle);
         self.bump_revision(info_hash, true);
         Ok(removed_entry)
     }
@@ -456,18 +516,78 @@ impl SessionRegistry {
                 };
             }
         }
-        let mut entries = self
-            .entries
-            .values()
-            .map(RegistryRecord::to_entry)
-            .collect::<Vec<_>>();
-        entries.sort_unstable_by(|left, right| left.info_hash.cmp(&right.info_hash));
-        let entries = Arc::new(entries);
+        let entries = Arc::new(self.rebuild_snapshot_entries());
         *cache = Some((self.revision, Arc::clone(&entries)));
         SessionSnapshot {
             revision: self.revision,
             entries,
         }
+    }
+
+    /// Rebuild the sorted, flattened projection backing `snapshot()`.
+    ///
+    /// Delegates to the per-shard cache: a shard whose revision matches its
+    /// cached slot is reused with an `Arc::clone` (no `RegistryRecord::to_entry`
+    /// calls, no allocation beyond the final concatenation), and only shards
+    /// whose revision advanced since they were last cached are rematerialized.
+    /// The final sort is required because shard numbers are hash buckets, not
+    /// lexical info-hash ranges; `SessionSnapshot::find` relies on one global
+    /// ordering for its binary search.
+    /// Under steady single-torrent churn across a large registry this keeps
+    /// the expensive per-entry projection work proportional to the number of
+    /// dirty shards rather than the registry size.
+    fn rebuild_snapshot_entries(&self) -> Vec<TorrentEntry> {
+        let mut combined = Vec::with_capacity(self.entries.len());
+        for shard in 0..SNAPSHOT_SHARDS {
+            let shard_entries = self.shard_snapshot(shard);
+            combined.extend(shard_entries.iter().cloned());
+        }
+        combined.sort_unstable_by(|left, right| left.info_hash.cmp(&right.info_hash));
+        combined
+    }
+
+    /// Return the cached (or freshly rebuilt) sorted projection for one
+    /// shard. Rebuilding walks only `shard_members[shard]`, not the whole
+    /// registry.
+    fn shard_snapshot(&self, shard: usize) -> Arc<Vec<TorrentEntry>> {
+        let mut cache = self.shard_snapshot_cache[shard]
+            .lock()
+            .expect("session shard snapshot cache mutex poisoned");
+        let current_revision = self.shard_revisions[shard];
+        if let Some((revision, entries)) = cache.as_ref() {
+            if *revision == current_revision {
+                return Arc::clone(entries);
+            }
+        }
+        let mut entries = self.shard_members[shard]
+            .iter()
+            .filter_map(|handle| self.entries.get(handle))
+            .map(RegistryRecord::to_entry)
+            .collect::<Vec<_>>();
+        entries.sort_unstable_by(|left, right| left.info_hash.cmp(&right.info_hash));
+        let entries = Arc::new(entries);
+        *cache = Some((current_revision, Arc::clone(&entries)));
+        entries
+    }
+
+    /// Shard index a given canonical info hash is assigned to. Exposed for
+    /// tests that need to construct two hashes guaranteed to land in the
+    /// same or different shards.
+    #[cfg(test)]
+    fn shard_of(info_hash: &str) -> usize {
+        snapshot_shard(&canonical_info_hash(info_hash))
+    }
+
+    /// Current cached pointer identity for a shard's projection, if any,
+    /// without triggering a rebuild. Tests use this to prove an untouched
+    /// shard's cache entry was reused (same allocation) rather than rebuilt.
+    #[cfg(test)]
+    fn shard_snapshot_ptr(&self, shard: usize) -> Option<*const Vec<TorrentEntry>> {
+        self.shard_snapshot_cache[shard]
+            .lock()
+            .expect("session shard snapshot cache mutex poisoned")
+            .as_ref()
+            .map(|(_, entries)| Arc::as_ptr(entries))
     }
 
     pub fn get_mut(&mut self, info_hash: &str) -> Option<SessionRegistryEntryMut<'_>> {
@@ -483,14 +603,16 @@ impl SessionRegistry {
             self.dormant_count -= 1;
             self.active_count += 1;
         }
-        let (entries, stats, revision, changes, change_notify) = (
+        let (entries, stats, revision, shard_revisions, changes, change_notify) = (
             &mut self.entries,
             &mut self.stats,
             &mut self.revision,
+            &mut self.shard_revisions,
             &mut self.changes,
             self.change_notify.as_ref(),
         );
         let snapshot_cache = &self.snapshot_cache;
+        let shard_revision = &mut shard_revisions[snapshot_shard(&info_hash)];
         let entry = match entries.get_mut(&handle)? {
             RegistryRecord::Active(entry) => entry,
             RegistryRecord::Dormant(_) => unreachable!("dormant entry was not promoted"),
@@ -500,6 +622,7 @@ impl SessionRegistry {
             entry,
             aggregate: stats,
             revision,
+            shard_revision,
             changes,
             change_notify,
             snapshot_cache,
@@ -765,6 +888,8 @@ impl SessionRegistry {
             .expect("session snapshot cache mutex poisoned")
             .take();
         self.revision = self.revision.wrapping_add(1);
+        let shard = &mut self.shard_revisions[snapshot_shard(&info_hash)];
+        *shard = shard.wrapping_add(1);
         self.changes.push_back(RegistryChange {
             revision: self.revision,
             info_hash,
@@ -1009,5 +1134,135 @@ mod tests {
         let after = reg.snapshot();
         assert_eq!(after.revision(), reg.revision());
         assert_eq!(after.find("a").unwrap().name, "changed");
+    }
+
+    /// Search a small pool of canonical-looking hex hashes for two that land
+    /// in different shards. `snapshot_shard` is a plain hash, so any fixed
+    /// pair could in principle collide; searching keeps the test robust to
+    /// implementation changes instead of hardcoding two hashes and hoping.
+    fn two_hashes_in_different_shards() -> (String, String) {
+        let pool = (0..SNAPSHOT_SHARDS * 4)
+            .map(|i| format!("{i:x}").repeat(40)[..40].to_owned())
+            .collect::<Vec<_>>();
+        for a in &pool {
+            for b in &pool {
+                if SessionRegistry::shard_of(a) != SessionRegistry::shard_of(b) {
+                    return (a.clone(), b.clone());
+                }
+            }
+        }
+        panic!("no two pool hashes landed in different shards");
+    }
+
+    #[test]
+    fn mutating_one_torrent_only_rebuilds_its_own_shard() {
+        let (hash_a, hash_b) = two_hashes_in_different_shards();
+        let shard_a = SessionRegistry::shard_of(&hash_a);
+        let shard_b = SessionRegistry::shard_of(&hash_b);
+        assert_ne!(shard_a, shard_b);
+
+        let mut reg = SessionRegistry::new();
+        reg.add(entry(&hash_a)).unwrap();
+        reg.add(entry(&hash_b)).unwrap();
+
+        // Force both shards' caches to materialize.
+        let _ = reg.snapshot();
+        let ptr_a_before = reg.shard_snapshot_ptr(shard_a);
+        let ptr_b_before = reg.shard_snapshot_ptr(shard_b);
+        assert!(ptr_a_before.is_some());
+        assert!(ptr_b_before.is_some());
+
+        // Mutate only the torrent in shard_a.
+        reg.get_mut(&hash_a).unwrap().name = "changed".to_owned();
+        let _ = reg.snapshot();
+
+        let ptr_a_after = reg.shard_snapshot_ptr(shard_a);
+        let ptr_b_after = reg.shard_snapshot_ptr(shard_b);
+        assert_ne!(
+            ptr_a_before, ptr_a_after,
+            "the mutated torrent's shard must be rematerialized"
+        );
+        assert_eq!(
+            ptr_b_before, ptr_b_after,
+            "an untouched shard must be reused via Arc::clone, not rebuilt"
+        );
+    }
+
+    #[test]
+    fn mutation_does_not_advance_other_shards_revision() {
+        let (hash_a, hash_b) = two_hashes_in_different_shards();
+        let shard_a = SessionRegistry::shard_of(&hash_a);
+        let shard_b = SessionRegistry::shard_of(&hash_b);
+
+        let mut reg = SessionRegistry::new();
+        reg.add(entry(&hash_a)).unwrap();
+        reg.add(entry(&hash_b)).unwrap();
+
+        let revisions_before = reg.shard_revisions.clone();
+        reg.get_mut(&hash_a).unwrap().name = "changed".to_owned();
+        let revisions_after = reg.shard_revisions.clone();
+
+        assert_ne!(
+            revisions_before[shard_a], revisions_after[shard_a],
+            "shard containing the mutated torrent must advance"
+        );
+        assert_eq!(
+            revisions_before[shard_b], revisions_after[shard_b],
+            "an unrelated shard's revision must not advance"
+        );
+        // The global revision still advances exactly like before sharding;
+        // `changes_since` semantics are unaffected.
+        assert_ne!(reg.revision(), 0);
+    }
+
+    #[test]
+    fn snapshot_stays_globally_sorted_and_correct_across_many_shards() {
+        let mut reg = SessionRegistry::new();
+        // Insert enough distinct hashes to spread across every shard and in
+        // an order that does not already match sorted order.
+        let mut hashes = (0..(SNAPSHOT_SHARDS * 3))
+            .map(|i| format!("{i:08x}").repeat(5)[..40].to_owned())
+            .collect::<Vec<_>>();
+        hashes.sort();
+        hashes.reverse();
+        for hash in &hashes {
+            reg.add(entry(hash)).unwrap();
+        }
+
+        // Mutate a handful of entries spread across different shards so the
+        // combined snapshot has to merge freshly rebuilt shards alongside
+        // reused ones.
+        for hash in hashes.iter().step_by(7) {
+            reg.get_mut(hash).unwrap().name = format!("renamed-{hash}");
+        }
+
+        let snapshot = reg.snapshot();
+        assert_eq!(snapshot.len(), hashes.len());
+        let mut expected = hashes.clone();
+        expected.sort();
+        let actual = snapshot
+            .iter()
+            .map(|entry| entry.info_hash.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(actual, expected, "snapshot must stay sorted by info_hash");
+
+        for hash in hashes.iter().step_by(7) {
+            assert_eq!(snapshot.find(hash).unwrap().name, format!("renamed-{hash}"));
+        }
+    }
+
+    #[test]
+    fn snapshot_reflects_removals_across_shards() {
+        let (hash_a, hash_b) = two_hashes_in_different_shards();
+        let mut reg = SessionRegistry::new();
+        reg.add(entry(&hash_a)).unwrap();
+        reg.add(entry(&hash_b)).unwrap();
+        let _ = reg.snapshot();
+
+        reg.remove(&hash_a).unwrap();
+        let snapshot = reg.snapshot();
+        assert_eq!(snapshot.len(), 1);
+        assert!(snapshot.find(&hash_a).is_none());
+        assert!(snapshot.find(&hash_b).is_some());
     }
 }

@@ -14,6 +14,12 @@ pub enum WireError {
     )]
     MessageTooLarge(u32),
 
+    #[error("peer frame buffer allocation of {0} bytes denied")]
+    PeerBufferAllocationDenied(u64),
+
+    #[error("peer frame buffer length does not fit in the accounting range")]
+    PeerBufferLengthOverflow,
+
     #[error("unknown message id: {0}")]
     UnknownMessageId(u8),
 

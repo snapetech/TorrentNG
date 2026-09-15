@@ -6,6 +6,45 @@ use crate::{
     response::{AnnounceResponse, TrackerStatus},
 };
 
+// These values are copied into the long-lived per-torrent tracker state and
+// can later be projected into SQLite/API responses. Keep direct callers
+// bounded too, even though the normal response parsers enforce the same
+// limits before constructing an announce response.
+pub const MAX_TRACKER_STATE_TEXT_BYTES: usize = 16 * 1024;
+pub const MAX_TRACKER_STATE_ID_BYTES: usize = 16 * 1024;
+
+fn bound_tracker_state_text(value: String) -> String {
+    if value.len() <= MAX_TRACKER_STATE_TEXT_BYTES {
+        return value;
+    }
+
+    const SUFFIX: &str = "…";
+    let mut end = MAX_TRACKER_STATE_TEXT_BYTES - SUFFIX.len();
+    while !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    let mut bounded = value[..end].to_owned();
+    bounded.push_str(SUFFIX);
+    bounded
+}
+
+fn bound_tracker_error(error: TrackerError) -> TrackerError {
+    match error {
+        TrackerError::FailureReason(value) => {
+            TrackerError::FailureReason(bound_tracker_state_text(value))
+        }
+        TrackerError::Network(value) => TrackerError::Network(bound_tracker_state_text(value)),
+        TrackerError::Udp(value) => TrackerError::Udp(bound_tracker_state_text(value)),
+        TrackerError::ParseError(value) => {
+            TrackerError::ParseError(bound_tracker_state_text(value))
+        }
+        TrackerError::InvalidUrl(value) => {
+            TrackerError::InvalidUrl(bound_tracker_state_text(value))
+        }
+        other => other,
+    }
+}
+
 /// Per-tracker state machine.
 ///
 /// Tracks the announce schedule, retry state, and last known status
@@ -75,8 +114,12 @@ impl TrackerState {
         if let Some(configured_min_interval) = configured_min_interval {
             self.interval = self.interval.max(configured_min_interval);
         }
-        if let Some(ref id) = resp.tracker_id {
-            self.tracker_id = Some(id.clone());
+        if let Some(id) = resp
+            .tracker_id
+            .as_deref()
+            .filter(|id| id.len() <= MAX_TRACKER_STATE_ID_BYTES)
+        {
+            self.tracker_id = Some(id.to_owned());
         }
         self.scrape_complete = resp.complete;
         self.scrape_incomplete = resp.incomplete;
@@ -89,8 +132,8 @@ impl TrackerState {
         let jittered = jitter_interval(minimum, 0.1).max(minimum);
         self.next_announce = Some(now + jittered);
 
-        self.status = if let Some(ref warn) = resp.warning_message {
-            TrackerStatus::Warning(warn.clone())
+        self.status = if let Some(warn) = resp.warning_message.as_deref() {
+            TrackerStatus::Warning(bound_tracker_state_text(warn.to_owned()))
         } else {
             TrackerStatus::Working
         };
@@ -99,10 +142,10 @@ impl TrackerState {
     /// Record a failed announce.
     pub fn on_failure(&mut self, err: TrackerError) {
         self.last_announce = Some(Instant::now());
-        self.consecutive_failures += 1;
+        self.consecutive_failures = self.consecutive_failures.saturating_add(1);
         let delay = self.backoff.next_delay();
         self.next_announce = Some(Instant::now() + delay);
-        self.status = TrackerStatus::Error(err);
+        self.status = TrackerStatus::Error(bound_tracker_error(err));
     }
 
     /// True if it's time (or past time) to announce again.
@@ -204,6 +247,16 @@ mod tests {
     }
 
     #[test]
+    fn failure_count_saturates_at_u32_max() {
+        let mut ts = TrackerState::new("http://tracker.example.com/announce");
+        ts.consecutive_failures = u32::MAX;
+
+        ts.on_failure(TrackerError::Timeout);
+
+        assert_eq!(ts.consecutive_failures(), u32::MAX);
+    }
+
+    #[test]
     fn schedule_immediate_makes_it_due() {
         let mut ts = TrackerState::new("http://tracker.example.com/announce");
         ts.on_success(&mock_response(1800, None));
@@ -228,6 +281,46 @@ mod tests {
         ts.on_success(&response);
 
         assert_eq!(ts.tracker_id, Some(vec![0x00, 0xff, 0x80]));
+    }
+
+    #[test]
+    fn oversized_tracker_id_is_not_retained() {
+        let mut ts = TrackerState::new("http://tracker.example.com/announce");
+        let mut response = mock_response(1800, None);
+        response.tracker_id = Some(vec![0xff; MAX_TRACKER_STATE_ID_BYTES + 1]);
+
+        ts.on_success(&response);
+
+        assert_eq!(ts.tracker_id, None);
+    }
+
+    #[test]
+    fn failure_text_is_bounded_before_retaining_it() {
+        let mut ts = TrackerState::new("http://tracker.example.com/announce");
+        ts.on_failure(TrackerError::ParseError(
+            "x".repeat(MAX_TRACKER_STATE_TEXT_BYTES + 1),
+        ));
+
+        let TrackerStatus::Error(TrackerError::ParseError(message)) = &ts.status else {
+            panic!("expected bounded parse error status");
+        };
+        assert!(message.len() <= MAX_TRACKER_STATE_TEXT_BYTES);
+        assert!(message.ends_with('…'));
+    }
+
+    #[test]
+    fn warning_text_is_bounded_before_retaining_it() {
+        let mut ts = TrackerState::new("http://tracker.example.com/announce");
+        ts.on_success(&mock_response(
+            1800,
+            Some(&"x".repeat(MAX_TRACKER_STATE_TEXT_BYTES + 1)),
+        ));
+
+        let TrackerStatus::Warning(message) = &ts.status else {
+            panic!("expected bounded warning status");
+        };
+        assert!(message.len() <= MAX_TRACKER_STATE_TEXT_BYTES);
+        assert!(message.ends_with('…'));
     }
 
     #[test]

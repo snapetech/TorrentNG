@@ -1,5 +1,5 @@
 /// BEP 5 routing table: 160 k-buckets, each holding up to K=8 nodes.
-use std::net::SocketAddrV4;
+use std::net::{SocketAddrV4, SocketAddrV6};
 
 use crate::node_id::NodeId;
 
@@ -10,6 +10,13 @@ pub const BUCKET_COUNT: usize = 160;
 pub struct KNode {
     pub id: NodeId,
     pub addr: SocketAddrV4,
+}
+
+/// IPv6 endpoint stored in the independent BEP 32 routing table.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KNode6 {
+    pub id: NodeId,
+    pub addr: SocketAddrV6,
 }
 
 #[derive(Debug, Default, Clone)]
@@ -117,6 +124,99 @@ impl RoutingTable {
 
     pub fn total_nodes(&self) -> usize {
         self.buckets.iter().map(|b| b.len()).sum()
+    }
+}
+
+#[derive(Debug, Default, Clone)]
+pub struct KBucket6 {
+    nodes: Vec<KNode6>,
+}
+
+impl KBucket6 {
+    pub fn len(&self) -> usize {
+        self.nodes.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.nodes.is_empty()
+    }
+
+    pub fn is_full(&self) -> bool {
+        self.nodes.len() >= K
+    }
+
+    pub fn insert(&mut self, node: KNode6) -> bool {
+        if let Some(existing) = self.nodes.iter_mut().find(|n| n.id == node.id) {
+            existing.addr = node.addr;
+            return false;
+        }
+        if self.is_full() {
+            return false;
+        }
+        self.nodes.push(node);
+        true
+    }
+
+    pub fn remove(&mut self, id: &NodeId) -> bool {
+        let before = self.nodes.len();
+        self.nodes.retain(|node| &node.id != id);
+        self.nodes.len() < before
+    }
+
+    pub fn nodes(&self) -> &[KNode6] {
+        &self.nodes
+    }
+}
+
+/// Independent IPv6 BEP 32 routing table. IPv4 and IPv6 tables intentionally
+/// do not share buckets: endpoint-family separation is part of the protocol.
+pub struct RoutingTable6 {
+    pub local_id: NodeId,
+    buckets: Vec<KBucket6>,
+}
+
+impl RoutingTable6 {
+    pub fn new(local_id: NodeId) -> Self {
+        Self {
+            local_id,
+            buckets: vec![KBucket6::default(); BUCKET_COUNT],
+        }
+    }
+
+    fn bucket_idx(&self, id: &NodeId) -> usize {
+        self.local_id.distance(id).bucket_index().unwrap_or(0)
+    }
+
+    pub fn insert(&mut self, node: KNode6) -> bool {
+        if node.id == self.local_id {
+            return false;
+        }
+        let idx = self.bucket_idx(&node.id);
+        self.buckets[idx].insert(node)
+    }
+
+    pub fn remove(&mut self, id: &NodeId) -> bool {
+        let idx = self.bucket_idx(id);
+        self.buckets[idx].remove(id)
+    }
+
+    pub fn closest(&self, target: &NodeId, k: usize) -> Vec<&KNode6> {
+        let mut candidates: Vec<(&KNode6, _)> = self
+            .buckets
+            .iter()
+            .flat_map(|bucket| bucket.nodes().iter())
+            .map(|node| (node, node.id.distance(target)))
+            .collect();
+        candidates.sort_unstable_by_key(|(_, distance)| *distance);
+        candidates
+            .into_iter()
+            .take(k)
+            .map(|(node, _)| node)
+            .collect()
+    }
+
+    pub fn total_nodes(&self) -> usize {
+        self.buckets.iter().map(KBucket6::len).sum()
     }
 }
 

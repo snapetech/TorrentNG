@@ -24,6 +24,12 @@ pub enum MetainfoError {
     ZeroTotalLength,
     #[error("invalid piece length: {0}")]
     InvalidPieceLength(u64),
+    #[error("invalid BEP 52 piece layers: {0}")]
+    InvalidPieceLayer(&'static str),
+    #[error("invalid BEP 52 piece-layer count: expected {expected}, got {actual}")]
+    InvalidPieceLayerCount { expected: usize, actual: usize },
+    #[error("BEP 52 piece-layer root does not match file pieces root")]
+    PieceLayerRootMismatch,
     #[error("invalid file path: {0}")]
     InvalidPath(#[from] PathError),
     #[error("invalid UTF-8 in field: {0}")]

@@ -1,4 +1,4 @@
-# TorrentNG WebUI/API service
+# TorrentNG compatible-client WebUI/API service
 
 This directory is the current repository path for TorrentNG's compatible-client
 WebUI/API service. The executable built here is `torrentng`: it serves the

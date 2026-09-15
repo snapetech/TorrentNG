@@ -261,8 +261,10 @@ Still genuinely open after this pass:
 - TNG-013 has a local 32-client/8-slow-SSE release-process load result, but no
   representative production-corpus allocator profile or public-client load
   evidence. Arbitrary filter-index refresh remains linear by design.
-- TNG-016 remains explicitly unsupported for pure-v2 transfer; this is a
-  deliberate capability boundary, not a hidden implementation claim.
+- TNG-016's local pure-v2 transfer and tracker lifecycle implementation is
+  present for complete metainfo. Pure-v2 magnet metadata completion remains
+  unsupported; public-network interoperability and broader transfer evidence
+  are still external gates.
 - TNG-023 still needs accepted certification evidence before its `certified`
   state can change. TNG-025/027/028 now have hosted CI evidence in run
   `33916500668`; branch-protection enforcement remains a repository-settings
@@ -323,10 +325,10 @@ and is superseded by the source reconciliation above.
 | TNG-013 | Implemented and locally load-tested: immutable snapshots, indexes, pagination, journals, bounded SSE chunks; 204,936-request many-client/slow-consumer run passes with zero errors | Representative production corpus, allocator profile, and public/client load evidence remain external |
 | TNG-014 | Implemented locally: packed bitmaps, shared immutable piece maps, and governor-bounded peer/piece state | Run peer-count and large-piece-count memory profile |
 | TNG-015 | Implemented locally: guarded webseed timer and exponential retry backoff | Run idle/large-swarm benchmark |
-| TNG-016 | Explicitly unsupported: pure-v2 transfer/completion is not claimed | No implementation action until a complete v2 transfer design exists |
+| TNG-016 | Implemented locally: pure-v2 file-root recheck, BEP 52 TCP/uTP transfer, and tracker lifecycle | Pure-v2 magnet metadata completion and public interoperability evidence remain open |
 | TNG-017 | Implemented locally: independent rate windows and choker inputs | Run controlled transfer proof |
 | TNG-018 | Implemented locally: handshake, idle, request, and response budgets | Run scheduler-saturation evidence |
-| TNG-019 | Implemented locally within declared IPv4 live-DHT scope: bounds, source checks, tokens, caps | Do not claim live IPv6 DHT; run hostile-input/load evidence |
+| TNG-019 | Implemented locally for IPv4 and IPv6 live-DHT routing: bounds, source checks, tokens, caps, and stale-query pruning | Run hostile-input/load and restart evidence |
 | TNG-020 | Implemented locally: checked tracker values, bounded UDP handling, PEX add/drop parsing and handling | Run broad tracker/transport interoperability evidence |
 | TNG-021 | Resolved: TorrentNG list contract and bounded pagination agree | None beyond regression maintenance |
 | TNG-022 | Implemented locally: durable categories/tags/bans and ban eviction; unsupported mode/plugin operations now fail explicitly | Keep projection-only compatibility behavior documented; run real-client matrix |
@@ -1034,37 +1036,29 @@ Acceptance: idle-torrent CPU/timer counts and webseed recovery benchmarks.
 
 ## P1 — protocol and transfer correctness
 
-### TNG-016 — Pure v2 completion is a capability lie
+### TNG-016 — Pure v2 completion is a capability boundary
 
-**Status: Explicitly unsupported; honesty fix chosen over full implementation** · **Priority: P1** · **Confidence: high**
+**Status: Implemented locally for complete metainfo; metadata completion remains unsupported; evidence deferred** · **Priority: P1** · **Confidence: high**
 
-Verified evidence: the required action offered two paths -- implement it,
-or "reject unsupported pure-v2 operations explicitly." This took the
-second path. `Engine`'s taskless-v2 peer-transfer and tracker-lifecycle
-branches now return `Err("pure v2 peer transfer is not implemented")` /
-`Err("pure v2 tracker lifecycle is not implemented")` instead of a silent
-`Ok(())`, and `torrentng_client_capabilities` was corrected to advertise
-`pure_v2_metadata_completion: false` and `pure_v2_transfer: false`. Storage
-plan controls and storage scheduling are separate implemented capabilities;
-they are not implied by pure-v2 support. Three tests
-that asserted the old silent-success behavior were updated to assert the
-new explicit errors instead (all previously green tests were asserting the
-capability lie was correct behavior -- see burn-down log). Full pure-v2
-transfer/tracker implementation itself remains not done; that is now
-honestly reflected rather than claimed.
+The native engine now starts a dedicated pure-v2 actor for complete `.torrent`
+or raw metainfo. It restores v2 file paths and priorities, rechecks file roots,
+handles partial resume and seeding, serves and downloads BEP 52 pieces over TCP
+and uTP, performs bounded hash exchange with `hash reject` responses for
+unsupported ranges, and runs the v2 tracker announce/update/reannounce
+lifecycle using the truncated v2 infohash required by the tracker protocol.
+BEP 47 padding is treated as synthetic zero content and is not required on
+disk.
 
-Evidence: engine task startup accepts `TorrentMetaV1`; pure-v2 metadata is a
-taskless/recheck placeholder while the TorrentNG-client capability manifest claims pure
-v2 metadata completion.
+Pure-v2 `btmh` magnet metadata completion remains unsupported because the
+current metadata exchange path does not acquire the v2 file tree and piece
+layers. The capability manifest therefore keeps
+`pure_v2_metadata_completion: false` while reporting pure-v2 transfer as
+implemented. Public-network interoperability, real-client coverage, and
+target-hardware evidence remain external gates.
 
-Current action: preserve the explicit unsupported boundary in the capability
-manifest, API errors, compatibility docs, and regression tests. Implementing
-pure-v2 piece-layer acquisition, verification, storage, resume, and
-tracker/peer lifecycle is a separate product project, not an implied backend
-capability or a prerequisite for this burn-down.
-
-Acceptance: pure-v2 magnet, metadata completion, partial resume, payload
-verification, seeding, export, and compatibility tests.
+Acceptance: focused v2 recheck, path-policy, peer-wire, hash-exchange,
+padding, tracker, and uTP tests pass; magnet metadata completion remains an
+explicit unsupported boundary.
 
 ### TNG-017 — Peer rate snapshots and choker inputs are wrong
 
@@ -1097,11 +1091,11 @@ transport load runs remain deployment evidence work.
 
 ### TNG-019 — DHT resource and validation controls are incomplete
 
-**Status: Functional implementation complete within declared IPv4 scope; evidence deferred** · **Priority: P1** · **Confidence: high**
+**Status: Functional implementation complete for IPv4 and IPv6; evidence deferred** · **Priority: P1** · **Confidence: high**
 
-Original evidence: DHT is IPv4-only in the live task; there is no effective
-rate limit or outstanding expiry; transaction IDs are two bytes; response
-source validation and global announced-peer caps are incomplete.
+Original evidence: the live task was IPv4-only; there was no effective rate
+limit or outstanding expiry; transaction IDs were two bytes; response source
+validation and global announced-peer caps were incomplete.
 
 Verified evidence (this session): fixed the most severe issue -- confirmed
 this was a real, exploitable gap, not just a hardening nice-to-have.
@@ -1146,22 +1140,19 @@ Full workspace `cargo test --workspace --all-targets --locked`,
 `cargo clippy --workspace --all-targets --locked -- -D warnings` all green
 (`rt-engine` 134 tests, up from 129).
 
-The implementation gap is now narrowed to declared scope and external proof.
-The live DHT task remains IPv4-only for routing; IPv6 peer values can be
-represented and forwarded, but IPv6 routing is not advertised as supported.
-Inbound packets are bounded globally and per source IP, source-address and
-token binding are enforced, tracked torrents/query history/outstanding
-requests/announced peer sets have explicit caps, and stale outstanding work is
-expired. Focused tests cover spoofed responses, transaction handling, timeout
-expiry, per-IP/global flood budgets, global announced-peer caps, and token
-validation.
+The implementation gap is now narrowed to external proof. The live DHT task
+binds and routes IPv4 and IPv6 packets, validates response source addresses
+and tokens, bounds inbound work globally and per source IP, caps tracked
+torrents/query history/outstanding requests/announced peer sets, and expires
+stale outstanding work. IPv6 compact peer values are forwarded to the same
+source-aware peer admission path. Focused tests cover both address families,
+spoofed responses, transaction handling, timeout expiry, per-IP/global flood
+budgets, global announced-peer caps, and token validation.
 
-Remaining action: keep the IPv4-only scope explicit and run broader hostile
-input/load and restart evidence. Full IPv6 DHT routing is a separate feature,
-not an unreported partial capability.
+Remaining action: run broader hostile-input/load and restart evidence.
 
-Acceptance for the current implementation gate is met for the declared scope;
-IPv6 routing, live flood measurements, and restart evidence remain deferred.
+Acceptance for the implementation gate is met; live flood measurements and
+restart evidence remain deferred.
 
 ### TNG-020 — Tracker and PEX protocol handling is partial
 
@@ -1325,9 +1316,11 @@ completion and blocklist/plugin behavior are not claimed as TorrentNG-client fea
 Verified evidence: the TorrentNG-client capability manifest now separates
 `implemented`, `enabled`, `certified`, and `experimental` assurance states.
 Runtime/config-dependent uTP fields are derived from active policy, while
-pure-v2 transfer, IPv6 live-DHT routing, and scale certification remain
-explicitly outside the advertised certified set. Contract tests cover the
-manifest shape and mounted routes.
+pure-v2 metadata completion and scale certification remain outside the
+advertised implemented/certified set. Pure-v2 transfer and IPv4/IPv6 live-DHT
+routing are now advertised as implemented, with certification still governed
+by accepted external evidence. Contract tests cover the manifest shape and
+mounted routes.
 
 The remaining action is to keep `certified` empty for capabilities without
 accepted external evidence and to update it only from a release/evidence

@@ -13,4 +13,5 @@ sha2.workspace = true
 hex.workspace = true
 url.workspace = true
 rt-bencode = { path = "../rt-bencode" }
+rt-hash = { path = "../rt-hash" }
 rt-path = { path = "../rt-path" }

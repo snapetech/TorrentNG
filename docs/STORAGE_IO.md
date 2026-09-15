@@ -193,6 +193,10 @@ implementation:
 - If a storage plan cannot prove that a destructive or partially applied step
   is safely rolled back, its durable job is failed with a manual-recovery
   signal and owning torrents remain quiesced until the filesystem is resolved.
+- User cancellation first persists `cancelling`; the worker owns rollback and
+  cleanup, and only then publishes terminal `cancelled`. Restart recovery
+  reattaches that state with cancellation already set so a partially applied
+  plan is never resumed after the cancellation handoff.
 - Storage-plan queue events persist each target's pre-quiesce paused state, so
   restart recovery can resume active torrents after a successful or ordinary
   failed/cancelled plan without confusing them with torrents the user had

@@ -18,7 +18,7 @@ pub struct RatioGroup {
 
 impl Db {
     pub fn list_ratio_groups(&self) -> Result<Vec<RatioGroup>> {
-        let conn = self.0.lock().expect("db");
+        let conn = self.read();
         let raw: Option<String> = conn
             .query_row("SELECT value FROM kv WHERE key=?1", params![KEY], |r| {
                 r.get(0)
@@ -48,7 +48,7 @@ impl Db {
     }
 
     pub fn ratio_group_hashes(&self, group: &RatioGroup) -> Result<Vec<String>> {
-        let conn = self.0.lock().expect("db");
+        let conn = self.read();
         let mut clauses = Vec::new();
         let mut args = Vec::new();
 
@@ -88,7 +88,7 @@ impl Db {
     where
         F: FnOnce(&mut Vec<RatioGroup>),
     {
-        let mut conn = self.0.lock().expect("db");
+        let mut conn = self.conn();
         let tx = conn.transaction()?;
         let raw: Option<String> = tx
             .query_row("SELECT value FROM kv WHERE key=?1", params![KEY], |r| {

@@ -19,7 +19,7 @@ impl Db {
     // --- Categories ---
 
     pub fn list_categories(&self) -> Result<Vec<Category>> {
-        let conn = self.0.lock().expect("db");
+        let conn = self.read();
         let mut stmt = conn.prepare(
             "WITH names AS (
                 SELECT name FROM categories WHERE name != ''
@@ -53,7 +53,7 @@ impl Db {
     }
 
     pub fn upsert_category(&self, name: &str, save_path: &str) -> Result<()> {
-        let mut conn = self.0.lock().expect("db");
+        let mut conn = self.conn();
         let tx = conn.transaction()?;
         tx.execute(
             "INSERT INTO categories(name, save_path) VALUES(?1,?2)
@@ -67,7 +67,7 @@ impl Db {
     }
 
     pub fn delete_category(&self, name: &str) -> Result<()> {
-        let mut conn = self.0.lock().expect("db");
+        let mut conn = self.conn();
         let tx = conn.transaction()?;
         tx.execute("DELETE FROM categories WHERE name=?1", params![name])?;
         let revision = allocate_revision(&tx)?;
@@ -86,7 +86,7 @@ impl Db {
     }
 
     pub fn get_category_save_path(&self, name: &str) -> Result<Option<String>> {
-        let conn = self.0.lock().expect("db");
+        let conn = self.read();
         let mut stmt = conn.prepare("SELECT save_path FROM categories WHERE name=?1")?;
         let mut rows = stmt.query(params![name])?;
         Ok(rows.next()?.map(|r| r.get(0)).transpose()?)
@@ -95,7 +95,7 @@ impl Db {
     // --- Tags ---
 
     pub fn list_tags(&self) -> Result<Vec<String>> {
-        let conn = self.0.lock().expect("db");
+        let conn = self.read();
         let mut stmt = conn.prepare("SELECT name FROM tags ORDER BY name")?;
         let rows = stmt
             .query_map([], |r| r.get(0))?
@@ -104,7 +104,7 @@ impl Db {
     }
 
     pub fn ensure_tag(&self, name: &str) -> Result<()> {
-        let mut conn = self.0.lock().expect("db");
+        let mut conn = self.conn();
         let tx = conn.transaction()?;
         tx.execute("INSERT OR IGNORE INTO tags(name) VALUES(?1)", params![name])?;
         let revision = allocate_revision(&tx)?;
@@ -114,7 +114,7 @@ impl Db {
     }
 
     pub fn delete_tag(&self, name: &str) -> Result<()> {
-        let mut conn = self.0.lock().expect("db");
+        let mut conn = self.conn();
         let tx = conn.transaction()?;
         let revision = allocate_revision(&tx)?;
         tx.execute(
@@ -136,7 +136,7 @@ impl Db {
     // --- Torrent tags ---
 
     pub fn get_torrent_tags(&self, hash: &str) -> Result<Vec<String>> {
-        let conn = self.0.lock().expect("db");
+        let conn = self.read();
         let mut stmt =
             conn.prepare("SELECT tag FROM torrent_tags WHERE hash=?1 COLLATE NOCASE ORDER BY tag")?;
         let rows = stmt
@@ -146,7 +146,7 @@ impl Db {
     }
 
     pub fn add_torrent_tag(&self, hash: &str, tag: &str) -> Result<()> {
-        let mut conn = self.0.lock().expect("db");
+        let mut conn = self.conn();
         let tx = conn.transaction()?;
         let hash = canonical_existing_hash(&tx, hash)?;
         tx.execute("INSERT OR IGNORE INTO tags(name) VALUES(?1)", params![tag])?;
@@ -163,7 +163,7 @@ impl Db {
         if tags.is_empty() {
             return Ok(());
         }
-        let mut conn = self.0.lock().expect("db");
+        let mut conn = self.conn();
         let tx = conn.transaction()?;
         let hash = canonical_existing_hash(&tx, hash)?;
         for tag in tags {
@@ -179,7 +179,7 @@ impl Db {
     }
 
     pub fn remove_torrent_tag(&self, hash: &str, tag: &str) -> Result<()> {
-        let mut conn = self.0.lock().expect("db");
+        let mut conn = self.conn();
         let tx = conn.transaction()?;
         let hash = canonical_existing_hash(&tx, hash)?;
         tx.execute(
@@ -195,7 +195,7 @@ impl Db {
         if tags.is_empty() {
             return Ok(());
         }
-        let mut conn = self.0.lock().expect("db");
+        let mut conn = self.conn();
         let tx = conn.transaction()?;
         let hash = canonical_existing_hash(&tx, hash)?;
         for tag in tags {
@@ -210,7 +210,7 @@ impl Db {
     }
 
     pub fn set_torrent_tags(&self, hash: &str, tags: &[&str]) -> Result<()> {
-        let mut conn = self.0.lock().expect("db");
+        let mut conn = self.conn();
         let tx = conn.transaction()?;
         let hash = canonical_existing_hash(&tx, hash)?;
         tx.execute("DELETE FROM torrent_tags WHERE hash=?1", params![hash])?;
@@ -227,7 +227,7 @@ impl Db {
     }
 
     pub fn set_torrent_category(&self, hash: &str, category: &str) -> Result<()> {
-        let mut conn = self.0.lock().expect("db");
+        let mut conn = self.conn();
         let tx = conn.transaction()?;
         let hash = canonical_existing_hash(&tx, hash)?;
         let revision = allocate_revision(&tx)?;
@@ -249,7 +249,7 @@ impl Db {
     }
 
     pub fn set_torrent_location(&self, hash: &str, location: &str) -> Result<()> {
-        let mut conn = self.0.lock().expect("db");
+        let mut conn = self.conn();
         let tx = conn.transaction()?;
         let hash = canonical_existing_hash(&tx, hash)?;
         let revision = allocate_revision(&tx)?;
@@ -277,7 +277,7 @@ impl Db {
         is_active: bool,
         is_open: bool,
     ) -> Result<()> {
-        let mut conn = self.0.lock().expect("db");
+        let mut conn = self.conn();
         let tx = conn.transaction()?;
         let hash = canonical_existing_hash(&tx, hash)?;
         let revision = allocate_revision(&tx)?;
@@ -314,7 +314,7 @@ impl Db {
         if updates.is_empty() {
             return Ok(());
         }
-        let mut conn = self.0.lock().expect("db");
+        let mut conn = self.conn();
         let tx = conn.transaction()?;
         let revision = allocate_revision(&tx)?;
         {

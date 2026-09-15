@@ -206,7 +206,7 @@ github:release:
   script:
     - test -n "$GITHUB_TOKEN"
     - test -n "$GITHUB_REPOSITORY"
-    - gh release create "$CI_COMMIT_TAG" --repo "$GITHUB_REPOSITORY" --title "$CI_COMMIT_TAG" --notes "Released from GitLab pipeline $CI_PIPELINE_URL" --verify-tag
+    - gh release create "$CI_COMMIT_TAG" --repo "$GITHUB_REPOSITORY" --title "$CI_COMMIT_TAG" --notes "The universal torrent client interface: one WebUI/API for the TorrentNG Engine and qBittorrent, rTorrent, Transmission, and Deluge. Released from GitLab pipeline $CI_PIPELINE_URL" --verify-tag
   rules:
     - if: '$CI_COMMIT_TAG'
 

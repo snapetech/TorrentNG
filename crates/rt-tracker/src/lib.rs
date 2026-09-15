@@ -9,9 +9,9 @@ pub mod tier;
 pub mod udp;
 
 pub use error::TrackerError;
-pub use peer::{CompactPeer, Peer};
+pub use peer::{CompactPeer, Peer, MAX_TRACKER_PEERS};
 pub use policy::PrivatePolicy;
 pub use request::{to_http_scrape_url, AnnounceRequest, InfoHash, TrackerEvent};
 pub use response::{AnnounceResponse, ScrapeStats, TrackerStatus};
-pub use state::TrackerState;
+pub use state::{TrackerState, MAX_TRACKER_STATE_ID_BYTES, MAX_TRACKER_STATE_TEXT_BYTES};
 pub use tier::{Tier, TierSet};

@@ -15,10 +15,42 @@ impl ExtensionFlags {
         self.0[5] & 0x10 != 0
     }
 
+    /// BEP 6 Fast extension (byte 7, bit 0x04).
+    pub fn supports_fast_extension(self) -> bool {
+        self.0[7] & 0x04 != 0
+    }
+
+    /// BEP 52 v2 peer support. The v2 bit is the fourth-most-significant bit
+    /// of the final reserved byte (`0x10`).
+    pub fn supports_v2(self) -> bool {
+        self.0[7] & 0x10 != 0
+    }
+
     pub fn with_extension_protocol() -> Self {
         let mut flags = [0u8; 8];
         flags[5] |= 0x10;
         ExtensionFlags(flags)
+    }
+
+    /// BEP 10 extension protocol plus BEP 6 Fast extension. TorrentNG
+    /// advertises both in every handshake since it implements both (Fast
+    /// extension support is currently scoped to `HaveAll`/`HaveNone`).
+    pub fn with_extension_protocol_and_fast() -> Self {
+        let mut flags = Self::with_extension_protocol();
+        flags.0[7] |= 0x04;
+        flags
+    }
+
+    /// Advertise BEP 10, BEP 6 Fast, and BEP 52 v2 support.
+    pub fn with_extension_protocol_and_fast_and_v2() -> Self {
+        let mut flags = Self::with_extension_protocol_and_fast();
+        flags.0[7] |= 0x10;
+        flags
+    }
+
+    /// Add BEP 52 support to the standard extension/fast capability set.
+    pub fn with_v2_support() -> Self {
+        Self::with_extension_protocol_and_fast_and_v2()
     }
 }
 
@@ -97,5 +129,52 @@ mod tests {
         assert!(flags.supports_extension_protocol());
         let zero = ExtensionFlags::default();
         assert!(!zero.supports_extension_protocol());
+    }
+
+    #[test]
+    fn fast_extension_flag_roundtrip() {
+        let flags = ExtensionFlags::with_extension_protocol_and_fast();
+        assert!(flags.supports_extension_protocol());
+        assert!(flags.supports_fast_extension());
+
+        // Plain BEP 10 support (no Fast extension bit) must not be
+        // misdetected as Fast-extension support.
+        let ext_only = ExtensionFlags::with_extension_protocol();
+        assert!(!ext_only.supports_fast_extension());
+
+        let zero = ExtensionFlags::default();
+        assert!(!zero.supports_fast_extension());
+    }
+
+    #[test]
+    fn fast_extension_flag_survives_handshake_wire_roundtrip() {
+        let hs = Handshake {
+            reserved: ExtensionFlags::with_extension_protocol_and_fast(),
+            info_hash: [0x11u8; 20],
+            peer_id: [0x22u8; 20],
+        };
+        let encoded = hs.encode();
+        let parsed = Handshake::parse(&encoded).unwrap();
+        assert!(parsed.reserved.supports_extension_protocol());
+        assert!(parsed.reserved.supports_fast_extension());
+    }
+
+    #[test]
+    fn v2_extension_flag_roundtrip() {
+        let flags = ExtensionFlags::with_v2_support();
+        assert!(flags.supports_extension_protocol());
+        assert!(flags.supports_fast_extension());
+        assert!(flags.supports_v2());
+
+        let ext_only = ExtensionFlags::with_extension_protocol();
+        assert!(!ext_only.supports_v2());
+
+        let hs = Handshake {
+            reserved: flags,
+            info_hash: [0x31; 20],
+            peer_id: [0x32; 20],
+        };
+        let parsed = Handshake::parse(&hs.encode()).unwrap();
+        assert!(parsed.reserved.supports_v2());
     }
 }

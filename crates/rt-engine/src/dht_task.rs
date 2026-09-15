@@ -1,12 +1,17 @@
 //! Minimal BEP 5 DHT service loop.
 
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::net::{IpAddr, SocketAddr, SocketAddrV4, SocketAddrV6};
-use std::sync::{Mutex, OnceLock};
+use std::net::{IpAddr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
+#[cfg(unix)]
+use std::os::fd::AsRawFd;
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use anyhow::Context;
-use rt_dht::{DhtError, DhtQuery, DhtResponse, KNode, KrpcMessage, NodeId, RoutingTable, K};
+use rt_dht::{
+    DhtError, DhtQuery, DhtResponse, DhtWant, KNode, KNode6, KrpcMessage, NodeId, RoutingTable,
+    RoutingTable6, K,
+};
 use sha1::{Digest, Sha1};
 use tokio::net::UdpSocket;
 use tokio::sync::{mpsc, oneshot};
@@ -56,6 +61,9 @@ const DHT_BOOTSTRAP_NODE_TIMEOUT: Duration = Duration::from_secs(5);
 // deadline once per torrent while a large registration burst is being drained.
 const DHT_BOOTSTRAP_RETRY: Duration = Duration::from_secs(30);
 const DHT_ENGINE_READY_SEND_TIMEOUT: Duration = Duration::from_millis(500);
+const DHT_IPV6_COMMAND_SEND_TIMEOUT: Duration = Duration::from_millis(500);
+const DHT_IPV6_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
+const DHT_IPV6_ABORT_GRACE: Duration = Duration::from_millis(100);
 
 // The node ID is sent in ordinary DHT responses and therefore cannot be used
 // as an announce-token secret. Keep rotating unpredictable secrets for the
@@ -240,6 +248,27 @@ pub struct DhtRuntimeStats {
     pub queried_nodes: u64,
 }
 
+#[derive(Debug, Clone, Default)]
+struct DhtV6Stats {
+    routing_nodes: u64,
+    announced_peer_sets: u64,
+    announced_peers: u64,
+    tracked_torrents_rejected: u64,
+    outstanding_requests: u64,
+    queried_nodes: u64,
+}
+
+type DhtV6StatsHandle = Arc<Mutex<DhtV6Stats>>;
+
+enum DhtV6Command {
+    AddTorrent(DhtTorrent),
+    RemoveTorrent {
+        info_hash: [u8; 20],
+        generation: u64,
+    },
+    Shutdown,
+}
+
 pub async fn run_dht(
     port: u16,
     listen_port: u16,
@@ -261,6 +290,33 @@ pub async fn run_dht(
         node_id = %local_id,
         "DHT UDP socket bound"
     );
+    // BEP 32 uses independent IPv4 and IPv6 DHTs. Bind IPv6 on the same
+    // externally visible port when the host provides an IPv6 socket; an IPv6
+    // failure is non-fatal because many container/network namespaces expose
+    // only IPv4.
+    let socket6 = match bind_ipv6_socket(bound.port()) {
+        Ok(socket6) => {
+            info!(
+                component = "dht",
+                operation = "listen_ipv6",
+                addr = %socket6.local_addr()?,
+                node_id = %local_id,
+                "IPv6 DHT UDP socket bound"
+            );
+            Some(socket6)
+        }
+        Err(error) => {
+            warn!(
+                component = "dht",
+                operation = "listen_ipv6",
+                port = bound.port(),
+                result = "unavailable",
+                error = %error,
+                "IPv6 DHT socket unavailable; continuing with IPv4 DHT"
+            );
+            None
+        }
+    };
     match timeout(
         DHT_ENGINE_READY_SEND_TIMEOUT,
         engine_tx.send(EngineCmd::DhtTaskReady),
@@ -320,6 +376,25 @@ pub async fn run_dht(
     };
     task.bootstrap_if_due().await;
 
+    let (ipv6_cmd_tx, ipv6_join, ipv6_stats) = if let Some(socket6) = socket6 {
+        let (cmd_tx, cmd_rx) = mpsc::channel(1024);
+        let stats = Arc::new(Mutex::new(DhtV6Stats::default()));
+        let stats_for_task = Arc::clone(&stats);
+        let bootstrap_nodes_for_task = task.bootstrap_nodes.clone();
+        let join = tokio::spawn(run_ipv6_dht(
+            socket6,
+            local_id,
+            listen_port,
+            bootstrap_nodes_for_task,
+            tracked_torrents_cap,
+            cmd_rx,
+            stats_for_task,
+        ));
+        (Some(cmd_tx), Some(join), Some(stats))
+    } else {
+        (None, None, None)
+    };
+
     let mut ingress_budget = DhtIngressBudget::new(Instant::now());
     let mut bootstrap_tick = interval(Duration::from_secs(300));
     let mut search_tick = interval(Duration::from_secs(30));
@@ -331,6 +406,7 @@ pub async fn run_dht(
     // its prefix can be parsed as a different KRPC message.
     let mut buf = vec![0u8; DHT_MAX_DATAGRAM_LEN.saturating_add(1)];
     let mut shutdown_reply = None;
+    let mut loop_error = None;
     loop {
         if let Some(cmd) = pending_commands.pop_front() {
             if let DhtCommand::Shutdown { reply } = cmd {
@@ -343,8 +419,16 @@ pub async fn run_dht(
                 shutdown_reply = Some(reply);
                 break;
             }
-            if !task.handle_command(cmd).await {
-                break;
+            forward_ipv6_command(ipv6_cmd_tx.as_ref(), &cmd).await;
+            match cmd {
+                DhtCommand::GetStats { reply } => {
+                    let _ = reply.send(merge_v6_stats(task.runtime_stats(), ipv6_stats.as_ref()));
+                }
+                cmd => {
+                    if !task.handle_command(cmd).await {
+                        break;
+                    }
+                }
             }
             continue;
         }
@@ -369,8 +453,16 @@ pub async fn run_dht(
                     shutdown_reply = Some(reply);
                     break;
                 }
-                if !task.handle_command(cmd).await {
-                    break;
+                forward_ipv6_command(ipv6_cmd_tx.as_ref(), &cmd).await;
+                match cmd {
+                    DhtCommand::GetStats { reply } => {
+                        let _ = reply.send(merge_v6_stats(task.runtime_stats(), ipv6_stats.as_ref()));
+                    }
+                    cmd => {
+                        if !task.handle_command(cmd).await {
+                            break;
+                        }
+                    }
                 }
             }
             _ = bootstrap_tick.tick() => {
@@ -416,9 +508,45 @@ pub async fn run_dht(
                         }
                     }
                     Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
-                    Err(e) => return Err(e).context("receiving DHT UDP datagram"),
+                    Err(e) => {
+                        loop_error = Some(anyhow::Error::new(e));
+                        break;
+                    }
                 }
             }
+        }
+    }
+    if let Some(cmd_tx) = ipv6_cmd_tx {
+        match timeout(
+            DHT_IPV6_COMMAND_SEND_TIMEOUT,
+            cmd_tx.send(DhtV6Command::Shutdown),
+        )
+        .await
+        {
+            Ok(Ok(())) => {}
+            Ok(Err(_)) => {}
+            Err(_) => {
+                warn!(
+                    component = "dht",
+                    operation = "shutdown_ipv6",
+                    result = "command_timeout",
+                    timeout_ms = DHT_IPV6_COMMAND_SEND_TIMEOUT.as_millis() as u64,
+                    "IPv6 DHT shutdown command could not be queued before the deadline"
+                );
+            }
+        }
+    }
+    if let Some(mut join) = ipv6_join {
+        if timeout(DHT_IPV6_SHUTDOWN_TIMEOUT, &mut join).await.is_err() {
+            warn!(
+                component = "dht",
+                operation = "shutdown_ipv6",
+                result = "timeout",
+                timeout_ms = DHT_IPV6_SHUTDOWN_TIMEOUT.as_millis() as u64,
+                "IPv6 DHT task did not stop before the shutdown deadline; aborting it"
+            );
+            join.abort();
+            let _ = timeout(DHT_IPV6_ABORT_GRACE, &mut join).await;
         }
     }
     // Drop the socket-owning task before acknowledging shutdown. Callers can
@@ -427,7 +555,7 @@ pub async fn run_dht(
     if let Some(reply) = shutdown_reply {
         let _ = reply.send(());
     }
-    Ok(())
+    loop_error.map_or(Ok(()), Err)
 }
 
 struct DhtTask {
@@ -875,9 +1003,29 @@ impl DhtTask {
                 transaction_id,
                 response: self.closest_response(target),
             },
+            DhtQuery::FindNodeWithWant { target, want, .. } => KrpcMessage::Response {
+                transaction_id,
+                response: if want.contains(&DhtWant::Ipv4) {
+                    self.closest_response(target)
+                } else {
+                    DhtResponse::new(self.local_id)
+                },
+            },
             DhtQuery::GetPeers { info_hash, .. } => KrpcMessage::Response {
                 transaction_id,
                 response: self.get_peers_response(info_hash, addr),
+            },
+            DhtQuery::GetPeersWithWant {
+                info_hash, want, ..
+            } => KrpcMessage::Response {
+                transaction_id,
+                response: if want.contains(&DhtWant::Ipv4) {
+                    self.get_peers_response(info_hash, addr)
+                } else {
+                    let mut response = DhtResponse::new(self.local_id);
+                    response.token = Some(self.token_for_addr(addr));
+                    response
+                },
             },
             DhtQuery::AnnouncePeer {
                 implied_port,
@@ -1360,7 +1508,9 @@ impl DhtTask {
         let id = match query {
             DhtQuery::Ping { id }
             | DhtQuery::FindNode { id, .. }
+            | DhtQuery::FindNodeWithWant { id, .. }
             | DhtQuery::GetPeers { id, .. }
+            | DhtQuery::GetPeersWithWant { id, .. }
             | DhtQuery::AnnouncePeer { id, .. } => *id,
         };
         self.remember_node(id, addr);
@@ -1430,6 +1580,10 @@ impl DhtTask {
             }
             fresh
         });
+        // Keep timed-out addresses in `queried_nodes` for this lookup round.
+        // The continuation must advance to other routing-table candidates
+        // instead of immediately selecting the same silent K nodes again.
+        // The bounded history is cleared on the next full lookup restart.
         let pruned = before - self.outstanding.len();
         if pruned > 0 {
             debug!(
@@ -1441,6 +1595,872 @@ impl DhtTask {
             );
         }
         lookup_info_hashes.into_iter().collect()
+    }
+}
+
+fn bind_ipv6_socket(port: u16) -> std::io::Result<UdpSocket> {
+    let socket = std::net::UdpSocket::bind((Ipv6Addr::UNSPECIFIED, port))?;
+    #[cfg(unix)]
+    {
+        let value: libc::c_int = 1;
+        let result = unsafe {
+            libc::setsockopt(
+                socket.as_raw_fd(),
+                libc::IPPROTO_IPV6,
+                libc::IPV6_V6ONLY,
+                (&value as *const libc::c_int).cast(),
+                std::mem::size_of_val(&value) as libc::socklen_t,
+            )
+        };
+        if result != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+    }
+    socket.set_nonblocking(true)?;
+    UdpSocket::from_std(socket)
+}
+
+async fn forward_ipv6_command(cmd_tx: Option<&mpsc::Sender<DhtV6Command>>, cmd: &DhtCommand) {
+    let Some(cmd_tx) = cmd_tx else {
+        return;
+    };
+    let command = match cmd {
+        DhtCommand::AddTorrent(torrent) => Some(DhtV6Command::AddTorrent(torrent.clone())),
+        DhtCommand::RemoveTorrent {
+            info_hash,
+            generation,
+        } => Some(DhtV6Command::RemoveTorrent {
+            info_hash: *info_hash,
+            generation: *generation,
+        }),
+        DhtCommand::GetStats { .. } | DhtCommand::Shutdown { .. } => None,
+    };
+    if let Some(command) = command {
+        match timeout(DHT_IPV6_COMMAND_SEND_TIMEOUT, cmd_tx.send(command)).await {
+            Ok(Ok(())) => {}
+            Ok(Err(_)) => {
+                warn!(
+                    component = "dht",
+                    operation = "forward_ipv6_command",
+                    result = "closed",
+                    "IPv6 DHT command channel is closed"
+                );
+            }
+            Err(_) => {
+                warn!(
+                    component = "dht",
+                    operation = "forward_ipv6_command",
+                    result = "timeout",
+                    timeout_ms = DHT_IPV6_COMMAND_SEND_TIMEOUT.as_millis() as u64,
+                    "IPv6 DHT command channel remained full; dropping this mirrored command"
+                );
+            }
+        }
+    }
+}
+
+fn merge_v6_stats(mut stats: DhtRuntimeStats, ipv6: Option<&DhtV6StatsHandle>) -> DhtRuntimeStats {
+    let Some(ipv6) = ipv6 else {
+        return stats;
+    };
+    let Ok(ipv6) = ipv6.lock() else {
+        return stats;
+    };
+    stats.routing_nodes = stats.routing_nodes.saturating_add(ipv6.routing_nodes);
+    stats.announced_peer_sets = stats
+        .announced_peer_sets
+        .saturating_add(ipv6.announced_peer_sets);
+    stats.announced_peers = stats.announced_peers.saturating_add(ipv6.announced_peers);
+    stats.tracked_torrents_rejected = stats
+        .tracked_torrents_rejected
+        .saturating_add(ipv6.tracked_torrents_rejected);
+    stats.outstanding_requests = stats
+        .outstanding_requests
+        .saturating_add(ipv6.outstanding_requests);
+    stats.queried_nodes = stats.queried_nodes.saturating_add(ipv6.queried_nodes);
+    stats
+}
+
+async fn run_ipv6_dht(
+    socket: UdpSocket,
+    local_id: NodeId,
+    listen_port: u16,
+    bootstrap_nodes: Vec<String>,
+    tracked_torrents_cap: usize,
+    cmd_rx: mpsc::Receiver<DhtV6Command>,
+    stats: DhtV6StatsHandle,
+) -> anyhow::Result<()> {
+    let mut task = DhtV6Task {
+        local_id,
+        table: RoutingTable6::new(local_id),
+        socket,
+        listen_port,
+        bootstrap_nodes,
+        tracked_torrents_cap,
+        tracked_torrents_rejected: 0,
+        next_tx: {
+            let seed = *NodeId::random().as_bytes();
+            u16::from_be_bytes([seed[2], seed[3]]).max(1)
+        },
+        outstanding: HashMap::new(),
+        queried_nodes: HashMap::new(),
+        queried_node_count: 0,
+        torrents: HashMap::new(),
+        generations: HashMap::new(),
+        announced_peers: HashMap::new(),
+        announced_peer_count: 0,
+        last_full_lookup: HashMap::new(),
+        pending_peer_forwards: HashMap::new(),
+        pending_peer_count: 0,
+        last_bootstrap_at: None,
+        stats,
+    };
+    task.bootstrap_if_due().await;
+
+    let mut cmd_rx = cmd_rx;
+    let mut bootstrap_tick = interval(Duration::from_secs(300));
+    let mut search_tick = interval(Duration::from_secs(30));
+    let mut outstanding_sweep_tick = interval(Duration::from_secs(10));
+    let mut pending_forward_tick = interval(Duration::from_millis(100));
+    let mut ingress_budget = DhtIngressBudget::new(Instant::now());
+    let mut buf = vec![0u8; DHT_MAX_DATAGRAM_LEN.saturating_add(1)];
+
+    loop {
+        tokio::select! {
+            command = cmd_rx.recv() => {
+                match command {
+                    Some(DhtV6Command::AddTorrent(torrent)) => {
+                        task.handle_command(DhtV6Command::AddTorrent(torrent)).await;
+                    }
+                    Some(DhtV6Command::RemoveTorrent { info_hash, generation }) => {
+                        task.handle_command(DhtV6Command::RemoveTorrent { info_hash, generation }).await;
+                    }
+                    Some(DhtV6Command::Shutdown) | None => break,
+                }
+            }
+            _ = bootstrap_tick.tick() => {
+                if task.table.total_nodes() < K {
+                    task.bootstrap_if_due().await;
+                }
+            }
+            _ = search_tick.tick() => task.search_torrents().await,
+            _ = outstanding_sweep_tick.tick() => {
+                for info_hash in task.prune_stale_outstanding() {
+                    task.continue_lookup(info_hash).await;
+                }
+            }
+            _ = pending_forward_tick.tick() => {
+                task.prune_closed_torrents();
+                task.flush_pending_peer_forwards();
+            }
+            recv = task.socket.recv_from(&mut buf) => {
+                match recv {
+                    Ok((n, addr)) => {
+                        if !ingress_budget.allow(addr, Instant::now()) {
+                            debug!(component = "dht", operation = "ingress_rate_limit", peer = %addr, result = "rejected", "IPv6 DHT packet rate limit exceeded");
+                        } else if n > DHT_MAX_DATAGRAM_LEN {
+                            debug!(component = "dht", operation = "ingress_size_limit", peer = %addr, bytes = n, result = "rejected", "IPv6 DHT datagram exceeds configured parser limit");
+                        } else if addr.is_ipv6() {
+                            task.handle_packet(&buf[..n], addr).await;
+                        }
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+                    Err(error) => return Err(error).context("receiving IPv6 DHT UDP datagram"),
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+struct DhtV6Task {
+    local_id: NodeId,
+    table: RoutingTable6,
+    socket: UdpSocket,
+    listen_port: u16,
+    bootstrap_nodes: Vec<String>,
+    tracked_torrents_cap: usize,
+    tracked_torrents_rejected: u64,
+    next_tx: u16,
+    outstanding: HashMap<Vec<u8>, OutstandingQuery>,
+    queried_nodes: HashMap<[u8; 20], HashSet<SocketAddrV6>>,
+    queried_node_count: usize,
+    torrents: HashMap<[u8; 20], mpsc::Sender<TorrentCmd>>,
+    generations: HashMap<[u8; 20], u64>,
+    announced_peers: HashMap<[u8; 20], Vec<SocketAddr>>,
+    announced_peer_count: usize,
+    last_full_lookup: HashMap<[u8; 20], Instant>,
+    pending_peer_forwards: HashMap<[u8; 20], PendingPeerForward>,
+    pending_peer_count: usize,
+    last_bootstrap_at: Option<Instant>,
+    stats: DhtV6StatsHandle,
+}
+
+impl DhtV6Task {
+    /// Keep removed torrent generations as bounded tombstones, matching the
+    /// IPv4 DHT actor. Without this cap, a long-running daemon accumulates one
+    /// hash entry for every torrent incarnation ever seen on IPv6.
+    fn accept_generation(&mut self, info_hash: [u8; 20], generation: u64) -> bool {
+        if self
+            .generations
+            .get(&info_hash)
+            .is_some_and(|current| *current >= generation)
+        {
+            return false;
+        }
+        if !self.generations.contains_key(&info_hash)
+            && self.generations.len() >= self.tracked_torrents_cap.saturating_mul(2)
+        {
+            let evictable = self
+                .generations
+                .keys()
+                .find(|candidate| !self.torrents.contains_key(*candidate))
+                .copied();
+            let Some(evictable) = evictable else {
+                return false;
+            };
+            self.generations.remove(&evictable);
+        }
+        self.generations.insert(info_hash, generation);
+        true
+    }
+
+    async fn handle_command(&mut self, command: DhtV6Command) {
+        match command {
+            DhtV6Command::AddTorrent(torrent) => {
+                if !self.torrents.contains_key(&torrent.info_hash)
+                    && self.torrents.len() >= self.tracked_torrents_cap
+                {
+                    self.tracked_torrents_rejected =
+                        self.tracked_torrents_rejected.saturating_add(1);
+                    self.update_stats();
+                    return;
+                }
+                if !self.accept_generation(torrent.info_hash, torrent.generation) {
+                    self.update_stats();
+                    return;
+                }
+                self.remove_lookup_state(torrent.info_hash);
+                self.torrents.insert(torrent.info_hash, torrent.cmd_tx);
+                self.search_torrent(torrent.info_hash, true).await;
+            }
+            DhtV6Command::RemoveTorrent {
+                info_hash,
+                generation,
+            } => {
+                if !self.accept_generation(info_hash, generation) {
+                    self.update_stats();
+                    return;
+                }
+                self.remove_torrent(info_hash);
+            }
+            DhtV6Command::Shutdown => {}
+        }
+        self.update_stats();
+    }
+
+    fn remove_lookup_state(&mut self, info_hash: [u8; 20]) {
+        self.outstanding.retain(|_, query| {
+            !matches!(query.request, DhtRequest::GetPeers(candidate) if candidate == info_hash)
+        });
+        if let Some(nodes) = self.queried_nodes.remove(&info_hash) {
+            self.queried_node_count = self.queried_node_count.saturating_sub(nodes.len());
+        }
+        self.last_full_lookup.remove(&info_hash);
+        if let Some(pending) = self.pending_peer_forwards.remove(&info_hash) {
+            self.pending_peer_count = self.pending_peer_count.saturating_sub(pending.peers.len());
+        }
+    }
+
+    fn remove_torrent(&mut self, info_hash: [u8; 20]) {
+        self.torrents.remove(&info_hash);
+        self.remove_lookup_state(info_hash);
+        if let Some(peers) = self.announced_peers.remove(&info_hash) {
+            self.announced_peer_count = self.announced_peer_count.saturating_sub(peers.len());
+        }
+    }
+
+    fn prune_closed_torrents(&mut self) {
+        let closed = self
+            .torrents
+            .iter()
+            .filter_map(|(hash, tx)| tx.is_closed().then_some(*hash))
+            .collect::<Vec<_>>();
+        for info_hash in closed {
+            self.remove_torrent(info_hash);
+        }
+        self.update_stats();
+    }
+
+    async fn bootstrap(&mut self) {
+        let node_count = self.bootstrap_nodes.len().min(MAX_DHT_BOOTSTRAP_NODES);
+        let deadline = Instant::now() + DHT_BOOTSTRAP_DEADLINE;
+        let bootstrap_nodes = self
+            .bootstrap_nodes
+            .iter()
+            .take(node_count)
+            .cloned()
+            .collect::<Vec<_>>();
+        for node in bootstrap_nodes {
+            let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+                break;
+            };
+            let addrs = match timeout(
+                remaining.min(DHT_BOOTSTRAP_NODE_TIMEOUT),
+                tokio::net::lookup_host(&node),
+            )
+            .await
+            {
+                Ok(Ok(addrs)) => addrs
+                    .filter(SocketAddr::is_ipv6)
+                    .take(MAX_DHT_BOOTSTRAP_ADDRESSES.saturating_add(1))
+                    .collect::<Vec<_>>(),
+                _ => continue,
+            };
+            for addr in addrs.into_iter().take(MAX_DHT_BOOTSTRAP_ADDRESSES) {
+                let tx = self.transaction_id();
+                let message = KrpcMessage::Query {
+                    transaction_id: tx.clone(),
+                    query: DhtQuery::FindNodeWithWant {
+                        id: self.local_id,
+                        target: self.local_id,
+                        want: vec![DhtWant::Ipv6],
+                    },
+                };
+                if !self.insert_outstanding(
+                    tx.clone(),
+                    OutstandingQuery {
+                        addr,
+                        request: DhtRequest::Bootstrap,
+                        sent_at: Instant::now(),
+                    },
+                ) {
+                    break;
+                }
+                if self.socket.send_to(&message.encode(), addr).await.is_err() {
+                    self.outstanding.remove(&tx);
+                }
+            }
+        }
+    }
+
+    async fn bootstrap_if_due(&mut self) {
+        let now = Instant::now();
+        if !DhtTask::bootstrap_attempt_is_due(self.last_bootstrap_at, now) {
+            return;
+        }
+        self.last_bootstrap_at = Some(now);
+        self.bootstrap().await;
+    }
+
+    async fn handle_packet(&mut self, packet: &[u8], addr: SocketAddr) {
+        let Ok(message) = KrpcMessage::parse(packet) else {
+            return;
+        };
+        match message {
+            KrpcMessage::Query {
+                transaction_id,
+                query,
+            } => {
+                self.remember_query_sender(&query, addr);
+                self.handle_query(transaction_id, query, addr).await;
+            }
+            KrpcMessage::Response {
+                transaction_id,
+                response,
+            } => {
+                let Some(outstanding) = self.outstanding.get(&transaction_id).copied() else {
+                    return;
+                };
+                if outstanding.addr != addr || !addr.is_ipv6() {
+                    return;
+                }
+                self.outstanding.remove(&transaction_id);
+                self.remember_node(response.id, addr);
+                for node in response.nodes6 {
+                    self.table.insert(node);
+                }
+                if let DhtRequest::GetPeers(info_hash) = outstanding.request {
+                    if let Some(token) = response.token {
+                        self.announce_peer_to_node(info_hash, token, addr).await;
+                    }
+                    self.forward_peers(
+                        info_hash,
+                        response
+                            .values
+                            .into_iter()
+                            .filter(SocketAddr::is_ipv6)
+                            .collect(),
+                    );
+                    self.continue_lookup(info_hash).await;
+                }
+            }
+            KrpcMessage::Error { transaction_id, .. } => {
+                let Some(outstanding) = self.outstanding.get(&transaction_id).copied() else {
+                    return;
+                };
+                if outstanding.addr != addr {
+                    return;
+                }
+                self.outstanding.remove(&transaction_id);
+                if let DhtRequest::GetPeers(info_hash) = outstanding.request {
+                    self.continue_lookup(info_hash).await;
+                }
+            }
+        }
+        self.update_stats();
+    }
+
+    async fn handle_query(&mut self, transaction_id: Vec<u8>, query: DhtQuery, addr: SocketAddr) {
+        let response = match query {
+            DhtQuery::Ping { .. } => KrpcMessage::Response {
+                transaction_id,
+                response: DhtResponse::new(self.local_id),
+            },
+            DhtQuery::FindNode { target, .. } => KrpcMessage::Response {
+                transaction_id,
+                response: self.closest_response(target, true),
+            },
+            DhtQuery::FindNodeWithWant { target, want, .. } => KrpcMessage::Response {
+                transaction_id,
+                response: self.closest_response(target, want.contains(&DhtWant::Ipv6)),
+            },
+            DhtQuery::GetPeers { info_hash, .. } => KrpcMessage::Response {
+                transaction_id,
+                response: self.get_peers_response(info_hash, addr, true),
+            },
+            DhtQuery::GetPeersWithWant {
+                info_hash, want, ..
+            } => KrpcMessage::Response {
+                transaction_id,
+                response: self.get_peers_response(info_hash, addr, want.contains(&DhtWant::Ipv6)),
+            },
+            DhtQuery::AnnouncePeer {
+                implied_port,
+                info_hash,
+                port,
+                token,
+                ..
+            } => self.handle_announce_peer(
+                transaction_id,
+                addr,
+                implied_port,
+                info_hash,
+                port,
+                token,
+            ),
+        };
+        let Some(encoded) = encode_dht_response_bounded(response) else {
+            return;
+        };
+        let _ = self.socket.send_to(&encoded, addr).await;
+    }
+
+    fn closest_response(&self, target: NodeId, include_v6: bool) -> DhtResponse {
+        let mut response = DhtResponse::new(self.local_id);
+        if include_v6 {
+            response.nodes6 = self
+                .table
+                .closest(&target, K)
+                .into_iter()
+                .cloned()
+                .collect();
+        }
+        response
+    }
+
+    fn get_peers_response(
+        &self,
+        info_hash: [u8; 20],
+        addr: SocketAddr,
+        include_v6: bool,
+    ) -> DhtResponse {
+        let mut response = self.closest_response(NodeId::from_bytes(info_hash), include_v6);
+        response.token = Some(self.token_for_addr(addr));
+        if include_v6 {
+            if let Some(peers) = self.announced_peers.get(&info_hash) {
+                response.values = peers.iter().copied().filter(SocketAddr::is_ipv6).collect();
+                if !response.values.is_empty() {
+                    response.nodes6.clear();
+                }
+            }
+        }
+        response
+    }
+
+    fn handle_announce_peer(
+        &mut self,
+        transaction_id: Vec<u8>,
+        addr: SocketAddr,
+        implied_port: bool,
+        info_hash: [u8; 20],
+        port: u16,
+        token: Vec<u8>,
+    ) -> KrpcMessage {
+        if !addr.is_ipv6()
+            || !dht_token_secrets(Instant::now())
+                .iter()
+                .any(|secret| dht_token_for_secret(addr, secret) == token)
+        {
+            return KrpcMessage::Error {
+                transaction_id,
+                error: DhtError {
+                    code: 203,
+                    message: "bad token".to_owned(),
+                },
+            };
+        }
+        let peer = if implied_port {
+            addr
+        } else {
+            socket_addr_with_port(addr, port)
+        };
+        remember_announced_peer_in_map(
+            &mut self.announced_peers,
+            &mut self.announced_peer_count,
+            info_hash,
+            peer,
+        );
+        KrpcMessage::Response {
+            transaction_id,
+            response: DhtResponse::new(self.local_id),
+        }
+    }
+
+    fn token_for_addr(&self, addr: SocketAddr) -> Vec<u8> {
+        let secret = dht_token_secrets(Instant::now())
+            .into_iter()
+            .next()
+            .expect("DHT token secret cache always has a current secret");
+        dht_token_for_secret(addr, &secret)
+    }
+
+    async fn search_torrents(&mut self) {
+        let mut budget = DHT_QUERIED_NODES_GLOBAL_CAP;
+        for info_hash in self.torrents.keys().copied().collect::<Vec<_>>() {
+            if budget == 0 {
+                break;
+            }
+            budget = self
+                .search_torrent_with_budget(info_hash, false, budget)
+                .await;
+        }
+    }
+
+    async fn search_torrent(&mut self, info_hash: [u8; 20], force_restart: bool) {
+        self.search_torrent_with_budget(info_hash, force_restart, DHT_QUERIED_NODES_GLOBAL_CAP)
+            .await;
+    }
+
+    async fn search_torrent_with_budget(
+        &mut self,
+        info_hash: [u8; 20],
+        force_restart: bool,
+        mut budget: usize,
+    ) -> usize {
+        self.maybe_restart_lookup(info_hash, force_restart);
+        budget = budget.min(DHT_QUERIED_NODES_GLOBAL_CAP.saturating_sub(self.queried_node_count));
+        let nodes = self
+            .table
+            .closest(&NodeId::from_bytes(info_hash), K)
+            .into_iter()
+            .map(|node| node.addr)
+            .collect::<Vec<_>>();
+        if nodes.is_empty() {
+            self.bootstrap_if_due().await;
+            return budget;
+        }
+        for addr in nodes {
+            if budget == 0 {
+                break;
+            }
+            if self.send_get_peers(info_hash, addr).await {
+                budget -= 1;
+            }
+        }
+        budget
+    }
+
+    fn maybe_restart_lookup(&mut self, info_hash: [u8; 20], force_restart: bool) {
+        const RESTART_AFTER: Duration = Duration::from_secs(120);
+        let now = Instant::now();
+        if force_restart
+            || self
+                .last_full_lookup
+                .get(&info_hash)
+                .is_none_or(|last| now.duration_since(*last) >= RESTART_AFTER)
+        {
+            if let Some(nodes) = self.queried_nodes.remove(&info_hash) {
+                self.queried_node_count = self.queried_node_count.saturating_sub(nodes.len());
+            }
+            self.last_full_lookup.insert(info_hash, now);
+        }
+    }
+
+    async fn continue_lookup(&mut self, info_hash: [u8; 20]) {
+        if !self.torrents.contains_key(&info_hash) {
+            return;
+        }
+        let mut budget = DHT_QUERIED_NODES_GLOBAL_CAP.saturating_sub(self.queried_node_count);
+        let addrs = self
+            .table
+            .closest(
+                &NodeId::from_bytes(info_hash),
+                DHT_QUERIED_NODES_PER_INFO_HASH_CAP,
+            )
+            .into_iter()
+            .filter_map(|node| {
+                let already = self
+                    .queried_nodes
+                    .get(&info_hash)
+                    .is_some_and(|nodes| nodes.contains(&node.addr));
+                (!already).then_some(node.addr)
+            })
+            .collect::<Vec<_>>();
+        for addr in addrs.into_iter().take(K) {
+            if budget == 0 {
+                break;
+            }
+            if self.send_get_peers(info_hash, addr).await {
+                budget -= 1;
+            }
+        }
+    }
+
+    async fn send_get_peers(&mut self, info_hash: [u8; 20], addr: SocketAddrV6) -> bool {
+        if self.outstanding.len() >= DHT_OUTSTANDING_QUERY_CAP
+            || self
+                .queried_nodes
+                .get(&info_hash)
+                .is_some_and(|nodes| nodes.len() >= DHT_QUERIED_NODES_PER_INFO_HASH_CAP)
+        {
+            return false;
+        }
+        if !self
+            .queried_nodes
+            .entry(info_hash)
+            .or_default()
+            .insert(addr)
+        {
+            return false;
+        }
+        self.queried_node_count = self.queried_node_count.saturating_add(1);
+        let tx = self.transaction_id();
+        let message = KrpcMessage::Query {
+            transaction_id: tx.clone(),
+            query: DhtQuery::GetPeersWithWant {
+                id: self.local_id,
+                info_hash,
+                want: vec![DhtWant::Ipv6],
+            },
+        };
+        if !self.insert_outstanding(
+            tx.clone(),
+            OutstandingQuery {
+                addr: SocketAddr::V6(addr),
+                request: DhtRequest::GetPeers(info_hash),
+                sent_at: Instant::now(),
+            },
+        ) {
+            self.remove_queried(info_hash, addr);
+            return false;
+        }
+        if self.socket.send_to(&message.encode(), addr).await.is_err() {
+            self.outstanding.remove(&tx);
+            self.remove_queried(info_hash, addr);
+            return false;
+        }
+        true
+    }
+
+    fn remove_queried(&mut self, info_hash: [u8; 20], addr: SocketAddrV6) {
+        if let Some(nodes) = self.queried_nodes.get_mut(&info_hash) {
+            if nodes.remove(&addr) {
+                self.queried_node_count = self.queried_node_count.saturating_sub(1);
+            }
+            if nodes.is_empty() {
+                self.queried_nodes.remove(&info_hash);
+            }
+        }
+    }
+
+    async fn announce_peer_to_node(
+        &mut self,
+        info_hash: [u8; 20],
+        token: Vec<u8>,
+        addr: SocketAddr,
+    ) {
+        let tx = self.transaction_id();
+        let message = KrpcMessage::Query {
+            transaction_id: tx.clone(),
+            query: DhtQuery::AnnouncePeer {
+                id: self.local_id,
+                implied_port: false,
+                info_hash,
+                port: self.listen_port,
+                token,
+            },
+        };
+        if !self.insert_outstanding(
+            tx.clone(),
+            OutstandingQuery {
+                addr,
+                request: DhtRequest::AnnouncePeer,
+                sent_at: Instant::now(),
+            },
+        ) {
+            return;
+        }
+        if self.socket.send_to(&message.encode(), addr).await.is_err() {
+            self.outstanding.remove(&tx);
+        }
+    }
+
+    fn forward_peers(&mut self, info_hash: [u8; 20], peers: Vec<SocketAddr>) {
+        let peers = peers
+            .into_iter()
+            .filter(SocketAddr::is_ipv6)
+            .collect::<Vec<_>>();
+        if peers.is_empty() {
+            return;
+        }
+        let Some(cmd_tx) = self.torrents.get(&info_hash).cloned() else {
+            return;
+        };
+        if self.pending_peer_forwards.contains_key(&info_hash) {
+            self.queue_pending_peer_forward(info_hash, cmd_tx, peers);
+            self.flush_pending_peer_forward(info_hash);
+            return;
+        }
+        match cmd_tx.try_send(TorrentCmd::NewPeers(peers)) {
+            Ok(()) => {}
+            Err(mpsc::error::TrySendError::Closed(_)) => self.remove_torrent(info_hash),
+            Err(mpsc::error::TrySendError::Full(TorrentCmd::NewPeers(peers))) => {
+                self.queue_pending_peer_forward(info_hash, cmd_tx, peers)
+            }
+            Err(mpsc::error::TrySendError::Full(_)) => unreachable!(),
+        }
+    }
+
+    fn queue_pending_peer_forward(
+        &mut self,
+        info_hash: [u8; 20],
+        cmd_tx: mpsc::Sender<TorrentCmd>,
+        peers: Vec<SocketAddr>,
+    ) {
+        let pending = self
+            .pending_peer_forwards
+            .entry(info_hash)
+            .or_insert_with(|| PendingPeerForward {
+                cmd_tx,
+                peers: Vec::new(),
+            });
+        for peer in peers {
+            if pending.peers.contains(&peer)
+                || pending.peers.len() >= DHT_PENDING_FORWARD_PEERS_PER_TORRENT_CAP
+                || self.pending_peer_count >= DHT_PENDING_FORWARD_PEERS_GLOBAL_CAP
+            {
+                break;
+            }
+            pending.peers.push(peer);
+            self.pending_peer_count = self.pending_peer_count.saturating_add(1);
+        }
+    }
+
+    fn flush_pending_peer_forwards(&mut self) {
+        let hashes = self
+            .pending_peer_forwards
+            .keys()
+            .copied()
+            .collect::<Vec<_>>();
+        for info_hash in hashes {
+            self.flush_pending_peer_forward(info_hash);
+        }
+    }
+
+    fn flush_pending_peer_forward(&mut self, info_hash: [u8; 20]) {
+        let Some(pending) = self.pending_peer_forwards.remove(&info_hash) else {
+            return;
+        };
+        self.pending_peer_count = self.pending_peer_count.saturating_sub(pending.peers.len());
+        match pending.cmd_tx.try_send(TorrentCmd::NewPeers(pending.peers)) {
+            Ok(()) => {}
+            Err(mpsc::error::TrySendError::Full(TorrentCmd::NewPeers(peers))) => {
+                self.pending_peer_count = self.pending_peer_count.saturating_add(peers.len());
+                self.pending_peer_forwards.insert(
+                    info_hash,
+                    PendingPeerForward {
+                        cmd_tx: pending.cmd_tx,
+                        peers,
+                    },
+                );
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => self.remove_torrent(info_hash),
+            Err(mpsc::error::TrySendError::Full(_)) => unreachable!(),
+        }
+    }
+
+    fn remember_query_sender(&mut self, query: &DhtQuery, addr: SocketAddr) {
+        let id = match query {
+            DhtQuery::Ping { id }
+            | DhtQuery::FindNode { id, .. }
+            | DhtQuery::FindNodeWithWant { id, .. }
+            | DhtQuery::GetPeers { id, .. }
+            | DhtQuery::GetPeersWithWant { id, .. }
+            | DhtQuery::AnnouncePeer { id, .. } => *id,
+        };
+        self.remember_node(id, addr);
+    }
+
+    fn remember_node(&mut self, id: NodeId, addr: SocketAddr) {
+        if let SocketAddr::V6(addr) = addr {
+            self.table.insert(KNode6 { id, addr });
+        }
+    }
+
+    fn transaction_id(&mut self) -> Vec<u8> {
+        loop {
+            let tx = self.next_tx.to_be_bytes().to_vec();
+            self.next_tx = self.next_tx.wrapping_add(1).max(1);
+            if !self.outstanding.contains_key(&tx) {
+                return tx;
+            }
+        }
+    }
+
+    fn insert_outstanding(&mut self, tx: Vec<u8>, query: OutstandingQuery) -> bool {
+        if self.outstanding.len() >= DHT_OUTSTANDING_QUERY_CAP
+            && !self.outstanding.contains_key(&tx)
+        {
+            return false;
+        }
+        self.outstanding.insert(tx, query);
+        true
+    }
+
+    fn prune_stale_outstanding(&mut self) -> Vec<[u8; 20]> {
+        let mut hashes = HashSet::new();
+        self.outstanding.retain(|_, query| {
+            let fresh = query.sent_at.elapsed() < OUTSTANDING_QUERY_TTL;
+            if !fresh {
+                if let DhtRequest::GetPeers(info_hash) = query.request {
+                    hashes.insert(info_hash);
+                }
+            }
+            fresh
+        });
+        hashes.into_iter().collect()
+    }
+
+    fn update_stats(&self) {
+        if let Ok(mut stats) = self.stats.lock() {
+            stats.routing_nodes = self.table.total_nodes() as u64;
+            stats.announced_peer_sets = self.announced_peers.len() as u64;
+            stats.announced_peers = self.announced_peer_count as u64;
+            stats.tracked_torrents_rejected = self.tracked_torrents_rejected;
+            stats.outstanding_requests = self.outstanding.len() as u64;
+            stats.queried_nodes = self.queried_node_count as u64;
+        }
     }
 }
 
@@ -1585,6 +2605,69 @@ mod tests {
         assert!(task.await.expect("DHT task panicked").is_ok());
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn forwarding_ipv6_command_has_bounded_queue_wait() {
+        let (cmd_tx, mut cmd_rx) = mpsc::channel(1);
+        cmd_tx
+            .try_send(DhtV6Command::Shutdown)
+            .expect("test should fill the IPv6 command queue");
+        let command = DhtCommand::RemoveTorrent {
+            info_hash: [1; 20],
+            generation: 1,
+        };
+        let mut forward = std::pin::pin!(forward_ipv6_command(Some(&cmd_tx), &command));
+        tokio::task::yield_now().await;
+        tokio::time::advance(DHT_IPV6_COMMAND_SEND_TIMEOUT).await;
+        timeout(Duration::from_secs(1), &mut forward)
+            .await
+            .expect("full IPv6 command queue should not stall the IPv4 DHT actor");
+        assert!(matches!(cmd_rx.try_recv(), Ok(DhtV6Command::Shutdown)));
+    }
+
+    #[tokio::test]
+    async fn ipv6_generation_tombstones_are_bounded() {
+        let socket = match bind_ipv6_socket(0) {
+            Ok(socket) => socket,
+            Err(_) => return,
+        };
+        let local_id = NodeId::from_bytes([2; 20]);
+        let tracked_torrents_cap = 2;
+        let mut task = DhtV6Task {
+            local_id,
+            table: RoutingTable6::new(local_id),
+            socket,
+            listen_port: 6881,
+            bootstrap_nodes: Vec::new(),
+            tracked_torrents_cap,
+            tracked_torrents_rejected: 0,
+            next_tx: 1,
+            outstanding: HashMap::new(),
+            queried_nodes: HashMap::new(),
+            queried_node_count: 0,
+            torrents: HashMap::new(),
+            generations: HashMap::new(),
+            announced_peers: HashMap::new(),
+            announced_peer_count: 0,
+            last_full_lookup: HashMap::new(),
+            pending_peer_forwards: HashMap::new(),
+            pending_peer_count: 0,
+            last_bootstrap_at: None,
+            stats: Arc::new(Mutex::new(DhtV6Stats::default())),
+        };
+
+        for index in 0..32_u64 {
+            let mut info_hash = [0; 20];
+            info_hash[..8].copy_from_slice(&index.to_be_bytes());
+            task.handle_command(DhtV6Command::RemoveTorrent {
+                info_hash,
+                generation: 1,
+            })
+            .await;
+        }
+
+        assert!(task.generations.len() <= tracked_torrents_cap * 2);
+    }
+
     #[test]
     fn bootstrap_attempts_are_rate_limited() {
         let first = Instant::now();
@@ -1650,6 +2733,7 @@ mod tests {
         let response = DhtResponse {
             id: NodeId::from_bytes([1; 20]),
             nodes: Vec::new(),
+            nodes6: Vec::new(),
             values: (1..=DHT_ANNOUNCED_PEERS_PER_INFO_HASH_CAP)
                 .map(|port| {
                     SocketAddr::V4(SocketAddrV4::new(
@@ -2505,6 +3589,7 @@ mod tests {
             response: DhtResponse {
                 id: remote_id,
                 nodes: Vec::new(),
+                nodes6: Vec::new(),
                 values: vec![discovered_peer],
                 token: None,
             },
@@ -2569,6 +3654,7 @@ mod tests {
             response: DhtResponse {
                 id: remote_id,
                 nodes: Vec::new(),
+                nodes6: Vec::new(),
                 values: vec![discovered_peer],
                 token: None,
             },
@@ -2636,6 +3722,7 @@ mod tests {
             response: DhtResponse {
                 id: remote_id,
                 nodes: Vec::new(),
+                nodes6: Vec::new(),
                 values: vec![discovered_peer],
                 token: None,
             },
@@ -2692,6 +3779,7 @@ mod tests {
             response: DhtResponse {
                 id: remote_id,
                 nodes: Vec::new(),
+                nodes6: Vec::new(),
                 values: Vec::new(),
                 token: None,
             },
@@ -2834,6 +3922,7 @@ mod tests {
             response: DhtResponse {
                 id: remote_id,
                 nodes: Vec::new(),
+                nodes6: Vec::new(),
                 values: vec![discovered_peer],
                 token: None,
             },

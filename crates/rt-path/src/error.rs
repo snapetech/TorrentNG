@@ -16,6 +16,10 @@ pub enum PathError {
     IllegalCharacter(char),
     #[error("path component is too long: {len} > max {max}")]
     ComponentTooLong { len: usize, max: usize },
+    #[error("too many path components: {count} > max {max}")]
+    TooManyComponents { count: usize, max: usize },
+    #[error("path is too long: {len} > max {max}")]
+    PathTooLong { len: usize, max: usize },
     #[error("path is empty")]
     EmptyPath,
 }

@@ -8,6 +8,8 @@ const WINDOWS_RESERVED: &[&str] = &[
     "COM9", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
 ];
 const MAX_COMPONENT_BYTES: usize = 4096;
+pub const MAX_COMPONENTS: usize = 256;
+pub const MAX_PATH_BYTES: usize = MAX_COMPONENT_BYTES * MAX_COMPONENTS + MAX_COMPONENTS - 1;
 
 /// A validated, sanitized, storage-root-relative path.
 ///
@@ -29,13 +31,55 @@ impl SafeRelPath {
         if components.is_empty() {
             return Err(PathError::EmptyPath);
         }
+        if components.len() > MAX_COMPONENTS {
+            return Err(PathError::TooManyComponents {
+                count: components.len(),
+                max: MAX_COMPONENTS,
+            });
+        }
         let mut parts = Vec::with_capacity(components.len());
+        let mut path_bytes: usize = 0;
         for c in components {
             let s = c.as_ref();
             validate_component(s, check_windows_reserved)?;
+            path_bytes = path_bytes.saturating_add(s.len());
+            if !parts.is_empty() {
+                path_bytes = path_bytes.saturating_add(1);
+            }
+            if path_bytes > MAX_PATH_BYTES {
+                return Err(PathError::PathTooLong {
+                    len: path_bytes,
+                    max: MAX_PATH_BYTES,
+                });
+            }
             parts.push(s.to_owned());
         }
         Ok(SafeRelPath(parts))
+    }
+
+    /// Parse a slash-separated path while bounding the number of borrowed
+    /// components before allocating the validated path.
+    pub fn from_slash_separated(
+        path: &str,
+        check_windows_reserved: bool,
+    ) -> Result<Self, PathError> {
+        if path.len() > MAX_PATH_BYTES {
+            return Err(PathError::PathTooLong {
+                len: path.len(),
+                max: MAX_PATH_BYTES,
+            });
+        }
+        let mut components = Vec::new();
+        for component in path.split('/') {
+            if components.len() >= MAX_COMPONENTS {
+                return Err(PathError::TooManyComponents {
+                    count: components.len() + 1,
+                    max: MAX_COMPONENTS,
+                });
+            }
+            components.push(component);
+        }
+        Self::from_components(&components, check_windows_reserved)
     }
 
     /// Parse a single-component name (single-file torrent).
@@ -141,6 +185,29 @@ mod tests {
         assert!(matches!(
             SafeRelPath::from_components(&[component], false),
             Err(PathError::ComponentTooLong { .. })
+        ));
+    }
+
+    #[test]
+    fn reject_too_many_components_before_copying_them() {
+        let components = vec!["x"; MAX_COMPONENTS + 1];
+        assert_eq!(
+            SafeRelPath::from_components(&components, false).unwrap_err(),
+            PathError::TooManyComponents {
+                count: MAX_COMPONENTS + 1,
+                max: MAX_COMPONENTS,
+            }
+        );
+    }
+
+    #[test]
+    fn slash_parser_bounds_component_collection() {
+        let path = std::iter::repeat_n("x", MAX_COMPONENTS + 1)
+            .collect::<Vec<_>>()
+            .join("/");
+        assert!(matches!(
+            SafeRelPath::from_slash_separated(&path, false),
+            Err(PathError::TooManyComponents { .. })
         ));
     }
 

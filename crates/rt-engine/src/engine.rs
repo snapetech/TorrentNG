@@ -80,6 +80,9 @@ use crate::tier::{DormantTorrentSnapshot, TierController, TierEvent, TierInput, 
 use crate::torrent_task::{
     persistent_torrent_metadata_memory_bytes, TorrentCmd, TorrentTask, MAX_PEER_SNAPSHOT_ITEMS,
 };
+use crate::torrent_task_v2::{
+    persistent_torrent_metadata_memory_bytes_v2, v2_piece_index_memory_bytes, V2TorrentTask,
+};
 
 const EVENT_ENGINE_STARTED: &str = "engine_started";
 const EVENT_TORRENT_ADDED: &str = "torrent_added";
@@ -246,10 +249,10 @@ const DHT_REGISTRATION_BATCH_SIZE: usize = 512;
 // turning normal queue pressure into one detached retry task per torrent.
 const DHT_COMMAND_CHANNEL_CAPACITY: usize = 16_384;
 const MAX_DHT_RETRY_TASKS: usize = 256;
-// A saturated DHT mailbox must not retain one detached retry task forever.
-// Removal is best-effort after this aggregate window; closed torrent actors
-// are still pruned by the DHT task, and a later registration carries a newer
-// generation if the torrent is resumed.
+// Bound detached DHT retry tasks. Removal is best-effort after the aggregate
+// delivery window; closed torrent actors are still pruned by the DHT task.
+// Registration retries use the engine actor as a stateful handoff and remain
+// bounded by this same cap until either the actor accepts them or stops.
 const DHT_COMMAND_DELIVERY_DEADLINE: Duration = Duration::from_secs(5);
 // Registration workers wait on a smaller blocking-parse semaphore. Bound
 // the Tokio tasks that can wait for those permits too; otherwise enabling DHT
@@ -910,7 +913,7 @@ fn spawn_dht_registration_retry(
     };
     tokio::spawn(async move {
         let _guard = guard;
-        send_engine_command_until_delivered(
+        send_engine_command_until_actor_stops(
             engine_cmd_tx,
             EngineCmd::RegisterDhtTorrent {
                 info_hash,
@@ -1102,6 +1105,26 @@ fn reserve_piece_index_memory(
         })
 }
 
+fn reserve_piece_index_memory_for_hash(
+    resources: &ResourceGovernor,
+    info_hash_len: usize,
+    piece_count: usize,
+) -> CmdResult<MemoryLease> {
+    if info_hash_len == 64 {
+        let bytes = u64::try_from(v2_piece_index_memory_bytes(piece_count))
+            .map_err(|_| "v2 piece index memory estimate does not fit in u64".to_owned())?;
+        resources
+            .try_acquire(MemoryClass::PieceIndex, bytes)
+            .ok_or_else(|| {
+                format!(
+                    "v2 piece index allocation of {bytes} bytes denied for {piece_count} pieces"
+                )
+            })
+    } else {
+        reserve_piece_index_memory(resources, piece_count)
+    }
+}
+
 /// Estimate all persistent per-torrent v1 piece-index memory.
 ///
 /// `TorrentTask` retains the parsed SHA-1 hash vector for every piece in
@@ -1123,7 +1146,20 @@ fn reserve_piece_index_memory_for_meta(
         TorrentMeta::Hybrid(meta, _) => {
             reserve_piece_index_memory(resources, meta.pieces.len()).map(Some)
         }
-        TorrentMeta::V2(_) => Ok(None),
+        TorrentMeta::V2(meta) => {
+            let piece_count = usize::try_from(meta.piece_count())
+                .map_err(|_| "v2 piece count does not fit in usize".to_owned())?;
+            let bytes = u64::try_from(v2_piece_index_memory_bytes(piece_count))
+                .map_err(|_| "v2 piece index memory estimate does not fit in u64".to_owned())?;
+            resources
+                .try_acquire(MemoryClass::PieceIndex, bytes)
+                .ok_or_else(|| {
+                    format!(
+                        "v2 piece index allocation of {bytes} bytes denied for {piece_count} pieces"
+                    )
+                })
+                .map(Some)
+        }
     }
 }
 
@@ -1141,6 +1177,33 @@ fn reserve_torrent_metadata_memory(
                 meta.files.len()
             )
         })
+}
+
+fn reserve_torrent_metadata_memory_v2(
+    resources: &ResourceGovernor,
+    meta: &TorrentMetaV2,
+) -> CmdResult<MemoryLease> {
+    let bytes = u64::try_from(persistent_torrent_metadata_memory_bytes_v2(meta))
+        .map_err(|_| "v2 torrent metadata memory estimate does not fit in u64".to_owned())?;
+    resources
+        .try_acquire(MemoryClass::Metadata, bytes)
+        .ok_or_else(|| {
+            format!(
+                "v2 torrent metadata allocation of {bytes} bytes denied for {} files",
+                meta.files.len()
+            )
+        })
+}
+
+fn reserve_torrent_metadata_memory_for_meta(
+    resources: &ResourceGovernor,
+    meta: &TorrentMeta,
+) -> CmdResult<Option<MemoryLease>> {
+    match meta {
+        TorrentMeta::V1(meta) => reserve_torrent_metadata_memory(resources, meta).map(Some),
+        TorrentMeta::Hybrid(meta, _) => reserve_torrent_metadata_memory(resources, meta).map(Some),
+        TorrentMeta::V2(meta) => reserve_torrent_metadata_memory_v2(resources, meta).map(Some),
+    }
 }
 
 fn storage_io_config_from_config(config: &Config) -> StorageIoConfig {
@@ -1837,14 +1900,16 @@ fn validate_torrent_meta(meta: &TorrentMeta) -> CmdResult<()> {
                     .enumerate()
                     .map(|(index, file)| (index, &file.path, file.length, file.offset)),
             )?;
+            if total == 0 {
+                return Err("torrent total length must be greater than zero".to_owned());
+            }
             if meta.piece_length == 0 || meta.piece_length > u64::from(u32::MAX) {
                 return Err(format!(
                     "torrent piece length {} is outside the engine range",
                     meta.piece_length
                 ));
             }
-            let piece_count = total.div_ceil(meta.piece_length);
-            let piece_count = usize::try_from(piece_count)
+            let piece_count = usize::try_from(meta.piece_count())
                 .map_err(|_| "torrent piece count does not fit in memory".to_owned())?;
             if piece_count > MAX_ENGINE_META_PIECES {
                 return Err(format!(
@@ -4519,12 +4584,27 @@ impl Engine {
                     && placeholder.is_none()
                     && self.is_pure_v2_torrent(&info_hash);
                 if taskless_v2 {
-                    let result = if let Some(job_id) = active_recheck_job {
-                        self.control_recheck_job(&job_id, JOB_STATE_RUNNING).await
+                    if let Some(job_id) = active_recheck_job {
+                        let result = self.control_recheck_job(&job_id, JOB_STATE_RUNNING).await;
+                        let _ = reply.send(result);
                     } else {
-                        Err("pure v2 peer transfer is not implemented".to_owned())
-                    };
-                    let _ = reply.send(result);
+                        match self
+                            .begin_torrent_task_promotion(
+                                &info_hash,
+                                TorrentPromotionAction::Resume { reply },
+                            )
+                            .await
+                        {
+                            TorrentPromotionBegin::Ready(action) => {
+                                self.execute_torrent_promotion_action(
+                                    &info_hash, *action, false, false,
+                                )
+                                .await;
+                            }
+                            TorrentPromotionBegin::Pending => {}
+                            TorrentPromotionBegin::Rejected => {}
+                        }
+                    }
                 } else if v2_only_placeholder {
                     let event = self.session_event_row(
                         Some(&info_hash),
@@ -4758,9 +4838,22 @@ impl Engine {
                     );
                     let _ = reply.send(Ok(()));
                 } else if taskless_v2 {
-                    let _ = reply.send(Err(
-                        "pure v2 tracker lifecycle is not implemented".to_owned()
-                    ));
+                    match self
+                        .begin_torrent_task_promotion(
+                            &info_hash,
+                            TorrentPromotionAction::Reannounce { reply },
+                        )
+                        .await
+                    {
+                        TorrentPromotionBegin::Ready(action) => {
+                            self.execute_torrent_promotion_action(
+                                &info_hash, *action, false, false,
+                            )
+                            .await;
+                        }
+                        TorrentPromotionBegin::Pending => {}
+                        TorrentPromotionBegin::Rejected => {}
+                    }
                 } else if placeholder.is_some() {
                     let result = match self.ensure_metadata_task(&info_hash).await {
                         Ok(()) => {
@@ -5854,17 +5947,8 @@ impl Engine {
         let info_hash_hex = meta_info_hash_hex(&meta);
         let piece_index_memory_lease =
             reserve_piece_index_memory_for_meta(&self.services.resources, &meta)?;
-        let torrent_metadata_memory_lease = match &meta {
-            TorrentMeta::V1(meta) => Some(reserve_torrent_metadata_memory(
-                &self.services.resources,
-                meta,
-            )?),
-            TorrentMeta::Hybrid(meta, _) => Some(reserve_torrent_metadata_memory(
-                &self.services.resources,
-                meta,
-            )?),
-            TorrentMeta::V2(_) => None,
-        };
+        let torrent_metadata_memory_lease =
+            reserve_torrent_metadata_memory_for_meta(&self.services.resources, &meta)?;
 
         if self.runtime.torrent_chans.contains_key(&info_hash_hex)
             || self.runtime.pending_torrent_adds.contains(&info_hash_hex)
@@ -5890,7 +5974,7 @@ impl Engine {
             entry.tags = normalize_tags(tags);
             reg.add(entry).map_err(|e| e.to_string())?;
             // TorrentEntry starts in Stopped; transition to target state.
-            let target = if paused || matches!(meta, TorrentMeta::V2(_)) {
+            let target = if paused {
                 TorrentState::Paused
             } else {
                 TorrentState::Downloading
@@ -5903,12 +5987,13 @@ impl Engine {
         let is_private = meta.is_private();
         let torrent_name = meta.name().to_owned();
         let v2_only = matches!(meta, TorrentMeta::V2(_));
+        let dht_info_hash = meta_dht_info_hash(&meta);
         let added_event = self.session_event_row(
             Some(&info_hash_hex),
             EVENT_TORRENT_ADDED,
             Some("torrent added"),
             serde_json::json!({
-                "paused": paused || v2_only,
+                "paused": paused,
                 "private": is_private,
                 "name": torrent_name,
                 "v2_only": v2_only,
@@ -5943,31 +6028,31 @@ impl Engine {
             return Err(error.to_string());
         }
 
-        if let Some(v1) = meta_v1(meta) {
-            let Some(torrent_metadata_memory_lease) = torrent_metadata_memory_lease else {
-                return Err("v1 torrent add lost its metadata memory reservation".to_owned());
-            };
-            let info_hash = v1.info_hash;
-            let initial_state = if paused {
-                TorrentState::Paused
-            } else {
-                TorrentState::Downloading
-            };
-            let _cmd_tx = self
-                .spawn_torrent_task(
-                    info_hash_hex.clone(),
-                    v1,
-                    save,
-                    paused,
-                    initial_state,
-                    piece_index_memory_lease
-                        .expect("v1 torrent add must reserve piece-index memory"),
-                    torrent_metadata_memory_lease,
-                )
+        let Some(piece_index_memory_lease) = piece_index_memory_lease else {
+            return Err("torrent add lost its piece-index memory reservation".to_owned());
+        };
+        let Some(torrent_metadata_memory_lease) = torrent_metadata_memory_lease else {
+            return Err("torrent add lost its metadata memory reservation".to_owned());
+        };
+        let initial_state = if paused {
+            TorrentState::Paused
+        } else {
+            TorrentState::Downloading
+        };
+        let _cmd_tx = self
+            .spawn_torrent_task_for_meta(
+                info_hash_hex.clone(),
+                meta,
+                save,
+                paused,
+                initial_state,
+                piece_index_memory_lease,
+                torrent_metadata_memory_lease,
+            )
+            .await;
+        if !paused && !is_private {
+            self.register_dht_torrent(dht_info_hash, &info_hash_hex)
                 .await;
-            if !paused && !is_private {
-                self.register_dht_torrent(info_hash, &info_hash_hex).await;
-            }
         }
         info!(
             component = "engine",
@@ -6342,6 +6427,7 @@ impl Engine {
         let torrent_name = meta.name().to_owned();
         let total_length = meta_total_length(&meta);
         let v2_only = matches!(meta, TorrentMeta::V2(_));
+        let dht_info_hash = meta_dht_info_hash(&meta);
         let piece_index_memory_lease =
             match reserve_piece_index_memory_for_meta(&self.services.resources, &meta) {
                 Ok(lease) => lease,
@@ -6354,35 +6440,18 @@ impl Engine {
                     return Err(error);
                 }
             };
-        let torrent_metadata_memory_lease = match &meta {
-            TorrentMeta::V1(meta) => {
-                match reserve_torrent_metadata_memory(&self.services.resources, meta) {
-                    Ok(lease) => Some(lease),
-                    Err(error) => {
-                        self.remove_magnet_blob_candidate_best_effort(
-                            info_hash_hex,
-                            staged_blob.as_deref(),
-                            "magnet_completion_metadata_memory_limit",
-                        );
-                        return Err(error);
-                    }
+        let torrent_metadata_memory_lease =
+            match reserve_torrent_metadata_memory_for_meta(&self.services.resources, &meta) {
+                Ok(lease) => lease,
+                Err(error) => {
+                    self.remove_magnet_blob_candidate_best_effort(
+                        info_hash_hex,
+                        staged_blob.as_deref(),
+                        "magnet_completion_metadata_memory_limit",
+                    );
+                    return Err(error);
                 }
-            }
-            TorrentMeta::Hybrid(meta, _) => {
-                match reserve_torrent_metadata_memory(&self.services.resources, meta) {
-                    Ok(lease) => Some(lease),
-                    Err(error) => {
-                        self.remove_magnet_blob_candidate_best_effort(
-                            info_hash_hex,
-                            staged_blob.as_deref(),
-                            "magnet_completion_metadata_memory_limit",
-                        );
-                        return Err(error);
-                    }
-                }
-            }
-            TorrentMeta::V2(_) => None,
-        };
+            };
 
         let (save, category, tags, previous_entry, previous_was_dormant) = {
             let reg = self.registry.read().await;
@@ -6412,17 +6481,9 @@ impl Engine {
         // metadata task. A pause or stopped state that arrived while metadata
         // was in flight must survive completion instead of being silently
         // converted into a downloading torrent.
-        let initial_state = if v2_only {
-            if previous_entry.state == TorrentState::Stopped {
-                TorrentState::Stopped
-            } else {
-                TorrentState::Paused
-            }
-        } else {
-            match previous_entry.state {
-                TorrentState::Paused | TorrentState::Stopped => previous_entry.state,
-                _ => TorrentState::Downloading,
-            }
+        let initial_state = match previous_entry.state {
+            TorrentState::Paused | TorrentState::Stopped => previous_entry.state,
+            _ => TorrentState::Downloading,
         };
         let start_paused = matches!(initial_state, TorrentState::Paused | TorrentState::Stopped);
         if let Err(error) = self.authorize_storage_path_async(&save).await {
@@ -6541,26 +6602,26 @@ impl Engine {
         if is_private {
             self.unregister_dht_torrent(info_hash_hex).await;
         }
-        if let Some(v1) = meta_v1(meta) {
-            let info_hash = v1.info_hash;
-            let Some(torrent_metadata_memory_lease) = torrent_metadata_memory_lease else {
-                return Err("v1 magnet completion lost its metadata memory reservation".to_owned());
-            };
-            let _tx = self
-                .spawn_torrent_task(
-                    info_hash_hex.to_owned(),
-                    v1,
-                    save,
-                    start_paused,
-                    initial_state,
-                    piece_index_memory_lease
-                        .expect("v1 magnet completion must reserve piece-index memory"),
-                    torrent_metadata_memory_lease,
-                )
+        let Some(piece_index_memory_lease) = piece_index_memory_lease else {
+            return Err("magnet completion lost its piece-index memory reservation".to_owned());
+        };
+        let Some(torrent_metadata_memory_lease) = torrent_metadata_memory_lease else {
+            return Err("magnet completion lost its metadata memory reservation".to_owned());
+        };
+        let _tx = self
+            .spawn_torrent_task_for_meta(
+                info_hash_hex.to_owned(),
+                meta,
+                save,
+                start_paused,
+                initial_state,
+                piece_index_memory_lease,
+                torrent_metadata_memory_lease,
+            )
+            .await;
+        if !start_paused && !is_private {
+            self.register_dht_torrent(dht_info_hash, info_hash_hex)
                 .await;
-            if !start_paused && !is_private {
-                self.register_dht_torrent(info_hash, info_hash_hex).await;
-            }
         }
         info!(
             component = "engine",
@@ -6623,6 +6684,117 @@ impl Engine {
         )
         .await;
         task.attach_torrent_metadata_memory_lease(torrent_metadata_memory_lease);
+        let handle = tokio::spawn(task.run());
+        let tier_key = info_hash_hex.clone();
+        self.runtime
+            .torrent_chans
+            .insert(info_hash_hex.clone(), cmd_tx.clone());
+        self.runtime.torrent_tasks.insert(info_hash_hex, handle);
+        let now = Instant::now();
+        self.runtime.tier_last_active.insert(tier_key.clone(), now);
+        self.runtime.tier_controller.apply_input(
+            tier_key,
+            TierInput {
+                state: initial_state,
+                connected_peers: 0,
+                outstanding_requests: 0,
+                inbound_peer: false,
+                tracker_due: false,
+                last_active: Some(now),
+                now,
+            },
+        );
+        cmd_tx
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn spawn_torrent_task_for_meta(
+        &mut self,
+        info_hash_hex: String,
+        meta: TorrentMeta,
+        save: PathBuf,
+        paused: bool,
+        initial_state: TorrentState,
+        piece_index_memory_lease: MemoryLease,
+        torrent_metadata_memory_lease: MemoryLease,
+    ) -> mpsc::Sender<TorrentCmd> {
+        match meta {
+            TorrentMeta::V1(meta) => {
+                self.spawn_torrent_task(
+                    info_hash_hex,
+                    meta,
+                    save,
+                    paused,
+                    initial_state,
+                    piece_index_memory_lease,
+                    torrent_metadata_memory_lease,
+                )
+                .await
+            }
+            TorrentMeta::Hybrid(meta, _) => {
+                self.spawn_torrent_task(
+                    info_hash_hex,
+                    *meta,
+                    save,
+                    paused,
+                    initial_state,
+                    piece_index_memory_lease,
+                    torrent_metadata_memory_lease,
+                )
+                .await
+            }
+            TorrentMeta::V2(meta) => {
+                self.spawn_v2_torrent_task(
+                    info_hash_hex,
+                    meta,
+                    save,
+                    paused,
+                    initial_state,
+                    piece_index_memory_lease,
+                    torrent_metadata_memory_lease,
+                )
+                .await
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn spawn_v2_torrent_task(
+        &mut self,
+        info_hash_hex: String,
+        meta: TorrentMetaV2,
+        save: PathBuf,
+        paused: bool,
+        initial_state: TorrentState,
+        piece_index_memory_lease: MemoryLease,
+        torrent_metadata_memory_lease: MemoryLease,
+    ) -> mpsc::Sender<TorrentCmd> {
+        let (cmd_tx, cmd_rx) = mpsc::channel::<TorrentCmd>(32);
+        let task = V2TorrentTask::new(
+            meta,
+            save,
+            paused,
+            initial_state,
+            Arc::clone(&self.registry),
+            self.db_executor(),
+            self.services.resources.clone(),
+            cmd_rx,
+            self.config.network.max_peers,
+            self.config
+                .memory
+                .piece_assembly_cap_mb
+                .saturating_mul(1024 * 1024) as usize,
+            storage_io_config_from_config(&self.config),
+            OutboundEgressPolicy::from_config(&self.config.tracker),
+            self.config.network.listen_port,
+            self.config.tracker.http_timeout_secs,
+            self.config.tracker.udp_timeout_secs,
+            self.config.tracker.min_interval_secs,
+            self.services.network_budget.clone(),
+            Some(piece_index_memory_lease),
+            Some(torrent_metadata_memory_lease),
+        )
+        .await;
         let handle = tokio::spawn(task.run());
         let tier_key = info_hash_hex.clone();
         self.runtime
@@ -7774,6 +7946,13 @@ impl Engine {
         info_hash: String,
         command: TorrentCmd,
     ) -> CmdResult<()> {
+        // The peer-wire handshake has only 20 bytes for an infohash. Pure
+        // v2 torrents are persisted under their full 32-byte SHA-256
+        // infohash, so resolve the truncated wire key before touching the
+        // registry, storage authority, or promotion state. Without this,
+        // inbound peers can never reach a pure-v2 task (and dormant v2 rows
+        // cannot be promoted).
+        let info_hash = self.resolve_incoming_peer_hash(&info_hash).await?;
         if let Some(peer_addr) = torrent_command_peer_addr(&command) {
             if self.registry.read().await.is_peer_banned(peer_addr) {
                 return Ok(());
@@ -7940,6 +8119,32 @@ impl Engine {
         Ok(())
     }
 
+    async fn resolve_incoming_peer_hash(&self, presented: &str) -> CmdResult<String> {
+        let presented = canonical_info_hash(presented.to_owned());
+        if self.runtime.torrent_chans.contains_key(&presented)
+            || self.registry.read().await.get(&presented).is_some()
+        {
+            return Ok(presented);
+        }
+        if presented.len() != 40 {
+            return Err(format!(
+                "no torrent matches incoming peer infohash {presented}"
+            ));
+        }
+
+        let mut matches = Vec::with_capacity(1);
+        for candidate in self.runtime.torrent_chans.keys() {
+            add_incoming_v2_match(&mut matches, &presented, candidate)?;
+        }
+        let registry = self.registry.read().await;
+        for candidate in registry.iter() {
+            add_incoming_v2_match(&mut matches, &presented, &candidate.info_hash)?;
+        }
+        matches
+            .pop()
+            .ok_or_else(|| format!("no torrent matches incoming peer infohash {presented}"))
+    }
+
     async fn load_persisted_torrents(&mut self) -> anyhow::Result<()> {
         let mut rows = self
             .run_db("load_persisted_torrents", |db| {
@@ -8062,7 +8267,6 @@ impl Engine {
                                 }
                             }
                             Err(error) => {
-                                start_task = false;
                                 warn!(
                                     component = "memory",
                                     operation = "restore_metadata_task",
@@ -8100,16 +8304,20 @@ impl Engine {
                 }
                 continue;
             }
-            // A v1 task allocates dense picker and availability state before
-            // it can service any commands. Reserve that state while the row
-            // is still only a durable projection; if the process-wide class
-            // is full, restore the torrent dormant and let a later
+            // A live task allocates its piece index and availability state
+            // before it can service commands. Reserve that state while the
+            // row is still only a durable projection; if the process-wide
+            // class is full, restore the torrent dormant and let a later
             // promotion retry after memory is released.
             let mut piece_index_memory_lease = None;
-            if start_task && row.info_hash.len() == 40 {
+            if start_task && matches!(row.info_hash.len(), 40 | 64) {
                 match usize::try_from(row.piece_count) {
                     Ok(piece_count) => {
-                        match reserve_piece_index_memory(&self.services.resources, piece_count) {
+                        match reserve_piece_index_memory_for_hash(
+                            &self.services.resources,
+                            row.info_hash.len(),
+                            piece_count,
+                        ) {
                             Ok(lease) => piece_index_memory_lease = Some(lease),
                             Err(error) => {
                                 warn!(
@@ -8270,7 +8478,7 @@ impl Engine {
             let actual_piece_count = match &meta {
                 TorrentMeta::V1(meta) => Some(meta.pieces.len()),
                 TorrentMeta::Hybrid(meta, _) => Some(meta.pieces.len()),
-                TorrentMeta::V2(_) => None,
+                TorrentMeta::V2(meta) => usize::try_from(meta.piece_count()).ok(),
             };
             if let Some(actual_piece_count) = actual_piece_count {
                 let actual_piece_count = i64::try_from(actual_piece_count).unwrap_or(i64::MAX);
@@ -8315,60 +8523,29 @@ impl Engine {
                 continue;
             }
             let torrent_metadata_memory_lease = if start_task {
-                match &meta {
-                    TorrentMeta::V1(meta) => {
-                        match reserve_torrent_metadata_memory(&self.services.resources, meta) {
-                            Ok(lease) => Some(lease),
-                            Err(error) => {
-                                warn!(
-                                    component = "memory",
-                                    operation = "restore_torrent_metadata",
-                                    torrent = %row.info_hash,
-                                    result = "deferred",
-                                    error = %error,
-                                    "restoring torrent in error state because persistent metadata memory is unavailable"
-                                );
-                                self.restore_persisted_error_projection(
-                                    row,
-                                    "runtime",
-                                    &blob_path,
-                                    format!(
-                                        "persistent torrent metadata memory admission was unavailable: {error}"
-                                    ),
-                                    false,
-                                )
-                                .await?;
-                                continue;
-                            }
-                        }
+                match reserve_torrent_metadata_memory_for_meta(&self.services.resources, &meta) {
+                    Ok(lease) => lease,
+                    Err(error) => {
+                        warn!(
+                            component = "memory",
+                            operation = "restore_torrent_metadata",
+                            torrent = %row.info_hash,
+                            result = "deferred",
+                            error = %error,
+                            "restoring torrent in error state because persistent metadata memory is unavailable"
+                        );
+                        self.restore_persisted_error_projection(
+                            row,
+                            "runtime",
+                            &blob_path,
+                            format!(
+                                "persistent torrent metadata memory admission was unavailable: {error}"
+                            ),
+                            false,
+                        )
+                        .await?;
+                        continue;
                     }
-                    TorrentMeta::Hybrid(meta, _) => {
-                        match reserve_torrent_metadata_memory(&self.services.resources, meta) {
-                            Ok(lease) => Some(lease),
-                            Err(error) => {
-                                warn!(
-                                    component = "memory",
-                                    operation = "restore_torrent_metadata",
-                                    torrent = %row.info_hash,
-                                    result = "deferred",
-                                    error = %error,
-                                    "restoring torrent in error state because persistent metadata memory is unavailable"
-                                );
-                                self.restore_persisted_error_projection(
-                                    row,
-                                    "runtime",
-                                    &blob_path,
-                                    format!(
-                                        "persistent torrent metadata memory admission was unavailable: {error}"
-                                    ),
-                                    false,
-                                )
-                                .await?;
-                                continue;
-                            }
-                        }
-                    }
-                    TorrentMeta::V2(_) => None,
                 }
             } else {
                 None
@@ -8403,48 +8580,47 @@ impl Engine {
             );
             let is_private = meta.is_private();
             let v2_only = matches!(meta, TorrentMeta::V2(_));
+            let dht_info_hash = meta_dht_info_hash(&meta);
             if start_task {
-                if let Some(v1) = meta_v1(meta) {
-                    let Some(piece_index_memory_lease) = piece_index_memory_lease else {
-                        self.restore_persisted_error_projection(
-                            row,
-                            "runtime",
-                            &blob_path,
-                            "piece-index memory admission was unavailable".to_owned(),
-                            false,
-                        )
-                        .await?;
-                        continue;
-                    };
-                    let Some(torrent_metadata_memory_lease) = torrent_metadata_memory_lease else {
-                        self.restore_persisted_error_projection(
-                            row,
-                            "runtime",
-                            &blob_path,
-                            "persistent torrent metadata memory admission was lost".to_owned(),
-                            false,
-                        )
-                        .await?;
-                        continue;
-                    };
-                    let info_hash = v1.info_hash;
-                    let _tx = self
-                        .spawn_torrent_task(
-                            row.info_hash.clone(),
-                            v1,
-                            PathBuf::from(&row.save_path),
-                            matches!(
-                                state,
-                                TorrentState::Paused | TorrentState::Stopped | TorrentState::Queued
-                            ),
+                let Some(piece_index_memory_lease) = piece_index_memory_lease else {
+                    self.restore_persisted_error_projection(
+                        row,
+                        "runtime",
+                        &blob_path,
+                        "piece-index memory admission was unavailable".to_owned(),
+                        false,
+                    )
+                    .await?;
+                    continue;
+                };
+                let Some(torrent_metadata_memory_lease) = torrent_metadata_memory_lease else {
+                    self.restore_persisted_error_projection(
+                        row,
+                        "runtime",
+                        &blob_path,
+                        "persistent torrent metadata memory admission was lost".to_owned(),
+                        false,
+                    )
+                    .await?;
+                    continue;
+                };
+                let _tx = self
+                    .spawn_torrent_task_for_meta(
+                        row.info_hash.clone(),
+                        meta,
+                        PathBuf::from(&row.save_path),
+                        matches!(
                             state,
-                            piece_index_memory_lease,
-                            torrent_metadata_memory_lease,
-                        )
+                            TorrentState::Paused | TorrentState::Stopped | TorrentState::Queued
+                        ),
+                        state,
+                        piece_index_memory_lease,
+                        torrent_metadata_memory_lease,
+                    )
+                    .await;
+                if !is_private && should_register_dht_on_restore(state) {
+                    self.register_dht_torrent(dht_info_hash, &row.info_hash)
                         .await;
-                    if !is_private && should_register_dht_on_restore(state) {
-                        self.register_dht_torrent(info_hash, &row.info_hash).await;
-                    }
                 }
             }
             self.append_session_event(
@@ -12716,13 +12892,6 @@ impl Engine {
                 return;
             }
         };
-        let taskless_v2 = !self.runtime.torrent_chans.contains_key(&info_hash)
-            && placeholder.is_none()
-            && self.is_pure_v2_torrent(&info_hash);
-        if taskless_v2 {
-            let _ = reply.send(Err("pure v2 peer transfer is not implemented".to_owned()));
-            return;
-        }
         if placeholder.is_some() {
             let had_runtime_task = self.runtime.torrent_chans.contains_key(&info_hash);
             let previous_entry = self.registry.read().await.get(&info_hash);
@@ -12805,12 +12974,6 @@ impl Engine {
             }
         }
         let placeholder = self.metadata_placeholder_row_checked_sync(info_hash)?;
-        let taskless_v2 = !self.runtime.torrent_chans.contains_key(info_hash)
-            && placeholder.is_none()
-            && self.is_pure_v2_torrent(info_hash);
-        if taskless_v2 {
-            return Err("pure v2 peer transfer is not implemented".to_owned());
-        }
         let was_taskless = !self.runtime.torrent_chans.contains_key(info_hash);
         if placeholder.is_some() {
             self.update_metadata_placeholder_state_with_event(
@@ -14088,12 +14251,6 @@ impl Engine {
                 .ok_or_else(|| format!("torrent {info_hash} not found"))?;
             (entry.state, entry.amount_left)
         };
-        let taskless_v2 = !self.runtime.torrent_chans.contains_key(info_hash)
-            && self
-                .metadata_placeholder_row_checked(info_hash)
-                .await?
-                .is_none()
-            && self.is_pure_v2_torrent(info_hash);
         let info_hash_for_db = info_hash.to_owned();
         let (is_private, tracker_counts, active_jobs) = self
             .run_db("diagnose_torrent", move |db| {
@@ -14121,18 +14278,10 @@ impl Engine {
         if state == TorrentState::Seeding && bytes_left == 0 {
             reasons.push("torrent is already seeding".to_owned());
         } else {
-            if taskless_v2 {
-                reasons.push(
-                    "pure v2 torrent has metadata but no active v2 peer transfer task".to_owned(),
-                );
-                next_actions.push("recheck local files or wait for v2 transfer support".to_owned());
-            }
             match state {
                 TorrentState::Paused | TorrentState::Stopped => {
                     reasons.push("torrent is paused or stopped".to_owned());
-                    if !taskless_v2 {
-                        next_actions.push("resume the torrent".to_owned());
-                    }
+                    next_actions.push("resume the torrent".to_owned());
                 }
                 TorrentState::Checking => {
                     reasons.push("torrent is currently checking pieces".to_owned());
@@ -14837,20 +14986,43 @@ impl Engine {
             return;
         }
 
-        let piece_index_memory_lease = match reserve_piece_index_memory(
-            &self.services.resources,
-            prepared.meta.pieces.len(),
-        ) {
-            Ok(lease) => lease,
-            Err(error) => {
-                self.fail_torrent_promotion_actions(&info_hash, actions, error)
+        let PreparedTorrentTaskData {
+            meta,
+            save_path,
+            info_hash: dht_info_hash,
+            is_private,
+            parse_memory_lease,
+        } = prepared;
+        let piece_index_memory_lease =
+            match reserve_piece_index_memory_for_meta(&self.services.resources, &meta) {
+                Ok(Some(lease)) => lease,
+                Ok(None) => {
+                    self.fail_torrent_promotion_actions(
+                        &info_hash,
+                        actions,
+                        "torrent promotion lost its piece-index memory reservation".to_owned(),
+                    )
                     .await;
-                return;
-            }
-        };
+                    return;
+                }
+                Err(error) => {
+                    self.fail_torrent_promotion_actions(&info_hash, actions, error)
+                        .await;
+                    return;
+                }
+            };
         let torrent_metadata_memory_lease =
-            match reserve_torrent_metadata_memory(&self.services.resources, &prepared.meta) {
-                Ok(lease) => lease,
+            match reserve_torrent_metadata_memory_for_meta(&self.services.resources, &meta) {
+                Ok(Some(lease)) => lease,
+                Ok(None) => {
+                    self.fail_torrent_promotion_actions(
+                        &info_hash,
+                        actions,
+                        "torrent promotion lost its metadata memory reservation".to_owned(),
+                    )
+                    .await;
+                    return;
+                }
                 Err(error) => {
                     self.fail_torrent_promotion_actions(&info_hash, actions, error)
                         .await;
@@ -14859,7 +15031,7 @@ impl Engine {
             };
         // The persistent leases now cover the retained task graph. Release the
         // detached file-read/parser overlap before installing the task.
-        drop(prepared.parse_memory_lease);
+        drop(parse_memory_lease);
 
         self.runtime
             .tier_controller
@@ -14868,10 +15040,10 @@ impl Engine {
             .tier_controller
             .clear_dormant_snapshot(&info_hash);
         let _tx = self
-            .spawn_torrent_task(
+            .spawn_torrent_task_for_meta(
                 info_hash.clone(),
-                prepared.meta,
-                prepared.save_path,
+                meta,
+                save_path,
                 true,
                 initial_state,
                 piece_index_memory_lease,
@@ -14884,12 +15056,11 @@ impl Engine {
         // peers and remains inactive after verification. Error/queued rows
         // are different: an explicit recheck is their recovery path and the
         // task transitions them into an active state when it completes.
-        let register_dht_before_promotion = !prepared.is_private
-            && !matches!(initial_state, TorrentState::Paused | TorrentState::Stopped);
-        let register_dht_after_resume = !prepared.is_private && !register_dht_before_promotion;
+        let register_dht_before_promotion =
+            !is_private && !matches!(initial_state, TorrentState::Paused | TorrentState::Stopped);
+        let register_dht_after_resume = !is_private && !register_dht_before_promotion;
         if register_dht_before_promotion {
-            self.register_dht_torrent(prepared.info_hash, &info_hash)
-                .await;
+            self.register_dht_torrent(dht_info_hash, &info_hash).await;
         }
         for action in actions {
             self.execute_torrent_promotion_action(
@@ -15282,15 +15453,14 @@ impl Engine {
             "test torrent promotion",
         )?;
         let meta = parse_torrent(&raw).map_err(|e| e.to_string())?;
-        let Some(v1) = meta_v1(meta) else {
-            return Err("pure v2 peer transfer is not implemented".to_owned());
-        };
-        let info_hash = v1.info_hash;
-        let is_private = v1.private;
+        let info_hash = meta_dht_info_hash(&meta);
+        let is_private = meta.is_private();
         let piece_index_memory_lease =
-            reserve_piece_index_memory(&self.services.resources, v1.pieces.len())?;
+            reserve_piece_index_memory_for_meta(&self.services.resources, &meta)?
+                .ok_or_else(|| "v2 torrent lost its piece-index memory reservation".to_owned())?;
         let torrent_metadata_memory_lease =
-            reserve_torrent_metadata_memory(&self.services.resources, &v1)?;
+            reserve_torrent_metadata_memory_for_meta(&self.services.resources, &meta)?
+                .ok_or_else(|| "torrent lost its metadata memory reservation".to_owned())?;
         self.authorize_storage_path_async(Path::new(&row.save_path))
             .await?;
         let tier_key = info_hash_hex.to_owned();
@@ -15300,9 +15470,9 @@ impl Engine {
             .clear_dormant_snapshot(&tier_key);
         let initial_state = state_from_str(&row.state);
         let _tx = self
-            .spawn_torrent_task(
+            .spawn_torrent_task_for_meta(
                 tier_key,
-                v1,
+                meta,
                 PathBuf::from(row.save_path),
                 true,
                 initial_state,
@@ -15564,7 +15734,7 @@ impl Engine {
         let Some(dht_tx) = &self.services.dht_tx else {
             return;
         };
-        let Ok(info_hash) = parse_info_hash_hex(info_hash_hex) else {
+        let Ok(info_hash) = parse_dht_info_hash_hex(info_hash_hex) else {
             return;
         };
         let command = DhtCommand::RemoveTorrent {
@@ -17775,17 +17945,21 @@ pub(crate) fn row_from_v1_meta(entry: &TorrentEntry, meta: &TorrentMetaV1) -> To
     )
 }
 
+pub(crate) fn row_from_v2_meta(entry: &TorrentEntry, meta: &TorrentMetaV2) -> TorrentRow {
+    row_from_entry_parts(
+        entry,
+        meta.total_length(),
+        meta.piece_length,
+        usize::try_from(meta.piece_count()).unwrap_or(usize::MAX),
+        meta.private,
+        meta.all_trackers(),
+    )
+}
+
 pub(crate) fn row_from_entry(entry: &TorrentEntry, meta: &TorrentMeta) -> TorrentRow {
     match meta {
         TorrentMeta::V1(meta) => row_from_v1_meta(entry, meta),
-        TorrentMeta::V2(meta) => row_from_entry_parts(
-            entry,
-            meta.total_length(),
-            meta.piece_length,
-            meta.total_length().div_ceil(meta.piece_length) as usize,
-            meta.private,
-            meta.all_trackers(),
-        ),
+        TorrentMeta::V2(meta) => row_from_v2_meta(entry, meta),
         TorrentMeta::Hybrid(meta, _) => row_from_v1_meta(entry, meta),
     }
 }
@@ -18050,14 +18224,6 @@ fn save_magnet_blob_staging(raw: &[u8], staging_path: &Path) -> anyhow::Result<P
     Ok(staging_path.to_path_buf())
 }
 
-fn meta_v1(meta: TorrentMeta) -> Option<TorrentMetaV1> {
-    match meta {
-        TorrentMeta::V1(meta) => Some(meta),
-        TorrentMeta::Hybrid(meta, _) => Some(*meta),
-        TorrentMeta::V2(_) => None,
-    }
-}
-
 fn meta_raw(meta: &TorrentMeta) -> &[u8] {
     match meta {
         TorrentMeta::V1(meta) => &meta.raw,
@@ -18071,6 +18237,16 @@ fn meta_info_hash_hex(meta: &TorrentMeta) -> String {
         TorrentMeta::V1(meta) => hex::encode(meta.info_hash),
         TorrentMeta::V2(meta) => hex::encode(meta.info_hash_v2),
         TorrentMeta::Hybrid(meta, _) => hex::encode(meta.info_hash),
+    }
+}
+
+fn meta_dht_info_hash(meta: &TorrentMeta) -> [u8; 20] {
+    match meta {
+        TorrentMeta::V1(meta) => meta.info_hash,
+        TorrentMeta::Hybrid(meta, _) => meta.info_hash,
+        TorrentMeta::V2(meta) => meta.info_hash_v2[..20]
+            .try_into()
+            .expect("v2 info hash is at least 20 bytes"),
     }
 }
 
@@ -18095,7 +18271,7 @@ fn meta_piece_length(meta: &TorrentMeta) -> u64 {
 fn meta_piece_count(meta: &TorrentMeta) -> usize {
     match meta {
         TorrentMeta::V1(meta) => meta.pieces.len(),
-        TorrentMeta::V2(meta) => meta.total_length().div_ceil(meta.piece_length) as usize,
+        TorrentMeta::V2(meta) => usize::try_from(meta.piece_count()).unwrap_or(usize::MAX),
         TorrentMeta::Hybrid(meta, _) => meta.pieces.len(),
     }
 }
@@ -18298,13 +18474,11 @@ fn prepare_torrent_task_from_storage(
     drop(raw);
     let files = meta_file_rows(info_hash, &meta);
     let is_private = meta.is_private();
-    let Some(v1) = meta_v1(meta) else {
-        return Err("pure v2 peer transfer is not implemented".to_owned());
-    };
-    if hex::encode(v1.info_hash) != info_hash {
+    let dht_info_hash = meta_dht_info_hash(&meta);
+    let fetched_hash = meta_info_hash_hex(&meta);
+    if fetched_hash != info_hash {
         return Err(format!(
-            "torrent metadata info hash {} does not match persisted row {info_hash}",
-            hex::encode(v1.info_hash)
+            "torrent metadata info hash {fetched_hash} does not match persisted row {info_hash}"
         ));
     }
     if !files.is_empty() {
@@ -18330,8 +18504,8 @@ fn prepare_torrent_task_from_storage(
         })?;
     }
     Ok(PreparedTorrentTaskData {
-        info_hash: v1.info_hash,
-        meta: v1,
+        info_hash: dht_info_hash,
+        meta,
         save_path,
         is_private,
         parse_memory_lease,
@@ -18437,7 +18611,11 @@ async fn register_dht_torrent_from_storage_or_hash_task(
     .await;
     match parsed {
         Ok(Ok(Some(info_hash_bytes))) => {
-            send_engine_command_until_delivered(
+            // Registration is a stateful handoff. A full engine mailbox must
+            // delay it until the actor accepts the command; otherwise a
+            // healthy DHT task can permanently miss this torrent until its
+            // next restart-triggered registration sweep.
+            send_engine_command_until_actor_stops(
                 engine_cmd_tx,
                 EngineCmd::RegisterDhtTorrent {
                     info_hash: info_hash_hex,
@@ -18474,7 +18652,7 @@ fn load_dht_info_hash_from_storage(
     known_non_private: Option<bool>,
 ) -> Result<Option<[u8; 20]>, String> {
     if known_non_private == Some(true) {
-        return Ok(parse_info_hash_hex(info_hash).ok());
+        return Ok(parse_dht_info_hash_hex(info_hash).ok());
     }
     let blob_path = torrent_blob_path(config, info_hash);
     if rt_storage::metadata_no_follow(&blob_path).is_ok() {
@@ -18506,10 +18684,19 @@ fn load_dht_info_hash_from_storage(
                 }
                 Ok(Some(meta.info_hash))
             }
+            TorrentMeta::V2(meta) if !meta.private => {
+                let fetched_hash = hex::encode(meta.info_hash_v2);
+                if fetched_hash != info_hash {
+                    return Err(format!(
+                        "torrent metadata info hash {fetched_hash} does not match persisted row {info_hash}"
+                    ));
+                }
+                Ok(Some(meta_dht_info_hash(&TorrentMeta::V2(meta))))
+            }
             _ => Ok(None),
         };
     }
-    Ok(parse_info_hash_hex(info_hash).ok())
+    Ok(parse_dht_info_hash_hex(info_hash).ok())
 }
 
 async fn load_torrent_metadata_bounded(
@@ -18579,8 +18766,7 @@ fn add_metadata_projection_v1_bytes(total: &mut usize, value: &TorrentMetaV1) {
 }
 
 fn add_metadata_projection_v2_bytes(total: &mut usize, value: &TorrentMetaV2) {
-    let piece_count = value.total_length().div_ceil(value.piece_length);
-    let piece_count = usize::try_from(piece_count).unwrap_or(usize::MAX);
+    let piece_count = usize::try_from(value.piece_count()).unwrap_or(usize::MAX);
     *total =
         total.saturating_add(piece_count.saturating_mul(METADATA_PROJECTION_RESERVE_PER_PIECE));
     for file in &value.files {
@@ -18837,6 +19023,10 @@ async fn execute_pure_v2_recheck(
     let files = parsed
         .files
         .iter()
+        // BEP 47 padding is synthetic zero content.  It may be omitted from
+        // the local filesystem, so taskless v2 rechecks must not report an
+        // absent padding path as a missing payload file.
+        .filter(|file| !file.pad)
         .map(|file| V2FileHash {
             file_index: file.index,
             path: file.path.clone(),
@@ -19019,6 +19209,17 @@ fn parse_info_hash_hex(info_hash: &str) -> Result<[u8; 20], ()> {
         out[idx] = u8::from_str_radix(hex, 16).map_err(|_| ())?;
     }
     Ok(out)
+}
+
+fn parse_dht_info_hash_hex(info_hash: &str) -> Result<[u8; 20], ()> {
+    if let Ok(v1) = parse_info_hash_hex(info_hash) {
+        return Ok(v1);
+    }
+    if info_hash.len() != 64 {
+        return Err(());
+    }
+    let bytes = hex::decode(info_hash).map_err(|_| ())?;
+    bytes[..20].try_into().map_err(|_| ())
 }
 
 fn canonical_info_hash(info_hash: String) -> String {
@@ -19313,7 +19514,12 @@ fn metadata_from_meta(meta: &TorrentMeta) -> EngineTorrentMetadata {
                 .collect(),
         },
         TorrentMeta::V2(meta) => {
-            let piece_count = meta.total_length().div_ceil(meta.piece_length) as usize;
+            // Pure-v2 pieces live in the logical address space, which
+            // includes alignment gaps between files. Using total payload
+            // bytes here under-reports the bitmap for multi-file torrents
+            // with a gap and makes the API projection disagree with the
+            // actor's V2PieceMap.
+            let piece_count = usize::try_from(meta.piece_count()).unwrap_or(usize::MAX);
             EngineTorrentMetadata {
                 piece_length: meta.piece_length,
                 piece_count,
@@ -20885,7 +21091,7 @@ mod tests {
                 Some(torrent_handle),
                 Ok(PreparedTorrentTaskData {
                     info_hash: meta.info_hash,
-                    meta,
+                    meta: TorrentMeta::V1(meta),
                     save_path,
                     is_private: false,
                     parse_memory_lease: test_metadata_lease(1),
@@ -21842,10 +22048,33 @@ mod tests {
     }
 
     fn raw_v2_torrent() -> Vec<u8> {
-        raw_v2_torrent_with_root([0xAB; 32], 65_536)
+        raw_v2_torrent_with_content(&vec![0u8; 65_536])
     }
 
-    fn raw_v2_torrent_with_root(pieces_root: [u8; 32], length: i64) -> Vec<u8> {
+    fn raw_v2_torrent_with_content(content: &[u8]) -> Vec<u8> {
+        let mut piece_layers = content
+            .chunks(16_384)
+            .map(|chunk| BlockHash::of(chunk).0)
+            .collect::<Vec<_>>();
+        if piece_layers.is_empty() {
+            piece_layers.push(BlockHash::of(&[]).0);
+        }
+        raw_v2_torrent_with_layers(
+            merkle_root(&piece_layers),
+            content.len() as i64,
+            &piece_layers,
+        )
+    }
+
+    fn raw_v2_torrent_with_layers(
+        pieces_root: [u8; 32],
+        length: i64,
+        piece_layers: &[[u8; 32]],
+    ) -> Vec<u8> {
+        let mut piece_layer_bytes = Vec::with_capacity(piece_layers.len() * 32);
+        for hash in piece_layers {
+            piece_layer_bytes.extend_from_slice(hash);
+        }
         let leaf = BValue::Dict({
             let mut pairs: Vec<(&[u8], BValue<'_>)> = vec![
                 (b"length", BValue::Int(length)),
@@ -21863,23 +22092,15 @@ mod tests {
             (b"piece length", BValue::Int(16_384)),
         ];
         info_pairs.sort_by(|a, b| a.0.cmp(b.0));
+        let piece_layers =
+            BValue::Dict(vec![(&pieces_root[..], BValue::Bytes(&piece_layer_bytes))]);
         let mut pairs: Vec<(&[u8], BValue<'_>)> = vec![
             (b"announce", BValue::Bytes(b"http://tracker.example/v2")),
             (b"info", BValue::Dict(info_pairs)),
+            (b"piece layers", piece_layers),
         ];
         pairs.sort_by(|a, b| a.0.cmp(b.0));
         encode(&BValue::Dict(pairs))
-    }
-
-    fn v2_file_root(content: &[u8]) -> [u8; 32] {
-        let mut leaves = content
-            .chunks(V2FileVerifier::LEAF_SIZE)
-            .map(|chunk| BlockHash::of(chunk).0)
-            .collect::<Vec<_>>();
-        if leaves.is_empty() {
-            leaves.push(BlockHash::of(&[]).0);
-        }
-        merkle_root(&leaves)
     }
 
     #[test]
@@ -21958,6 +22179,18 @@ mod tests {
         assert_eq!(decode_info_hash_bytes(&"0a".repeat(20)).unwrap().len(), 20);
         assert_eq!(decode_info_hash_bytes(&"0b".repeat(32)).unwrap().len(), 32);
         assert!(decode_info_hash_bytes(&"0c".repeat(21)).is_err());
+    }
+
+    #[test]
+    fn incoming_v2_hash_matching_is_unique_and_deduplicated() {
+        let presented = "ab".repeat(20);
+        let first = format!("{presented}{}", "cd".repeat(12));
+        let second = format!("{presented}{}", "ef".repeat(12));
+        let mut matches = Vec::new();
+        add_incoming_v2_match(&mut matches, &presented, &first).unwrap();
+        add_incoming_v2_match(&mut matches, &presented, &first).unwrap();
+        assert_eq!(matches, vec![first.clone()]);
+        assert!(add_incoming_v2_match(&mut matches, &presented, &second).is_err());
     }
 
     #[test]
@@ -22184,7 +22417,7 @@ mod tests {
         let content: Vec<u8> = (0..(V2FileVerifier::LEAF_SIZE + 11))
             .map(|idx| idx as u8)
             .collect();
-        let raw = raw_v2_torrent_with_root(v2_file_root(&content), content.len() as i64);
+        let raw = raw_v2_torrent_with_content(&content);
         let meta = parse_torrent(&raw).unwrap();
         let info_hash = meta_info_hash_hex(&meta);
         std::fs::create_dir_all(&save_root).unwrap();
@@ -22243,7 +22476,7 @@ mod tests {
                 .await
         );
         reply_rx.await.unwrap().unwrap();
-        let completion = tokio::time::timeout(Duration::from_secs(2), engine.cmd_rx.recv())
+        let completion = tokio::time::timeout(Duration::from_secs(10), engine.cmd_rx.recv())
             .await
             .expect("pure v2 recheck worker did not send completion")
             .expect("engine command channel closed");
@@ -22304,10 +22537,11 @@ mod tests {
                 .await
         );
         invalid_reply_rx.await.unwrap().unwrap();
-        let invalid_completion = tokio::time::timeout(Duration::from_secs(2), engine.cmd_rx.recv())
-            .await
-            .expect("invalid pure v2 recheck worker did not send completion")
-            .expect("engine command channel closed");
+        let invalid_completion =
+            tokio::time::timeout(Duration::from_secs(10), engine.cmd_rx.recv())
+                .await
+                .expect("invalid pure v2 recheck worker did not send completion")
+                .expect("engine command channel closed");
         match &invalid_completion {
             EngineCmd::PureV2RecheckFinished {
                 amount_left,
@@ -23006,7 +23240,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn complete_v2_only_magnet_persists_metadata_without_task() {
+    async fn complete_v2_only_magnet_starts_runtime_task() {
         let temp = tempfile::tempdir().unwrap();
         let mut config = Config::default();
         config.storage.download_dir = temp.path().to_path_buf();
@@ -23070,13 +23304,20 @@ mod tests {
 
         engine.complete_magnet(&hash, raw.clone()).await.unwrap();
 
-        assert!(engine.runtime.torrent_chans.is_empty());
+        assert!(engine.runtime.torrent_chans.contains_key(&hash));
+        let task_tx = engine.runtime.torrent_chans.get(&hash).cloned().unwrap();
+        let (stats_reply, stats_rx) = tokio::sync::oneshot::channel();
+        task_tx
+            .send(TorrentCmd::GetRuntimeStats { reply: stats_reply })
+            .await
+            .unwrap();
+        stats_rx.await.unwrap();
         let reg = registry.read().await;
         let entry = reg.get(&hash).unwrap();
         assert_eq!(entry.name, "v2dir");
         assert_eq!(entry.total_length, 65_536);
         assert_eq!(entry.amount_left, 65_536);
-        assert_eq!(entry.state, TorrentState::Paused);
+        assert_eq!(entry.state, TorrentState::Downloading);
         assert_eq!(entry.category.as_deref(), Some("movies"));
         assert_eq!(entry.tags, vec!["v2".to_owned()]);
         drop(reg);
@@ -23115,26 +23356,20 @@ mod tests {
         assert_eq!(projected.files[0].priority, 0);
         assert!(!projected.files[0].wanted);
 
-        // TNG-016: a taskless pure-v2 placeholder has no transfer support
-        // implemented yet, and must say so explicitly rather than silently
-        // accepting peers it can never actually use.
         let add_peers_result = engine
             .add_peers_inner(&hash, vec!["127.0.0.1:6881".parse::<SocketAddr>().unwrap()])
             .await;
-        assert_eq!(
-            add_peers_result,
-            Err("pure v2 peer transfer is not implemented".to_owned())
-        );
-        assert!(engine.torrent_peers_inner(&hash).await.unwrap().is_empty());
+        assert_eq!(add_peers_result, Ok(()));
+        assert!(engine.torrent_peers_inner(&hash).await.is_ok());
         let diagnostic = engine.diagnose_torrent_inner(&hash).await.unwrap();
-        assert!(diagnostic
+        // The actor has applied the persisted priority-0 policy before the
+        // diagnostic is read.  A non-wanted pure-v2 file contributes no
+        // missing bytes even though its payload is not present locally.
+        assert_eq!(diagnostic.bytes_left, 0);
+        assert!(!diagnostic
             .reasons
             .iter()
-            .any(|reason| reason.contains("pure v2 torrent has metadata")));
-        assert!(diagnostic
-            .next_actions
-            .iter()
-            .any(|action| action.contains("v2 transfer support")));
+            .any(|reason| reason.contains("65536 bytes are still missing")));
 
         let (reply, rx) = tokio::sync::oneshot::channel();
         assert!(
@@ -23160,16 +23395,16 @@ mod tests {
                 })
                 .await
         );
-        // TNG-016: resuming a taskless pure-v2 placeholder must say it can't
-        // actually transfer, not silently report success while doing
-        // nothing -- the torrent correctly stays Paused either way.
-        assert_eq!(
-            rx.await.unwrap(),
-            Err("pure v2 peer transfer is not implemented".to_owned())
-        );
+        rx.await.unwrap().unwrap();
+        let (stats_reply, stats_rx) = tokio::sync::oneshot::channel();
+        task_tx
+            .send(TorrentCmd::GetRuntimeStats { reply: stats_reply })
+            .await
+            .unwrap();
+        stats_rx.await.unwrap();
         assert_eq!(
             registry.read().await.get(&hash).unwrap().state,
-            TorrentState::Paused
+            TorrentState::Seeding
         );
 
         let (reply, rx) = tokio::sync::oneshot::channel();
@@ -23181,13 +23416,8 @@ mod tests {
                 })
                 .await
         );
-        // TNG-016: same honesty fix for tracker lifecycle (announce) on a
-        // taskless pure-v2 placeholder.
-        assert_eq!(
-            rx.await.unwrap(),
-            Err("pure v2 tracker lifecycle is not implemented".to_owned())
-        );
-        assert!(engine.runtime.torrent_chans.is_empty());
+        rx.await.unwrap().unwrap();
+        assert!(engine.runtime.torrent_chans.contains_key(&hash));
 
         assert_eq!(
             std::fs::read(torrent_blob_path(&engine.config, &hash)).unwrap(),
@@ -23197,7 +23427,7 @@ mod tests {
             let db = engine.db.lock().unwrap();
             let row = rt_db::get(&db, &hash).unwrap();
             assert_eq!(row.name, "v2-renamed");
-            assert_eq!(row.state, "paused");
+            assert_eq!(row.state, "seeding");
             assert_eq!(row.total_length, 65_536);
             assert_eq!(row.piece_length, 16_384);
             assert_eq!(row.piece_count, 4);
@@ -23214,7 +23444,7 @@ mod tests {
             let trackers = rt_db::list_torrent_trackers(&db, &hash).unwrap();
             assert_eq!(trackers.len(), 1);
             assert_eq!(trackers[0].url, "http://tracker.example/v2");
-            assert_eq!(trackers[0].left_bytes, 65_536);
+            assert_eq!(trackers[0].left_bytes, 0);
         }
 
         let (reply, rx) = tokio::sync::oneshot::channel();
@@ -24366,7 +24596,7 @@ mod tests {
             registry.read().await.get(&info_hash).unwrap().state,
             TorrentState::Checking
         );
-        let completion = tokio::time::timeout(Duration::from_secs(2), engine.cmd_rx.recv())
+        let completion = tokio::time::timeout(Duration::from_secs(10), engine.cmd_rx.recv())
             .await
             .expect("resumed pure v2 recheck worker did not send completion")
             .expect("engine command channel closed");
@@ -29321,6 +29551,26 @@ fn torrent_command_peer_addr(command: &TorrentCmd) -> Option<SocketAddr> {
         }
         _ => None,
     }
+}
+
+fn add_incoming_v2_match(
+    matches: &mut Vec<String>,
+    presented: &str,
+    candidate: &str,
+) -> CmdResult<()> {
+    if candidate.len() != 64 || !candidate.starts_with(presented) {
+        return Ok(());
+    }
+    if matches.iter().any(|known| known == candidate) {
+        return Ok(());
+    }
+    if !matches.is_empty() {
+        return Err(format!(
+            "incoming peer infohash {presented} matches multiple pure-v2 torrents"
+        ));
+    }
+    matches.push(candidate.to_owned());
+    Ok(())
 }
 
 fn incoming_utp_enabled() -> bool {

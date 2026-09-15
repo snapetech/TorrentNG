@@ -145,6 +145,20 @@ fn estimate_deluge_torrent_detail_snapshot_bytes() -> u64 {
     64 * 1024
 }
 
+fn estimate_deluge_tracker_snapshot_bytes(tracker_count: u64, tracker_bytes: u64) -> u64 {
+    // Tracker status text and opaque IDs are part of the durable row. Reserve
+    // for the engine-owned strings, the compatibility clones, and JSON
+    // encoding before materializing a legacy response.
+    16 * 1024 + tracker_count.saturating_mul(1024) + tracker_bytes.saturating_mul(4)
+}
+
+fn estimate_deluge_file_snapshot_bytes(files: &[rt_engine::EngineTorrentFile]) -> u64 {
+    let path_bytes = files.iter().fold(0u64, |total, file| {
+        total.saturating_add(file.path.len() as u64)
+    });
+    16 * 1024 + (files.len() as u64).saturating_mul(512) + path_bytes.saturating_mul(4)
+}
+
 fn deluge_engine(state: &AppState) -> Result<&EngineHandle, String> {
     state
         .engine
@@ -1376,6 +1390,29 @@ async fn load_deluge_runtime_projections(
     Ok(projections)
 }
 
+async fn load_deluge_tracker_snapshot_size(
+    engine: &EngineHandle,
+    hashes: &[String],
+) -> Result<(u64, u64), String> {
+    let mut total_count = 0u64;
+    let mut total_bytes = 0u64;
+    for batch in hashes.chunks(DELUGE_RUNTIME_PROJECTION_CONCURRENCY) {
+        let mut tasks = JoinSet::new();
+        for info_hash in batch {
+            let engine = engine.clone();
+            let info_hash = info_hash.clone();
+            tasks.spawn(async move { engine.torrent_tracker_snapshot_size(info_hash).await });
+        }
+        while let Some(result) = tasks.join_next().await {
+            let (count, bytes) =
+                result.map_err(|error| format!("Deluge tracker size task failed: {error}"))??;
+            total_count = total_count.saturating_add(count);
+            total_bytes = total_bytes.saturating_add(bytes);
+        }
+    }
+    Ok((total_count, total_bytes))
+}
+
 fn merge_deluge_runtime_projections(
     projections: Vec<DelugeRuntimeProjection>,
     metadata: &mut std::collections::HashMap<String, EngineTorrentMetadata>,
@@ -1631,14 +1668,28 @@ async fn torrents_status(state: &AppState, params: &[Value]) -> Result<Value, St
         })
         .collect::<Vec<_>>();
     ensure_legacy_full_list_bound(entries.len(), "Deluge core.get_torrents_status")?;
+    let need_trackers = deluge_fields_need_trackers(&wanted_fields);
+    let (tracker_count, tracker_bytes) = if need_trackers {
+        if let Some(engine) = &state.engine {
+            let hashes = entries
+                .iter()
+                .map(|entry| entry.info_hash.clone())
+                .collect::<Vec<_>>();
+            load_deluge_tracker_snapshot_size(engine, &hashes).await?
+        } else {
+            (0, 0)
+        }
+    } else {
+        (0, 0)
+    };
+    let estimate = estimate_deluge_torrents_snapshot_bytes(entries.len()).saturating_add(
+        estimate_deluge_tracker_snapshot_bytes(tracker_count, tracker_bytes),
+    );
     let _lease = if state.engine.is_some() {
         Some(
-            reserve_deluge_api_snapshot(
-                state,
-                estimate_deluge_torrents_snapshot_bytes(entries.len()),
-            )
-            .await?
-            .ok_or_else(|| "api snapshot memory budget exhausted".to_owned())?,
+            reserve_deluge_api_snapshot(state, estimate)
+                .await?
+                .ok_or_else(|| "api snapshot memory budget exhausted".to_owned())?,
         )
     } else {
         None
@@ -1661,7 +1712,7 @@ async fn torrents_status(state: &AppState, params: &[Value]) -> Result<Value, St
             need_metadata,
             deluge_fields_need_peers(&wanted_fields),
             need_limits,
-            deluge_fields_need_trackers(&wanted_fields),
+            need_trackers,
         )
         .await?;
         merge_deluge_runtime_projections(
@@ -1795,9 +1846,17 @@ async fn torrent_status(
             .ok_or_else(|| format!("torrent {hash} not found"))?
     };
     let hash = entry.info_hash.clone();
+    let (tracker_count, tracker_bytes) = if let Some(engine) = &state.engine {
+        engine.torrent_tracker_snapshot_size(hash.clone()).await?
+    } else {
+        (0, 0)
+    };
+    let estimate = estimate_deluge_torrent_detail_snapshot_bytes().saturating_add(
+        estimate_deluge_tracker_snapshot_bytes(tracker_count, tracker_bytes),
+    );
     let _lease = if state.engine.is_some() {
         Some(
-            reserve_deluge_api_snapshot(state, estimate_deluge_torrent_detail_snapshot_bytes())
+            reserve_deluge_api_snapshot(state, estimate)
                 .await?
                 .ok_or_else(|| "api snapshot memory budget exhausted".to_owned())?,
         )
@@ -1979,6 +2038,13 @@ async fn torrent_files(state: &AppState, hash: &str) -> Result<Value, String> {
     let hash = canonical_torrent_hash(state, hash).await?;
     if let Some(engine) = &state.engine {
         let meta = engine.torrent_metadata(hash).await?;
+        let _lease = engine
+            .reserve_memory(
+                MemoryClass::ApiSnapshot,
+                estimate_deluge_file_snapshot_bytes(&meta.files),
+            )
+            .await?
+            .ok_or_else(|| "api snapshot memory budget exhausted".to_owned())?;
         return Ok(json!(meta
             .files
             .into_iter()

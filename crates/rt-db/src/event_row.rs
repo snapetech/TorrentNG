@@ -1,7 +1,26 @@
-use rusqlite::{params, params_from_iter, types::Value, Connection, Row, Transaction};
+use rusqlite::{
+    params, params_from_iter,
+    types::{Type, Value, ValueRef},
+    Connection, Row, Transaction,
+};
 use serde::{Deserialize, Serialize};
+use std::io;
 
 use crate::error::DbError;
+
+pub const MAX_SESSION_EVENT_PAYLOAD_BYTES: usize = 256 * 1024;
+pub const MAX_JOB_EVENT_PAYLOAD_BYTES: usize = 1024 * 1024;
+pub const MAX_SESSION_EVENT_RESULT_ITEMS: usize = 1_000;
+pub const MAX_JOB_EVENT_RESULT_ITEMS: usize = 1_024;
+const MAX_EVENT_INFO_HASH_BYTES: usize = 64;
+const MAX_EVENT_JOB_ID_BYTES: usize = 256;
+const MAX_EVENT_KIND_BYTES: usize = 256;
+const MAX_EVENT_MESSAGE_BYTES: usize = 64 * 1024;
+const MAX_EVENT_LEVEL_FILTER_ITEMS: usize = 64;
+
+fn sqlite_limit(value: usize) -> i64 {
+    i64::try_from(value.max(1)).unwrap_or(i64::MAX)
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SessionEventRow {
@@ -28,10 +47,25 @@ impl SessionEventRow {
         Ok(SessionEventRow {
             event_id: Some(row.get(0)?),
             occurred_at: row.get(1)?,
-            info_hash: row.get(2)?,
-            kind: row.get(3)?,
-            message: row.get(4)?,
-            payload: row.get(5)?,
+            info_hash: optional_bounded_event_text(
+                row,
+                2,
+                "session event info hash",
+                MAX_EVENT_INFO_HASH_BYTES,
+            )?,
+            kind: bounded_event_text(row, 3, "session event kind", MAX_EVENT_KIND_BYTES)?,
+            message: optional_bounded_event_text(
+                row,
+                4,
+                "session event message",
+                MAX_EVENT_MESSAGE_BYTES,
+            )?,
+            payload: bounded_event_text(
+                row,
+                5,
+                "session event payload",
+                MAX_SESSION_EVENT_PAYLOAD_BYTES,
+            )?,
         })
     }
 }
@@ -40,20 +74,163 @@ impl JobEventRow {
     fn from_row(row: &Row<'_>) -> rusqlite::Result<Self> {
         Ok(JobEventRow {
             event_id: Some(row.get(0)?),
-            job_id: row.get(1)?,
+            job_id: bounded_event_text(row, 1, "job event job id", MAX_EVENT_JOB_ID_BYTES)?,
             occurred_at: row.get(2)?,
-            kind: row.get(3)?,
-            message: row.get(4)?,
-            payload: row.get(5)?,
+            kind: bounded_event_text(row, 3, "job event kind", MAX_EVENT_KIND_BYTES)?,
+            message: optional_bounded_event_text(
+                row,
+                4,
+                "job event message",
+                MAX_EVENT_MESSAGE_BYTES,
+            )?,
+            payload: bounded_event_text(row, 5, "job event payload", MAX_JOB_EVENT_PAYLOAD_BYTES)?,
         })
     }
+}
+
+fn event_column_value_error(
+    column: usize,
+    value_type: Type,
+    message: impl Into<String>,
+) -> rusqlite::Error {
+    rusqlite::Error::FromSqlConversionFailure(
+        column,
+        value_type,
+        Box::new(io::Error::new(io::ErrorKind::InvalidData, message.into())),
+    )
+}
+
+fn event_text_value<'a>(
+    row: &'a Row<'_>,
+    column: usize,
+    field: &str,
+) -> rusqlite::Result<Option<&'a [u8]>> {
+    match row.get_ref(column)? {
+        ValueRef::Text(value) | ValueRef::Blob(value) => Ok(Some(value)),
+        ValueRef::Null => Ok(None),
+        other => Err(event_column_value_error(
+            column,
+            Type::Text,
+            format!("{field} has unexpected SQLite type {other:?}"),
+        )),
+    }
+}
+
+fn bounded_event_text(
+    row: &Row<'_>,
+    column: usize,
+    field: &str,
+    maximum: usize,
+) -> rusqlite::Result<String> {
+    let Some(value) = event_text_value(row, column, field)? else {
+        return Err(event_column_value_error(
+            column,
+            Type::Text,
+            format!("{field} is NULL"),
+        ));
+    };
+    if value.len() > maximum {
+        return Err(event_column_value_error(
+            column,
+            Type::Text,
+            format!("{field} is {} bytes; maximum is {maximum}", value.len()),
+        ));
+    }
+    std::str::from_utf8(value)
+        .map(str::to_owned)
+        .map_err(|error| {
+            event_column_value_error(column, Type::Text, format!("{field} is not UTF-8: {error}"))
+        })
+}
+
+fn optional_bounded_event_text(
+    row: &Row<'_>,
+    column: usize,
+    field: &str,
+    maximum: usize,
+) -> rusqlite::Result<Option<String>> {
+    let Some(value) = event_text_value(row, column, field)? else {
+        return Ok(None);
+    };
+    if value.len() > maximum {
+        return Err(event_column_value_error(
+            column,
+            Type::Text,
+            format!("{field} is {} bytes; maximum is {maximum}", value.len()),
+        ));
+    }
+    std::str::from_utf8(value)
+        .map(|value| Some(value.to_owned()))
+        .map_err(|error| {
+            event_column_value_error(column, Type::Text, format!("{field} is not UTF-8: {error}"))
+        })
+}
+
+fn validate_event_text(value: &str, maximum: usize, field: &'static str) -> Result<(), DbError> {
+    if value.len() > maximum {
+        return Err(DbError::ValueTooLarge {
+            field,
+            len: value.len() as u64,
+            max: maximum as u64,
+        });
+    }
+    Ok(())
+}
+
+fn validate_optional_event_text(
+    value: Option<&str>,
+    maximum: usize,
+    field: &'static str,
+) -> Result<(), DbError> {
+    if let Some(value) = value {
+        validate_event_text(value, maximum, field)?;
+    }
+    Ok(())
+}
+
+fn validate_session_event(event: &SessionEventRow) -> Result<(), DbError> {
+    validate_optional_event_text(
+        event.info_hash.as_deref(),
+        MAX_EVENT_INFO_HASH_BYTES,
+        "session event info hash",
+    )?;
+    validate_event_text(&event.kind, MAX_EVENT_KIND_BYTES, "session event kind")?;
+    validate_optional_event_text(
+        event.message.as_deref(),
+        MAX_EVENT_MESSAGE_BYTES,
+        "session event message",
+    )?;
+    validate_event_text(
+        &event.payload,
+        MAX_SESSION_EVENT_PAYLOAD_BYTES,
+        "session event payload",
+    )?;
+    serde_json::from_str::<serde_json::Value>(&event.payload)?;
+    Ok(())
+}
+
+fn validate_job_event(event: &JobEventRow) -> Result<(), DbError> {
+    validate_event_text(&event.job_id, MAX_EVENT_JOB_ID_BYTES, "job event job id")?;
+    validate_event_text(&event.kind, MAX_EVENT_KIND_BYTES, "job event kind")?;
+    validate_optional_event_text(
+        event.message.as_deref(),
+        MAX_EVENT_MESSAGE_BYTES,
+        "job event message",
+    )?;
+    validate_event_text(
+        &event.payload,
+        MAX_JOB_EVENT_PAYLOAD_BYTES,
+        "job event payload",
+    )?;
+    serde_json::from_str::<serde_json::Value>(&event.payload)?;
+    Ok(())
 }
 
 pub fn append_session_event(conn: &Connection, event: &SessionEventRow) -> Result<i64, DbError> {
     // Session-event payloads are projected by every API surface. Reject bad
     // JSON at the write boundary so a later read cannot turn durable
     // corruption into a dropped or empty-looking event.
-    serde_json::from_str::<serde_json::Value>(&event.payload)?;
+    validate_session_event(event)?;
     let level = session_event_level(event);
     conn.execute(
         "INSERT INTO session_events (occurred_at, info_hash, kind, message, payload, level)
@@ -77,7 +254,7 @@ pub fn append_session_event_in_tx(
     tx: &Transaction<'_>,
     event: &SessionEventRow,
 ) -> Result<i64, DbError> {
-    serde_json::from_str::<serde_json::Value>(&event.payload)?;
+    validate_session_event(event)?;
     let level = session_event_level(event);
     tx.execute(
         "INSERT INTO session_events (occurred_at, info_hash, kind, message, payload, level)
@@ -100,7 +277,7 @@ pub fn prune_session_events(conn: &Connection, retention: usize) -> Result<usize
          WHERE event_id NOT IN (
              SELECT event_id FROM session_events ORDER BY event_id DESC LIMIT ?1
          )",
-        params![retention.max(1) as i64],
+        params![sqlite_limit(retention)],
     )?;
     Ok(deleted)
 }
@@ -117,7 +294,7 @@ pub fn prune_session_events_in_tx(
          WHERE event_id NOT IN (
              SELECT event_id FROM session_events ORDER BY event_id DESC LIMIT ?1
          )",
-        params![retention.max(1) as i64],
+        params![sqlite_limit(retention)],
     )?;
     Ok(deleted)
 }
@@ -138,7 +315,14 @@ pub fn list_session_events_filtered(
     last_known_id: Option<i64>,
     limit: usize,
 ) -> Result<Vec<SessionEventRow>, DbError> {
-    let limit = limit.max(1) as i64;
+    if levels.len() > MAX_EVENT_LEVEL_FILTER_ITEMS {
+        return Err(DbError::ValueTooLarge {
+            field: "session event level filter",
+            len: levels.len() as u64,
+            max: MAX_EVENT_LEVEL_FILTER_ITEMS as u64,
+        });
+    }
+    let limit = sqlite_limit(limit.min(MAX_SESSION_EVENT_RESULT_ITEMS));
     let mut sql = String::from(
         "SELECT event_id, occurred_at, info_hash, kind, message, payload FROM session_events",
     );
@@ -223,6 +407,7 @@ fn level_from_kind(kind: &str) -> &'static str {
 }
 
 pub fn append_job_event(conn: &Connection, event: &JobEventRow) -> Result<i64, DbError> {
+    validate_job_event(event)?;
     conn.execute(
         "INSERT INTO job_events (job_id, occurred_at, kind, message, payload)
          VALUES (?1, ?2, ?3, ?4, ?5)",
@@ -240,6 +425,7 @@ pub fn append_job_event(conn: &Connection, event: &JobEventRow) -> Result<i64, D
 /// Append a job event inside a caller-owned transaction so it can commit with
 /// the job projection it describes.
 pub fn append_job_event_in_tx(tx: &Transaction<'_>, event: &JobEventRow) -> Result<i64, DbError> {
+    validate_job_event(event)?;
     tx.execute(
         "INSERT INTO job_events (job_id, occurred_at, kind, message, payload)
          VALUES (?1, ?2, ?3, ?4, ?5)",
@@ -267,7 +453,10 @@ pub fn list_job_events(
          LIMIT ?2",
     )?;
     let rows = stmt
-        .query_map(params![job_id, limit.max(1) as i64], JobEventRow::from_row)?
+        .query_map(
+            params![job_id, sqlite_limit(limit.min(MAX_JOB_EVENT_RESULT_ITEMS)),],
+            JobEventRow::from_row,
+        )?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     Ok(rows)
 }
@@ -337,6 +526,120 @@ mod tests {
         )
         .unwrap_err();
         assert!(matches!(error, DbError::Json(_)));
+    }
+
+    #[test]
+    fn event_writes_reject_oversized_payloads() {
+        let conn = setup();
+        let session_payload =
+            serde_json::to_string(&"x".repeat(MAX_SESSION_EVENT_PAYLOAD_BYTES)).unwrap();
+        let error = append_session_event(
+            &conn,
+            &SessionEventRow {
+                event_id: None,
+                occurred_at: 10,
+                info_hash: None,
+                kind: "oversized".into(),
+                message: None,
+                payload: session_payload,
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            DbError::ValueTooLarge {
+                field: "session event payload",
+                ..
+            }
+        ));
+
+        let job_payload = serde_json::to_string(&"x".repeat(MAX_JOB_EVENT_PAYLOAD_BYTES)).unwrap();
+        let error = append_job_event(
+            &conn,
+            &JobEventRow {
+                event_id: None,
+                job_id: "job-1".into(),
+                occurred_at: 10,
+                kind: "oversized".into(),
+                message: None,
+                payload: job_payload,
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            DbError::ValueTooLarge {
+                field: "job event payload",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn append_job_event_rejects_invalid_json_payload() {
+        let conn = setup();
+        let error = append_job_event(
+            &conn,
+            &JobEventRow {
+                event_id: None,
+                job_id: "job-1".into(),
+                occurred_at: 10,
+                kind: "corrupt".into(),
+                message: None,
+                payload: "{not-json}".into(),
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(error, DbError::Json(_)));
+    }
+
+    #[test]
+    fn event_reads_reject_oversized_payloads_before_materializing_them() {
+        let conn = setup();
+        let session_payload =
+            serde_json::to_string(&"x".repeat(MAX_SESSION_EVENT_PAYLOAD_BYTES)).unwrap();
+        conn.execute(
+            "INSERT INTO session_events
+             (occurred_at, info_hash, kind, message, payload, level)
+             VALUES (10, NULL, 'corrupt', NULL, ?1, 'info')",
+            params![session_payload],
+        )
+        .unwrap();
+        assert!(list_session_events(&conn, None, 1).is_err());
+
+        job_row::upsert_job(
+            &conn,
+            &job_row::JobRow {
+                job_id: "job-1".into(),
+                kind: "test".into(),
+                state: "queued".into(),
+                dry_run: false,
+                affected_torrents: Vec::new(),
+                total: 0,
+                done: 0,
+                checkpoint: 0,
+                file_index: None,
+                piece_index: None,
+                byte_offset: None,
+                verified_bytes: 0,
+                invalid_pieces: Vec::new(),
+                error: None,
+                created_at: 10,
+                started_at: None,
+                updated_at: 10,
+                finished_at: None,
+            },
+        )
+        .unwrap();
+        let job_payload = serde_json::to_string(&"x".repeat(MAX_JOB_EVENT_PAYLOAD_BYTES)).unwrap();
+        conn.execute(
+            "INSERT INTO job_events (job_id, occurred_at, kind, message, payload)
+             VALUES ('job-1', 10, 'corrupt', NULL, ?1)",
+            params![job_payload],
+        )
+        .unwrap();
+        assert!(list_job_events(&conn, "job-1", 1).is_err());
+        assert!(first_job_event(&conn, "job-1").is_err());
     }
 
     #[test]
@@ -435,5 +738,12 @@ mod tests {
             first_job_event(&conn, "job-1").unwrap(),
             Some(events[0].clone())
         );
+    }
+
+    #[test]
+    fn sqlite_limit_clamps_zero_and_large_values() {
+        assert_eq!(sqlite_limit(0), 1);
+        #[cfg(target_pointer_width = "64")]
+        assert_eq!(sqlite_limit(i64::MAX as usize + 1), i64::MAX);
     }
 }

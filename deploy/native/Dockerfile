@@ -30,6 +30,9 @@ ENV TORRENTNGD_CONFIG=/etc/torrentngd/config.toml
 ENV TNG_STATIC_DIR=/usr/share/torrentng/webui
 ENV RUST_LOG=info
 
+LABEL org.opencontainers.image.title="TorrentNG Engine" \
+      org.opencontainers.image.description="TorrentNG Engine: native Rust BitTorrent client with the shared WebUI/API, migration tooling, storage, jobs, and recovery."
+
 USER torrentngd
 VOLUME ["/data", "/var/lib/torrentngd", "/config"]
 EXPOSE 8080 44444 44444/udp

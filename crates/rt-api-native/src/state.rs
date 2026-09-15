@@ -429,7 +429,7 @@ impl TorrentSnapshot {
         candidates
     }
 
-    pub(crate) fn category_facets(&self) -> Vec<TorrentLabelFacet> {
+    pub(crate) fn category_facets(&self) -> impl Iterator<Item = TorrentLabelFacet> + '_ {
         self.filters
             .by_category
             .iter()
@@ -441,15 +441,13 @@ impl TorrentSnapshot {
                     .and_then(|index| self.torrents.get(index))
                     .map(|item| item.summary.save_path.clone()),
             })
-            .collect()
     }
 
-    pub(crate) fn tag_facets(&self) -> Vec<(String, usize)> {
+    pub(crate) fn tag_facets(&self) -> impl Iterator<Item = (String, usize)> + '_ {
         self.filters
             .by_tag
             .iter()
             .map(|(name, indexes)| (name.clone(), indexes.count()))
-            .collect()
     }
 }
 

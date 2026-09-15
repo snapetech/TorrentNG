@@ -1,3 +1,5 @@
+use std::convert::Infallible;
+
 use axum::{
     body::{to_bytes, Body},
     extract::{DefaultBodyLimit, State},
@@ -30,14 +32,26 @@ use rt_api_model::{
     api_token_allowed, csrf_request_allowed, has_session_cookie, request_fingerprint,
     valid_idempotency_key, CachedResponse, IdempotencyClaim, MAX_IDEMPOTENCY_BODY_BYTES,
 };
+use tower::limit::GlobalConcurrencyLimitLayer;
+
+const MAX_NATIVE_LARGE_BODY_REQUESTS: usize = 4;
+const MAX_NATIVE_DEFAULT_BODY_BYTES: usize = 8 * 1024 * 1024;
+const MAX_NATIVE_TORRENT_BODY_BYTES: usize = 96 * 1024 * 1024;
 
 pub fn build_router(state: AppState) -> Router {
+    let large_body_limit = GlobalConcurrencyLimitLayer::new(MAX_NATIVE_LARGE_BODY_REQUESTS);
     Router::new()
         .route("/health", get(health))
         .route("/metrics", get(metrics))
         .route("/api/v1/auth/login", post(auth_login))
         .route("/api/v1/auth/logout", post(auth_logout))
-        .route("/api/v1/torrents", get(list_torrents).post(add_torrent))
+        .route(
+            "/api/v1/torrents",
+                get(list_torrents)
+                .post(add_torrent)
+                .layer::<_, Infallible>(large_body_limit)
+                .layer(DefaultBodyLimit::max(MAX_NATIVE_TORRENT_BODY_BYTES)),
+        )
         .route("/api/v1/torrents/live", get(live_torrent_stats))
         .route(
             "/api/v1/torrents/:hash",
@@ -177,10 +191,10 @@ pub fn build_router(state: AppState) -> Router {
             torrentng_idempotency_guard,
         ))
         .route_layer(middleware::from_fn_with_state(state.clone(), torrentng_auth_guard))
-        // The metainfo parser accepts up to 64 MiB of raw torrent data. The
-        // TorrentNG JSON/base64 envelope is larger, so keep the transport bound
-        // explicit instead of relying on axum's small default.
-        .layer(DefaultBodyLimit::max(96 * 1024 * 1024))
+        // Keep ordinary JSON/form routes well below the torrent upload limit.
+        // The route-local limit above is the only path that needs the larger
+        // TorrentNG JSON/base64 envelope.
+        .layer(DefaultBodyLimit::max(MAX_NATIVE_DEFAULT_BODY_BYTES))
         .with_state(state)
 }
 

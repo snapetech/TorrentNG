@@ -17,6 +17,11 @@ use thiserror::Error;
 const MAX_TORRENT_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_RESUME_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_BLOCKS_PER_PARTIAL_PIECE: usize = 16_384;
+const MAX_PARTIAL_PIECES: usize = 16_384;
+const MAX_MIGRATION_SCAN_FILES: usize = 100_000;
+const MAX_MIGRATION_SCAN_PATH_BYTES: usize = 64 * 1024 * 1024;
+const MAX_MIGRATION_SCAN_DEPTH: usize = 128;
+const MAX_MIGRATION_PLAN_BYTES: usize = 512 * 1024 * 1024;
 const RESUME_BLOCK_LENGTH: u64 = 16 * 1024;
 
 #[derive(Debug, Error)]
@@ -27,6 +32,8 @@ pub enum MigrationError {
     Db(#[from] rt_db::DbError),
     #[error("sqlite error: {0}")]
     Sqlite(#[from] rusqlite::Error),
+    #[error("migration source scan exceeded the {kind} limit of {maximum}")]
+    ScanLimit { kind: &'static str, maximum: usize },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -158,8 +165,27 @@ impl MigrationPlan {
         conn: &mut rusqlite::Connection,
         options: &ImportOptions,
     ) -> Result<DbImportSummary, MigrationError> {
-        let import = self.to_db_import(options);
-        import.apply(conn)
+        let tx = conn.transaction()?;
+        let mut files = 0usize;
+        let mut trackers = 0usize;
+        for torrent in &self.torrents {
+            let import = torrent.to_db_rows(options);
+            rt_db::upsert_in_tx(&tx, &import.torrent)?;
+            rt_db::replace_torrent_files_in_tx(&tx, &import.torrent.info_hash, &import.files)?;
+            rt_db::replace_torrent_trackers_in_tx(
+                &tx,
+                &import.torrent.info_hash,
+                &import.trackers,
+            )?;
+            files = files.saturating_add(import.files.len());
+            trackers = trackers.saturating_add(import.trackers.len());
+        }
+        tx.commit()?;
+        Ok(DbImportSummary {
+            torrents: self.torrents.len(),
+            files,
+            trackers,
+        })
     }
 
     pub fn apply_native_import(
@@ -610,17 +636,23 @@ impl MigrationPlan {
         policy: ImportPolicy,
     ) -> Result<FastresumeImportSummary, MigrationError> {
         let store = FastresumeStore::new(dir.as_ref().to_path_buf());
-        let import = self.to_fastresume_import(policy);
-        for (_, state) in &import.states {
-            store.save(state).map_err(|e| {
+        let mut states = 0usize;
+        let mut skipped = 0usize;
+        for torrent in &self.torrents {
+            let Some(state) = torrent.to_fastresume_state(policy) else {
+                skipped = skipped.saturating_add(1);
+                continue;
+            };
+            store.save(&state).map_err(|e| {
                 MigrationError::Io(std::io::Error::other(format!(
                     "fastresume save failed: {e}"
                 )))
             })?;
+            states = states.saturating_add(1);
         }
         Ok(FastresumeImportSummary {
-            states: import.states.len(),
-            skipped: import.skipped.len(),
+            states,
+            skipped,
             confidence: self.resume_confidence_summary(),
         })
     }
@@ -847,6 +879,7 @@ fn dry_run_session(
     let mut skipped = Vec::new();
     let mut resume_by_stem = BTreeMap::new();
     let mut aggregate_resume_paths = Vec::new();
+    let mut materialized_bytes = 0usize;
     let files = collect_files(root)?;
     let auxiliary_artifacts = collect_auxiliary_artifacts(root, &files)?;
 
@@ -869,7 +902,19 @@ fn dry_run_session(
         }
         match migration_torrent_from_path(&path, &resume_by_stem, &aggregate_resume_paths, options)
         {
-            Ok(torrent) => torrents.push(torrent),
+            Ok(torrent) => {
+                let item_bytes = estimate_migration_torrent_bytes(&torrent);
+                if admit_migration_plan_bytes(&mut materialized_bytes, item_bytes) {
+                    torrents.push(torrent);
+                } else {
+                    skipped.push(SkippedEntry {
+                        path,
+                        reason: format!(
+                            "migration plan memory budget of {MAX_MIGRATION_PLAN_BYTES} bytes exceeded"
+                        ),
+                    });
+                }
+            }
             Err(reason) => skipped.push(SkippedEntry { path, reason }),
         }
     }
@@ -883,6 +928,82 @@ fn dry_run_session(
         auxiliary_artifacts,
         skipped,
     })
+}
+
+fn estimate_migration_torrent_bytes(torrent: &MigrationTorrent) -> usize {
+    let path_bytes = |path: &Path| path.to_string_lossy().len();
+    let optional_path_bytes = |path: Option<&PathBuf>| path.map_or(0, |path| path_bytes(path));
+    let string_vec_bytes = |values: &[String]| {
+        values.iter().fold(0usize, |total, value| {
+            total
+                .saturating_add(value.len())
+                .saturating_add(std::mem::size_of::<String>())
+        })
+    };
+    let file_bytes = torrent.files.iter().fold(0usize, |total, file| {
+        total
+            .saturating_add(file.path.len())
+            .saturating_add(std::mem::size_of::<MigrationFile>())
+    });
+    let tracker_bytes = string_vec_bytes(&torrent.trackers);
+    let activity_bytes = torrent
+        .tracker_activity
+        .failure_reason
+        .as_ref()
+        .map_or(0, String::len)
+        .saturating_add(
+            torrent
+                .tracker_activity
+                .warning_message
+                .as_ref()
+                .map_or(0, String::len),
+        );
+    let fastresume_bytes = torrent.fastresume.as_ref().map_or(0, |state| {
+        state
+            .pieces
+            .len()
+            .saturating_mul(std::mem::size_of::<PieceState>())
+            .saturating_add(state.partial_pieces.iter().fold(0usize, |total, partial| {
+                total
+                    .saturating_add(std::mem::size_of::<PartialPieceState>())
+                    .saturating_add(
+                        partial
+                            .received_blocks
+                            .len()
+                            .saturating_mul(std::mem::size_of::<u32>()),
+                    )
+            }))
+            .saturating_add(
+                state
+                    .file_hints
+                    .len()
+                    .saturating_mul(std::mem::size_of::<FileHint>()),
+            )
+    });
+    4096usize
+        .saturating_add(torrent.info_hash.len())
+        .saturating_add(torrent.name.len())
+        .saturating_add(path_bytes(&torrent.torrent_path))
+        .saturating_add(optional_path_bytes(torrent.resume_path.as_ref()))
+        .saturating_add(optional_path_bytes(torrent.save_path.as_ref()))
+        .saturating_add(torrent.category.as_ref().map_or(0, String::len))
+        .saturating_add(string_vec_bytes(&torrent.tags))
+        .saturating_add(file_bytes)
+        .saturating_add(tracker_bytes)
+        .saturating_add(activity_bytes)
+        .saturating_add(fastresume_bytes)
+        .saturating_add(string_vec_bytes(&torrent.warnings))
+}
+
+fn admit_migration_plan_bytes(total: &mut usize, item_bytes: usize) -> bool {
+    let Some(next) = total.checked_add(item_bytes) else {
+        return false;
+    };
+    if next > MAX_MIGRATION_PLAN_BYTES {
+        return false;
+    }
+    *total = next;
+    true
 }
 
 fn resume_sidecar_keys(stem: &str) -> Vec<String> {
@@ -1653,6 +1774,9 @@ fn libtorrent_partial_pieces(value: &BValue<'_>) -> Vec<PartialPieceState> {
             received_blocks.sort_unstable();
             received_blocks.dedup();
             received_blocks.truncate(MAX_BLOCKS_PER_PARTIAL_PIECE);
+            if out.len() >= MAX_PARTIAL_PIECES {
+                continue;
+            }
             out.push(PartialPieceState {
                 piece,
                 received_blocks,
@@ -1999,19 +2123,65 @@ fn collect_files(root: &Path) -> Result<Vec<PathBuf>, MigrationError> {
     if !root.exists() {
         return Ok(out);
     }
-    collect_files_inner(root, &mut out)?;
+    let mut budget = MigrationScanBudget::default();
+    collect_files_inner(root, 0, &mut budget, &mut out)?;
     out.sort();
     Ok(out)
 }
 
-fn collect_files_inner(path: &Path, out: &mut Vec<PathBuf>) -> Result<(), MigrationError> {
+#[derive(Debug, Default)]
+struct MigrationScanBudget {
+    files: usize,
+    path_bytes: usize,
+}
+
+impl MigrationScanBudget {
+    fn admit_file(&mut self, path: &Path) -> Result<(), MigrationError> {
+        if self.files >= MAX_MIGRATION_SCAN_FILES {
+            return Err(MigrationError::ScanLimit {
+                kind: "regular-file count",
+                maximum: MAX_MIGRATION_SCAN_FILES,
+            });
+        }
+        let path_bytes = path.to_string_lossy().len();
+        let Some(total_path_bytes) = self.path_bytes.checked_add(path_bytes) else {
+            return Err(MigrationError::ScanLimit {
+                kind: "scanned path bytes",
+                maximum: MAX_MIGRATION_SCAN_PATH_BYTES,
+            });
+        };
+        if total_path_bytes > MAX_MIGRATION_SCAN_PATH_BYTES {
+            return Err(MigrationError::ScanLimit {
+                kind: "scanned path bytes",
+                maximum: MAX_MIGRATION_SCAN_PATH_BYTES,
+            });
+        }
+        self.files += 1;
+        self.path_bytes = total_path_bytes;
+        Ok(())
+    }
+}
+
+fn collect_files_inner(
+    path: &Path,
+    depth: usize,
+    budget: &mut MigrationScanBudget,
+    out: &mut Vec<PathBuf>,
+) -> Result<(), MigrationError> {
+    if depth > MAX_MIGRATION_SCAN_DEPTH {
+        return Err(MigrationError::ScanLimit {
+            kind: "directory depth",
+            maximum: MAX_MIGRATION_SCAN_DEPTH,
+        });
+    }
     for entry in std::fs::read_dir(path)? {
         let entry = entry?;
         let path = entry.path();
         let file_type = entry.file_type()?;
         if file_type.is_dir() {
-            collect_files_inner(&path, out)?;
+            collect_files_inner(&path, depth + 1, budget, out)?;
         } else if file_type.is_file() {
+            budget.admit_file(&path)?;
             out.push(path);
         }
     }
@@ -3918,6 +4088,20 @@ mod tests {
     }
 
     #[test]
+    fn partial_piece_count_is_bounded() {
+        let unfinished = BValue::Dict(
+            (0..=MAX_PARTIAL_PIECES)
+                .map(|_| (b"0".as_slice(), BValue::List(vec![BValue::Int(0)])))
+                .collect(),
+        );
+        let resume = BValue::Dict(vec![(b"unfinished".as_slice(), unfinished)]);
+
+        let partial = libtorrent_partial_pieces(&resume);
+
+        assert_eq!(partial.len(), MAX_PARTIAL_PIECES);
+    }
+
+    #[test]
     fn require_verification_downgrades_imported_valid_pieces() {
         let dir = tempfile::tempdir().unwrap();
         let torrent_path = dir.path().join("sample.torrent");
@@ -4667,5 +4851,45 @@ mod tests {
 
         assert_eq!(plan.torrent_count(), 1);
         assert_eq!(plan.skipped.len(), 0);
+    }
+
+    #[test]
+    fn migration_scan_budget_rejects_file_and_path_limits() {
+        let mut budget = MigrationScanBudget::default();
+        for _ in 0..MAX_MIGRATION_SCAN_FILES {
+            budget.admit_file(Path::new("sample.torrent")).unwrap();
+        }
+        assert!(matches!(
+            budget.admit_file(Path::new("one-more.torrent")),
+            Err(MigrationError::ScanLimit {
+                kind: "regular-file count",
+                maximum: MAX_MIGRATION_SCAN_FILES,
+            })
+        ));
+
+        let mut budget = MigrationScanBudget::default();
+        let long_path = "x".repeat(MAX_MIGRATION_SCAN_PATH_BYTES + 1);
+        assert!(matches!(
+            budget.admit_file(Path::new(&long_path)),
+            Err(MigrationError::ScanLimit {
+                kind: "scanned path bytes",
+                maximum: MAX_MIGRATION_SCAN_PATH_BYTES,
+            })
+        ));
+    }
+
+    #[test]
+    fn migration_plan_materialization_admission_is_bounded() {
+        let mut total = 0;
+        assert!(admit_migration_plan_bytes(
+            &mut total,
+            MAX_MIGRATION_PLAN_BYTES - 1
+        ));
+        assert_eq!(total, MAX_MIGRATION_PLAN_BYTES - 1);
+        assert!(!admit_migration_plan_bytes(&mut total, 2));
+        assert_eq!(total, MAX_MIGRATION_PLAN_BYTES - 1);
+
+        let mut overflowing_total = usize::MAX;
+        assert!(!admit_migration_plan_bytes(&mut overflowing_total, 1));
     }
 }

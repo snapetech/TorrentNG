@@ -12,12 +12,14 @@ tracing.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 hex.workspace = true
+tokio = { workspace = true, features = ["rt"] }
 rt-path = { path = "../rt-path" }
 rt-piece-map = { path = "../rt-piece-map" }
 rt-storage = { path = "../rt-storage" }
 
 [dev-dependencies]
 tempfile.workspace = true
+tokio = { workspace = true, features = ["rt", "rt-multi-thread", "macros", "sync"] }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

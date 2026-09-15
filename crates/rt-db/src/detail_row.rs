@@ -1,7 +1,33 @@
-use rusqlite::{params, Connection, Row};
+use rusqlite::{
+    params,
+    types::{Type, ValueRef},
+    Connection, OptionalExtension, Row,
+};
 use serde::{Deserialize, Serialize};
+use std::io;
 
 use crate::error::DbError;
+use crate::torrent_row::{
+    MAX_TORRENT_TRACKER_RESULT_BYTES, MAX_TORRENT_TRACKER_RESULT_ITEMS,
+    MAX_TORRENT_TRACKER_URL_BYTES,
+};
+
+pub const MAX_TORRENT_TRACKER_TEXT_BYTES: usize = 16 * 1024;
+pub const MAX_TORRENT_TRACKER_ID_BYTES: usize = 16 * 1024;
+pub const MAX_TORRENT_TRACKER_INFO_HASH_BYTES: usize = 64;
+pub const MAX_TORRENT_FILE_PATH_BYTES: usize = 16 * 1024;
+pub const MAX_TORRENT_FILE_RESULT_ITEMS: usize = 100_000;
+pub const MAX_TORRENT_FILE_RESULT_BYTES: usize = 64 * 1024 * 1024;
+const MAX_TORRENT_FILE_INFO_HASH_BYTES: usize = 64;
+
+// Tracker filtering is used to intersect the live registry, so it may need
+// to return the full supported session population rather than the smaller
+// mutation/list-page limit. Keep that population and its hash strings bounded
+// before the API builds a HashSet from it.
+const MAX_TRACKER_MATCH_RESULT_ITEMS: usize = 100_000;
+const MAX_TRACKER_MATCH_RESULT_BYTES: usize = 16 * 1024 * 1024;
+const MAX_GLOBAL_TRACKER_RESULT_ITEMS: usize = 100_000;
+const MAX_GLOBAL_TRACKER_RESULT_BYTES: usize = 256 * 1024 * 1024;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct TorrentFileRow {
@@ -84,9 +110,19 @@ pub struct TorrentLimitRow {
 impl TorrentFileRow {
     fn from_row(row: &Row<'_>) -> rusqlite::Result<Self> {
         Ok(TorrentFileRow {
-            info_hash: row.get(0)?,
+            info_hash: bounded_file_text_column(
+                row,
+                0,
+                "torrent file info hash",
+                MAX_TORRENT_FILE_INFO_HASH_BYTES,
+            )?,
             file_index: row.get(1)?,
-            path: row.get(2)?,
+            path: bounded_file_text_column(
+                row,
+                2,
+                "torrent file path",
+                MAX_TORRENT_FILE_PATH_BYTES,
+            )?,
             length: row.get(3)?,
             offset: row.get(4)?,
             priority: row.get(5)?,
@@ -96,20 +132,121 @@ impl TorrentFileRow {
     }
 }
 
+fn file_column_value_error(column: usize, message: impl Into<String>) -> rusqlite::Error {
+    rusqlite::Error::FromSqlConversionFailure(
+        column,
+        Type::Text,
+        Box::new(io::Error::new(io::ErrorKind::InvalidData, message.into())),
+    )
+}
+
+fn file_text_value<'a>(
+    row: &'a Row<'_>,
+    column: usize,
+    field: &str,
+) -> rusqlite::Result<Option<&'a [u8]>> {
+    match row.get_ref(column)? {
+        ValueRef::Text(value) | ValueRef::Blob(value) => Ok(Some(value)),
+        ValueRef::Null => Ok(None),
+        other => Err(file_column_value_error(
+            column,
+            format!("{field} has unexpected SQLite type {other:?}"),
+        )),
+    }
+}
+
+fn bounded_file_text_column(
+    row: &Row<'_>,
+    column: usize,
+    field: &str,
+    maximum: usize,
+) -> rusqlite::Result<String> {
+    let Some(value) = file_text_value(row, column, field)? else {
+        return Err(file_column_value_error(column, format!("{field} is NULL")));
+    };
+    if value.len() > maximum {
+        return Err(file_column_value_error(
+            column,
+            format!("{field} is {} bytes; maximum is {maximum}", value.len()),
+        ));
+    }
+    std::str::from_utf8(value)
+        .map(str::to_owned)
+        .map_err(|error| file_column_value_error(column, format!("{field} is not UTF-8: {error}")))
+}
+
+fn validate_torrent_files(files: &[TorrentFileRow]) -> Result<(), DbError> {
+    if files.len() > MAX_TORRENT_FILE_RESULT_ITEMS {
+        return Err(DbError::ValueTooLarge {
+            field: "torrent file result items",
+            len: files.len() as u64,
+            max: MAX_TORRENT_FILE_RESULT_ITEMS as u64,
+        });
+    }
+    let mut bytes = 0usize;
+    for file in files {
+        if file.info_hash.len() > MAX_TORRENT_FILE_INFO_HASH_BYTES {
+            return Err(DbError::ValueTooLarge {
+                field: "torrent file info hash",
+                len: file.info_hash.len() as u64,
+                max: MAX_TORRENT_FILE_INFO_HASH_BYTES as u64,
+            });
+        }
+        if file.path.len() > MAX_TORRENT_FILE_PATH_BYTES {
+            return Err(DbError::ValueTooLarge {
+                field: "torrent file path",
+                len: file.path.len() as u64,
+                max: MAX_TORRENT_FILE_PATH_BYTES as u64,
+            });
+        }
+        bytes = bytes
+            .saturating_add(file.info_hash.len())
+            .saturating_add(file.path.len());
+    }
+    if bytes > MAX_TORRENT_FILE_RESULT_BYTES {
+        return Err(DbError::ValueTooLarge {
+            field: "torrent file result bytes",
+            len: bytes as u64,
+            max: MAX_TORRENT_FILE_RESULT_BYTES as u64,
+        });
+    }
+    Ok(())
+}
+
 impl TorrentTrackerRow {
     fn from_row(row: &Row<'_>) -> rusqlite::Result<Self> {
         Ok(TorrentTrackerRow {
-            info_hash: row.get(0)?,
+            info_hash: bounded_tracker_text_column(
+                row,
+                0,
+                "tracker info hash",
+                MAX_TORRENT_TRACKER_INFO_HASH_BYTES,
+            )?,
             tracker_index: row.get(1)?,
             tier: row.get(2)?,
-            url: row.get(3)?,
-            tracker_id: row.get(4)?,
-            status: row.get(5)?,
+            url: bounded_tracker_text_column(row, 3, "tracker URL", MAX_TORRENT_TRACKER_URL_BYTES)?,
+            tracker_id: optional_bounded_tracker_id_column(row, 4)?,
+            status: bounded_tracker_text_column(
+                row,
+                5,
+                "tracker status",
+                MAX_TORRENT_TRACKER_TEXT_BYTES,
+            )?,
             last_announce_at: row.get(6)?,
             next_announce_at: row.get(7)?,
             last_success_at: row.get(8)?,
-            failure_reason: row.get(9)?,
-            warning_message: row.get(10)?,
+            failure_reason: optional_bounded_tracker_text_column(
+                row,
+                9,
+                "tracker failure reason",
+                MAX_TORRENT_TRACKER_TEXT_BYTES,
+            )?,
+            warning_message: optional_bounded_tracker_text_column(
+                row,
+                10,
+                "tracker warning message",
+                MAX_TORRENT_TRACKER_TEXT_BYTES,
+            )?,
             seeders: row.get(11)?,
             leechers: row.get(12)?,
             completed: row.get(13)?,
@@ -118,6 +255,104 @@ impl TorrentTrackerRow {
             left_bytes: row.get(16)?,
         })
     }
+}
+
+fn tracker_column_value_error(
+    column: usize,
+    value_type: Type,
+    message: impl Into<String>,
+) -> rusqlite::Error {
+    rusqlite::Error::FromSqlConversionFailure(
+        column,
+        value_type,
+        Box::new(io::Error::new(io::ErrorKind::InvalidData, message.into())),
+    )
+}
+
+fn tracker_text_value<'a>(
+    row: &'a Row<'_>,
+    column: usize,
+    field: &str,
+) -> rusqlite::Result<Option<&'a [u8]>> {
+    match row.get_ref(column)? {
+        ValueRef::Text(value) | ValueRef::Blob(value) => Ok(Some(value)),
+        ValueRef::Null => Ok(None),
+        other => Err(tracker_column_value_error(
+            column,
+            Type::Text,
+            format!("{field} has unexpected SQLite type {other:?}"),
+        )),
+    }
+}
+
+fn bounded_tracker_text_column(
+    row: &Row<'_>,
+    column: usize,
+    field: &str,
+    maximum: usize,
+) -> rusqlite::Result<String> {
+    let Some(value) = tracker_text_value(row, column, field)? else {
+        return Err(tracker_column_value_error(
+            column,
+            Type::Text,
+            format!("{field} is NULL"),
+        ));
+    };
+    if value.len() > maximum {
+        return Err(tracker_column_value_error(
+            column,
+            Type::Text,
+            format!("{field} is {} bytes; maximum is {maximum}", value.len()),
+        ));
+    }
+    std::str::from_utf8(value)
+        .map(str::to_owned)
+        .map_err(|error| {
+            tracker_column_value_error(column, Type::Text, format!("{field} is not UTF-8: {error}"))
+        })
+}
+
+fn optional_bounded_tracker_text_column(
+    row: &Row<'_>,
+    column: usize,
+    field: &str,
+    maximum: usize,
+) -> rusqlite::Result<Option<String>> {
+    let Some(value) = tracker_text_value(row, column, field)? else {
+        return Ok(None);
+    };
+    if value.len() > maximum {
+        return Err(tracker_column_value_error(
+            column,
+            Type::Text,
+            format!("{field} is {} bytes; maximum is {maximum}", value.len()),
+        ));
+    }
+    std::str::from_utf8(value)
+        .map(|value| Some(value.to_owned()))
+        .map_err(|error| {
+            tracker_column_value_error(column, Type::Text, format!("{field} is not UTF-8: {error}"))
+        })
+}
+
+fn optional_bounded_tracker_id_column(
+    row: &Row<'_>,
+    column: usize,
+) -> rusqlite::Result<Option<Vec<u8>>> {
+    let Some(value) = tracker_text_value(row, column, "tracker ID")? else {
+        return Ok(None);
+    };
+    if value.len() > MAX_TORRENT_TRACKER_ID_BYTES {
+        return Err(tracker_column_value_error(
+            column,
+            Type::Blob,
+            format!(
+                "tracker ID is {} bytes; maximum is {MAX_TORRENT_TRACKER_ID_BYTES}",
+                value.len()
+            ),
+        ));
+    }
+    Ok(Some(value.to_owned()))
 }
 
 impl TorrentLimitRow {
@@ -145,6 +380,14 @@ pub fn replace_torrent_files(
     info_hash: &str,
     files: &[TorrentFileRow],
 ) -> Result<(), DbError> {
+    validate_torrent_files(files)?;
+    if info_hash.len() > MAX_TORRENT_FILE_INFO_HASH_BYTES {
+        return Err(DbError::ValueTooLarge {
+            field: "torrent file info hash",
+            len: info_hash.len() as u64,
+            max: MAX_TORRENT_FILE_INFO_HASH_BYTES as u64,
+        });
+    }
     let tx = conn.transaction()?;
     tx.execute(
         "DELETE FROM torrent_files WHERE info_hash = ?1",
@@ -176,6 +419,14 @@ pub fn replace_torrent_files_in_tx(
     info_hash: &str,
     files: &[TorrentFileRow],
 ) -> Result<(), DbError> {
+    validate_torrent_files(files)?;
+    if info_hash.len() > MAX_TORRENT_FILE_INFO_HASH_BYTES {
+        return Err(DbError::ValueTooLarge {
+            field: "torrent file info hash",
+            len: info_hash.len() as u64,
+            max: MAX_TORRENT_FILE_INFO_HASH_BYTES as u64,
+        });
+    }
     tx.execute(
         "DELETE FROM torrent_files WHERE info_hash = ?1",
         params![info_hash],
@@ -206,14 +457,41 @@ pub fn list_torrent_files(
 ) -> Result<Vec<TorrentFileRow>, DbError> {
     let mut stmt = conn.prepare(
         "SELECT info_hash, file_index, path, length, offset, priority, wanted, completed_bytes
+                , COUNT(*) OVER () AS result_count
+                , COALESCE(SUM(
+                    length(CAST(info_hash AS BLOB)) + length(CAST(path AS BLOB))
+                ) OVER (), 0) AS result_bytes
          FROM torrent_files
          WHERE info_hash = ?1
          ORDER BY file_index ASC",
     )?;
-    let rows = stmt
-        .query_map(params![info_hash], TorrentFileRow::from_row)?
-        .collect::<rusqlite::Result<Vec<_>>>()?;
-    Ok(rows)
+    let mut rows = stmt.query(params![info_hash])?;
+    let Some(first) = rows.next()? else {
+        return Ok(Vec::new());
+    };
+    let result_count = first.get::<_, i64>(8)?.max(0) as u64;
+    let result_bytes = first.get::<_, i64>(9)?.max(0) as u64;
+    if result_count > MAX_TORRENT_FILE_RESULT_ITEMS as u64 {
+        return Err(DbError::ValueTooLarge {
+            field: "torrent file result items",
+            len: result_count,
+            max: MAX_TORRENT_FILE_RESULT_ITEMS as u64,
+        });
+    }
+    if result_bytes > MAX_TORRENT_FILE_RESULT_BYTES as u64 {
+        return Err(DbError::ValueTooLarge {
+            field: "torrent file result bytes",
+            len: result_bytes,
+            max: MAX_TORRENT_FILE_RESULT_BYTES as u64,
+        });
+    }
+
+    let mut result = Vec::with_capacity(result_count as usize);
+    result.push(TorrentFileRow::from_row(first)?);
+    while let Some(row) = rows.next()? {
+        result.push(TorrentFileRow::from_row(row)?);
+    }
+    Ok(result)
 }
 
 /// Count a torrent's durable file projection without materializing every file
@@ -314,6 +592,8 @@ pub fn list_torrent_trackers(
     conn: &Connection,
     info_hash: &str,
 ) -> Result<Vec<TorrentTrackerRow>, DbError> {
+    let (count, bytes) = torrent_tracker_snapshot_size(conn, info_hash)?;
+    validate_tracker_snapshot_result(count, bytes)?;
     let mut stmt = conn.prepare(
         "SELECT info_hash, tracker_index, tier, url, tracker_id, status, last_announce_at,
                 next_announce_at, last_success_at, failure_reason, warning_message,
@@ -328,7 +608,161 @@ pub fn list_torrent_trackers(
     Ok(rows)
 }
 
+/// Return only tracker URLs for compatibility mutations that need to edit
+/// the current list. Avoid materializing status, counters, messages, and
+/// opaque tracker IDs when the caller will immediately replace the URLs.
+pub fn list_torrent_tracker_urls(
+    conn: &Connection,
+    info_hash: &str,
+) -> Result<Vec<String>, DbError> {
+    let (count, bytes) = torrent_tracker_snapshot_size(conn, info_hash)?;
+    validate_tracker_snapshot_result(count, bytes)?;
+    let mut stmt = conn.prepare(
+        "SELECT url
+         FROM torrent_trackers
+         WHERE info_hash = ?1
+         ORDER BY tier ASC, tracker_index ASC",
+    )?;
+    let rows = stmt
+        .query_map(params![info_hash], |row| {
+            bounded_tracker_text_column(row, 0, "tracker URL", MAX_TORRENT_TRACKER_URL_BYTES)
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows)
+}
+
+/// Return only the qBittorrent-compatible primary tracker projection.
+///
+/// The compatibility list path needs the first tracker URL and total count,
+/// not every tracker status, counter, message, and opaque tracker ID. Keep
+/// that read narrow so a large tracker set cannot be materialized for each
+/// live torrent projection.
+pub fn torrent_tracker_projection(
+    conn: &Connection,
+    info_hash: &str,
+) -> Result<Option<(String, u64)>, DbError> {
+    let mut stmt = conn.prepare(
+        "SELECT url,
+                (SELECT COUNT(*) FROM torrent_trackers WHERE info_hash = ?1)
+         FROM torrent_trackers
+         WHERE info_hash = ?1
+         ORDER BY tier ASC, tracker_index ASC
+         LIMIT 1",
+    )?;
+    let projection = stmt
+        .query_row(params![info_hash], |row| {
+            let count: i64 = row.get(1)?;
+            let url =
+                bounded_tracker_text_column(row, 0, "tracker URL", MAX_TORRENT_TRACKER_URL_BYTES)?;
+            Ok((url, count.max(0) as u64))
+        })
+        .optional()?;
+    Ok(projection)
+}
+
+/// Return the row count and UTF-8 byte footprint needed before materializing
+/// a compatibility tracker snapshot. Keep this aggregate narrow: callers use
+/// it for memory admission before loading status text, tracker IDs, and
+/// counters for every tracker row.
+pub fn torrent_tracker_snapshot_size(
+    conn: &Connection,
+    info_hash: &str,
+) -> Result<(u64, u64), DbError> {
+    let (count, bytes): (i64, i64) = conn.query_row(
+        "SELECT COUNT(*),
+                COALESCE(SUM(
+                    length(CAST(info_hash AS BLOB))
+                    + length(CAST(url AS BLOB))
+                    + length(CAST(status AS BLOB))
+                    + COALESCE(length(CAST(failure_reason AS BLOB)), 0)
+                    + COALESCE(length(CAST(warning_message AS BLOB)), 0)
+                    + COALESCE(length(tracker_id), 0)
+                ), 0)
+         FROM torrent_trackers
+         WHERE info_hash = ?1",
+        params![info_hash],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+    Ok((count.max(0) as u64, bytes.max(0) as u64))
+}
+
+fn validate_tracker_snapshot_result(count: u64, bytes: u64) -> Result<(), DbError> {
+    if count > MAX_TORRENT_TRACKER_RESULT_ITEMS as u64 {
+        return Err(DbError::ValueTooLarge {
+            field: "torrent tracker result items",
+            len: count,
+            max: MAX_TORRENT_TRACKER_RESULT_ITEMS as u64,
+        });
+    }
+    if bytes > MAX_TORRENT_TRACKER_RESULT_BYTES as u64 {
+        return Err(DbError::ValueTooLarge {
+            field: "torrent tracker result bytes",
+            len: bytes,
+            max: MAX_TORRENT_TRACKER_RESULT_BYTES as u64,
+        });
+    }
+    Ok(())
+}
+
+/// Return the earliest persisted announce deadline for one torrent without
+/// materializing its tracker rows.
+pub fn torrent_tracker_deadline(
+    conn: &Connection,
+    info_hash: &str,
+) -> Result<Option<i64>, DbError> {
+    conn.query_row(
+        "SELECT MIN(next_announce_at)
+         FROM torrent_trackers
+         WHERE info_hash = ?1",
+        params![info_hash],
+        |row| row.get(0),
+    )
+    .map_err(DbError::from)
+}
+
+/// Check whether a torrent has any normalized tracker rows without loading
+/// the tracker projection. Startup repair uses this narrow probe while
+/// processing legacy rows in bounded batches.
+pub fn torrent_tracker_rows_exist(conn: &Connection, info_hash: &str) -> Result<bool, DbError> {
+    let exists: i64 = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM torrent_trackers WHERE info_hash = ?1)",
+        params![info_hash],
+        |row| row.get(0),
+    )?;
+    Ok(exists != 0)
+}
+
 pub fn list_all_torrent_trackers(conn: &Connection) -> Result<Vec<TorrentTrackerRow>, DbError> {
+    let (count, bytes): (i64, i64) = conn.query_row(
+        "SELECT COUNT(*),
+                COALESCE(SUM(
+                    length(CAST(info_hash AS BLOB))
+                    + length(CAST(url AS BLOB))
+                    + length(CAST(status AS BLOB))
+                    + COALESCE(length(CAST(failure_reason AS BLOB)), 0)
+                    + COALESCE(length(CAST(warning_message AS BLOB)), 0)
+                    + COALESCE(length(tracker_id), 0)
+                ), 0)
+         FROM torrent_trackers",
+        [],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+    let count = count.max(0) as u64;
+    let bytes = bytes.max(0) as u64;
+    if count > MAX_GLOBAL_TRACKER_RESULT_ITEMS as u64 {
+        return Err(DbError::ValueTooLarge {
+            field: "global torrent tracker result items",
+            len: count,
+            max: MAX_GLOBAL_TRACKER_RESULT_ITEMS as u64,
+        });
+    }
+    if bytes > MAX_GLOBAL_TRACKER_RESULT_BYTES as u64 {
+        return Err(DbError::ValueTooLarge {
+            field: "global torrent tracker result bytes",
+            len: bytes,
+            max: MAX_GLOBAL_TRACKER_RESULT_BYTES as u64,
+        });
+    }
     let mut stmt = conn.prepare(
         "SELECT info_hash, tracker_index, tier, url, tracker_id, status, last_announce_at,
                 next_announce_at, last_success_at, failure_reason, warning_message,
@@ -340,6 +774,89 @@ pub fn list_all_torrent_trackers(conn: &Connection) -> Result<Vec<TorrentTracker
         .query_map([], TorrentTrackerRow::from_row)?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     Ok(rows)
+}
+
+/// Return the earliest persisted announce deadline for each torrent.
+///
+/// Startup only needs this aggregate to decide which dormant torrents must be
+/// promoted. Keep the query narrow so restoring a large database does not
+/// materialize tracker URLs, status text, counters, and opaque tracker IDs.
+pub fn list_torrent_tracker_deadlines(conn: &Connection) -> Result<Vec<(String, i64)>, DbError> {
+    let mut stmt = conn.prepare(
+        "SELECT info_hash, MIN(next_announce_at)
+         FROM torrent_trackers
+         WHERE next_announce_at IS NOT NULL
+         GROUP BY info_hash
+         ORDER BY info_hash ASC",
+    )?;
+    let mut rows = stmt.query([])?;
+    let mut result = Vec::new();
+    while let Some(row) = rows.next()? {
+        if result.len() >= MAX_TRACKER_MATCH_RESULT_ITEMS {
+            return Err(DbError::ValueTooLarge {
+                field: "tracker deadline result items",
+                len: (result.len() + 1) as u64,
+                max: MAX_TRACKER_MATCH_RESULT_ITEMS as u64,
+            });
+        }
+        let info_hash = bounded_tracker_text_column(
+            row,
+            0,
+            "tracker deadline info hash",
+            MAX_TORRENT_TRACKER_INFO_HASH_BYTES,
+        )?;
+        result.push((info_hash, row.get(1)?));
+    }
+    let bytes = result
+        .iter()
+        .map(|(info_hash, _)| info_hash.len())
+        .sum::<usize>();
+    if bytes > MAX_TRACKER_MATCH_RESULT_BYTES {
+        return Err(DbError::ValueTooLarge {
+            field: "tracker deadline result bytes",
+            len: bytes as u64,
+            max: MAX_TRACKER_MATCH_RESULT_BYTES as u64,
+        });
+    }
+    Ok(result)
+}
+
+/// Return the set of torrents that have persisted tracker rows without
+/// materializing each tracker detail row.
+pub fn list_torrent_tracker_hashes(conn: &Connection) -> Result<Vec<String>, DbError> {
+    let mut stmt = conn.prepare(
+        "SELECT DISTINCT info_hash
+         FROM torrent_trackers
+         ORDER BY info_hash ASC",
+    )?;
+    let mut rows = stmt.query([])?;
+    let mut result = Vec::new();
+    let mut bytes = 0usize;
+    while let Some(row) = rows.next()? {
+        if result.len() >= MAX_TRACKER_MATCH_RESULT_ITEMS {
+            return Err(DbError::ValueTooLarge {
+                field: "tracker hash result items",
+                len: (result.len() + 1) as u64,
+                max: MAX_TRACKER_MATCH_RESULT_ITEMS as u64,
+            });
+        }
+        let info_hash = bounded_tracker_text_column(
+            row,
+            0,
+            "tracker hash info hash",
+            MAX_TORRENT_TRACKER_INFO_HASH_BYTES,
+        )?;
+        bytes = bytes.saturating_add(info_hash.len());
+        if bytes > MAX_TRACKER_MATCH_RESULT_BYTES {
+            return Err(DbError::ValueTooLarge {
+                field: "tracker hash result bytes",
+                len: bytes as u64,
+                max: MAX_TRACKER_MATCH_RESULT_BYTES as u64,
+            });
+        }
+        result.push(info_hash);
+    }
+    Ok(result)
 }
 
 /// Return torrent hashes whose normalized tracker URL contains `needle`.
@@ -356,15 +873,95 @@ pub fn list_torrent_hashes_by_tracker(
         return Ok(Vec::new());
     }
     let mut stmt = conn.prepare(
-        "SELECT DISTINCT info_hash
-         FROM torrent_trackers
-         WHERE instr(lower(url), lower(?1)) > 0
+        "SELECT info_hash,
+                COUNT(*) OVER () AS result_count,
+                COALESCE(SUM(length(CAST(info_hash AS BLOB))) OVER (), 0)
+                    AS result_bytes
+         FROM (
+             SELECT DISTINCT info_hash
+             FROM torrent_trackers
+             WHERE instr(lower(url), lower(?1)) > 0
+         )
          ORDER BY info_hash ASC",
     )?;
-    let rows = stmt
-        .query_map(params![needle], |row| row.get(0))?
-        .collect::<rusqlite::Result<Vec<String>>>()?;
-    Ok(rows)
+    let mut rows = stmt.query(params![needle])?;
+    let Some(first) = rows.next()? else {
+        return Ok(Vec::new());
+    };
+    let result_count = first.get::<_, i64>(1)?.max(0) as u64;
+    let result_bytes = first.get::<_, i64>(2)?.max(0) as u64;
+    if result_count > MAX_TRACKER_MATCH_RESULT_ITEMS as u64 {
+        return Err(DbError::ValueTooLarge {
+            field: "tracker match result items",
+            len: result_count,
+            max: MAX_TRACKER_MATCH_RESULT_ITEMS as u64,
+        });
+    }
+    if result_bytes > MAX_TRACKER_MATCH_RESULT_BYTES as u64 {
+        return Err(DbError::ValueTooLarge {
+            field: "tracker match result bytes",
+            len: result_bytes,
+            max: MAX_TRACKER_MATCH_RESULT_BYTES as u64,
+        });
+    }
+
+    let mut result = Vec::with_capacity(result_count as usize);
+    result.push(bounded_tracker_text_column(
+        first,
+        0,
+        "torrent info hash",
+        MAX_TORRENT_TRACKER_INFO_HASH_BYTES,
+    )?);
+    while let Some(row) = rows.next()? {
+        result.push(bounded_tracker_text_column(
+            row,
+            0,
+            "torrent info hash",
+            MAX_TORRENT_TRACKER_INFO_HASH_BYTES,
+        )?);
+    }
+    Ok(result)
+}
+
+/// Return the count and hash-string footprint of a tracker filter result
+/// without materializing the matching hashes. Callers use this to admit the
+/// transient set they build while intersecting the live registry.
+pub fn torrent_hashes_by_tracker_snapshot_size(
+    conn: &Connection,
+    needle: &str,
+) -> Result<(u64, u64), DbError> {
+    let needle = needle.trim();
+    if needle.is_empty() {
+        return Ok((0, 0));
+    }
+    let (count, bytes): (i64, i64) = conn.query_row(
+        "SELECT COUNT(*),
+                COALESCE(SUM(length(CAST(info_hash AS BLOB))), 0)
+         FROM (
+             SELECT DISTINCT info_hash
+             FROM torrent_trackers
+             WHERE instr(lower(url), lower(?1)) > 0
+         )",
+        params![needle],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+    let count = count.max(0) as u64;
+    let bytes = bytes.max(0) as u64;
+    if count > MAX_TRACKER_MATCH_RESULT_ITEMS as u64 {
+        return Err(DbError::ValueTooLarge {
+            field: "tracker match result items",
+            len: count,
+            max: MAX_TRACKER_MATCH_RESULT_ITEMS as u64,
+        });
+    }
+    if bytes > MAX_TRACKER_MATCH_RESULT_BYTES as u64 {
+        return Err(DbError::ValueTooLarge {
+            field: "tracker match result bytes",
+            len: bytes,
+            max: MAX_TRACKER_MATCH_RESULT_BYTES as u64,
+        });
+    }
+    Ok((count, bytes))
 }
 
 pub fn torrent_tracker_status_counts(
@@ -377,7 +974,10 @@ pub fn torrent_tracker_status_counts(
     )?;
     let mut counts = TorrentTrackerStatusCounts::default();
     let rows = stmt.query_map([], |row| {
-        Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+        Ok((
+            bounded_tracker_text_column(row, 0, "tracker status", MAX_TORRENT_TRACKER_TEXT_BYTES)?,
+            row.get::<_, i64>(1)?,
+        ))
     })?;
     for row in rows {
         let (status, count) = row?;
@@ -393,60 +993,168 @@ pub fn torrent_tracker_status_counts(
     Ok(counts)
 }
 
+/// Return tracker status counts for one torrent without materializing any
+/// tracker text. This is used by diagnostics, which only need the aggregate
+/// counts and must not load optional failure messages or tracker IDs.
+pub fn torrent_tracker_status_counts_for_torrent(
+    conn: &Connection,
+    info_hash: &str,
+) -> Result<TorrentTrackerStatusCounts, DbError> {
+    let (total, working, warning, error): (i64, i64, i64, i64) = conn.query_row(
+        "SELECT COUNT(*),
+                COALESCE(SUM(CASE WHEN status = 'working' THEN 1 ELSE 0 END), 0),
+                COALESCE(SUM(CASE WHEN status = 'warning' THEN 1 ELSE 0 END), 0),
+                COALESCE(SUM(CASE WHEN status = 'error' THEN 1 ELSE 0 END), 0)
+         FROM torrent_trackers
+         WHERE info_hash = ?1",
+        params![info_hash],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+    )?;
+    Ok(TorrentTrackerStatusCounts {
+        total: total.max(0) as u64,
+        working: working.max(0) as u64,
+        warning: warning.max(0) as u64,
+        error: error.max(0) as u64,
+    })
+}
+
 /// Aggregate normalized tracker state without materializing every tracker
 /// row in the API process. The inner query collapses duplicate tracker URLs
-/// within a torrent before the outer query sums peer counts.
+/// within a torrent before the outer query sums peer counts. The windowed
+/// result totals are read from the first row before any tracker text is
+/// cloned, so a damaged or unexpectedly large database fails closed without
+/// building an unbounded Rust result.
 pub fn torrent_tracker_health(conn: &Connection) -> Result<Vec<TorrentTrackerHealthRow>, DbError> {
     let mut stmt = conn.prepare(
-        "SELECT tracker,
-                COUNT(*) AS torrent_count,
-                COALESCE(SUM(active_count), 0) AS active_count,
-                COALESCE(SUM(complete_count), 0) AS complete_count,
-                COALESCE(SUM(error_count), 0) AS error_count,
-                COALESCE(SUM(seed_count), 0) AS seed_count,
-                COALESCE(SUM(peer_count), 0) AS peer_count,
-                MAX(last_updated) AS last_updated
-         FROM (
-             SELECT tt.url AS tracker,
-                    tt.info_hash,
-                    CASE WHEN t.state IN ('downloading', 'seeding')
-                         THEN 1 ELSE 0 END AS active_count,
-                    -- `completed_at` is historical and can survive a
-                    -- recheck that returns a torrent to downloading. Use
-                    -- the live amount-left invariant for current progress.
-                    CASE WHEN t.state IN ('seeding', 'completed')
-                              OR (t.total_length > 0 AND t.amount_left = 0)
-                         THEN 1 ELSE 0 END AS complete_count,
-                    MAX(CASE WHEN tt.status = 'error' THEN 1 ELSE 0 END)
-                        AS error_count,
-                    MAX(COALESCE(tt.seeders, 0)) AS seed_count,
-                    MAX(COALESCE(tt.leechers, 0)) AS peer_count,
-                    MAX(COALESCE(tt.last_announce_at, tt.last_success_at))
-                        AS last_updated
+        "WITH tracker_health AS (
+             SELECT tracker,
+                    COUNT(*) AS torrent_count,
+                    COALESCE(SUM(active_count), 0) AS active_count,
+                    COALESCE(SUM(complete_count), 0) AS complete_count,
+                    COALESCE(SUM(error_count), 0) AS error_count,
+                    COALESCE(SUM(seed_count), 0) AS seed_count,
+                    COALESCE(SUM(peer_count), 0) AS peer_count,
+                    MAX(last_updated) AS last_updated
+             FROM (
+                 SELECT tt.url AS tracker,
+                        tt.info_hash,
+                        CASE WHEN t.state IN ('downloading', 'seeding')
+                             THEN 1 ELSE 0 END AS active_count,
+                        -- `completed_at` is historical and can survive a
+                        -- recheck that returns a torrent to downloading. Use
+                        -- the live amount-left invariant for current progress.
+                        CASE WHEN t.state IN ('seeding', 'completed')
+                                  OR (t.total_length > 0 AND t.amount_left = 0)
+                             THEN 1 ELSE 0 END AS complete_count,
+                        MAX(CASE WHEN tt.status = 'error' THEN 1 ELSE 0 END)
+                            AS error_count,
+                        MAX(COALESCE(tt.seeders, 0)) AS seed_count,
+                        MAX(COALESCE(tt.leechers, 0)) AS peer_count,
+                        MAX(COALESCE(tt.last_announce_at, tt.last_success_at))
+                            AS last_updated
+                 FROM torrent_trackers AS tt
+                 INNER JOIN torrents AS t ON t.info_hash = tt.info_hash
+                 WHERE tt.url <> ''
+                 GROUP BY tt.url, tt.info_hash
+             )
+             GROUP BY tracker
+         )
+         SELECT tracker,
+                torrent_count,
+                active_count,
+                complete_count,
+                error_count,
+                seed_count,
+                peer_count,
+                last_updated,
+                COUNT(*) OVER () AS result_count,
+                COALESCE(SUM(length(CAST(tracker AS BLOB))) OVER (), 0)
+                    AS result_bytes
+         FROM tracker_health
+         ORDER BY error_count DESC, torrent_count DESC, tracker COLLATE NOCASE",
+    )?;
+    let mut rows = stmt.query([])?;
+    let Some(first) = rows.next()? else {
+        return Ok(Vec::new());
+    };
+    let result_count = first.get::<_, i64>(8)?.max(0) as u64;
+    let result_bytes = first.get::<_, i64>(9)?.max(0) as u64;
+    if result_count > MAX_TORRENT_TRACKER_RESULT_ITEMS as u64 {
+        return Err(DbError::ValueTooLarge {
+            field: "tracker health result items",
+            len: result_count,
+            max: MAX_TORRENT_TRACKER_RESULT_ITEMS as u64,
+        });
+    }
+    if result_bytes > MAX_TORRENT_TRACKER_RESULT_BYTES as u64 {
+        return Err(DbError::ValueTooLarge {
+            field: "tracker health result bytes",
+            len: result_bytes,
+            max: MAX_TORRENT_TRACKER_RESULT_BYTES as u64,
+        });
+    }
+
+    let mut result = Vec::with_capacity(result_count as usize);
+    result.push(torrent_tracker_health_from_row(first)?);
+    while let Some(row) = rows.next()? {
+        result.push(torrent_tracker_health_from_row(row)?);
+    }
+    Ok(result)
+}
+
+/// Return the count and tracker-URL footprint of the grouped health result
+/// without materializing the aggregate rows. This is the admission half of
+/// the tracker-health API projection.
+pub fn torrent_tracker_health_snapshot_size(conn: &Connection) -> Result<(u64, u64), DbError> {
+    let (count, bytes): (i64, i64) = conn.query_row(
+        "WITH tracker_urls AS (
+             SELECT tt.url AS tracker
              FROM torrent_trackers AS tt
              INNER JOIN torrents AS t ON t.info_hash = tt.info_hash
              WHERE tt.url <> ''
              GROUP BY tt.url, tt.info_hash
+         ), grouped_trackers AS (
+             SELECT tracker
+             FROM tracker_urls
+             GROUP BY tracker
          )
-         GROUP BY tracker
-         ORDER BY error_count DESC, torrent_count DESC, tracker COLLATE NOCASE",
+         SELECT COUNT(*),
+                COALESCE(SUM(length(CAST(tracker AS BLOB))), 0)
+         FROM grouped_trackers",
+        [],
+        |row| Ok((row.get(0)?, row.get(1)?)),
     )?;
-    let rows = stmt
-        .query_map([], |row| {
-            let to_u64 = |value: i64| u64::try_from(value.max(0)).unwrap_or(0);
-            Ok(TorrentTrackerHealthRow {
-                tracker: row.get(0)?,
-                torrent_count: to_u64(row.get(1)?),
-                active_count: to_u64(row.get(2)?),
-                complete_count: to_u64(row.get(3)?),
-                error_count: to_u64(row.get(4)?),
-                seed_count: to_u64(row.get(5)?),
-                peer_count: to_u64(row.get(6)?),
-                last_updated: row.get(7)?,
-            })
-        })?
-        .collect::<rusqlite::Result<Vec<_>>>()?;
-    Ok(rows)
+    let count = count.max(0) as u64;
+    let bytes = bytes.max(0) as u64;
+    if count > MAX_TORRENT_TRACKER_RESULT_ITEMS as u64 {
+        return Err(DbError::ValueTooLarge {
+            field: "tracker health result items",
+            len: count,
+            max: MAX_TORRENT_TRACKER_RESULT_ITEMS as u64,
+        });
+    }
+    if bytes > MAX_TORRENT_TRACKER_RESULT_BYTES as u64 {
+        return Err(DbError::ValueTooLarge {
+            field: "tracker health result bytes",
+            len: bytes,
+            max: MAX_TORRENT_TRACKER_RESULT_BYTES as u64,
+        });
+    }
+    Ok((count, bytes))
+}
+
+fn torrent_tracker_health_from_row(row: &Row<'_>) -> rusqlite::Result<TorrentTrackerHealthRow> {
+    let to_u64 = |value: i64| u64::try_from(value.max(0)).unwrap_or(0);
+    Ok(TorrentTrackerHealthRow {
+        tracker: bounded_tracker_text_column(row, 0, "tracker URL", MAX_TORRENT_TRACKER_URL_BYTES)?,
+        torrent_count: to_u64(row.get(1)?),
+        active_count: to_u64(row.get(2)?),
+        complete_count: to_u64(row.get(3)?),
+        error_count: to_u64(row.get(4)?),
+        seed_count: to_u64(row.get(5)?),
+        peer_count: to_u64(row.get(6)?),
+        last_updated: row.get(7)?,
+    })
 }
 
 pub fn upsert_torrent_limits(conn: &Connection, limits: &TorrentLimitRow) -> Result<(), DbError> {
@@ -603,6 +1311,62 @@ mod tests {
     }
 
     #[test]
+    fn file_writes_reject_oversized_paths_before_replacing_existing_rows() {
+        let mut conn = setup();
+        let info_hash = "a".repeat(40);
+        replace_torrent_files(
+            &mut conn,
+            &info_hash,
+            &[TorrentFileRow {
+                info_hash: info_hash.clone(),
+                file_index: 0,
+                path: "existing.bin".into(),
+                length: 100,
+                offset: 0,
+                priority: 1,
+                wanted: true,
+                completed_bytes: 50,
+            }],
+        )
+        .unwrap();
+
+        let error = replace_torrent_files(
+            &mut conn,
+            &info_hash,
+            &[TorrentFileRow {
+                info_hash: info_hash.clone(),
+                file_index: 0,
+                path: "x".repeat(MAX_TORRENT_FILE_PATH_BYTES + 1),
+                length: 100,
+                offset: 0,
+                priority: 1,
+                wanted: true,
+                completed_bytes: 50,
+            }],
+        )
+        .unwrap_err();
+        assert!(matches!(error, DbError::ValueTooLarge { .. }));
+
+        let files = list_torrent_files(&conn, &info_hash).unwrap();
+        assert_eq!(files[0].path, "existing.bin");
+    }
+
+    #[test]
+    fn file_reads_reject_oversized_paths_before_materializing_them() {
+        let conn = setup();
+        let info_hash = "a".repeat(40);
+        conn.execute(
+            "INSERT INTO torrent_files
+                (info_hash, file_index, path, length, offset, priority, wanted, completed_bytes)
+             VALUES (?1, 0, ?2, 100, 0, 1, 1, 50)",
+            params![&info_hash, "x".repeat(MAX_TORRENT_FILE_PATH_BYTES + 1)],
+        )
+        .unwrap();
+
+        assert!(list_torrent_files(&conn, &info_hash).is_err());
+    }
+
+    #[test]
     fn replace_and_list_trackers() {
         let mut conn = setup();
         replace_torrent_trackers(
@@ -629,8 +1393,17 @@ mod tests {
             }],
         )
         .unwrap();
+        assert!(torrent_tracker_rows_exist(&conn, &"a".repeat(40)).unwrap());
         let trackers = list_torrent_trackers(&conn, &"a".repeat(40)).unwrap();
         assert_eq!(trackers.len(), 1);
+        assert_eq!(
+            torrent_tracker_projection(&conn, &"a".repeat(40)).unwrap(),
+            Some(("http://tracker/announce".to_owned(), 1))
+        );
+        assert_eq!(
+            list_torrent_tracker_urls(&conn, &"a".repeat(40)).unwrap(),
+            vec!["http://tracker/announce"]
+        );
         assert_eq!(trackers[0].seeders, Some(1));
         assert_eq!(trackers[0].leechers, Some(2));
         assert_eq!(trackers[0].completed, Some(3));
@@ -644,6 +1417,10 @@ mod tests {
         assert_eq!(
             list_torrent_hashes_by_tracker(&conn, "tracker/announce").unwrap(),
             vec!["a".repeat(40)]
+        );
+        assert_eq!(
+            torrent_hashes_by_tracker_snapshot_size(&conn, "tracker/announce").unwrap(),
+            (1, 40)
         );
         assert_eq!(
             list_torrent_hashes_by_tracker(&conn, "TRACKER/ANNOUNCE").unwrap(),
@@ -661,6 +1438,155 @@ mod tests {
                 error: 0,
             }
         );
+    }
+
+    #[test]
+    fn tracker_reads_reject_oversized_columns_before_materializing_them() {
+        let conn = setup();
+        let info_hash = "a".repeat(40);
+        conn.execute(
+            "INSERT INTO torrent_trackers
+                (info_hash, tracker_index, tier, url, status, failure_reason, warning_message)
+             VALUES (?1, 0, 0, ?2, 'working', NULL, NULL)",
+            params![&info_hash, "https://tracker.example/announce"],
+        )
+        .unwrap();
+
+        conn.execute(
+            "UPDATE torrent_trackers SET url = ?1 WHERE info_hash = ?2",
+            params!["x".repeat(MAX_TORRENT_TRACKER_URL_BYTES + 1), &info_hash],
+        )
+        .unwrap();
+        assert!(list_torrent_trackers(&conn, &info_hash).is_err());
+        assert!(list_torrent_tracker_urls(&conn, &info_hash).is_err());
+        assert!(torrent_tracker_projection(&conn, &info_hash).is_err());
+        assert!(torrent_tracker_health(&conn).is_err());
+
+        conn.execute(
+            "UPDATE torrent_trackers SET url = ?1, tracker_id = ?2 WHERE info_hash = ?3",
+            params![
+                "https://tracker.example/announce",
+                vec![0xffu8; MAX_TORRENT_TRACKER_ID_BYTES + 1],
+                &info_hash
+            ],
+        )
+        .unwrap();
+        assert!(list_torrent_trackers(&conn, &info_hash).is_err());
+        assert_eq!(
+            list_torrent_tracker_urls(&conn, &info_hash).unwrap(),
+            vec!["https://tracker.example/announce"]
+        );
+        assert_eq!(
+            torrent_tracker_projection(&conn, &info_hash).unwrap(),
+            Some(("https://tracker.example/announce".to_owned(), 1))
+        );
+
+        conn.execute(
+            "UPDATE torrent_trackers
+             SET tracker_id = NULL, failure_reason = ?1
+             WHERE info_hash = ?2",
+            params!["x".repeat(MAX_TORRENT_TRACKER_TEXT_BYTES + 1), &info_hash],
+        )
+        .unwrap();
+        assert!(list_torrent_trackers(&conn, &info_hash).is_err());
+
+        conn.execute(
+            "UPDATE torrent_trackers
+             SET failure_reason = NULL, warning_message = ?1
+             WHERE info_hash = ?2",
+            params!["x".repeat(MAX_TORRENT_TRACKER_TEXT_BYTES + 1), &info_hash],
+        )
+        .unwrap();
+        assert!(list_torrent_trackers(&conn, &info_hash).is_err());
+
+        conn.execute(
+            "UPDATE torrent_trackers
+             SET warning_message = NULL, status = ?1
+             WHERE info_hash = ?2",
+            params!["x".repeat(MAX_TORRENT_TRACKER_TEXT_BYTES + 1), &info_hash],
+        )
+        .unwrap();
+        assert!(torrent_tracker_status_counts(&conn).is_err());
+    }
+
+    #[test]
+    fn tracker_health_rejects_an_oversized_result_before_materializing_it() {
+        let mut conn = setup();
+        let info_hash = "a".repeat(40);
+        let trackers = (0..=MAX_TORRENT_TRACKER_RESULT_BYTES / MAX_TORRENT_TRACKER_URL_BYTES)
+            .map(|tracker_index| TorrentTrackerRow {
+                info_hash: info_hash.clone(),
+                tracker_index: tracker_index as i64,
+                tier: 0,
+                url: format!(
+                    "{tracker_index:04}{}",
+                    "x".repeat(MAX_TORRENT_TRACKER_URL_BYTES - 4)
+                ),
+                tracker_id: None,
+                status: "working".into(),
+                last_announce_at: None,
+                next_announce_at: None,
+                last_success_at: None,
+                failure_reason: None,
+                warning_message: None,
+                seeders: None,
+                leechers: None,
+                completed: None,
+                uploaded: 0,
+                downloaded: 0,
+                left_bytes: 0,
+            })
+            .collect::<Vec<_>>();
+        replace_torrent_trackers(&mut conn, &info_hash, &trackers).unwrap();
+
+        assert!(matches!(
+            torrent_tracker_health(&conn),
+            Err(DbError::ValueTooLarge {
+                field: "tracker health result bytes",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn tracker_startup_aggregates_group_deadlines_and_hashes() {
+        let mut conn = setup();
+        let info_hash = "a".repeat(40);
+        let tracker = |tracker_index: i64, next_announce_at: Option<i64>| TorrentTrackerRow {
+            info_hash: info_hash.clone(),
+            tracker_index,
+            tier: 0,
+            url: format!("https://tracker-{tracker_index}.example/announce"),
+            tracker_id: None,
+            status: "working".into(),
+            last_announce_at: None,
+            next_announce_at,
+            last_success_at: None,
+            failure_reason: None,
+            warning_message: None,
+            seeders: None,
+            leechers: None,
+            completed: None,
+            uploaded: 0,
+            downloaded: 0,
+            left_bytes: 0,
+        };
+        replace_torrent_trackers(
+            &mut conn,
+            &info_hash,
+            &[
+                tracker(0, Some(200)),
+                tracker(1, Some(100)),
+                tracker(2, None),
+            ],
+        )
+        .unwrap();
+
+        assert_eq!(
+            list_torrent_tracker_deadlines(&conn).unwrap(),
+            vec![(info_hash.clone(), 100)]
+        );
+        assert_eq!(list_torrent_tracker_hashes(&conn).unwrap(), vec![info_hash]);
     }
 
     #[test]
@@ -739,6 +1665,10 @@ mod tests {
                 peer_count: 8,
                 last_updated: Some(50),
             }
+        );
+        assert_eq!(
+            torrent_tracker_health_snapshot_size(&conn).unwrap(),
+            (1, url.len() as u64)
         );
     }
 

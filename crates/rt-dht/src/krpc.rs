@@ -4,7 +4,7 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV
 
 use rt_bencode::{encode, BValue, Decoder};
 
-use crate::{KNode, NodeId};
+use crate::{KNode, KNode6, NodeId};
 
 #[derive(Debug, thiserror::Error)]
 pub enum KrpcError {
@@ -25,9 +25,21 @@ pub enum DhtQuery {
         id: NodeId,
         target: NodeId,
     },
+    /// BEP 32 find_node with an explicit address-family request.
+    FindNodeWithWant {
+        id: NodeId,
+        target: NodeId,
+        want: Vec<DhtWant>,
+    },
     GetPeers {
         id: NodeId,
         info_hash: [u8; 20],
+    },
+    /// BEP 32 get_peers with an explicit address-family request.
+    GetPeersWithWant {
+        id: NodeId,
+        info_hash: [u8; 20],
+        want: Vec<DhtWant>,
     },
     AnnouncePeer {
         id: NodeId,
@@ -38,12 +50,21 @@ pub enum DhtQuery {
     },
 }
 
+/// Address families named by the BEP 32 `want` argument.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum DhtWant {
+    Ipv4,
+    Ipv6,
+}
+
 impl DhtQuery {
     pub fn name(&self) -> &'static [u8] {
         match self {
             DhtQuery::Ping { .. } => b"ping",
             DhtQuery::FindNode { .. } => b"find_node",
+            DhtQuery::FindNodeWithWant { .. } => b"find_node",
             DhtQuery::GetPeers { .. } => b"get_peers",
+            DhtQuery::GetPeersWithWant { .. } => b"get_peers",
             DhtQuery::AnnouncePeer { .. } => b"announce_peer",
         }
     }
@@ -53,6 +74,7 @@ impl DhtQuery {
 pub struct DhtResponse {
     pub id: NodeId,
     pub nodes: Vec<KNode>,
+    pub nodes6: Vec<KNode6>,
     pub values: Vec<SocketAddr>,
     pub token: Option<Vec<u8>>,
 }
@@ -62,6 +84,7 @@ impl DhtResponse {
         Self {
             id,
             nodes: Vec::new(),
+            nodes6: Vec::new(),
             values: Vec::new(),
             token: None,
         }
@@ -135,11 +158,27 @@ fn encode_query(transaction_id: &[u8], query: &DhtQuery) -> Vec<u8> {
             target = *id.as_bytes();
             args.push((b"target".as_ref(), BValue::Bytes(&target)));
         }
+        DhtQuery::FindNodeWithWant {
+            target: id, want, ..
+        } => {
+            target = *id.as_bytes();
+            args.push((b"target".as_ref(), BValue::Bytes(&target)));
+            push_want(&mut args, want);
+        }
         DhtQuery::GetPeers {
             info_hash: hash, ..
         } => {
             info_hash = *hash;
             args.push((b"info_hash".as_ref(), BValue::Bytes(&info_hash)));
+        }
+        DhtQuery::GetPeersWithWant {
+            info_hash: hash,
+            want,
+            ..
+        } => {
+            info_hash = *hash;
+            args.push((b"info_hash".as_ref(), BValue::Bytes(&info_hash)));
+            push_want(&mut args, want);
         }
         DhtQuery::AnnouncePeer {
             implied_port: implied,
@@ -166,13 +205,60 @@ fn encode_query(transaction_id: &[u8], query: &DhtQuery) -> Vec<u8> {
     ]))
 }
 
+fn push_want<'a>(args: &mut Vec<(&'a [u8], BValue<'a>)>, want: &[DhtWant]) {
+    let values = want
+        .iter()
+        .map(|family| {
+            BValue::Bytes(match family {
+                DhtWant::Ipv4 => b"n4".as_ref(),
+                DhtWant::Ipv6 => b"n6".as_ref(),
+            })
+        })
+        .collect();
+    args.push((b"want".as_ref(), BValue::List(values)));
+}
+
+fn parse_want(args: &BValue<'_>) -> Result<Option<Vec<DhtWant>>, KrpcError> {
+    let Some(value) = args.get(b"want") else {
+        return Ok(None);
+    };
+    let BValue::List(items) = value else {
+        return Err(KrpcError::Invalid("want must be a list"));
+    };
+    if items.len() > 2 {
+        return Err(KrpcError::Invalid(
+            "want contains too many address families",
+        ));
+    }
+    let mut want = Vec::with_capacity(items.len());
+    for item in items {
+        let family = item
+            .as_bytes()
+            .ok_or(KrpcError::Invalid("want entries must be bytes"))?;
+        let family = match family {
+            b"n4" => DhtWant::Ipv4,
+            b"n6" => DhtWant::Ipv6,
+            _ => return Err(KrpcError::Invalid("want entry must be n4 or n6")),
+        };
+        if want.contains(&family) {
+            return Err(KrpcError::Invalid("want contains a duplicate family"));
+        }
+        want.push(family);
+    }
+    Ok(Some(want))
+}
+
 fn encode_response(transaction_id: &[u8], response: &DhtResponse) -> Vec<u8> {
     let id = *response.id.as_bytes();
     let nodes = encode_compact_nodes(&response.nodes);
+    let nodes6 = encode_compact_nodes6(&response.nodes6);
     let compact_values = encode_compact_peer_values(&response.values);
     let mut pairs = vec![(b"id".as_ref(), BValue::Bytes(&id))];
     if !nodes.is_empty() {
         pairs.push((b"nodes".as_ref(), BValue::Bytes(&nodes)));
+    }
+    if !nodes6.is_empty() {
+        pairs.push((b"nodes6".as_ref(), BValue::Bytes(&nodes6)));
     }
     if let Some(token) = &response.token {
         pairs.push((b"token".as_ref(), BValue::Bytes(token)));
@@ -210,7 +296,9 @@ fn query_id(query: &DhtQuery) -> NodeId {
     match query {
         DhtQuery::Ping { id }
         | DhtQuery::FindNode { id, .. }
+        | DhtQuery::FindNodeWithWant { id, .. }
         | DhtQuery::GetPeers { id, .. }
+        | DhtQuery::GetPeersWithWant { id, .. }
         | DhtQuery::AnnouncePeer { id, .. } => *id,
     }
 }
@@ -224,14 +312,24 @@ fn parse_query(value: &BValue<'_>, transaction_id: Vec<u8>) -> Result<KrpcMessag
     let id = parse_node_id(required_bytes(args, b"id")?)?;
     let query = match q {
         "ping" => DhtQuery::Ping { id },
-        "find_node" => DhtQuery::FindNode {
-            id,
-            target: parse_node_id(required_bytes(args, b"target")?)?,
-        },
-        "get_peers" => DhtQuery::GetPeers {
-            id,
-            info_hash: parse_20(required_bytes(args, b"info_hash")?)?,
-        },
+        "find_node" => {
+            let target = parse_node_id(required_bytes(args, b"target")?)?;
+            match parse_want(args)? {
+                Some(want) => DhtQuery::FindNodeWithWant { id, target, want },
+                None => DhtQuery::FindNode { id, target },
+            }
+        }
+        "get_peers" => {
+            let info_hash = parse_20(required_bytes(args, b"info_hash")?)?;
+            match parse_want(args)? {
+                Some(want) => DhtQuery::GetPeersWithWant {
+                    id,
+                    info_hash,
+                    want,
+                },
+                None => DhtQuery::GetPeers { id, info_hash },
+            }
+        }
         "announce_peer" => DhtQuery::AnnouncePeer {
             id,
             implied_port: optional_int(args, b"implied_port").unwrap_or(0) != 0,
@@ -256,6 +354,10 @@ fn parse_response(value: &BValue<'_>, transaction_id: Vec<u8>) -> Result<KrpcMes
         Some(bytes) => parse_compact_nodes(bytes)?,
         None => Vec::new(),
     };
+    let nodes6 = match r.get(b"nodes6").and_then(BValue::as_bytes) {
+        Some(bytes) => parse_compact_nodes6(bytes)?,
+        None => Vec::new(),
+    };
     let values = match r.get(b"values") {
         Some(BValue::List(items)) => {
             let mut peers = Vec::new();
@@ -274,6 +376,7 @@ fn parse_response(value: &BValue<'_>, transaction_id: Vec<u8>) -> Result<KrpcMes
         response: DhtResponse {
             id,
             nodes,
+            nodes6,
             values,
             token,
         },
@@ -328,6 +431,42 @@ pub fn parse_compact_nodes(bytes: &[u8]) -> Result<Vec<KNode>, KrpcError> {
             KNode {
                 id: NodeId::from_bytes(id),
                 addr: SocketAddrV4::new(ip, port),
+            }
+        })
+        .collect())
+}
+
+/// Encode BEP 32 compact IPv6 routing nodes (`20-byte id + 16-byte address +
+/// 2-byte port`).
+pub fn encode_compact_nodes6(nodes: &[KNode6]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(nodes.len() * 38);
+    for node in nodes {
+        out.extend_from_slice(node.id.as_bytes());
+        out.extend_from_slice(&node.addr.ip().octets());
+        out.extend_from_slice(&node.addr.port().to_be_bytes());
+    }
+    out
+}
+
+pub fn parse_compact_nodes6(bytes: &[u8]) -> Result<Vec<KNode6>, KrpcError> {
+    if !bytes.len().is_multiple_of(38) {
+        return Err(KrpcError::Invalid(
+            "compact IPv6 nodes length is not a multiple of 38",
+        ));
+    }
+    Ok(bytes
+        .as_chunks::<38>()
+        .0
+        .iter()
+        .map(|chunk| {
+            let mut id = [0u8; 20];
+            id.copy_from_slice(&chunk[..20]);
+            let mut ip = [0u8; 16];
+            ip.copy_from_slice(&chunk[20..36]);
+            let port = u16::from_be_bytes([chunk[36], chunk[37]]);
+            KNode6 {
+                id: NodeId::from_bytes(id),
+                addr: SocketAddrV6::new(Ipv6Addr::from(ip), port, 0, 0),
             }
         })
         .collect())
@@ -490,12 +629,38 @@ mod tests {
     }
 
     #[test]
+    fn bep32_find_node_want_roundtrip() {
+        let msg = KrpcMessage::Query {
+            transaction_id: b"fw".to_vec(),
+            query: DhtQuery::FindNodeWithWant {
+                id: id(1),
+                target: id(2),
+                want: vec![DhtWant::Ipv4, DhtWant::Ipv6],
+            },
+        };
+        assert_eq!(KrpcMessage::parse(&msg.encode()).unwrap(), msg);
+    }
+
+    #[test]
     fn get_peers_query_roundtrip() {
         let msg = KrpcMessage::Query {
             transaction_id: b"gp".to_vec(),
             query: DhtQuery::GetPeers {
                 id: id(1),
                 info_hash: [9u8; 20],
+            },
+        };
+        assert_eq!(KrpcMessage::parse(&msg.encode()).unwrap(), msg);
+    }
+
+    #[test]
+    fn bep32_get_peers_want_roundtrip() {
+        let msg = KrpcMessage::Query {
+            transaction_id: b"gw".to_vec(),
+            query: DhtQuery::GetPeersWithWant {
+                id: id(1),
+                info_hash: [9u8; 20],
+                want: vec![DhtWant::Ipv6],
             },
         };
         assert_eq!(KrpcMessage::parse(&msg.encode()).unwrap(), msg);
@@ -523,6 +688,10 @@ mod tests {
             id: id(5),
             addr: "127.0.0.1:6881".parse().unwrap(),
         });
+        response.nodes6.push(KNode6 {
+            id: id(6),
+            addr: "[2001:db8::2]:6882".parse().unwrap(),
+        });
         response.values.push("10.0.0.2:51413".parse().unwrap());
         response.values.push("[2001:db8::1]:51413".parse().unwrap());
         response.token = Some(b"token".to_vec());
@@ -548,7 +717,20 @@ mod tests {
     #[test]
     fn rejects_bad_compact_lengths() {
         assert!(parse_compact_nodes(&[0; 25]).is_err());
+        assert!(parse_compact_nodes6(&[0; 37]).is_err());
         assert!(parse_compact_peers(&[0; 5]).is_err());
+    }
+
+    #[test]
+    fn compact_nodes6_roundtrip() {
+        let nodes = vec![KNode6 {
+            id: id(7),
+            addr: "[2001:db8::7]:51413".parse().unwrap(),
+        }];
+        assert_eq!(
+            parse_compact_nodes6(&encode_compact_nodes6(&nodes)).unwrap(),
+            nodes
+        );
     }
 
     #[test]

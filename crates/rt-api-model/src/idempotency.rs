@@ -18,6 +18,9 @@ use tokio::sync::Notify;
 pub const MAX_IDEMPOTENCY_KEY_BYTES: usize = 128;
 pub const MAX_IDEMPOTENCY_ENTRIES: usize = 1_024;
 pub const IDEMPOTENCY_TTL: Duration = Duration::from_secs(24 * 60 * 60);
+/// Aggregate bound for retained successful idempotency responses. The entry
+/// count alone would permit roughly 8 GiB at the per-response limit.
+pub const MAX_IDEMPOTENCY_CACHE_BYTES: usize = 32 * 1024 * 1024;
 
 /// The request/response size limit for the middleware that uses this store.
 /// It is deliberately separate from individual endpoint body limits.
@@ -43,9 +46,15 @@ struct Entry {
     state: EntryState,
 }
 
+#[derive(Debug)]
+struct StoreState {
+    entries: HashMap<String, Entry>,
+    cached_bytes: usize,
+}
+
 #[derive(Debug, Clone)]
 pub struct IdempotencyStore {
-    entries: Arc<Mutex<HashMap<String, Entry>>>,
+    state: Arc<Mutex<StoreState>>,
 }
 
 /// Owns an in-flight claim and releases it if the HTTP request future is
@@ -87,19 +96,34 @@ pub enum Claim {
 impl IdempotencyStore {
     pub fn new() -> Arc<Self> {
         Arc::new(Self {
-            entries: Arc::new(Mutex::new(HashMap::new())),
+            state: Arc::new(Mutex::new(StoreState {
+                entries: HashMap::new(),
+                cached_bytes: 0,
+            })),
         })
     }
 
     pub fn claim(&self, key: &str, fingerprint: [u8; 32]) -> Claim {
-        let mut entries = self.entries.lock().expect("idempotency mutex poisoned");
+        let mut state = self.state.lock().expect("idempotency mutex poisoned");
         let now = Instant::now();
-        entries.retain(|_, entry| {
-            matches!(&entry.state, EntryState::InFlight(_))
-                || now.saturating_duration_since(entry.created_at) < IDEMPOTENCY_TTL
-        });
+        {
+            let StoreState {
+                entries,
+                cached_bytes,
+            } = &mut *state;
+            entries.retain(|_, entry| {
+                let keep = matches!(&entry.state, EntryState::InFlight(_))
+                    || now.saturating_duration_since(entry.created_at) < IDEMPOTENCY_TTL;
+                if !keep {
+                    if let EntryState::Complete(response) = &entry.state {
+                        *cached_bytes = cached_bytes.saturating_sub(cached_response_size(response));
+                    }
+                }
+                keep
+            });
+        }
 
-        if let Some(entry) = entries.get(key) {
+        if let Some(entry) = state.entries.get(key) {
             if entry.fingerprint != fingerprint {
                 return Claim::Conflict;
             }
@@ -109,10 +133,10 @@ impl IdempotencyStore {
             };
         }
 
-        if entries.len() >= MAX_IDEMPOTENCY_ENTRIES {
+        if state.entries.len() >= MAX_IDEMPOTENCY_ENTRIES {
             return Claim::Saturated;
         }
-        entries.insert(
+        state.entries.insert(
             key.to_owned(),
             Entry {
                 fingerprint,
@@ -136,48 +160,108 @@ impl IdempotencyStore {
         }
     }
 
-    pub fn complete(&self, key: &str, fingerprint: [u8; 32], response: CachedResponse) {
-        let notify = {
-            let mut entries = self.entries.lock().expect("idempotency mutex poisoned");
-            let Some(entry) = entries.get_mut(key) else {
-                return;
+    pub fn complete(&self, key: &str, fingerprint: [u8; 32], response: CachedResponse) -> bool {
+        let response_bytes = cached_response_size(&response);
+        let (notify, cached) = {
+            let mut state = self.state.lock().expect("idempotency mutex poisoned");
+            let Some(entry) = state.entries.get(key) else {
+                return false;
             };
             if entry.fingerprint != fingerprint {
-                return;
+                return false;
             }
             let EntryState::InFlight(notify) = &entry.state else {
-                return;
+                return false;
             };
             let notify = Arc::clone(notify);
-            entry.created_at = Instant::now();
-            entry.state = EntryState::Complete(response);
-            notify
+
+            while state.cached_bytes.saturating_add(response_bytes) > MAX_IDEMPOTENCY_CACHE_BYTES {
+                let oldest_key = state
+                    .entries
+                    .iter()
+                    .filter_map(|(entry_key, entry)| match &entry.state {
+                        EntryState::Complete(_) => Some((entry_key, entry.created_at)),
+                        EntryState::InFlight(_) => None,
+                    })
+                    .min_by_key(|(_, created_at)| *created_at)
+                    .map(|(entry_key, _)| entry_key.clone());
+                let Some(oldest_key) = oldest_key else {
+                    break;
+                };
+                if let Some(removed) = state.entries.remove(&oldest_key) {
+                    if let EntryState::Complete(response) = removed.state {
+                        state.cached_bytes = state
+                            .cached_bytes
+                            .saturating_sub(cached_response_size(&response));
+                    }
+                }
+            }
+
+            if state.cached_bytes.saturating_add(response_bytes) > MAX_IDEMPOTENCY_CACHE_BYTES {
+                // A response larger than the aggregate budget cannot be
+                // retained. Release waiters instead of leaving an in-flight
+                // claim that can never transition to a replayable result.
+                let removed = state.entries.remove(key);
+                let notify = match removed.map(|entry| entry.state) {
+                    Some(EntryState::InFlight(notify)) => notify,
+                    _ => return false,
+                };
+                (notify, false)
+            } else {
+                let Some(entry) = state.entries.get_mut(key) else {
+                    return false;
+                };
+                entry.created_at = Instant::now();
+                entry.state = EntryState::Complete(response);
+                state.cached_bytes = state.cached_bytes.saturating_add(response_bytes);
+                (notify, true)
+            }
         };
         // `notify_one` preserves a permit for a waiter that races completion;
         // `notify_waiters` wakes all requests already waiting on this key.
         notify.notify_one();
         notify.notify_waiters();
+        cached
     }
 
     pub fn abandon(&self, key: &str, fingerprint: [u8; 32]) {
         let notify = {
-            let mut entries = self.entries.lock().expect("idempotency mutex poisoned");
-            let should_remove = entries
+            let mut state = self.state.lock().expect("idempotency mutex poisoned");
+            let should_remove = state
+                .entries
                 .get(key)
                 .is_some_and(|entry| entry.fingerprint == fingerprint);
             if !should_remove {
                 return;
             }
-            let entry = entries.remove(key).expect("idempotency entry disappeared");
+            let entry = state
+                .entries
+                .remove(key)
+                .expect("idempotency entry disappeared");
             match entry.state {
                 EntryState::InFlight(notify) => Some(notify),
-                EntryState::Complete(_) => None,
+                EntryState::Complete(response) => {
+                    state.cached_bytes = state
+                        .cached_bytes
+                        .saturating_sub(cached_response_size(&response));
+                    None
+                }
             }
         };
         if let Some(notify) = notify {
             notify.notify_waiters();
         }
     }
+}
+
+fn cached_response_size(response: &CachedResponse) -> usize {
+    response.body.len().saturating_add(
+        response
+            .headers
+            .iter()
+            .map(|(name, value)| name.len().saturating_add(value.len()))
+            .fold(0usize, usize::saturating_add),
+    )
 }
 
 impl IdempotencyExecutionGuard {
@@ -279,5 +363,32 @@ mod tests {
         assert!(!valid_idempotency_key(
             &"x".repeat(MAX_IDEMPOTENCY_KEY_BYTES + 1)
         ));
+    }
+
+    #[test]
+    fn completed_responses_are_evicted_at_the_aggregate_byte_bound() {
+        let store = IdempotencyStore::new();
+        let body_size = MAX_IDEMPOTENCY_CACHE_BYTES / 2;
+        let keys = ["cache-1", "cache-2", "cache-3"];
+        for key in keys {
+            let fp = fingerprint(key.as_bytes());
+            assert!(matches!(store.claim(key, fp), Claim::Execute));
+            assert!(store.complete(
+                key,
+                fp,
+                CachedResponse {
+                    status: 200,
+                    headers: Vec::new(),
+                    body: vec![0; body_size],
+                },
+            ));
+        }
+
+        let first = fingerprint(b"cache-1");
+        assert!(matches!(store.claim("cache-1", first), Claim::Execute));
+        let second = fingerprint(b"cache-2");
+        assert!(matches!(store.claim("cache-2", second), Claim::Replay(_)));
+        let third = fingerprint(b"cache-3");
+        assert!(matches!(store.claim("cache-3", third), Claim::Replay(_)));
     }
 }

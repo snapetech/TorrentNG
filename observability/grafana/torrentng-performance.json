@@ -1,0 +1,62 @@
+{
+  "title": "TorrentNG Performance",
+  "uid": "torrentng-performance",
+  "schemaVersion": 39,
+  "version": 1,
+  "refresh": "30s",
+  "time": { "from": "now-6h", "to": "now" },
+  "templating": {
+    "list": [
+      { "name": "datasource", "label": "Prometheus", "type": "datasource", "query": "prometheus", "current": {} }
+    ]
+  },
+  "panels": [
+    {
+      "id": 1,
+      "type": "timeseries",
+      "title": "Torrent states",
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "targets": [
+        { "expr": "torrentng_torrents_downloading", "legendFormat": "downloading" },
+        { "expr": "torrentng_torrents_seeding", "legendFormat": "seeding" },
+        { "expr": "torrentng_torrents_errored", "legendFormat": "errored" }
+      ],
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 0 }
+    },
+    {
+      "id": 2,
+      "type": "timeseries",
+      "title": "Transfer rates",
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "targets": [
+        { "expr": "torrentng_download_rate_bytes_per_second", "legendFormat": "download" },
+        { "expr": "torrentng_upload_rate_bytes_per_second", "legendFormat": "upload" }
+      ],
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 0 }
+    },
+    {
+      "id": 3,
+      "type": "timeseries",
+      "title": "Storage queue pressure",
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "targets": [
+        { "expr": "torrentng_storage_jobs_queue_depth", "legendFormat": "queue depth" },
+        { "expr": "torrentng_storage_jobs_saturated", "legendFormat": "saturated" },
+        { "expr": "torrentng_storage_workers_healthy", "legendFormat": "workers healthy" }
+      ],
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 8 }
+    },
+    {
+      "id": 4,
+      "type": "timeseries",
+      "title": "DHT pressure",
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "targets": [
+        { "expr": "torrentng_dht_outstanding_requests", "legendFormat": "outstanding" },
+        { "expr": "torrentng_dht_announced_peers", "legendFormat": "announced peers" },
+        { "expr": "torrentng_dht_healthy", "legendFormat": "healthy" }
+      ],
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 8 }
+    }
+  ]
+}

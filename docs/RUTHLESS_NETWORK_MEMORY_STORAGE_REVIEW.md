@@ -24,8 +24,9 @@ release smoke reports are linked from the backend ledger.
 Remaining items are qualification evidence rather than unimplemented code:
 target-hardware storage/performance, hostile public-network traffic, hosted CI
 observation, representative allocator profiling, public/client compatibility,
-and a completed 24-hour soak. Pure-v2 transfer remains an explicit unsupported
-capability.
+and a completed 24-hour soak. Complete pure-v2 metainfo transfer and tracker
+lifecycle are implemented; pure-v2 magnet metadata completion remains an
+explicit unsupported capability.
 
 ## Executive verdict
 

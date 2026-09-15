@@ -185,6 +185,10 @@ impl UtpConnection {
             .saturating_sub(self.bytes_in_flight)
     }
 
+    pub(crate) fn set_local_window_bytes(&mut self, bytes: u32) {
+        self.local_window_bytes = bytes;
+    }
+
     pub fn congestion_window_bytes(&self) -> u32 {
         self.congestion.cwnd_bytes()
     }
@@ -273,7 +277,11 @@ impl UtpConnection {
         }
     }
 
-    pub fn on_inbound(&mut self, packet: &UtpPacket) -> Result<InboundAction, UtpError> {
+    pub fn on_inbound(
+        &mut self,
+        packet: &UtpPacket,
+        now_us: u32,
+    ) -> Result<InboundAction, UtpError> {
         self.ids.validate_inbound(&packet.header)?;
         // RESET is a terminal control packet. Its ACK number is not part of
         // the data acknowledgement stream, so an old or unrelated ACK must
@@ -287,14 +295,17 @@ impl UtpConnection {
         let ack_advanced = self.apply_ack(packet.header.ack_nr)?;
         if packet.header.timestamp_diff > 0 {
             self.update_rtt(packet.header.timestamp_diff);
-            self.congestion.on_ack(DelaySample {
-                timestamp_diff_us: packet.header.timestamp_diff,
-                // The payload belongs to the inbound packet and says
-                // nothing about how many of our bytes its ACK covered.
-                // ACK-only STATE packets are the normal case, so use the
-                // send-side flight that the ACK actually advanced instead.
-                bytes_acked: if ack_advanced { bytes_acked } else { 0 },
-            });
+            self.congestion.on_ack(
+                now_us,
+                DelaySample {
+                    timestamp_diff_us: packet.header.timestamp_diff,
+                    // The payload belongs to the inbound packet and says
+                    // nothing about how many of our bytes its ACK covered.
+                    // ACK-only STATE packets are the normal case, so use the
+                    // send-side flight that the ACK actually advanced instead.
+                    bytes_acked: if ack_advanced { bytes_acked } else { 0 },
+                },
+            );
         }
 
         match packet.header.packet_type {
@@ -478,7 +489,7 @@ mod tests {
         assert_eq!(syn.header.connection_id, 50);
 
         let state = inbound_state(conn.ids(), 90, 7);
-        assert_eq!(conn.on_inbound(&state).unwrap(), InboundAction::None);
+        assert_eq!(conn.on_inbound(&state, 0).unwrap(), InboundAction::None);
         assert_eq!(conn.state(), ConnectionState::Connected);
         assert_eq!(conn.available_send_window(), 32_000);
         assert!(conn.retransmit_timeout_us() >= 100_000);
@@ -525,7 +536,7 @@ mod tests {
         conn.build_syn(1);
         let mut handshake = inbound_state(conn.ids(), 90, 10);
         handshake.header.timestamp_diff = 0;
-        conn.on_inbound(&handshake).unwrap();
+        conn.on_inbound(&handshake, 0).unwrap();
 
         let before = conn.congestion_window_bytes();
         let data = conn.build_data(2, 0, vec![0; 4_096]);
@@ -534,7 +545,7 @@ mod tests {
         // This is an ACK-only STATE packet; its empty payload must not make
         // the congestion controller believe that zero bytes were delivered.
         assert!(ack.payload.is_empty());
-        conn.on_inbound(&ack).unwrap();
+        conn.on_inbound(&ack, 0).unwrap();
 
         assert_eq!(conn.congestion_window_bytes(), before.saturating_add(4_096));
     }
@@ -569,7 +580,7 @@ mod tests {
             payload: b"abc".to_vec(),
         };
         assert_eq!(
-            conn.on_inbound(&packet).unwrap(),
+            conn.on_inbound(&packet, 0).unwrap(),
             InboundAction::DeliverPayload
         );
         assert_eq!(conn.ack_nr(), 13);
@@ -582,22 +593,22 @@ mod tests {
         let syn = initiator.build_syn(1);
         let mut acceptor = UtpConnection::accept(&syn.header, 20).unwrap();
         let state = acceptor.build_state(2, 0);
-        initiator.on_inbound(&state).unwrap();
+        initiator.on_inbound(&state, 0).unwrap();
 
         let data = initiator.build_data(3, 0, b"first".to_vec());
         assert_eq!(
-            acceptor.on_inbound(&data).unwrap(),
+            acceptor.on_inbound(&data, 0).unwrap(),
             InboundAction::DeliverPayload
         );
         assert_eq!(
-            acceptor.on_inbound(&data).unwrap(),
+            acceptor.on_inbound(&data, 0).unwrap(),
             InboundAction::SendState
         );
 
         let mut future = data.clone();
         future.header.seq_nr = future.header.seq_nr.wrapping_add(2);
         assert_eq!(
-            acceptor.on_inbound(&future).unwrap(),
+            acceptor.on_inbound(&future, 0).unwrap(),
             InboundAction::SendState
         );
         assert_eq!(acceptor.ack_nr(), data.header.seq_nr);
@@ -609,7 +620,7 @@ mod tests {
         let mut state = inbound_state(conn.ids(), 2, 1);
         state.header.connection_id = 999;
         assert!(matches!(
-            conn.on_inbound(&state),
+            conn.on_inbound(&state, 0),
             Err(UtpError::ConnectionIdMismatch {
                 expected: 11,
                 actual: 999
@@ -622,7 +633,7 @@ mod tests {
         let mut conn = UtpConnection::connect(1, 10);
         let state = inbound_state(conn.ids(), 2, 99);
         assert!(matches!(
-            conn.on_inbound(&state),
+            conn.on_inbound(&state, 0),
             Err(UtpError::AckOutOfWindow {
                 ack_nr: 99,
                 oldest_unacked: 10,
@@ -650,7 +661,7 @@ mod tests {
             payload: Vec::new(),
         };
 
-        assert_eq!(conn.on_inbound(&packet).unwrap(), InboundAction::Reset);
+        assert_eq!(conn.on_inbound(&packet, 0).unwrap(), InboundAction::Reset);
         assert_eq!(conn.state(), ConnectionState::Reset);
     }
 
@@ -658,7 +669,7 @@ mod tests {
     fn zero_ack_is_treated_as_no_ack_before_peer_has_seen_sequence() {
         let mut conn = UtpConnection::connect(1, 10);
         let state = inbound_state(conn.ids(), 2, 0);
-        assert_eq!(conn.on_inbound(&state).unwrap(), InboundAction::None);
+        assert_eq!(conn.on_inbound(&state, 0).unwrap(), InboundAction::None);
     }
 
     #[test]

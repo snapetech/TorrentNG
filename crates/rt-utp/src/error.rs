@@ -53,4 +53,7 @@ pub enum UtpError {
 
     #[error("uTP stream closed")]
     Closed,
+
+    #[error("uTP receive buffer exceeded {max} bytes (attempted {actual})")]
+    ReceiveBufferFull { max: usize, actual: usize },
 }

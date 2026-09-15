@@ -2,11 +2,12 @@
 
 Start here when choosing, testing, or operating TorrentNG.
 
-TorrentNG is a unified BitTorrent WebUI and automation API. It can sit on top
-of a compatible client that is already managing a library, or it can use the
-next-generation first-party TorrentNG client, `torrentngd`. The documentation
-tracks both the common UI/API contract and the backend-specific capabilities;
-compatible does not mean every client exposes identical features.
+TorrentNG is the universal torrent client interface: one shared WebUI and
+automation API for qBittorrent, rTorrent, Transmission, Deluge, and the
+built-in TorrentNG Engine (`torrentngd`). Use an existing client's library, or
+let the Engine own transfers, storage, persistence, jobs, and recovery. The
+documentation tracks both the common UI/API contract and the backend-specific
+capabilities; compatible does not mean every client exposes identical features.
 
 ## Product arrangements
 

@@ -353,9 +353,19 @@ feature matrix:
    implemented.
 
 The remaining boundaries are release-evidence boundaries, not local
-implementation gaps: HDD throughput claims require an HDD target, LVM/PV
-placement claims require an LVM target with extent probing enabled, and
-automatic `io_uring` defaulting requires target-hardware graduation evidence.
+implementation gaps: HDD throughput claims require an HDD target, and LVM/PV
+placement claims require an LVM target with extent probing enabled.
+
+`auto` backend selection now probes for `io_uring` and uses it when the probe
+reports it usable, falling back to `PreadBackend` otherwise — the identical
+fallback path an explicit `uring` request already exercised. This is backed by
+the `rt-storage` backend test suite plus a real-device NVMe/btrfs roundtrip and
+throughput comparison (`scripts/storage_real_device_benchmark.sh`), which
+found `io_uring` at parity with `pread` and correct on real reads/writes. It
+is functional-correctness and parity evidence on the hardware available
+in-repo, not a target-hardware fleet soak across HDD, containers, and varied
+kernels — operators who want the conservative baseline can still force
+`pread` explicitly via backend configuration.
 
 ---
 
@@ -372,9 +382,11 @@ automatic `io_uring` defaulting requires target-hardware graduation evidence.
   isolation contains the blast radius — correct device resolution is
   load-bearing; a wrong mapping (e.g. mergerfs branch miss) degrades
   ordering, never correctness.
-- **io_uring portability:** the `DiskBackend` trait and `PreadBackend` are the
-  portable baseline. `io_uring` is an explicit optimization path, not a
-  requirement, until target hardware proves it should be selected by `auto`.
+- **io_uring portability:** the `DiskBackend` trait and `PreadBackend` remain
+  the portable baseline and the automatic fallback on any kernel/container
+  where the `io_uring` probe fails. `auto` now prefers `io_uring` when the
+  probe succeeds (see above); `pread` stays available as an explicit override
+  for operators who want the conservative path regardless of probe result.
 - **`fadvise(DONTNEED)` can hurt** if a "cold" torrent is about to get hot;
   drive it from the tier signal, not per-op heuristics, and never on `Hot`.
 

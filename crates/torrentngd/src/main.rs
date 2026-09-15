@@ -32,6 +32,16 @@ use rt_session::SessionRegistry;
 mod export;
 mod migrate;
 
+// jemalloc handles the daemon's real allocation shape — many concurrent
+// per-torrent tasks doing small, high-churn allocations (peer buffers,
+// piece-map/picker state, DB rows) over long uptimes — better than glibc's
+// allocator, which fragments and grows RSS under sustained small-object
+// churn. Background threads purge freed arenas back to the OS instead of
+// holding them, which is what actually keeps long-run memory flat.
+#[cfg(target_os = "linux")]
+#[global_allocator]
+static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
 /// Bound request handlers that can fan out into engine/database work. The
 /// limit is deliberately enforced at the daemon boundary so all mounted API
 /// facades share one budget instead of each compatibility router admitting
@@ -210,20 +220,51 @@ async fn main() -> anyhow::Result<()> {
     };
 
     let (shutdown_started_tx, shutdown_started_rx) = oneshot::channel();
+    let api_shutdown_started = Arc::new(Notify::new());
+    let shutdown_started_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let shutdown_task = tokio::spawn(shutdown_signal(
         engine_handle.clone(),
         shutdown_notify,
         shutdown_started_tx,
+        Arc::clone(&api_shutdown_started),
+        Arc::clone(&shutdown_started_flag),
     ));
-    let serve_result = axum::serve(
-        listener,
-        app.into_make_service_with_connect_info::<SocketAddr>(),
-    )
-    .with_graceful_shutdown(async move {
-        let _ = shutdown_started_rx.await;
-    })
-    .await;
-    if serve_result.is_err() {
+    let api_shutdown_grace =
+        std::time::Duration::from_secs(config.daemon.shutdown_timeout_secs.max(1));
+    let mut serve = Box::pin(async move {
+        axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<SocketAddr>(),
+        )
+        .with_graceful_shutdown(async move {
+            let _ = shutdown_started_rx.await;
+        })
+        .await
+    });
+    let serve_result = tokio::select! {
+        result = &mut serve => result,
+        _ = async {
+            api_shutdown_started.notified().await;
+            tokio::time::sleep(api_shutdown_grace).await;
+        } => {
+            tracing::warn!(
+                component = "http",
+                operation = "shutdown",
+                result = "timeout",
+                timeout_secs = api_shutdown_grace.as_secs(),
+                "API connections did not drain before the shutdown deadline"
+            );
+            Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "API graceful shutdown timed out",
+            ))
+        }
+    };
+    // A timed-out server future owns the active connection tasks. Drop it
+    // before waiting on the engine so long-lived SSE/WebSocket clients cannot
+    // keep the daemon process alive after the API deadline.
+    drop(serve);
+    if serve_result.is_err() && !shutdown_started_flag.load(Ordering::Acquire) {
         // A server failure can occur without a signal. Do not leave the
         // signal waiter detached while the main task performs the fallback
         // engine shutdown below.
@@ -245,6 +286,8 @@ async fn shutdown_signal(
     engine: rt_engine::EngineHandle,
     shutdown_notify: Arc<Notify>,
     shutdown_started: oneshot::Sender<()>,
+    api_shutdown_started: Arc<Notify>,
+    shutdown_started_flag: Arc<std::sync::atomic::AtomicBool>,
 ) {
     #[cfg(unix)]
     {
@@ -306,6 +349,8 @@ async fn shutdown_signal(
             }
         }
     }
+    shutdown_started_flag.store(true, Ordering::Release);
+    api_shutdown_started.notify_one();
     let _ = shutdown_started.send(());
     engine.shutdown().await;
 }

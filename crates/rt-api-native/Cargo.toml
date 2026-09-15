@@ -24,8 +24,8 @@ rt-session = { path = "../rt-session" }
 rt-storage = { path = "../rt-storage" }
 rt-utp = { path = "../rt-utp" }
 sha2.workspace = true
+tower.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
 tokio = { version = "1", features = ["full"] }
-tower.workspace = true

@@ -2,6 +2,12 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
 use crate::error::TrackerError;
 
+/// Hard ceiling used by tracker response parsers when a caller does not
+/// provide a tighter connection-specific limit. A response body can be
+/// byte-bounded and still contain hundreds of thousands of compact peers;
+/// never let the convenience parsers materialize all of them.
+pub const MAX_TRACKER_PEERS: usize = 16_384;
+
 /// A peer address returned by a tracker.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Peer {
@@ -39,7 +45,7 @@ impl CompactPeer {
 
 /// Parse compact IPv4 peer list (BEP 23): 6-byte chunks.
 pub fn parse_compact_peers_v4(bytes: &[u8]) -> Result<Vec<Peer>, TrackerError> {
-    parse_compact_peers_v4_with_limit(bytes, usize::MAX)
+    parse_compact_peers_v4_with_limit(bytes, MAX_TRACKER_PEERS)
 }
 
 /// Parse at most `max_peers` entries from a compact IPv4 peer list.
@@ -66,7 +72,7 @@ pub fn parse_compact_peers_v4_with_limit(
 
 /// Parse compact IPv6 peer list: 18-byte chunks.
 pub fn parse_compact_peers_v6(bytes: &[u8]) -> Result<Vec<Peer>, TrackerError> {
-    parse_compact_peers_v6_with_limit(bytes, usize::MAX)
+    parse_compact_peers_v6_with_limit(bytes, MAX_TRACKER_PEERS)
 }
 
 /// Parse at most `max_peers` entries from a compact IPv6 peer list.
@@ -125,6 +131,15 @@ mod tests {
     fn empty_compact_peers() {
         let peers = parse_compact_peers_v4(&[]).unwrap();
         assert!(peers.is_empty());
+    }
+
+    #[test]
+    fn convenience_parser_caps_peer_materialization() {
+        let bytes = vec![0u8; (MAX_TRACKER_PEERS + 1) * 6];
+
+        let peers = parse_compact_peers_v4(&bytes).unwrap();
+
+        assert_eq!(peers.len(), MAX_TRACKER_PEERS);
     }
 
     #[test]

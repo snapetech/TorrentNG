@@ -54,10 +54,14 @@ uTP first for DHT, PEX, and manually added peers while tracker-discovered peers
 stay on TCP. `TNG_UTP_OUTGOING=prefer|only` broadens outbound uTP peer-wire
 dialing (`prefer` falls back to TCP, `only` does not), and
 `TNG_UTP_OUTGOING=tcp-only` disables outbound uTP. `TNG_UTP_INCOMING=1`
-binds the shared UDP incoming uTP endpoint on `listen_port`; the incoming
-listener flag is boolean only (`1`, `true`, `yes`, or `on`) and does not accept
-policy words such as `prefer` or `utp-only`. `TNG_UTP_METADATA=prefer|only`
-enables uTP magnet metadata fetch explicitly.
+binds the incoming uTP endpoint on `listen_port`; the incoming listener flag is
+boolean only (`1`, `true`, `yes`, or `on`) and does not accept policy words such
+as `prefer` or `utp-only`. Because the native DHT and uTP listeners own
+separate UDP sockets, `dht.port = 0` moves the implicit DHT listener to the next
+UDP port when incoming uTP is enabled (and uses an ephemeral port if
+`listen_port = 65535`). An explicit `dht.port` equal to `listen_port` is
+rejected in that mode. `TNG_UTP_METADATA=prefer|only` enables uTP magnet
+metadata fetch explicitly.
 
 ### `[storage]`
 
@@ -85,6 +89,7 @@ enables uTP magnet metadata fetch explicitly.
 | `storage_frame_cap_mb` | `128` | Storage frame memory class cap |
 | `queued_disk_cap_mb` | `64` | Queued disk/hash/elevator memory class cap |
 | `piece_assembly_cap_mb` | `128` | Incomplete piece assembly memory class cap; `0` disables in-memory assembly and keeps direct block writes enabled |
+| `piece_index_cap_mb` | `128` | Persistent piece-picker, availability-index, and v1 piece-hash memory class cap |
 | `peer_buffer_cap_mb` | `128` | Peer state, rx/tx, upload, and webseed buffer memory class cap |
 | `metadata_cap_mb` | `32` | Metadata, tracker peer cache, DHT table, and API snapshot class baseline cap |
 | `pressure_constrained_pct` | `75` | Percent of total cap that reports constrained pressure |
@@ -115,12 +120,13 @@ enqueue and released on queue rejection, cancellation, or completion.
 | Key | Default | Description |
 |---|---|---|
 | `enabled` | `true` | Enable DHT |
-| `port` | `0` | UDP DHT port; `0` uses `network.listen_port` |
+| `port` | `0` | UDP DHT port; `0` uses `network.listen_port`, except that incoming uTP moves the implicit listener to the next UDP port to avoid two independent sockets competing for one port |
 | `bootstrap_nodes` | Public BitTorrent bootstrap routers | Bootstrap nodes as `host:port` strings |
 
-The live TorrentNG-client DHT transport is currently IPv4-only. The metainfo and magnet
-identity model accepts v1, v2, and hybrid identities, but this does not imply
-IPv6 DHT routing or IPv6 tracker/peer coverage.
+The live TorrentNG-client DHT transport supports IPv4 and IPv6. The metainfo
+and magnet identity model accepts v1, v2, and hybrid identities; tracker and
+peer address-family coverage still depends on the configured network and
+external endpoint.
 
 ### `[db]`
 

@@ -1564,6 +1564,7 @@ dependencies = [
  "serde_json",
  "tempfile",
  "thiserror 1.0.69",
+ "tokio",
  "tracing",
 ]
 
@@ -1599,6 +1600,7 @@ version = "0.1.0"
 dependencies = [
  "hex",
  "rt-bencode",
+ "rt-hash",
  "rt-path",
  "sha1",
  "sha2",
@@ -1666,6 +1668,7 @@ version = "0.1.0"
 dependencies = [
  "bytes",
  "rt-bencode",
+ "rt-metrics",
  "thiserror 1.0.69",
  "tokio",
  "tokio-util",
@@ -1699,6 +1702,7 @@ name = "rt-storage"
 version = "0.1.0"
 dependencies = [
  "bytes",
+ "futures",
  "io-uring",
  "libc",
  "once_cell",
@@ -1777,9 +1781,9 @@ dependencies = [
 
 [[package]]
 name = "rustls"
-version = "0.23.40"
+version = "0.23.45"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ef86cd5876211988985292b91c96a8f2d298df24e75989a43a3c73f2d4d8168b"
+checksum = "0d41d731c7d2f962d1ccc364cec258de3c0e93b38c2fb3ba97ac74513048d634"
 dependencies = [
  "once_cell",
  "ring",
@@ -1801,9 +1805,9 @@ dependencies = [
 
 [[package]]
 name = "rustls-webpki"
-version = "0.103.13"
+version = "0.103.15"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "61c429a8649f110dddef65e2a5ad240f747e85f7758a6bccc7e5777bd33f756e"
+checksum = "f3c3cf1d8b1e7d4927e2d154c3fcb02979afb9939629c62cd9048d4f07b60ac2"
 dependencies = [
  "ring",
  "rustls-pki-types",
@@ -2102,6 +2106,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "tikv-jemalloc-sys"
+version = "0.7.1+5.3.1-0-g81034ce1f1373e37dc865038e1bc8eeecf559ce8"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1a2825c78386b4ae0314074867860ba9577875de945f05992c38815cbec327f0"
+dependencies = [
+ "cc",
+ "libc",
+]
+
+[[package]]
+name = "tikv-jemallocator"
+version = "0.7.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "249f09e49ab1609436f34c776e84231bead18d6a955f119f939bdc1d847561bd"
+dependencies = [
+ "libc",
+ "tikv-jemalloc-sys",
+]
+
+[[package]]
 name = "tinystr"
 version = "0.8.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2253,6 +2277,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tempfile",
+ "tikv-jemallocator",
  "tokio",
  "tower-http 0.5.2",
  "tracing",
@@ -2269,6 +2294,8 @@ dependencies = [
  "futures-util",
  "pin-project",
  "pin-project-lite",
+ "tokio",
+ "tokio-util",
  "tower-layer",
  "tower-service",
  "tracing",

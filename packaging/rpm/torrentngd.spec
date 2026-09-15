@@ -1,7 +1,7 @@
 Name:           torrentngd
 Version:        0.1.0
 Release:        1%{?dist}
-Summary:        TorrentNG native BitTorrent daemon
+Summary:        TorrentNG Engine: native Rust BitTorrent client with the shared WebUI/API
 
 License:        GPL-3.0-or-later
 URL:            https://github.com/snapetech/TorrentNG
@@ -28,7 +28,7 @@ Requires:       systemd
 %{!?tmpfiles_create:%global tmpfiles_create() %{nil}}
 
 %description
-TorrentNG native BitTorrent daemon with a bundled Web UI and systemd service.
+TorrentNG Engine is the native Rust BitTorrent client. It serves the shared Web UI and compatibility APIs while owning transfers, storage, persistence, jobs, and recovery.
 
 %prep
 %setup -q -c

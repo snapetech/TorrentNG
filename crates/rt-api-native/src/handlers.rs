@@ -14,12 +14,11 @@ use axum::{
     http::{header, HeaderMap, HeaderValue, StatusCode},
     response::{
         sse::{Event, KeepAlive, Sse},
-        IntoResponse,
+        IntoResponse, Response,
     },
     Json,
 };
 use base64::Engine as _;
-use futures::Stream;
 use rt_api_model::{
     api_token_allowed, AddTorrentRequest, AddTorrentResponse, ApiError, ApiRuntimeMetricsSnapshot,
     ApiSseClientGuard, FileInfo, TorrentDetail, TorrentSummary,
@@ -30,7 +29,7 @@ use rt_engine::{
     MAX_MANUAL_PEER_ADDRESSES,
 };
 use rt_metainfo::parse_magnet;
-use rt_metrics::MemoryClass;
+use rt_metrics::{MemoryClass, MemoryLease};
 use rt_session::TorrentState;
 use rt_storage::{
     runtime::StorageRuntime, DeletePlanRequest, ImportPlanRequest, MovePlanRequest, PlanIssue,
@@ -63,12 +62,19 @@ const MAX_NATIVE_JSON_BYTES: usize = 1024 * 1024;
 const MAX_NATIVE_JSON_ENTRIES: usize = 4096;
 const MAX_NATIVE_WORKFLOW_RUNS: usize = 200;
 const MAX_NATIVE_MUTATION_ITEMS: usize = 16_384;
+const MAX_NATIVE_LABEL_ITEMS: usize = 16_384;
+const MAX_NATIVE_LABEL_BYTES: usize = 4 * 1024 * 1024;
 
 #[derive(Debug, Clone, Copy, Default)]
 struct MetricsHealth {
     engine_alive: bool,
     peer_listener_healthy: bool,
     subsystem: Option<EngineSubsystemHealth>,
+}
+
+struct TrackerFilterSnapshot {
+    hashes: HashSet<String>,
+    _lease: MemoryLease,
 }
 
 /// `POST /api/v1/auth/login` — TorrentNG WebUI session probe.
@@ -347,7 +353,11 @@ pub async fn list_torrents(
         query.filter.as_deref(),
         query.media_type.as_deref(),
     );
-    let candidates = restrict_to_tracker(&snapshot, candidates, tracker_hashes.as_ref());
+    let candidates = restrict_to_tracker(
+        &snapshot,
+        candidates,
+        tracker_hashes.as_ref().map(|filter| &filter.hashes),
+    );
     let total = match candidates.as_ref() {
         Some(indices) => indices
             .iter()
@@ -372,7 +382,7 @@ pub async fn list_torrents(
     // Keep the initial allocation independent of the caller's page size. The
     // response remains bounded by `limit`, but a hostile limit must not flow
     // directly into an allocation site.
-    let mut summaries = Vec::with_capacity(TORRENT_LIST_INITIAL_CAPACITY);
+    let mut selected = Vec::with_capacity(TORRENT_LIST_INITIAL_CAPACITY);
     let indices: Box<dyn Iterator<Item = &usize>> = if descending {
         Box::new(order.iter().rev())
     } else {
@@ -396,16 +406,22 @@ pub async fn list_torrents(
             skipped += 1;
             continue;
         }
-        summaries.push(item.summary.clone());
-        if summaries.len() == limit {
+        selected.push(*index);
+        if selected.len() == limit {
             break;
         }
     }
-    let estimate = estimate_torrent_summary_snapshot_bytes(summaries.len());
+    let estimate = estimate_torrent_summary_page_bytes(selected.iter().map(|index| {
+        &snapshot
+            .torrents
+            .get(*index)
+            .expect("snapshot index is valid")
+            .summary
+    }));
     state
         .api_metrics
         .record_estimated_response_bytes(estimate.saturating_add(256));
-    let lease = if let Some(engine) = &state.engine {
+    let _lease = if let Some(engine) = &state.engine {
         match engine
             .reserve_memory(MemoryClass::ApiSnapshot, estimate)
             .await
@@ -423,7 +439,17 @@ pub async fn list_torrents(
     } else {
         None
     };
-    drop(lease);
+    let summaries = selected
+        .into_iter()
+        .map(|index| {
+            snapshot
+                .torrents
+                .get(index)
+                .expect("snapshot index is valid")
+                .summary
+                .clone()
+        })
+        .collect::<Vec<_>>();
     (
         StatusCode::OK,
         Json(TorrentListResponse {
@@ -438,24 +464,31 @@ pub async fn list_torrents(
 async fn tracker_filter_hashes(
     state: &AppState,
     tracker: Option<&str>,
-) -> Result<Option<HashSet<String>>, String> {
+) -> Result<Option<TrackerFilterSnapshot>, String> {
     let Some(tracker) = tracker.map(str::trim).filter(|tracker| !tracker.is_empty()) else {
         return Ok(None);
     };
     let Some(engine) = &state.engine else {
         return Err("TorrentNG client is required for tracker filtering".to_owned());
     };
-    engine
+    let (hash_count, hash_bytes) = engine
+        .torrent_hashes_by_tracker_snapshot_size(tracker.to_owned())
+        .await?;
+    let estimate = estimate_native_tracker_filter_snapshot_bytes(hash_count, hash_bytes);
+    let lease = engine
+        .reserve_memory(MemoryClass::ApiSnapshot, estimate)
+        .await?
+        .ok_or_else(|| "api snapshot memory budget exhausted".to_owned())?;
+    let hashes = engine
         .torrent_hashes_by_tracker(tracker.to_owned())
-        .await
-        .map(|hashes| {
-            Some(
-                hashes
-                    .into_iter()
-                    .map(|hash| hash.to_ascii_lowercase())
-                    .collect(),
-            )
-        })
+        .await?
+        .into_iter()
+        .map(|hash| hash.to_ascii_lowercase())
+        .collect();
+    Ok(Some(TrackerFilterSnapshot {
+        hashes,
+        _lease: lease,
+    }))
 }
 
 fn restrict_to_tracker(
@@ -1823,6 +1856,23 @@ pub async fn list_torrent_files(
     };
     match engine.torrent_metadata(info_hash).await {
         Ok(meta) => {
+            let _lease = match engine
+                .reserve_memory(
+                    MemoryClass::ApiSnapshot,
+                    estimate_native_file_snapshot_bytes(&meta.files),
+                )
+                .await
+            {
+                Ok(Some(lease)) => lease,
+                Ok(None) => return api_snapshot_budget_exhausted(),
+                Err(error) => {
+                    return (
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        Json(serde_json::to_value(ApiError::internal(error)).unwrap()),
+                    )
+                        .into_response();
+                }
+            };
             let files: Vec<FileInfo> = meta
                 .files
                 .into_iter()
@@ -1931,22 +1981,103 @@ pub async fn patch_torrent_files(
 pub async fn list_torrent_trackers(
     State(state): State<AppState>,
     Path(info_hash): Path<String>,
-) -> impl IntoResponse {
+) -> Response {
     if !torrent_exists(&state, &info_hash).await {
         return not_found(info_hash);
     }
     let Some(engine) = &state.engine else {
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     };
-    match engine.torrent_metadata(info_hash).await {
-        Ok(meta) => (
-            StatusCode::OK,
-            Json(serde_json::to_value(meta.trackers).unwrap()),
-        )
-            .into_response(),
-        Err(e) => (
-            StatusCode::BAD_REQUEST,
-            Json(serde_json::to_value(ApiError::bad_request(e)).unwrap()),
+    // Normalized tracker rows are authoritative for engine-managed torrents.
+    // Use the narrow URL projection so this endpoint does not parse a full
+    // 64-MiB torrent blob merely to return announce URLs. A missing
+    // projection means an older database; preserve its metainfo fallback.
+    match engine.torrent_tracker_projection(info_hash.clone()).await {
+        Ok(Some((_primary_url, tracker_count))) => {
+            let (_count, tracker_bytes) = match engine
+                .torrent_tracker_snapshot_size(info_hash.clone())
+                .await
+            {
+                Ok(size) => size,
+                Err(error) => {
+                    return (
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        Json(serde_json::to_value(ApiError::internal(error)).unwrap()),
+                    )
+                        .into_response();
+                }
+            };
+            let estimate =
+                estimate_native_tracker_snapshot_bytes(u64::from(tracker_count), tracker_bytes);
+            let lease = match engine
+                .reserve_memory(MemoryClass::ApiSnapshot, estimate)
+                .await
+            {
+                Ok(Some(lease)) => lease,
+                Ok(None) => return api_snapshot_budget_exhausted(),
+                Err(error) => {
+                    return (
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        Json(serde_json::to_value(ApiError::internal(error)).unwrap()),
+                    )
+                        .into_response();
+                }
+            };
+            let response = match engine.torrent_tracker_urls(info_hash).await {
+                Ok(trackers) => (
+                    StatusCode::OK,
+                    Json(serde_json::to_value(trackers).unwrap()),
+                )
+                    .into_response(),
+                Err(error) => (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::to_value(ApiError::bad_request(error)).unwrap()),
+                )
+                    .into_response(),
+            };
+            drop(lease);
+            response
+        }
+        Ok(None) => match engine.torrent_metadata(info_hash).await {
+            Ok(meta) => {
+                let tracker_bytes = meta.trackers.iter().fold(0u64, |total, tracker| {
+                    total.saturating_add(tracker.len() as u64)
+                });
+                let estimate = estimate_native_tracker_snapshot_bytes(
+                    u64::try_from(meta.trackers.len()).unwrap_or(u64::MAX),
+                    tracker_bytes,
+                );
+                let lease = match engine
+                    .reserve_memory(MemoryClass::ApiSnapshot, estimate)
+                    .await
+                {
+                    Ok(Some(lease)) => lease,
+                    Ok(None) => return api_snapshot_budget_exhausted(),
+                    Err(error) => {
+                        return (
+                            StatusCode::SERVICE_UNAVAILABLE,
+                            Json(serde_json::to_value(ApiError::internal(error)).unwrap()),
+                        )
+                            .into_response();
+                    }
+                };
+                let response = (
+                    StatusCode::OK,
+                    Json(serde_json::to_value(meta.trackers).unwrap()),
+                )
+                    .into_response();
+                drop(lease);
+                response
+            }
+            Err(e) => (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::to_value(ApiError::bad_request(e)).unwrap()),
+            )
+                .into_response(),
+        },
+        Err(error) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::to_value(ApiError::internal(error)).unwrap()),
         )
             .into_response(),
     }
@@ -1985,12 +2116,31 @@ pub async fn patch_torrent_trackers(
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     };
 
-    let mut trackers = match engine.torrent_metadata(info_hash.clone()).await {
-        Ok(meta) => meta.trackers,
-        Err(e) => {
+    let mut trackers = match engine.torrent_tracker_projection(info_hash.clone()).await {
+        Ok(Some(_)) => match engine.torrent_tracker_urls(info_hash.clone()).await {
+            Ok(trackers) => trackers,
+            Err(e) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::to_value(ApiError::bad_request(e)).unwrap()),
+                )
+                    .into_response()
+            }
+        },
+        Ok(None) => match engine.torrent_metadata(info_hash.clone()).await {
+            Ok(meta) => meta.trackers,
+            Err(e) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::to_value(ApiError::bad_request(e)).unwrap()),
+                )
+                    .into_response()
+            }
+        },
+        Err(error) => {
             return (
-                StatusCode::BAD_REQUEST,
-                Json(serde_json::to_value(ApiError::bad_request(e)).unwrap()),
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::to_value(ApiError::internal(error)).unwrap()),
             )
                 .into_response()
         }
@@ -2851,8 +3001,32 @@ pub async fn categories(State(state): State<AppState>) -> impl IntoResponse {
     } else {
         state.categories.read().await.clone()
     };
+    let mut label_bytes = 0usize;
+    if categories.len() > MAX_NATIVE_LABEL_ITEMS
+        || categories.iter().any(|(name, save_path)| {
+            label_bytes = label_bytes
+                .saturating_add(name.len())
+                .saturating_add(save_path.len());
+            label_bytes > MAX_NATIVE_LABEL_BYTES
+        })
+    {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    }
     let mut torrent_counts = BTreeMap::<String, usize>::new();
     for facet in snapshot.category_facets() {
+        if facet.name.is_empty() || categories.contains_key(&facet.name) {
+            continue;
+        }
+        let added = facet
+            .name
+            .len()
+            .saturating_add(facet.save_path.as_ref().map_or(0, String::len));
+        if categories.len() >= MAX_NATIVE_LABEL_ITEMS
+            || label_bytes.saturating_add(added) > MAX_NATIVE_LABEL_BYTES
+        {
+            return StatusCode::SERVICE_UNAVAILABLE.into_response();
+        }
+        label_bytes = label_bytes.saturating_add(added);
         categories
             .entry(facet.name.clone())
             .or_insert_with(|| facet.save_path.unwrap_or_default());
@@ -2869,6 +3043,21 @@ pub async fn categories(State(state): State<AppState>) -> impl IntoResponse {
             }
         })
         .collect::<Vec<_>>();
+    let _lease = if let Some(engine) = &state.engine {
+        match engine
+            .reserve_memory(
+                MemoryClass::ApiSnapshot,
+                estimate_native_label_snapshot_bytes(rows.len(), label_bytes),
+            )
+            .await
+        {
+            Ok(Some(lease)) => Some(lease),
+            Ok(None) => return api_snapshot_budget_exhausted(),
+            Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+        }
+    } else {
+        None
+    };
     (StatusCode::OK, Json(rows)).into_response()
 }
 
@@ -2956,25 +3145,49 @@ pub async fn delete_category(
 /// `GET /api/v1/tags` — list known tag names.
 pub async fn tags(State(state): State<AppState>) -> impl IntoResponse {
     let mut tags = BTreeSet::<String>::new();
+    let mut label_bytes = 0usize;
     if let Some(engine) = &state.engine {
         match engine.list_tags().await {
-            Ok(global_tags) => tags.extend(global_tags),
+            Ok(global_tags) => {
+                for tag in global_tags {
+                    if !insert_native_label(&mut tags, &mut label_bytes, tag) {
+                        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+                    }
+                }
+            }
             Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
         }
     } else {
-        tags.extend(state.tags.read().await.iter().cloned());
+        for tag in state.tags.read().await.iter().cloned() {
+            if !insert_native_label(&mut tags, &mut label_bytes, tag) {
+                return StatusCode::SERVICE_UNAVAILABLE.into_response();
+            }
+        }
     }
     let snapshot = match state.torrent_snapshot(None).await {
         Ok(snapshot) => snapshot,
         Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
     };
-    tags.extend(
-        snapshot
-            .tag_facets()
-            .into_iter()
-            .filter(|(tag, _)| !tag.is_empty())
-            .map(|(tag, _)| tag),
-    );
+    for (tag, _) in snapshot.tag_facets() {
+        if !insert_native_label(&mut tags, &mut label_bytes, tag) {
+            return StatusCode::SERVICE_UNAVAILABLE.into_response();
+        }
+    }
+    let _lease = if let Some(engine) = &state.engine {
+        match engine
+            .reserve_memory(
+                MemoryClass::ApiSnapshot,
+                estimate_native_label_snapshot_bytes(tags.len(), label_bytes),
+            )
+            .await
+        {
+            Ok(Some(lease)) => Some(lease),
+            Ok(None) => return api_snapshot_budget_exhausted(),
+            Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+        }
+    } else {
+        None
+    };
     (StatusCode::OK, Json(tags.into_iter().collect::<Vec<_>>())).into_response()
 }
 
@@ -3233,6 +3446,37 @@ pub async fn tracker_health(State(state): State<AppState>) -> impl IntoResponse 
     let Some(engine) = &state.engine else {
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     };
+    let (tracker_count, tracker_bytes) = match engine.tracker_health_snapshot_size().await {
+        Ok(size) => size,
+        Err(error) => {
+            tracing::warn!(
+                component = "api",
+                operation = "tracker_health_snapshot_size",
+                result = "error",
+                error = %error,
+                "tracker health snapshot admission query failed"
+            );
+            return StatusCode::SERVICE_UNAVAILABLE.into_response();
+        }
+    };
+    let estimate = estimate_native_tracker_health_snapshot_bytes(tracker_count, tracker_bytes);
+    state
+        .api_metrics
+        .record_estimated_response_bytes(estimate.saturating_add(256));
+    let _lease = match engine
+        .reserve_memory(MemoryClass::ApiSnapshot, estimate)
+        .await
+    {
+        Ok(Some(lease)) => lease,
+        Ok(None) => return api_snapshot_budget_exhausted(),
+        Err(error) => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::to_value(ApiError::internal(error)).unwrap()),
+            )
+                .into_response();
+        }
+    };
     let rows = match engine.tracker_health().await {
         Ok(rows) => rows,
         Err(error) => {
@@ -3286,9 +3530,12 @@ pub async fn sidebar_facets(
         query.filter.as_deref(),
         None,
     );
-    let shared_candidates =
-        restrict_to_tracker(&snapshot, shared_candidates, tracker_hashes.as_ref())
-            .unwrap_or_else(|| (0..snapshot.torrents.len()).collect());
+    let shared_candidates = restrict_to_tracker(
+        &snapshot,
+        shared_candidates,
+        tracker_hashes.as_ref().map(|filter| &filter.hashes),
+    )
+    .unwrap_or_else(|| (0..snapshot.torrents.len()).collect());
     let status_keys = [
         "all",
         "downloading",
@@ -3334,8 +3581,12 @@ pub async fn sidebar_facets(
                 Some(key),
             )
             .unwrap_or_default();
-        let candidates = restrict_to_tracker(&snapshot, Some(candidates), tracker_hashes.as_ref())
-            .unwrap_or_default();
+        let candidates = restrict_to_tracker(
+            &snapshot,
+            Some(candidates),
+            tracker_hashes.as_ref().map(|filter| &filter.hashes),
+        )
+        .unwrap_or_default();
         (key.to_owned(), candidates.len())
     })
     .collect::<BTreeMap<_, _>>();
@@ -4437,7 +4688,7 @@ fn torrentng_client_capabilities() -> serde_json::Value {
             "magnets": true,
             "pure_v2_metadata_placeholders": true,
             "pure_v2_metadata_completion": false,
-            "pure_v2_transfer": false,
+            "pure_v2_transfer": true,
         },
         "session": {
             "durable_torrents": true,
@@ -4468,7 +4719,7 @@ fn torrentng_client_capabilities() -> serde_json::Value {
             "http_trackers": true,
             "udp_trackers": true,
             "dht": true,
-            "dht_address_families": ["ipv4"],
+            "dht_address_families": ["ipv4", "ipv6"],
             "utp_packet_codec": true,
             "utp_udp_stream": true,
             "utp_outgoing_opt_in": true,
@@ -4668,76 +4919,82 @@ pub async fn metrics(State(state): State<AppState>) -> impl IntoResponse {
 pub async fn stream_events(
     State(state): State<AppState>,
     Query(query): Query<EventStreamQuery>,
-) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
+) -> Response {
     // The notifier belongs to the registry, so every engine/API mutation
     // wakes this stream without making idle clients rescan the journal once
     // per second.
     let change_notify = state.registry.read().await.change_notifier();
-    let stream = futures::stream::unfold(
-        EventStreamState::new(
-            state,
-            query.last_known_revision,
-            query
-                .batch_size
-                .unwrap_or(SSE_INITIAL_BATCH_DEFAULT)
-                .clamp(1, SSE_INITIAL_BATCH_MAX),
-            change_notify,
-        ),
-        |mut stream_state| async move {
-            loop {
-                let now = Instant::now();
-                if now.duration_since(stream_state.last_polled_at) > Duration::from_secs(3) {
-                    stream_state.state.api_metrics.record_sse_lagged();
-                }
-                if now.duration_since(stream_state.last_polled_at) > SSE_SLOW_CLIENT_RESYNC_AFTER {
-                    // A stalled HTTP consumer must not make this stream walk
-                    // an arbitrarily long journal when it eventually polls
-                    // again. Coalesce the missed history into bounded
-                    // snapshot chunks instead.
-                    stream_state.registry_revision = None;
-                    stream_state.initial_snapshot = None;
-                    stream_state.initial_snapshot_offset = 0;
-                    stream_state.state.api_metrics.record_sse_resync();
-                }
-                stream_state.last_polled_at = now;
-                // Register the wait before reading the journal. If a
-                // mutation races with the read, either the journal observes
-                // it or Notify retains a permit for this wait.
-                let change_notify = Arc::clone(&stream_state.change_notify);
-                let notified = change_notify.notified();
-                let delta = torrent_delta_for_stream(&mut stream_state).await;
-                if delta.snapshot || !delta.torrents.is_empty() || !delta.removed.is_empty() {
-                    stream_state.seq = stream_state.seq.saturating_add(1);
-                    let cursor = stream_state.registry_revision.unwrap_or_default();
-                    let payload = serde_json::json!({
-                        "seq": stream_state.seq,
-                        "cursor": cursor,
-                        "snapshot": delta.snapshot,
-                        "snapshot_complete": delta.snapshot_complete,
-                        "torrents": delta.torrents,
-                        "removed": delta.removed,
-                    });
-                    stream_state.state.api_metrics.record_sse_event();
-                    stream_state
-                        .state
-                        .api_metrics
-                        .record_estimated_response_bytes(payload.to_string().len() as u64);
-                    let event = Event::default()
-                        .event("torrent_delta")
-                        .id(cursor.to_string())
-                        .json_data(payload)
-                        .expect("torrent delta serializes");
-                    return Some((Ok(event), stream_state));
-                }
-                tokio::select! {
-                    _ = stream_state.tick.tick() => {}
-                    _ = notified => {}
-                }
+    let Some(initial_state) = EventStreamState::try_new(
+        state,
+        query.last_known_revision,
+        query
+            .batch_size
+            .unwrap_or(SSE_INITIAL_BATCH_DEFAULT)
+            .clamp(1, SSE_INITIAL_BATCH_MAX),
+        change_notify,
+    ) else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "SSE client capacity exhausted; retry later",
+        )
+            .into_response();
+    };
+    let stream = futures::stream::unfold(initial_state, |mut stream_state| async move {
+        loop {
+            let now = Instant::now();
+            if now.duration_since(stream_state.last_polled_at) > Duration::from_secs(3) {
+                stream_state.state.api_metrics.record_sse_lagged();
             }
-        },
-    );
+            if now.duration_since(stream_state.last_polled_at) > SSE_SLOW_CLIENT_RESYNC_AFTER {
+                // A stalled HTTP consumer must not make this stream walk
+                // an arbitrarily long journal when it eventually polls
+                // again. Coalesce the missed history into bounded
+                // snapshot chunks instead.
+                stream_state.registry_revision = None;
+                stream_state.initial_snapshot = None;
+                stream_state.initial_snapshot_offset = 0;
+                stream_state.state.api_metrics.record_sse_resync();
+            }
+            stream_state.last_polled_at = now;
+            // Register the wait before reading the journal. If a
+            // mutation races with the read, either the journal observes
+            // it or Notify retains a permit for this wait.
+            let change_notify = Arc::clone(&stream_state.change_notify);
+            let notified = change_notify.notified();
+            let delta = torrent_delta_for_stream(&mut stream_state).await;
+            if delta.snapshot || !delta.torrents.is_empty() || !delta.removed.is_empty() {
+                stream_state.seq = stream_state.seq.saturating_add(1);
+                let cursor = stream_state.registry_revision.unwrap_or_default();
+                let payload = serde_json::json!({
+                    "seq": stream_state.seq,
+                    "cursor": cursor,
+                    "snapshot": delta.snapshot,
+                    "snapshot_complete": delta.snapshot_complete,
+                    "torrents": delta.torrents,
+                    "removed": delta.removed,
+                });
+                stream_state.state.api_metrics.record_sse_event();
+                stream_state
+                    .state
+                    .api_metrics
+                    .record_estimated_response_bytes(payload.to_string().len() as u64);
+                let event = Event::default()
+                    .event("torrent_delta")
+                    .id(cursor.to_string())
+                    .json_data(payload)
+                    .expect("torrent delta serializes");
+                return Some((Ok::<Event, Infallible>(event), stream_state));
+            }
+            tokio::select! {
+                _ = stream_state.tick.tick() => {}
+                _ = notified => {}
+            }
+        }
+    });
 
-    Sse::new(stream).keep_alive(KeepAlive::default())
+    Sse::new(stream)
+        .keep_alive(KeepAlive::default())
+        .into_response()
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -4874,14 +5131,14 @@ struct EventStreamState {
 }
 
 impl EventStreamState {
-    fn new(
+    fn try_new(
         state: AppState,
         registry_revision: Option<u64>,
         initial_batch_size: usize,
         change_notify: Arc<tokio::sync::Notify>,
-    ) -> Self {
-        let client_guard = state.api_metrics.register_sse_client();
-        EventStreamState {
+    ) -> Option<Self> {
+        let client_guard = state.api_metrics.try_register_sse_client()?;
+        Some(EventStreamState {
             state,
             registry_revision,
             seq: 0,
@@ -4892,7 +5149,18 @@ impl EventStreamState {
             initial_snapshot_offset: 0,
             initial_batch_size: initial_batch_size.clamp(1, SSE_INITIAL_BATCH_MAX),
             _client_guard: client_guard,
-        }
+        })
+    }
+
+    #[cfg(test)]
+    fn new(
+        state: AppState,
+        registry_revision: Option<u64>,
+        initial_batch_size: usize,
+        change_notify: Arc<tokio::sync::Notify>,
+    ) -> Self {
+        Self::try_new(state, registry_revision, initial_batch_size, change_notify)
+            .expect("test SSE client capacity exhausted")
     }
 }
 
@@ -5001,10 +5269,29 @@ async fn torrent_delta_for_stream(stream_state: &mut EventStreamState) -> Torren
     }
 }
 
-fn estimate_torrent_summary_snapshot_bytes(torrent_count: usize) -> u64 {
-    // Conservative enough to cover Vec growth and cloned strings for typical
-    // summaries without letting a huge API snapshot bypass governor pressure.
-    (torrent_count as u64).saturating_mul(1024)
+fn estimate_torrent_summary_page_bytes<'a>(
+    summaries: impl IntoIterator<Item = &'a TorrentSummary>,
+) -> u64 {
+    summaries.into_iter().fold(0, |total, summary| {
+        let string_bytes = summary
+            .info_hash
+            .len()
+            .saturating_add(summary.name.len())
+            .saturating_add(summary.state.len())
+            .saturating_add(summary.save_path.len())
+            .saturating_add(summary.category.as_ref().map_or(0, String::len))
+            .saturating_add(summary.tags.iter().map(String::len).sum::<usize>())
+            .saturating_add(summary.tracker_message.as_ref().map_or(0, String::len));
+        let string_bytes = u64::try_from(string_bytes).unwrap_or(u64::MAX);
+        let tag_slots = u64::try_from(summary.tags.len()).unwrap_or(u64::MAX);
+        total
+            .saturating_add(1024)
+            // Account for the cloned strings and the serialized JSON body.
+            // Escaped control characters can make the wire form much larger
+            // than the UTF-8 source, so keep a substantial margin here.
+            .saturating_add(string_bytes.saturating_mul(8))
+            .saturating_add(tag_slots.saturating_mul(64))
+    })
 }
 
 fn estimate_torrent_detail_base_snapshot_bytes() -> u64 {
@@ -5401,6 +5688,20 @@ fn render_metrics_with_health(
         "gauge",
         "Torrents registered with the TorrentNG-client DHT task",
         stats.dht_tracked_torrents,
+    );
+    metric(
+        &mut out,
+        "torrentng_dht_tracked_torrents_cap",
+        "gauge",
+        "Configured admission cap for DHT-tracked torrents (dht.tracked_torrents_cap)",
+        stats.dht_tracked_torrents_cap,
+    );
+    metric(
+        &mut out,
+        "torrentng_dht_tracked_torrents_rejected_total",
+        "counter",
+        "Torrents rejected from DHT tracking because dht_tracked_torrents_cap was reached; nonzero means DHT peer discovery is unavailable for at least one torrent",
+        stats.dht_tracked_torrents_rejected,
     );
     metric(
         &mut out,
@@ -6702,20 +7003,7 @@ async fn matching_hashes_for_json_rule(
         .and_then(serde_json::Value::as_str)
         .map(str::trim)
         .filter(|value| !value.is_empty());
-    let tracker_hashes = if let Some(tracker) = tracker {
-        let Some(engine) = &state.engine else {
-            return Err("TorrentNG client is required for tracker matching".to_owned());
-        };
-        Some(
-            engine
-                .torrent_hashes_by_tracker(tracker.to_owned())
-                .await?
-                .into_iter()
-                .collect::<BTreeSet<_>>(),
-        )
-    } else {
-        None
-    };
+    let tracker_hashes = tracker_filter_hashes(state, tracker).await?;
     let reg = state.registry.read().await;
     Ok(reg
         .iter()
@@ -6727,7 +7015,7 @@ async fn matching_hashes_for_json_rule(
         .filter(|entry| {
             tracker_hashes
                 .as_ref()
-                .map(|hashes| hashes.contains(&entry.info_hash))
+                .map(|filter| filter.hashes.contains(&entry.info_hash))
                 .unwrap_or(true)
         })
         .map(|entry| entry.info_hash.clone())
@@ -7412,6 +7700,51 @@ fn not_found(info_hash: String) -> axum::response::Response {
         .into_response()
 }
 
+fn estimate_native_tracker_snapshot_bytes(tracker_count: u64, tracker_bytes: u64) -> u64 {
+    // The engine query owns the persisted strings, the URL projection clones
+    // them, and JSON serialization retains another byte view. The full-row
+    // preflight is intentionally conservative for this URL-only response.
+    16 * 1024 + tracker_count.saturating_mul(1024) + tracker_bytes.saturating_mul(4)
+}
+
+fn estimate_native_tracker_health_snapshot_bytes(tracker_count: u64, tracker_bytes: u64) -> u64 {
+    16 * 1024 + tracker_count.saturating_mul(512) + tracker_bytes.saturating_mul(4)
+}
+
+fn estimate_native_tracker_filter_snapshot_bytes(hash_count: u64, hash_bytes: u64) -> u64 {
+    16 * 1024 + hash_count.saturating_mul(512) + hash_bytes.saturating_mul(4)
+}
+
+fn estimate_native_file_snapshot_bytes(files: &[rt_engine::EngineTorrentFile]) -> u64 {
+    let path_bytes = files.iter().fold(0u64, |total, file| {
+        total.saturating_add(file.path.len() as u64)
+    });
+    16 * 1024 + (files.len() as u64).saturating_mul(512) + path_bytes.saturating_mul(4)
+}
+
+fn insert_native_label(
+    labels: &mut BTreeSet<String>,
+    total_bytes: &mut usize,
+    label: String,
+) -> bool {
+    if label.is_empty() || labels.contains(&label) {
+        return true;
+    }
+    if labels.len() >= MAX_NATIVE_LABEL_ITEMS {
+        return false;
+    }
+    *total_bytes = total_bytes.saturating_add(label.len());
+    if *total_bytes > MAX_NATIVE_LABEL_BYTES {
+        return false;
+    }
+    labels.insert(label);
+    true
+}
+
+fn estimate_native_label_snapshot_bytes(item_count: usize, text_bytes: usize) -> u64 {
+    8 * 1024 + (item_count as u64).saturating_mul(512) + (text_bytes as u64).saturating_mul(8)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -7790,6 +8123,7 @@ mod tests {
             capabilities["metadata"]["pure_v2_metadata_completion"],
             false
         );
+        assert_eq!(capabilities["metadata"]["pure_v2_transfer"], true);
         assert_eq!(capabilities["session"]["crash_restore"], true);
         assert_eq!(capabilities["jobs"]["durable_recheck"], true);
         assert_eq!(capabilities["jobs"]["storage_plan_controls"], true);
@@ -7797,7 +8131,7 @@ mod tests {
         assert_eq!(capabilities["networking"]["dht"], true);
         assert_eq!(
             capabilities["networking"]["dht_address_families"],
-            serde_json::json!(["ipv4"])
+            serde_json::json!(["ipv4", "ipv6"])
         );
         assert_eq!(capabilities["networking"]["utp_packet_codec"], true);
         assert_eq!(capabilities["networking"]["utp_udp_stream"], true);
@@ -7937,6 +8271,8 @@ mod tests {
             dht_announced_peer_sets: 46,
             dht_announced_peers: 47,
             dht_tracked_torrents: 48,
+            dht_tracked_torrents_cap: 59,
+            dht_tracked_torrents_rejected: 60,
             dht_outstanding_requests: 49,
             dht_queried_nodes: 50,
             storage_file_pool_memory_bytes: 57,
@@ -8061,6 +8397,8 @@ mod tests {
         assert!(rendered.contains("torrentng_dht_announced_peer_sets 46"));
         assert!(rendered.contains("torrentng_dht_announced_peers 47"));
         assert!(rendered.contains("torrentng_dht_tracked_torrents 48"));
+        assert!(rendered.contains("torrentng_dht_tracked_torrents_cap 59"));
+        assert!(rendered.contains("torrentng_dht_tracked_torrents_rejected_total 60"));
         assert!(rendered.contains("torrentng_dht_outstanding_requests 49"));
         assert!(rendered.contains("torrentng_dht_queried_nodes 50"));
         assert!(rendered.contains("torrentng_storage_file_pool_memory_bytes 57"));
@@ -9483,8 +9821,6 @@ mod tests {
 
     #[test]
     fn api_snapshot_estimates_scale_with_torrent_count() {
-        assert_eq!(estimate_torrent_summary_snapshot_bytes(0), 0);
-        assert_eq!(estimate_torrent_summary_snapshot_bytes(10), 10 * 1024);
         let summary = TorrentSummary {
             info_hash: "a".repeat(40),
             name: "detail.bin".to_owned(),

@@ -1,5 +1,5 @@
 [Unit]
-Description=TorrentNG Compatible-Client WebUI/API Service
+Description=TorrentNG compatible-client WebUI/API service
 After=rtorrent.service
 Requires=rtorrent.service
 

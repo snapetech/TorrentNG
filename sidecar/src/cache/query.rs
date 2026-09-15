@@ -84,7 +84,7 @@ pub struct TorrentLiveRow {
 
 impl Db {
     pub fn get(&self, hash: &str) -> Result<Option<TorrentRow>> {
-        let conn = self.0.lock().expect("db mutex");
+        let conn = self.read();
         let mut stmt = conn.prepare(
             "SELECT t.hash, t.name, t.size_bytes, t.bytes_done, t.down_rate, t.up_rate,
                     t.up_total, t.down_total, t.ratio, t.is_active, t.is_open, t.complete,
@@ -153,7 +153,7 @@ impl Db {
              FROM torrents
              WHERE hash COLLATE NOCASE IN ({placeholders})"
         );
-        let conn = self.0.lock().expect("db mutex");
+        let conn = self.read();
         let mut stmt = conn.prepare(&sql)?;
         let rows = stmt.query_map(params_from_iter(hashes.iter()), |row| {
             Ok(TorrentLiveRow {
@@ -181,7 +181,7 @@ impl Db {
         if max_rows == 0 {
             return Ok(None);
         }
-        let conn = self.0.lock().expect("db mutex");
+        let conn = self.read();
         let revision = current_revision_locked(&conn)?;
         if since < 0 || since > revision {
             return Ok(None);
@@ -285,7 +285,7 @@ impl Db {
         let limit = p.limit.unwrap_or(200).clamp(1, 50000);
         let offset = validate_page_offset(p.offset)?;
 
-        let conn = self.0.lock().expect("db mutex");
+        let conn = self.read();
 
         let total: i64 = conn.query_row(
             &format!("SELECT COUNT(*) FROM torrents t{where_sql}"),
@@ -306,12 +306,12 @@ impl Db {
         let order = order_clause(p.sort.as_deref(), p.dir.as_deref());
         let limit = p.limit.unwrap_or(200).clamp(1, 50000);
         let offset = validate_page_offset(p.offset)?;
-        let conn = self.0.lock().expect("db mutex");
+        let conn = self.read();
         query_torrent_rows(&conn, &where_sql, &args, &order, limit, offset)
     }
 
     pub fn tracker_health(&self) -> Result<Vec<TrackerHealthRow>> {
-        let conn = self.0.lock().expect("db mutex");
+        let conn = self.read();
         let mut stmt = conn.prepare(
             "SELECT tracker_url,
                     COUNT(*) AS torrent_count,
@@ -348,7 +348,7 @@ impl Db {
     /// `media_type` fields are ignored) so counts stay in sync with an
     /// active search instead of always reflecting the whole library.
     pub fn sidebar_facets(&self, shared: &ListParams) -> Result<SidebarFacets> {
-        let conn = self.0.lock().expect("db mutex");
+        let conn = self.read();
         let (shared_clauses, shared_args) = shared_clauses(shared);
         let mut status = std::collections::BTreeMap::new();
 

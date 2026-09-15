@@ -1,6 +1,6 @@
 [package]
 name = "torrentngd"
-description = "TorrentNG: next-generation Rust BitTorrent client daemon with compatibility API facades"
+description = "TorrentNG Engine: native Rust BitTorrent client with the shared WebUI/API and compatibility facades"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -35,6 +35,9 @@ rt-api-qbit   = { path = "../rt-api-qbit" }
 rt-api-model  = { path = "../rt-api-model" }
 rt-api-transmission = { path = "../rt-api-transmission" }
 rt-api-deluge = { path = "../rt-api-deluge" }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+tikv-jemallocator = { version = "0.7.0", features = ["background_threads"] }
 
 [dev-dependencies]
 tempfile.workspace = true

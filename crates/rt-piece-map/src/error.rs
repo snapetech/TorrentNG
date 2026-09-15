@@ -32,4 +32,10 @@ pub enum PieceMapError {
     },
     #[error("integer overflow while building piece map: {0}")]
     IntegerOverflow(&'static str),
+    #[error("piece {0} has no mapped v2 file data")]
+    NoV2FileForPiece(u32),
+    #[error("v2 file span {file_index} is not aligned to piece length {piece_length}")]
+    V2FileNotAligned { file_index: u32, piece_length: u64 },
+    #[error("v2 file span {file_index} overlaps another file in logical piece space")]
+    V2FileOverlap { file_index: u32 },
 }

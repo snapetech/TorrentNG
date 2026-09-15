@@ -323,7 +323,7 @@ install_aur() {
   have git || die "git is required for AUR smoke"
   local pkg="$channel"
   [[ "$channel" == "aur" ]] && pkg="${AUR_PACKAGES%% *}"
-  [[ "$channel" == "aur-bin" ]] && pkg="$(awk '{print $2}' <<<"$AUR_PACKAGES")"
+  [[ "$channel" == "aur-bin" ]] && die "no binary AUR package is configured for $project"
   run git clone "https://aur.archlinux.org/$pkg.git" "$tmp_dir/aur"
   pushd "$tmp_dir/aur" >/dev/null
   run makepkg --syncdeps --noconfirm --install
@@ -440,7 +440,8 @@ case "$channel" in
   deb) install_deb ;;
   rpm) install_rpm ;;
   container-ghcr|container-dockerhub) install_container ;;
-  aur|aur-bin|slskdn|slskdn-bin) install_aur ;;
+  aur|slskdn) install_aur ;;
+  aur-bin|slskdn-bin) die "no binary AUR package is configured for $project" ;;
   copr) install_copr ;;
   ppa) install_ppa ;;
   snap) install_snap ;;

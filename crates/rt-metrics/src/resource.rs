@@ -3,7 +3,7 @@ use std::sync::{
     Arc,
 };
 
-pub const MEMORY_CLASS_COUNT: usize = 9;
+pub const MEMORY_CLASS_COUNT: usize = 10;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(usize)]
@@ -17,6 +17,7 @@ pub enum MemoryClass {
     DhtTable = 6,
     QueuedDisk = 7,
     ApiSnapshot = 8,
+    PieceIndex = 9,
 }
 
 impl MemoryClass {
@@ -30,6 +31,7 @@ impl MemoryClass {
         MemoryClass::DhtTable,
         MemoryClass::QueuedDisk,
         MemoryClass::ApiSnapshot,
+        MemoryClass::PieceIndex,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -43,6 +45,7 @@ impl MemoryClass {
             MemoryClass::DhtTable => "dht_table",
             MemoryClass::QueuedDisk => "queued_disk",
             MemoryClass::ApiSnapshot => "api_snapshot",
+            MemoryClass::PieceIndex => "piece_index",
         }
     }
 
@@ -91,6 +94,7 @@ impl Default for ResourceGovernorConfig {
                 32 * mib,
                 32 * mib,
                 16 * mib,
+                128 * mib,
             ],
             pressure_constrained_pct: 75,
             pressure_critical_pct: 90,
@@ -274,7 +278,7 @@ mod tests {
     fn config() -> ResourceGovernorConfig {
         ResourceGovernorConfig {
             total_cap_bytes: 100,
-            class_caps_bytes: [50, 80, 80, 80, 80, 80, 80, 80, 80],
+            class_caps_bytes: [50, 80, 80, 80, 80, 80, 80, 80, 80, 80],
             pressure_constrained_pct: 60,
             pressure_critical_pct: 90,
         }

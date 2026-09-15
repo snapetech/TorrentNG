@@ -89,6 +89,9 @@ ENV TNG_PACKAGED_RTORRENT_VERSION=0.16.11
 ENV TNG_PACKAGED_LIBTORRENT_VERSION=0.16.11
 ENV TNG_RTORRENT_PATCHES=rtorrent-0.16.11-user-agent-command,rtorrent-0.16.11-local-id-command,rtorrent-0.16.11-multicall-range,rtorrent-0.16.11-tracker-identity-gate
 
+LABEL org.opencontainers.image.title="TorrentNG Compatible-Client Service" \
+      org.opencontainers.image.description="TorrentNG compatible-client WebUI/API service for existing qBittorrent, rTorrent, Transmission, and Deluge deployments."
+
 VOLUME ["/data", "/session", "/config"]
 EXPOSE 8080 50000 50000/udp
 

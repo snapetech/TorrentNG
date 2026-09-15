@@ -50,7 +50,9 @@ const QBIT_LIST_INITIAL_CAPACITY: usize = 256;
 const QBIT_LIMIT_PROJECTION_CONCURRENCY: usize = 64;
 const QBIT_LIVE_PROJECTION_CONCURRENCY: usize = 64;
 const MAX_QBIT_MUTATION_ITEMS: usize = 16_384;
+const MAX_QBIT_TORRENT_BYTES: usize = 16 * 1024 * 1024;
 const MAX_QBIT_TRACKER_PROJECTION_CACHE: usize = 4_096;
+const QBIT_LIVE_TORRENT_INFO_EXTRA_BYTES: u64 = 64 * 1024;
 // qBittorrent forms use one value per named option. Keep the compatibility
 // parser from retaining an attacker-controlled number of distinct fields even
 // when the request body is otherwise within the multipart/body byte limit.
@@ -72,6 +74,8 @@ const MAX_QBIT_COOKIE_COUNT: usize = 4096;
 const MAX_QBIT_RSS_ITEMS: usize = 4096;
 const MAX_QBIT_RSS_RULES: usize = 1024;
 const MAX_QBIT_SEARCH_PLUGINS: usize = 256;
+const MAX_QBIT_LABEL_ITEMS: usize = 16_384;
+const MAX_QBIT_LABEL_BYTES: usize = 4 * 1024 * 1024;
 
 async fn category_definitions(state: &AppState) -> Result<BTreeMap<String, String>, String> {
     if let Some(engine) = &state.engine {
@@ -1180,13 +1184,18 @@ pub async fn torrents_info(
             break;
         }
     }
+    let include_live = selected.len() <= QBIT_LIVE_PROJECTION_MAX_ENTRIES;
+    let estimate = estimate_qbit_torrent_info_page_bytes(
+        selected.iter().map(|index| {
+            snapshot
+                .entries
+                .get(*index)
+                .expect("snapshot index is valid")
+        }),
+        include_live,
+    );
     let _lease = if state.engine.is_some() {
-        match reserve_qbit_api_snapshot(
-            &state,
-            estimate_qbit_torrent_info_snapshot_bytes(selected.len()),
-        )
-        .await
-        {
+        match reserve_qbit_api_snapshot(&state, estimate).await {
             Ok(Some(lease)) => Some(lease),
             Ok(None) => return qbit_api_snapshot_budget_exhausted(),
             Err(e) => return (StatusCode::SERVICE_UNAVAILABLE, e).into_response(),
@@ -1194,7 +1203,6 @@ pub async fn torrents_info(
     } else {
         None
     };
-    let include_live = selected.len() <= QBIT_LIVE_PROJECTION_MAX_ENTRIES;
     let infos = if include_live {
         let entries = selected
             .iter()
@@ -1231,9 +1239,7 @@ pub async fn torrents_info(
         }
         infos
     };
-    state
-        .api_metrics
-        .record_estimated_response_bytes(estimate_qbit_torrent_info_snapshot_bytes(infos.len()));
+    state.api_metrics.record_estimated_response_bytes(estimate);
 
     let mut response = (StatusCode::OK, Json(infos)).into_response();
     if let Ok(value) = HeaderValue::from_str(&snapshot.revision.to_string()) {
@@ -1571,16 +1577,26 @@ pub async fn torrents_add(
                 if torrent_blobs.len() >= MAX_QBIT_MUTATION_ITEMS {
                     return (StatusCode::BAD_REQUEST, "Fails.").into_response();
                 }
-                match field.bytes().await {
-                    Ok(bytes) => torrent_blobs.push(bytes.to_vec()),
-                    Err(error) => {
-                        return (
-                            StatusCode::BAD_REQUEST,
-                            format!("invalid torrent field: {error}"),
-                        )
-                            .into_response()
+                let mut field = field;
+                let mut bytes = Vec::new();
+                loop {
+                    let chunk = match field.chunk().await {
+                        Ok(Some(chunk)) => chunk,
+                        Ok(None) => break,
+                        Err(error) => {
+                            return (
+                                StatusCode::BAD_REQUEST,
+                                format!("invalid torrent field: {error}"),
+                            )
+                                .into_response();
+                        }
+                    };
+                    if bytes.len().saturating_add(chunk.len()) > MAX_QBIT_TORRENT_BYTES {
+                        return StatusCode::PAYLOAD_TOO_LARGE.into_response();
                     }
+                    bytes.extend_from_slice(&chunk);
                 }
+                torrent_blobs.push(bytes);
             }
             Some(name) => {
                 // Do not silently discard a qBit add option. If it has no
@@ -2017,9 +2033,9 @@ pub struct HashesQuery {
 pub async fn torrents_trackers(
     State(state): State<AppState>,
     Query(q): Query<HashQuery>,
-) -> impl IntoResponse {
+) -> Response {
     let Some(hash) = q.hash else {
-        return (StatusCode::BAD_REQUEST, Json(Vec::<QbTrackerInfo>::new()));
+        return (StatusCode::BAD_REQUEST, Json(Vec::<QbTrackerInfo>::new())).into_response();
     };
     let exists = {
         let reg = state.registry.read().await;
@@ -2031,48 +2047,85 @@ pub async fn torrents_trackers(
                 StatusCode::SERVICE_UNAVAILABLE,
                 Json(Vec::<QbTrackerInfo>::new()),
             )
+                .into_response()
         } else {
-            (StatusCode::NOT_FOUND, Json(Vec::<QbTrackerInfo>::new()))
+            (StatusCode::NOT_FOUND, Json(Vec::<QbTrackerInfo>::new())).into_response()
         };
     };
-    match engine.torrent_trackers(hash.clone()).await {
-        Ok(trackers) => {
-            let _lease = match reserve_qbit_api_snapshot(
+
+    // A normalized row projection is authoritative, including an explicit
+    // empty override. Once it exists, never resurrect metainfo trackers when
+    // the full status query is rejected by the engine's snapshot cap.
+    match engine.torrent_tracker_projection(hash.clone()).await {
+        Ok(Some(_)) => {
+            let (tracker_count, tracker_bytes) =
+                match engine.torrent_tracker_snapshot_size(hash.clone()).await {
+                    Ok(size) => size,
+                    Err(_) => {
+                        return (
+                            StatusCode::SERVICE_UNAVAILABLE,
+                            Json(Vec::<QbTrackerInfo>::new()),
+                        )
+                            .into_response()
+                    }
+                };
+            let tracker_count = usize::try_from(tracker_count).unwrap_or(usize::MAX);
+            let lease = match reserve_qbit_api_snapshot(
                 &state,
-                estimate_qbit_tracker_snapshot_bytes(trackers.len()),
+                estimate_qbit_tracker_snapshot_bytes(tracker_count, tracker_bytes),
             )
             .await
             {
-                Ok(Some(lease)) => Some(lease),
+                Ok(Some(lease)) => lease,
                 Ok(None) | Err(_) => {
                     return (
                         StatusCode::SERVICE_UNAVAILABLE,
                         Json(Vec::<QbTrackerInfo>::new()),
                     )
+                        .into_response()
                 }
             };
-            (
-                StatusCode::OK,
-                Json(qbit_trackers_from_snapshots(&trackers)),
-            )
+            let response = match engine.torrent_trackers(hash).await {
+                Ok(trackers) => (
+                    StatusCode::OK,
+                    Json(qbit_trackers_from_snapshots(&trackers)),
+                )
+                    .into_response(),
+                Err(_) => (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    Json(Vec::<QbTrackerInfo>::new()),
+                )
+                    .into_response(),
+            };
+            drop(lease);
+            response
         }
-        Err(_) => match engine.torrent_metadata(hash).await {
+        Err(_) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(Vec::<QbTrackerInfo>::new()),
+        )
+            .into_response(),
+        Ok(None) => match engine.torrent_metadata(hash).await {
             Ok(meta) => {
-                let _lease = match reserve_qbit_api_snapshot(
+                let tracker_bytes = meta.trackers.iter().fold(0u64, |total, tracker| {
+                    total.saturating_add(tracker.len() as u64)
+                });
+                let lease = match reserve_qbit_api_snapshot(
                     &state,
-                    estimate_qbit_tracker_snapshot_bytes(meta.trackers.len()),
+                    estimate_qbit_tracker_snapshot_bytes(meta.trackers.len(), tracker_bytes),
                 )
                 .await
                 {
-                    Ok(Some(lease)) => Some(lease),
+                    Ok(Some(lease)) => lease,
                     Ok(None) | Err(_) => {
                         return (
                             StatusCode::SERVICE_UNAVAILABLE,
                             Json(Vec::<QbTrackerInfo>::new()),
                         )
+                            .into_response()
                     }
                 };
-                let trackers = meta
+                let trackers: Vec<QbTrackerInfo> = meta
                     .trackers
                     .into_iter()
                     .enumerate()
@@ -2087,13 +2140,16 @@ pub async fn torrents_trackers(
                         msg: String::new(),
                     })
                     .collect();
-                (StatusCode::OK, Json(trackers))
+                let response = (StatusCode::OK, Json(trackers)).into_response();
+                drop(lease);
+                response
             }
             Err(_) if exists => (
                 StatusCode::SERVICE_UNAVAILABLE,
                 Json(Vec::<QbTrackerInfo>::new()),
-            ),
-            Err(_) => (StatusCode::NOT_FOUND, Json(Vec::<QbTrackerInfo>::new())),
+            )
+                .into_response(),
+            Err(_) => (StatusCode::NOT_FOUND, Json(Vec::<QbTrackerInfo>::new())).into_response(),
         },
     }
 }
@@ -2237,11 +2293,7 @@ pub async fn torrents_files(
         Ok(meta) => {
             let _lease = match reserve_qbit_api_snapshot(
                 &state,
-                estimate_qbit_metadata_snapshot_bytes(
-                    meta.files.len(),
-                    meta.piece_count,
-                    meta.webseeds.len(),
-                ),
+                estimate_qbit_file_snapshot_bytes(&meta.files),
             )
             .await
             {
@@ -2293,7 +2345,7 @@ pub async fn torrents_webseeds(
         Ok(meta) => {
             let _lease = match reserve_qbit_api_snapshot(
                 &state,
-                estimate_qbit_metadata_snapshot_bytes(0, 0, meta.webseeds.len()),
+                estimate_qbit_webseed_snapshot_bytes(&meta.webseeds),
             )
             .await
             {
@@ -2378,7 +2430,7 @@ pub async fn torrents_piece_hashes(
         Ok(meta) => {
             let _lease = match reserve_qbit_api_snapshot(
                 &state,
-                estimate_qbit_metadata_snapshot_bytes(0, meta.piece_hashes.len(), 0),
+                estimate_qbit_piece_hash_snapshot_bytes(meta.piece_hashes.len()),
             )
             .await
             {
@@ -2412,7 +2464,21 @@ pub async fn torrents_export(
     let Some(engine) = &state.engine else {
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     };
-    match engine.torrent_blob(hash).await {
+    let blob_size = match engine.torrent_blob_size(hash.clone()).await {
+        Ok(size) => size,
+        Err(error) => return qbit_engine_error_status(error).into_response(),
+    };
+    let estimate = estimate_qbit_blob_snapshot_bytes(blob_size);
+    let _lease = match reserve_qbit_api_snapshot(&state, estimate).await {
+        Ok(Some(lease)) => lease,
+        Ok(None) => return qbit_api_snapshot_budget_exhausted(),
+        Err(error) => return (StatusCode::SERVICE_UNAVAILABLE, error).into_response(),
+    };
+    let max_bytes = match usize::try_from(blob_size) {
+        Ok(size) => size,
+        Err(_) => return StatusCode::PAYLOAD_TOO_LARGE.into_response(),
+    };
+    match engine.torrent_blob_limited(hash, max_bytes).await {
         Ok(raw) => (
             StatusCode::OK,
             [(header::CONTENT_TYPE, "application/x-bittorrent")],
@@ -2463,6 +2529,20 @@ pub async fn torrents_properties(
         match engine.torrent_metadata(hash.clone()).await {
             Ok(meta) => Some(meta),
             Err(_) => {
+                return (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    Json(default_torrent_properties(String::new())),
+                )
+            }
+        }
+    } else {
+        None
+    };
+    let _metadata_lease = if let Some(meta) = meta.as_ref() {
+        let extra = estimate_qbit_properties_extra_snapshot_bytes(&entry, meta);
+        match reserve_qbit_api_snapshot(&state, extra).await {
+            Ok(Some(lease)) => Some(lease),
+            Ok(None) | Err(_) => {
                 return (
                     StatusCode::SERVICE_UNAVAILABLE,
                     Json(default_torrent_properties(String::new())),
@@ -2570,6 +2650,7 @@ pub async fn torrents_properties(
 /// `GET /api/qb/v2/torrents/categories`.
 pub async fn torrents_categories(State(state): State<AppState>) -> impl IntoResponse {
     let mut categories = serde_json::Map::new();
+    let mut label_bytes = 0usize;
     let stored = match category_definitions(&state).await {
         Ok(stored) => stored,
         Err(_) => {
@@ -2580,6 +2661,17 @@ pub async fn torrents_categories(State(state): State<AppState>) -> impl IntoResp
         }
     };
     for (category, save_path) in stored {
+        if !account_qbit_label(
+            &mut label_bytes,
+            categories.len(),
+            &category,
+            Some(&save_path),
+        ) {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::Value::Object(serde_json::Map::new())),
+            );
+        }
         let info = QbCategoryInfo {
             name: category.clone(),
             save_path: format!("{}/", save_path.trim_end_matches('/')),
@@ -2599,23 +2691,28 @@ pub async fn torrents_categories(State(state): State<AppState>) -> impl IntoResp
         if facet.name.is_empty() || categories.contains_key(&facet.name) {
             continue;
         }
+        let save_path = facet.save_path.as_deref().unwrap_or_default();
+        if !account_qbit_label(
+            &mut label_bytes,
+            categories.len(),
+            &facet.name,
+            Some(save_path),
+        ) {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::Value::Object(serde_json::Map::new())),
+            );
+        }
         let info = QbCategoryInfo {
             name: facet.name.clone(),
-            save_path: format!(
-                "{}/",
-                facet
-                    .save_path
-                    .as_deref()
-                    .unwrap_or_default()
-                    .trim_end_matches('/')
-            ),
+            save_path: format!("{}/", save_path.trim_end_matches('/')),
         };
         categories.insert(facet.name, serde_json::to_value(info).unwrap());
     }
     let _lease = if state.engine.is_some() {
         match reserve_qbit_api_snapshot(
             &state,
-            estimate_qbit_label_snapshot_bytes(categories.len()),
+            estimate_qbit_label_snapshot_bytes(categories.len(), label_bytes),
         )
         .await
         {
@@ -2636,28 +2733,40 @@ pub async fn torrents_categories(State(state): State<AppState>) -> impl IntoResp
 /// `GET /api/qb/v2/torrents/tags`.
 pub async fn torrents_tags(State(state): State<AppState>) -> impl IntoResponse {
     let mut tags = BTreeSet::new();
+    let mut label_bytes = 0usize;
     if let Some(engine) = &state.engine {
         match engine.list_tags().await {
-            Ok(global_tags) => tags.extend(global_tags),
+            Ok(global_tags) => {
+                for tag in global_tags {
+                    if !insert_qbit_label(&mut tags, &mut label_bytes, tag) {
+                        return (StatusCode::SERVICE_UNAVAILABLE, Json(Vec::<String>::new()));
+                    }
+                }
+            }
             Err(_) => return (StatusCode::SERVICE_UNAVAILABLE, Json(Vec::<String>::new())),
         }
     } else {
-        tags.extend(state.tags.read().await.iter().cloned());
+        for tag in state.tags.read().await.iter().cloned() {
+            if !insert_qbit_label(&mut tags, &mut label_bytes, tag) {
+                return (StatusCode::SERVICE_UNAVAILABLE, Json(Vec::<String>::new()));
+            }
+        }
     }
     let snapshot = match state.torrent_snapshot(None).await {
         Ok(snapshot) => snapshot,
         Err(_) => return (StatusCode::SERVICE_UNAVAILABLE, Json(Vec::<String>::new())),
     };
-    tags.extend(
-        snapshot
-            .tag_facets()
-            .into_iter()
-            .filter(|(tag, _)| !tag.is_empty())
-            .map(|(tag, _)| tag),
-    );
+    for (tag, _) in snapshot.tag_facets() {
+        if !insert_qbit_label(&mut tags, &mut label_bytes, tag) {
+            return (StatusCode::SERVICE_UNAVAILABLE, Json(Vec::<String>::new()));
+        }
+    }
     let _lease = if state.engine.is_some() {
-        match reserve_qbit_api_snapshot(&state, estimate_qbit_label_snapshot_bytes(tags.len()))
-            .await
+        match reserve_qbit_api_snapshot(
+            &state,
+            estimate_qbit_label_snapshot_bytes(tags.len(), label_bytes),
+        )
+        .await
         {
             Ok(Some(lease)) => Some(lease),
             Ok(None) | Err(_) => return (StatusCode::SERVICE_UNAVAILABLE, Json(Vec::new())),
@@ -3440,13 +3549,10 @@ pub async fn sync_maindata(
         }
     };
     let torrent_count = entries.len();
+    let include_live = torrent_count <= QBIT_LIVE_PROJECTION_MAX_ENTRIES;
+    let estimate = estimate_qbit_torrent_info_page_bytes(entries.iter(), include_live);
     let _lease = if state.engine.is_some() {
-        match reserve_qbit_api_snapshot(
-            &state,
-            estimate_qbit_maindata_snapshot_bytes(torrent_count),
-        )
-        .await
-        {
+        match reserve_qbit_api_snapshot(&state, estimate).await {
             Ok(Some(lease)) => Some(lease),
             Ok(None) => return qbit_api_snapshot_budget_exhausted(),
             Err(e) => return (StatusCode::SERVICE_UNAVAILABLE, e).into_response(),
@@ -3463,7 +3569,6 @@ pub async fn sync_maindata(
         }
     };
     let mut infos = Vec::with_capacity(entries.len());
-    let include_live = entries.len() <= QBIT_LIVE_PROJECTION_MAX_ENTRIES;
     if include_live {
         let live_entries = entries.iter().cloned().collect();
         infos = match load_qbit_live_projections(&state, live_entries, active_rechecks).await {
@@ -3479,9 +3584,7 @@ pub async fn sync_maindata(
             infos.push(info);
         }
     }
-    state
-        .api_metrics
-        .record_estimated_response_bytes(estimate_qbit_maindata_snapshot_bytes(infos.len()));
+    state.api_metrics.record_estimated_response_bytes(estimate);
     let rid = qbit_registry_rid(revision);
     let (alltime_dl, alltime_ul, session_rates, connected_peers, queued_io_jobs) =
         if let Some(engine) = &state.engine {
@@ -5005,6 +5108,48 @@ fn estimate_qbit_torrent_info_snapshot_bytes(torrent_count: usize) -> u64 {
     (torrent_count as u64).saturating_mul(2048)
 }
 
+fn estimate_qbit_blob_snapshot_bytes(blob_size: u64) -> u64 {
+    // The engine read owns the file bytes and the HTTP body may retain a
+    // second view while the response is being assembled. Reject a blob before
+    // reading it if this conservative estimate cannot fit the API budget.
+    64 * 1024 + blob_size.saturating_mul(2)
+}
+
+fn estimate_qbit_torrent_info_page_bytes<'a>(
+    entries: impl IntoIterator<Item = &'a rt_session::TorrentEntry>,
+    include_live: bool,
+) -> u64 {
+    entries.into_iter().fold(0, |total, entry| {
+        // A qBit info item repeats the torrent name and save path in the
+        // content/root paths, repeats the hash in the magnet/hash fields,
+        // clones the source entry for live projection, and is serialized to a
+        // second owned JSON body.  Count the repeated source strings before
+        // applying a margin for allocation and JSON escaping overhead.
+        let string_bytes = entry
+            .info_hash
+            .len()
+            .saturating_mul(3)
+            .saturating_add(entry.name.len().saturating_mul(3))
+            .saturating_add(entry.save_path.len().saturating_mul(3))
+            .saturating_add(entry.category.as_ref().map_or(0, String::len))
+            .saturating_add(entry.tags.iter().map(String::len).sum::<usize>())
+            .saturating_add(entry.tags.len().saturating_sub(1))
+            .saturating_add(64);
+        let string_bytes = u64::try_from(string_bytes).unwrap_or(u64::MAX);
+        let tag_slots = u64::try_from(entry.tags.len()).unwrap_or(u64::MAX);
+        total
+            .saturating_add(estimate_qbit_torrent_info_snapshot_bytes(1))
+            .saturating_add(string_bytes.saturating_mul(8))
+            .saturating_add(tag_slots.saturating_mul(64))
+            .saturating_add(if include_live {
+                QBIT_LIVE_TORRENT_INFO_EXTRA_BYTES
+            } else {
+                0
+            })
+    })
+}
+
+#[cfg(test)]
 fn estimate_qbit_maindata_snapshot_bytes(torrent_count: usize) -> u64 {
     // /sync/maindata wraps torrent info in a keyed map plus server state.
     16 * 1024 + (torrent_count as u64).saturating_mul(2304)
@@ -5021,8 +5166,34 @@ fn estimate_qbit_metadata_snapshot_bytes(
         + (webseed_count as u64).saturating_mul(256)
 }
 
-fn estimate_qbit_tracker_snapshot_bytes(tracker_count: usize) -> u64 {
-    8 * 1024 + (tracker_count as u64).saturating_mul(512)
+fn estimate_qbit_file_snapshot_bytes(files: &[EngineTorrentFile]) -> u64 {
+    16 * 1024
+        + files.iter().fold(0u64, |total, file| {
+            total
+                .saturating_add(512)
+                .saturating_add((file.path.len() as u64).saturating_mul(8))
+        })
+}
+
+fn estimate_qbit_webseed_snapshot_bytes(webseeds: &[String]) -> u64 {
+    8 * 1024
+        + webseeds.iter().fold(0u64, |total, webseed| {
+            total
+                .saturating_add(256)
+                .saturating_add((webseed.len() as u64).saturating_mul(8))
+        })
+}
+
+fn estimate_qbit_piece_hash_snapshot_bytes(piece_count: usize) -> u64 {
+    8 * 1024 + (piece_count as u64).saturating_mul(96)
+}
+
+fn estimate_qbit_tracker_snapshot_bytes(tracker_count: usize, tracker_bytes: u64) -> u64 {
+    // The engine query owns the persisted strings, the compatibility
+    // projection clones the URL/message strings, and JSON encoding creates a
+    // third byte view. Include the measured durable footprint instead of
+    // assuming every tracker fits in a small fixed row estimate.
+    16 * 1024 + (tracker_count as u64).saturating_mul(1024) + tracker_bytes.saturating_mul(4)
 }
 
 fn qbit_trackers_from_snapshots(trackers: &[EngineTrackerSnapshot]) -> Vec<QbTrackerInfo> {
@@ -5070,8 +5241,37 @@ fn qbit_tracker_message(tracker: &EngineTrackerSnapshot) -> String {
         .unwrap_or_default()
 }
 
-fn estimate_qbit_label_snapshot_bytes(item_count: usize) -> u64 {
-    8 * 1024 + (item_count as u64).saturating_mul(256)
+fn account_qbit_label(
+    total_bytes: &mut usize,
+    item_count: usize,
+    name: &str,
+    secondary: Option<&str>,
+) -> bool {
+    if item_count >= MAX_QBIT_LABEL_ITEMS {
+        return false;
+    }
+    let added = name.len().saturating_add(secondary.map_or(0, str::len));
+    *total_bytes = total_bytes.saturating_add(added);
+    *total_bytes <= MAX_QBIT_LABEL_BYTES
+}
+
+fn insert_qbit_label(
+    labels: &mut BTreeSet<String>,
+    total_bytes: &mut usize,
+    label: String,
+) -> bool {
+    if label.is_empty() || labels.contains(&label) {
+        return true;
+    }
+    if !account_qbit_label(total_bytes, labels.len(), &label, None) {
+        return false;
+    }
+    labels.insert(label);
+    true
+}
+
+fn estimate_qbit_label_snapshot_bytes(item_count: usize, text_bytes: usize) -> u64 {
+    8 * 1024 + (item_count as u64).saturating_mul(512) + (text_bytes as u64).saturating_mul(8)
 }
 
 fn estimate_qbit_limit_map_snapshot_bytes(torrent_count: usize) -> u64 {
@@ -5080,6 +5280,18 @@ fn estimate_qbit_limit_map_snapshot_bytes(torrent_count: usize) -> u64 {
 
 fn estimate_qbit_properties_snapshot_bytes() -> u64 {
     32 * 1024
+}
+
+fn estimate_qbit_properties_extra_snapshot_bytes(
+    entry: &rt_session::TorrentEntry,
+    meta: &EngineTorrentMetadata,
+) -> u64 {
+    let text_bytes = entry
+        .save_path
+        .len()
+        .saturating_add(meta.comment.as_ref().map_or(0, String::len))
+        .saturating_add(meta.created_by.as_ref().map_or(0, String::len));
+    (text_bytes as u64).saturating_mul(8)
 }
 
 fn estimate_qbit_peer_snapshot_bytes(peer_count: usize) -> u64 {
@@ -5498,14 +5710,16 @@ async fn qbit_tracker_projection(
     info_hash: &str,
 ) -> Result<(String, u32), String> {
     if let Some(engine) = &state.engine {
-        let trackers = engine.torrent_trackers(info_hash.to_owned()).await?;
-        let projection = qbit_tracker_projection_from_snapshots(&trackers);
-        if projection.1 > 0 {
+        if let Some(projection) = engine
+            .torrent_tracker_projection(info_hash.to_owned())
+            .await?
+        {
             return Ok(projection);
         }
         // Older durable rows may not have tracker detail rows yet. Use the
-        // metadata projection only after the authoritative detail query has
-        // succeeded; a failed metadata read must not become an empty 200.
+        // metadata projection only after the authoritative narrow detail
+        // query has succeeded; a failed metadata read must not become an
+        // empty 200.
         let meta = engine.torrent_metadata(info_hash.to_owned()).await?;
         let projection = (
             meta.trackers.first().cloned().unwrap_or_default(),
@@ -5528,6 +5742,7 @@ async fn qbit_tracker_projection(
     Ok((String::new(), 0))
 }
 
+#[cfg(test)]
 fn qbit_tracker_projection_from_snapshots(trackers: &[EngineTrackerSnapshot]) -> (String, u32) {
     let Some(first) = trackers.iter().min_by(|a, b| {
         a.tier
@@ -5805,11 +6020,25 @@ async fn current_tracker_urls(state: &AppState, hash: &str) -> Result<Vec<String
     let Some(engine) = &state.engine else {
         return Ok(Vec::new());
     };
-    engine
-        .torrent_metadata(hash.to_owned())
-        .await
-        .map(|meta| meta.trackers)
-        .map_err(|error| error.to_string())
+    // An empty normalized URL list is a valid explicit override. Check row
+    // presence separately so an intentionally cleared tracker list does not
+    // resurrect the metainfo trackers during a mutation.
+    match engine.torrent_tracker_projection(hash.to_owned()).await {
+        Ok(Some(_)) => engine
+            .torrent_tracker_urls(hash.to_owned())
+            .await
+            .map_err(|error| error.to_string()),
+        Ok(None) => {
+            // Older durable rows may not have normalized tracker detail rows
+            // yet. Preserve the metainfo fallback only for that case.
+            engine
+                .torrent_metadata(hash.to_owned())
+                .await
+                .map(|meta| meta.trackers)
+                .map_err(|error| error.to_string())
+        }
+        Err(error) => Err(error),
+    }
 }
 
 async fn update_torrent_trackers(
@@ -5836,8 +6065,6 @@ async fn fetch_torrent_url(
     raw_url: &str,
     egress_policy: &rt_engine::OutboundEgressPolicy,
 ) -> Result<Vec<u8>, String> {
-    const MAX_TORRENT_BYTES: usize = 16 * 1024 * 1024;
-
     let url = Url::parse(raw_url).map_err(|e| format!("invalid URL: {e}"))?;
     if !matches!(url.scheme(), "http" | "https") {
         return Err("only http and https torrent URLs are supported".to_owned());
@@ -5858,19 +6085,19 @@ async fn fetch_torrent_url(
     }
     if response
         .content_length()
-        .is_some_and(|length| length > MAX_TORRENT_BYTES as u64)
+        .is_some_and(|length| length > MAX_QBIT_TORRENT_BYTES as u64)
     {
         return Err("torrent response is too large".to_owned());
     }
     let mut body = Vec::with_capacity(
         response
             .content_length()
-            .map(|length| length.min(MAX_TORRENT_BYTES as u64) as usize)
+            .map(|length| length.min(MAX_QBIT_TORRENT_BYTES as u64) as usize)
             .unwrap_or_default(),
     );
     let mut response = response;
     while let Some(chunk) = response.chunk().await.map_err(|e| e.to_string())? {
-        if body.len().saturating_add(chunk.len()) > MAX_TORRENT_BYTES {
+        if body.len().saturating_add(chunk.len()) > MAX_QBIT_TORRENT_BYTES {
             return Err("torrent response is too large".to_owned());
         }
         body.extend_from_slice(&chunk);
@@ -9166,11 +9393,34 @@ mod tests {
             estimate_qbit_metadata_snapshot_bytes(10, 100, 2),
             16 * 1024 + 5_120 + 9_600 + 512
         );
-        assert_eq!(estimate_qbit_tracker_snapshot_bytes(10), 8 * 1024 + 5_120);
-        assert_eq!(estimate_qbit_label_snapshot_bytes(10), 8 * 1024 + 2_560);
+        assert_eq!(
+            estimate_qbit_tracker_snapshot_bytes(10, 100),
+            16 * 1024 + 10_240 + 400
+        );
+        assert_eq!(estimate_qbit_label_snapshot_bytes(10, 0), 8 * 1024 + 5_120);
+        assert_eq!(
+            estimate_qbit_label_snapshot_bytes(10, 100),
+            8 * 1024 + 5_120 + 800
+        );
         assert_eq!(estimate_qbit_limit_map_snapshot_bytes(10), 8 * 1024 + 1_920);
         assert_eq!(estimate_qbit_properties_snapshot_bytes(), 32 * 1024);
         assert_eq!(estimate_qbit_peer_snapshot_bytes(10), 8 * 1024 + 10_240);
+    }
+
+    #[test]
+    fn qbit_torrent_info_estimate_accounts_for_variable_projection_strings() {
+        let short = TorrentEntry::new("a".repeat(40), "short".into(), "/data".into());
+        let mut long = TorrentEntry::new("b".repeat(64), "n".repeat(4096), "p".repeat(4096));
+        long.category = Some("category".repeat(512));
+        long.tags = vec!["tag".repeat(1024), "other".repeat(1024)];
+
+        let short_estimate = estimate_qbit_torrent_info_page_bytes([&short], false);
+        let long_estimate = estimate_qbit_torrent_info_page_bytes([&long], false);
+        assert!(long_estimate > short_estimate);
+        assert!(
+            estimate_qbit_torrent_info_page_bytes([&short], true)
+                > estimate_qbit_torrent_info_page_bytes([&short], false)
+        );
     }
 
     #[test]

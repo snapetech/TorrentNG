@@ -1,3 +1,5 @@
+use std::convert::Infallible;
+
 use axum::{
     body::{to_bytes, Body},
     extract::{DefaultBodyLimit, State},
@@ -13,20 +15,34 @@ use rt_api_model::{
     api_token_allowed, csrf_request_allowed, has_session_cookie, request_fingerprint,
     valid_idempotency_key, CachedResponse, IdempotencyClaim, MAX_IDEMPOTENCY_BODY_BYTES,
 };
+use tower::limit::GlobalConcurrencyLimitLayer;
+
+const MAX_QBIT_LARGE_BODY_REQUESTS: usize = 4;
+const MAX_QBIT_DEFAULT_BODY_BYTES: usize = 8 * 1024 * 1024;
+const MAX_QBIT_TORRENT_BODY_BYTES: usize = 64 * 1024 * 1024;
 
 pub fn build_qbit_router(state: AppState) -> Router {
+    let large_body_limit = GlobalConcurrencyLimitLayer::new(MAX_QBIT_LARGE_BODY_REQUESTS);
     Router::new()
-        .nest("/api/qb/v2", protected_qbit_routes(state.clone()))
-        .nest("/api/v2", protected_qbit_routes(state.clone()))
+        .nest(
+            "/api/qb/v2",
+            protected_qbit_routes(state.clone(), large_body_limit.clone()),
+        )
+        .nest(
+            "/api/v2",
+            protected_qbit_routes(state.clone(), large_body_limit),
+        )
         .with_state(state)
 }
 
-fn protected_qbit_routes(state: AppState) -> Router<AppState> {
-    qbit_routes()
-        // Multipart add requests may contain a bounded set of torrent files;
-        // cap the whole request so repeated fields cannot create an
-        // unbounded allocation before the per-torrent 16 MiB limit applies.
-        .layer(DefaultBodyLimit::max(64 * 1024 * 1024))
+fn protected_qbit_routes(
+    state: AppState,
+    large_body_limit: GlobalConcurrencyLimitLayer,
+) -> Router<AppState> {
+    qbit_routes(large_body_limit)
+        // Keep ordinary qBit form endpoints at 8 MiB. `/torrents/add` installs
+        // its route-local 64 MiB total limit below.
+        .layer(DefaultBodyLimit::max(MAX_QBIT_DEFAULT_BODY_BYTES))
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
             qbit_idempotency_guard,
@@ -253,7 +269,7 @@ fn hex_value(byte: u8) -> Option<u8> {
     }
 }
 
-fn qbit_routes() -> Router<AppState> {
+fn qbit_routes(large_body_limit: GlobalConcurrencyLimitLayer) -> Router<AppState> {
     Router::new()
         .route("/auth/login", post(auth_login))
         .route("/auth/logout", post(auth_logout))
@@ -278,7 +294,12 @@ fn qbit_routes() -> Router<AppState> {
         )
         .route("/app/defaultSavePath", get(app_default_save_path))
         .route("/torrents/info", get(torrents_info))
-        .route("/torrents/add", post(torrents_add))
+        .route(
+            "/torrents/add",
+            post(torrents_add)
+                .layer::<_, Infallible>(large_body_limit)
+                .layer(DefaultBodyLimit::max(MAX_QBIT_TORRENT_BODY_BYTES)),
+        )
         .route("/torrents/pause", post(torrents_pause))
         .route("/torrents/resume", post(torrents_resume))
         .route("/torrents/start", post(torrents_start))

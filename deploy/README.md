@@ -1,7 +1,8 @@
 # deploy/
 
-Deployment assets for both TorrentNG backend arrangements. Pick the section
-below that matches the client ownership model you're running — see
+Deployment assets for TorrentNG's universal client interface: the TorrentNG
+Engine and compatible-client WebUI/API service. Pick the section below that
+matches the client ownership model you're running — see
 [docs/ENGINE_REWRITE.md](../docs/ENGINE_REWRITE.md) if you haven't decided
 yet.
 

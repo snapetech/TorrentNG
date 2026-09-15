@@ -424,6 +424,7 @@ jobs:
           else
             gh release create "$tag" dist/* \
               --title "TorrentNG $tag" \
+              --notes "The universal torrent client interface: one WebUI/API for the TorrentNG Engine and qBittorrent, rTorrent, Transmission, and Deluge." \
               --generate-notes \
               --verify-tag
           fi
@@ -470,7 +471,7 @@ jobs:
               embeds: [{
                 title: ("TorrentNG " + $tag + " released"),
                 url: $url,
-                description: ("A new tagged release is available for `" + $repo + "`."),
+                description: ("The universal torrent client interface: a new TorrentNG release is available for " + $repo + "."),
                 color: 3447003,
                 fields: [
                   {name: "Tag", value: $tag, inline: true},
