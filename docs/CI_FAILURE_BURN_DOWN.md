@@ -1,10 +1,9 @@
 # TorrentNG CI Failure Burn-down
 
-Status: **green on `main`** as of 2026-09-10. The latest completed GitHub
-Actions CI run was `34534365605` on commit `ecd75af`; all ten jobs passed.
-CodeQL run `34534364530` on the same commit also passed. (A newer push may
-already be in flight by the time this is read — check
-`gh run list --branch main --limit 5` for the current head.)
+Status: **green on `main`** as of 2026-09-15. The latest completed GitHub
+Actions CI run was `35016899959` on commit `56d77e5`; all ten jobs passed.
+CodeQL run `35016899910` on the same commit also passed across actions, Rust,
+JavaScript/TypeScript, and Python analysis.
 
 ## Failures fixed
 
@@ -15,6 +14,8 @@ already be in flight by the time this is read — check
 | `33908414275` / `native-quality` | `tar -xOzf ... | grep -q` caused GNU tar to receive a broken pipe under `pipefail`. | `dc4ab9a` extracts the archive before checking its contents; `b748f59` applied the same fix to archive listing. | Certification bundle self-test and final `native-quality` job passed in `33916500668`. |
 | `33909060233` / `native-quality` | Cleanup became visible on disk before the terminal job row was durably removed, so the test asserted too early. | `8a85615` waits for both filesystem cleanup and the empty durable job projection. | The regression passed repeatedly locally and in final hosted CI `33916500668`. |
 | Final interop harness path | `curl | grep -q` let `grep` exit early and surfaced curl's SIGPIPE as a false failure under `pipefail`. | `83b70ce` captures the metrics response and checks it with a here-string. | Current 28/28 Docker matrix and final CI `33916500668` are green. |
+| `35014022485` / `native-quality` | A pure-v2 magnet recheck updated runtime `amount_left` but left the tracker detail row at its pre-recheck `left_bytes` value. | `7f66041` flushes runtime and tracker state after the recheck before acknowledging the command, and retains peer availability updates across rechecks. | The regression passed repeatedly locally; all ten jobs passed in hosted CI `35016899959`. |
+| `35016119210` / `webui` | The accessibility scan sometimes sampled a properties dialog during its 140 ms entrance animation, producing a transient contrast violation. | `56d77e5` waits for the dialog opacity to settle at `1` before running axe. | Ten repeated dialog scans, the full local browser suite, and hosted CI `35016899959` passed. |
 
 ## Other CI hardening included
 
