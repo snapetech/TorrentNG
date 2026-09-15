@@ -9,7 +9,10 @@ use rt_path::SafeRelPath;
 
 use crate::{
     error::MetainfoError,
-    types::{TorrentFileV1, TorrentFileV2, TorrentMeta, TorrentMetaV1, TorrentMetaV2},
+    types::{
+        TorrentFileV1, TorrentFileV2, TorrentMeta, TorrentMetaV1, TorrentMetaV2,
+        V2PieceLayerRequirement, V2PieceLayerRequirements,
+    },
 };
 
 pub const MAX_TORRENT_BYTES: usize = 64 * 1024 * 1024;
@@ -229,6 +232,96 @@ pub fn torrent_info_bytes(raw: &[u8]) -> Result<Vec<u8>, MetainfoError> {
     let (_, info_span) = decode_torrent_info_span(raw)?;
     let info_span = info_span.ok_or(MetainfoError::MissingField("info span"))?;
     Ok(raw[info_span].to_vec())
+}
+
+/// Extract the piece-layer work needed to complete a v2 or hybrid magnet.
+///
+/// BEP 9 transfers only the exact `info` dictionary. BEP 52 stores the
+/// piece-layer hashes for files larger than one piece in the top-level
+/// metainfo, so a magnet worker needs this bounded view before it can request
+/// those hashes over the v2 peer protocol. The same file-tree validation used
+/// by [`parse_torrent`] is reused here; the only intentionally missing input
+/// is the top-level `piece layers` dictionary itself.
+pub fn v2_piece_layer_requirements(
+    info_bytes: &[u8],
+) -> Result<Option<V2PieceLayerRequirements>, MetainfoError> {
+    let info = rt_bencode::decode(info_bytes)?;
+    let BValue::Dict(_) = &info else {
+        return Err(MetainfoError::InvalidFieldType("info dict"));
+    };
+    let meta_version = info.get(b"meta version").and_then(|value| value.as_int());
+    let has_file_tree = info.get(b"file tree").is_some();
+    if let Some(version) = meta_version {
+        if version < 0 {
+            return Err(MetainfoError::InvalidIntegerValue {
+                field: "meta version",
+                value: version,
+            });
+        }
+        if version > 2 {
+            return Err(MetainfoError::UnsupportedMetaVersion(version));
+        }
+        if version == 2 && !has_file_tree {
+            return Err(MetainfoError::MissingField("file tree"));
+        }
+    }
+    if has_file_tree && meta_version != Some(2) {
+        return Err(match meta_version {
+            Some(version) => MetainfoError::UnsupportedMetaVersion(version),
+            None => MetainfoError::MissingField("meta version"),
+        });
+    }
+    if meta_version != Some(2) {
+        return Ok(None);
+    }
+
+    let piece_length = get_positive_u64(&info, b"piece length", "piece length")?;
+    if piece_length > u32::MAX as u64 {
+        return Err(MetainfoError::InvalidPieceLength(piece_length));
+    }
+    if piece_length < 16 * 1024 || !piece_length.is_power_of_two() {
+        return Err(MetainfoError::InvalidPieceLength(piece_length));
+    }
+
+    let files = parse_file_tree(&info, piece_length)?;
+    let mut requirements = Vec::new();
+    let mut seen_roots = std::collections::HashSet::new();
+    for file in files {
+        if file.length <= piece_length {
+            continue;
+        }
+        let pieces_root = file
+            .pieces_root
+            .ok_or(MetainfoError::MissingField("pieces root"))?;
+        let hash_count = file
+            .length
+            .checked_add(piece_length - 1)
+            .ok_or(MetainfoError::IntegerOverflow("piece layer count"))?
+            / piece_length;
+        let hash_count = usize::try_from(hash_count)
+            .map_err(|_| MetainfoError::IntegerOverflow("piece layer count"))?;
+        if hash_count > MAX_PIECES {
+            return Err(MetainfoError::LimitExceeded {
+                field: "piece layers",
+                limit: MAX_PIECES,
+            });
+        }
+        if !seen_roots.insert(pieces_root) {
+            return Err(MetainfoError::InvalidPieceLayer(
+                "duplicate pieces root across layered files",
+            ));
+        }
+        requirements.push(V2PieceLayerRequirement {
+            pieces_root,
+            file_length: file.length,
+            hash_count,
+        });
+    }
+
+    Ok(Some(V2PieceLayerRequirements {
+        piece_length,
+        files: requirements,
+    }))
 }
 
 /// Parse a v2 `file tree` dict into a flat list of files.
@@ -1364,6 +1457,26 @@ mod tests {
         assert_eq!(m.files[0].length, 65536);
         assert_eq!(m.files[0].path.as_display(), "data.bin");
         assert_eq!(m.info_hash_v2.len(), 32);
+    }
+
+    #[test]
+    fn extracts_v2_piece_layer_requirements_without_top_level_layers() {
+        let raw = v2_torrent("mydir", "data.bin", 65_536);
+        let info = torrent_info_bytes(&raw).unwrap();
+        let requirements = v2_piece_layer_requirements(&info).unwrap().unwrap();
+
+        assert_eq!(requirements.piece_length, 16 * 1024);
+        assert_eq!(requirements.files.len(), 1);
+        assert_eq!(requirements.files[0].file_length, 65_536);
+        assert_eq!(requirements.files[0].hash_count, 4);
+    }
+
+    #[test]
+    fn v2_piece_layer_requirements_are_empty_for_single_piece_files() {
+        let raw = v2_torrent("mydir", "data.bin", 1024);
+        let info = torrent_info_bytes(&raw).unwrap();
+        let requirements = v2_piece_layer_requirements(&info).unwrap().unwrap();
+        assert!(requirements.files.is_empty());
     }
 
     // Regression coverage for rootless BEP 52 file-tree paths.

@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::net::SocketAddr;
 
 use rt_path::SafeRelPath;
 
@@ -172,6 +173,27 @@ pub struct MagnetLink {
     pub info_hash_v2: Option<[u8; 32]>,
     pub display_name: Option<String>,
     pub trackers: Vec<String>,
+    /// BEP 9 `x.pe` direct peer hints used while metadata is pending.
+    pub peer_addresses: Vec<SocketAddr>,
+}
+
+/// One top-level BEP 52 piece-layer entry that must be acquired when a
+/// magnet's `info` dictionary describes a file larger than one piece.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct V2PieceLayerRequirement {
+    pub pieces_root: [u8; 32],
+    pub file_length: u64,
+    /// Number of hashes that belong in the serialized piece layer. Hashes
+    /// used only to balance the Merkle tree are not included.
+    pub hash_count: usize,
+}
+
+/// The bounded v2 structure extracted from a BEP 9 `info` dictionary before
+/// its piece layers have been obtained through BEP 52 hash exchange.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct V2PieceLayerRequirements {
+    pub piece_length: u64,
+    pub files: Vec<V2PieceLayerRequirement>,
 }
 
 impl TorrentMetaV2 {

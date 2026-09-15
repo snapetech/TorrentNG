@@ -1,4 +1,5 @@
 use std::collections::HashSet;
+use std::net::SocketAddr;
 
 use url::Url;
 
@@ -9,6 +10,7 @@ const MAX_MAGNET_NAME_BYTES: usize = 4096;
 const MAX_MAGNET_TRACKERS: usize = 4096;
 const MAX_MAGNET_TRACKER_BYTES: usize = 8192;
 const MAX_MAGNET_TRACKER_TOTAL_BYTES: usize = 1024 * 1024;
+const MAX_MAGNET_PEER_ADDRESSES: usize = 256;
 
 pub fn parse_magnet(input: &str) -> Result<MagnetLink, MetainfoError> {
     if input.len() > MAX_MAGNET_BYTES {
@@ -30,6 +32,8 @@ pub fn parse_magnet(input: &str) -> Result<MagnetLink, MetainfoError> {
     let mut trackers = Vec::new();
     let mut seen_trackers = HashSet::new();
     let mut tracker_bytes: usize = 0;
+    let mut peer_addresses = Vec::new();
+    let mut seen_peer_addresses = HashSet::new();
 
     for (key, value) in url.query_pairs() {
         match key.as_ref() {
@@ -71,6 +75,28 @@ pub fn parse_magnet(input: &str) -> Result<MagnetLink, MetainfoError> {
                     trackers.push(tracker.to_owned());
                 }
             }
+            "x.pe" => {
+                let peer = value.trim();
+                let peer = peer.parse::<SocketAddr>().map_err(|error| {
+                    MetainfoError::InvalidMagnet(format!(
+                        "invalid x.pe peer address {peer:?}: {error}"
+                    ))
+                })?;
+                if peer.port() == 0 {
+                    return Err(MetainfoError::InvalidMagnet(
+                        "x.pe peer port must be non-zero".to_owned(),
+                    ));
+                }
+                if seen_peer_addresses.insert(peer) {
+                    if peer_addresses.len() >= MAX_MAGNET_PEER_ADDRESSES {
+                        return Err(MetainfoError::LimitExceeded {
+                            field: "magnet peer addresses",
+                            limit: MAX_MAGNET_PEER_ADDRESSES,
+                        });
+                    }
+                    peer_addresses.push(peer);
+                }
+            }
             _ => {}
         }
     }
@@ -86,6 +112,7 @@ pub fn parse_magnet(input: &str) -> Result<MagnetLink, MetainfoError> {
         info_hash_v2,
         display_name,
         trackers,
+        peer_addresses,
     })
 }
 
@@ -197,6 +224,50 @@ mod tests {
         .unwrap();
 
         assert_eq!(magnet.info_hash_v2.unwrap(), [0xaa; 32]);
+    }
+
+    #[test]
+    fn parses_and_deduplicates_bep9_direct_peers() {
+        let magnet = parse_magnet(
+            "magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567&x.pe=127.0.0.1%3A6881&x.pe=%5B%3A%3A1%5D%3A6881&x.pe=127.0.0.1%3A6881",
+        )
+        .unwrap();
+
+        assert_eq!(
+            magnet.peer_addresses,
+            vec![
+                "127.0.0.1:6881".parse::<SocketAddr>().unwrap(),
+                "[::1]:6881".parse::<SocketAddr>().unwrap(),
+            ]
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_bep9_direct_peer() {
+        assert!(parse_magnet(
+            "magnet:?xt=urn:btih:0000000000000000000000000000000000000000&x.pe=127.0.0.1%3A0"
+        )
+        .is_err());
+        assert!(parse_magnet(
+            "magnet:?xt=urn:btih:0000000000000000000000000000000000000000&x.pe=localhost%3A6881"
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn rejects_too_many_bep9_direct_peers() {
+        let mut input = format!("magnet:?xt=urn:btih:{}", "0".repeat(40));
+        for index in 0..=MAX_MAGNET_PEER_ADDRESSES {
+            input.push_str("&x.pe=192.0.2.1:");
+            input.push_str(&(10_000 + index).to_string());
+        }
+        assert!(matches!(
+            parse_magnet(&input),
+            Err(MetainfoError::LimitExceeded {
+                field: "magnet peer addresses",
+                limit: MAX_MAGNET_PEER_ADDRESSES
+            })
+        ));
     }
 
     #[test]

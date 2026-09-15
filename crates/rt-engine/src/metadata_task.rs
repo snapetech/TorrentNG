@@ -7,6 +7,8 @@ use std::time::{Duration, Instant};
 use anyhow::Context;
 use futures::{stream::FuturesUnordered, SinkExt, StreamExt};
 use rt_bencode::decode;
+use rt_hash::{hash_pair, merkle_root, V2_BLOCK_SIZE};
+use rt_metainfo::{v2_piece_layer_requirements, V2PieceLayerRequirement};
 use rt_metrics::{MemoryClass, MemoryLease, ResourceGovernor};
 use rt_peer_wire::{
     codec::PeerCodec,
@@ -19,7 +21,8 @@ use rt_tracker::{
     AnnounceRequest, AnnounceResponse, InfoHash, TrackerError, TrackerEvent, MAX_TRACKER_PEERS,
 };
 use rt_utp::UtpStream;
-use sha1::{Digest, Sha1};
+use sha1::{Digest as Sha1Digest, Sha1};
+use sha2::{Digest as Sha2Digest, Sha256};
 use tokio::net::TcpStream;
 use tokio::net::UdpSocket;
 use tokio::sync::{mpsc, OwnedSemaphorePermit};
@@ -47,6 +50,7 @@ const METADATA_PEER_ATTEMPT_CACHE_MULTIPLIER: usize = 4;
 // lazily while peers arrive.
 const METADATA_PEER_ATTEMPT_SLOT_BYTES: usize = 256;
 const METADATA_TASK_BASE_MEMORY_BYTES: usize = 8 * 1024;
+const MAX_METADATA_DIRECT_PEERS: usize = 256;
 // A tracker announce response is parsed into `Peer` values, then its unique
 // socket addresses are retained in both the result vector and a dedup set.
 // Reserve one conservative aggregate allowance before either collection can
@@ -60,7 +64,47 @@ const METADATA_TRACKER_ANNOUNCE_DEADLINE: Duration = Duration::from_secs(10);
 #[derive(Debug)]
 struct FetchedMetadata {
     bytes: Vec<u8>,
+    piece_layers: Vec<([u8; 32], Vec<[u8; 32]>)>,
     _lease: MemoryLease,
+}
+
+/// The identity used while a magnet is still waiting for its info
+/// dictionary. The peer wire and tracker protocols use the first 20 bytes of
+/// a v2 SHA-256 infohash, while completion must compare the full digest.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum MetadataInfoHash {
+    V1([u8; 20]),
+    V2([u8; 32]),
+}
+
+impl MetadataInfoHash {
+    pub(crate) fn wire_hash(self) -> [u8; 20] {
+        match self {
+            Self::V1(hash) => hash,
+            Self::V2(hash) => hash[..20].try_into().expect("v2 hash has 20-byte prefix"),
+        }
+    }
+
+    fn is_v2(self) -> bool {
+        matches!(self, Self::V2(_))
+    }
+}
+
+/// Parse the durable magnet identity accepted by the engine. A v2 metadata
+/// placeholder is keyed by the full 64-character SHA-256 digest, even though
+/// its initial peer/tracker wire identity is truncated to 20 bytes.
+pub(crate) fn parse_metadata_info_hash_hex(value: &str) -> Result<MetadataInfoHash, ()> {
+    match value.len() {
+        40 => {
+            let bytes = hex::decode(value).map_err(|_| ())?;
+            Ok(MetadataInfoHash::V1(bytes.try_into().map_err(|_| ())?))
+        }
+        64 => {
+            let bytes = hex::decode(value).map_err(|_| ())?;
+            Ok(MetadataInfoHash::V2(bytes.try_into().map_err(|_| ())?))
+        }
+        _ => Err(()),
+    }
 }
 
 /// Memory retained by one metadata-pending torrent for its tracker URLs,
@@ -72,6 +116,7 @@ struct FetchedMetadata {
 pub(crate) struct MetadataTaskMemory {
     leases: Vec<MemoryLease>,
     reserved_bytes: u64,
+    direct_peers: Vec<SocketAddr>,
 }
 
 /// Compact caller-owned tracker vectors before admission. API callers and
@@ -85,9 +130,17 @@ pub(crate) fn compact_metadata_task_trackers(mut trackers: Vec<String>) -> Vec<S
     trackers
 }
 
+fn compact_metadata_task_peers(mut peers: Vec<SocketAddr>) -> Vec<SocketAddr> {
+    peers.sort_unstable();
+    peers.dedup();
+    peers.shrink_to_fit();
+    peers
+}
+
 fn metadata_task_memory_bytes(
     trackers: &[String],
     tracker_capacity: usize,
+    direct_peer_capacity: usize,
     max_peers: usize,
 ) -> usize {
     let tracker_vec_bytes = tracker_capacity.saturating_mul(size_of::<String>());
@@ -98,11 +151,18 @@ fn metadata_task_memory_bytes(
     let peer_attempt_bytes =
         metadata_peer_attempt_cache_cap(max_peers).saturating_mul(METADATA_PEER_ATTEMPT_SLOT_BYTES);
     let completion_tracker_bytes = metadata_completion_tracker_bytes(trackers);
+    // Keep room for the retained x.pe vector and the bounded working copy
+    // consumed by the first/retry fetch. SocketAddr is inline, so capacity is
+    // the only allocation component.
+    let direct_peer_bytes = direct_peer_capacity
+        .saturating_mul(size_of::<SocketAddr>())
+        .saturating_mul(2);
     METADATA_TASK_BASE_MEMORY_BYTES
         .saturating_add(tracker_vec_bytes)
         .saturating_add(tracker_string_bytes)
         .saturating_add(peer_attempt_bytes)
         .saturating_add(completion_tracker_bytes)
+        .saturating_add(direct_peer_bytes)
 }
 
 /// Admit the retained state before a metadata task is published into the
@@ -114,10 +174,30 @@ pub(crate) fn prepare_metadata_task_memory(
     trackers: Vec<String>,
     max_peers: usize,
 ) -> Result<(Vec<String>, MetadataTaskMemory), String> {
+    prepare_metadata_task_memory_with_peers(resources, trackers, Vec::new(), max_peers)
+}
+
+/// Admit metadata task state, including bounded BEP 9 `x.pe` direct peers.
+/// Direct peers are hints only; tracker and DHT discovery remain independent
+/// fallback paths.
+pub(crate) fn prepare_metadata_task_memory_with_peers(
+    resources: &ResourceGovernor,
+    trackers: Vec<String>,
+    direct_peers: Vec<SocketAddr>,
+    max_peers: usize,
+) -> Result<(Vec<String>, MetadataTaskMemory), String> {
     let trackers = compact_metadata_task_trackers(trackers);
+    let direct_peers = compact_metadata_task_peers(direct_peers);
+    if direct_peers.len() > MAX_METADATA_DIRECT_PEERS {
+        return Err(format!(
+            "metadata task has {} direct peers, maximum is {MAX_METADATA_DIRECT_PEERS}",
+            direct_peers.len()
+        ));
+    }
     let bytes = u64::try_from(metadata_task_memory_bytes(
         &trackers,
         trackers.capacity(),
+        direct_peers.capacity(),
         max_peers,
     ))
     .map_err(|_| "metadata task memory estimate does not fit in u64".to_owned())?;
@@ -134,6 +214,7 @@ pub(crate) fn prepare_metadata_task_memory(
         MetadataTaskMemory {
             leases: vec![lease],
             reserved_bytes: bytes,
+            direct_peers,
         },
     ))
 }
@@ -149,6 +230,7 @@ impl MetadataTaskMemory {
         let required = u64::try_from(metadata_task_memory_bytes(
             trackers,
             tracker_capacity,
+            self.direct_peers.capacity(),
             max_peers,
         ))
         .map_err(|_| "metadata task memory estimate does not fit in u64".to_owned())?;
@@ -205,7 +287,7 @@ fn parse_metadata_transport_policy(value: &str) -> MetadataTransportPolicy {
 // context object is introduced as part of the engine seam refactor.
 #[allow(clippy::too_many_arguments)]
 pub async fn run_metadata_task(
-    info_hash: [u8; 20],
+    info_hash: MetadataInfoHash,
     info_hash_hex: String,
     mut trackers: Vec<String>,
     mut task_memory: MetadataTaskMemory,
@@ -228,7 +310,46 @@ pub async fn run_metadata_task(
     let udp_timeout = Duration::from_secs(udp_timeout_secs);
     let mut tracker_event = TrackerEvent::Started;
     let mut pending_command = None;
+    let direct_peers = task_memory.direct_peers.clone();
+    let mut direct_peer_retry = !paused && !direct_peers.is_empty();
     loop {
+        // BEP 9 direct peers should be tried immediately, including for a
+        // trackerless magnet. Keep the operation outside the main select so
+        // it cannot borrow the retry map concurrently with a tracker tick;
+        // lifecycle commands still interrupt it through the same bounded
+        // operation wrapper used by tracker and inbound-peer work.
+        if direct_peer_retry && !paused && pending_command.is_none() {
+            direct_peer_retry = false;
+            match await_metadata_operation(
+                &mut cmd_rx,
+                try_fetch_from_peers(
+                    info_hash,
+                    &info_hash_hex,
+                    &trackers,
+                    direct_peers.clone(),
+                    max_peers,
+                    &mut peer_attempts,
+                    &engine_tx,
+                    &task_tx,
+                    &resources,
+                    &network_budget,
+                ),
+            )
+            .await
+            {
+                MetadataOperation::Completed(true) => {
+                    wait_for_metadata_completion(&mut cmd_rx, paused).await;
+                    return;
+                }
+                MetadataOperation::Completed(false) => {}
+                MetadataOperation::Command(command) => {
+                    pending_command = Some(command);
+                    direct_peer_retry = true;
+                }
+                MetadataOperation::Closed => return,
+            }
+            continue;
+        }
         tokio::select! {
             command = receive_metadata_command(&mut cmd_rx, &mut pending_command) => {
                 let Some(cmd) = command else {
@@ -444,6 +565,7 @@ pub async fn run_metadata_task(
                         paused = false;
                         tracker_event = TrackerEvent::Started;
                         tracker_tick.reset_immediately();
+                        direct_peer_retry = !direct_peers.is_empty();
                         if let Some(reply) = reply {
                             let _ = reply.send(Ok(()));
                         }
@@ -454,6 +576,9 @@ pub async fn run_metadata_task(
                             &mut tracker_event,
                             &mut tracker_tick,
                         );
+                        if !paused {
+                            direct_peer_retry = !direct_peers.is_empty();
+                        }
                     }
                     TorrentCmd::GetPeers { reply } => {
                         let _ = reply.send(Vec::new());
@@ -489,6 +614,7 @@ pub async fn run_metadata_task(
                         if !resume_paused {
                             tracker_event = TrackerEvent::Started;
                             tracker_tick.reset_immediately();
+                            direct_peer_retry = !direct_peers.is_empty();
                         }
                         let _ = reply.send(Ok(()));
                     }
@@ -533,8 +659,33 @@ pub async fn run_metadata_task(
                     }
                 }
             }
-            _ = tracker_tick.tick(), if !paused && !trackers.is_empty() => {
+            _ = tracker_tick.tick(), if !paused && (!trackers.is_empty() || !direct_peers.is_empty()) => {
                 let operation = async {
+                    // Retry bounded BEP 9 x.pe hints even when the magnet
+                    // has no tracker. The per-peer retry cache prevents an
+                    // immediate duplicate after the first attempt while the
+                    // interval provides eventual recovery for a peer that
+                    // was temporarily offline.
+                    if !direct_peers.is_empty()
+                        && try_fetch_from_peers(
+                            info_hash,
+                            &info_hash_hex,
+                            &trackers,
+                            direct_peers.clone(),
+                            max_peers,
+                            &mut peer_attempts,
+                            &engine_tx,
+                            &task_tx,
+                            &resources,
+                            &network_budget,
+                        )
+                        .await
+                    {
+                        return true;
+                    }
+                    if trackers.is_empty() {
+                        return false;
+                    }
                     let peers = announce_trackers(
                         info_hash,
                         &info_hash_hex,
@@ -795,7 +946,7 @@ async fn wait_for_metadata_completion(cmd_rx: &mut mpsc::Receiver<TorrentCmd>, m
 
 #[allow(clippy::too_many_arguments)]
 async fn try_fetch_from_peers(
-    info_hash: [u8; 20],
+    info_hash: MetadataInfoHash,
     info_hash_hex: &str,
     trackers: &[String],
     peers: Vec<SocketAddr>,
@@ -966,7 +1117,7 @@ fn prune_metadata_peer_attempts(
 
 async fn metadata_fetch_attempt(
     peer: SocketAddr,
-    info_hash: [u8; 20],
+    info_hash: MetadataInfoHash,
     resources: ResourceGovernor,
     network_budget: GlobalNetworkBudget,
 ) -> (SocketAddr, anyhow::Result<FetchedMetadata>) {
@@ -1009,9 +1160,10 @@ async fn complete_metadata(
 ) -> bool {
     let FetchedMetadata {
         bytes: info,
+        piece_layers,
         _lease: metadata_memory_lease,
     } = fetched;
-    let raw = match build_torrent_from_info(&info, trackers) {
+    let raw = match build_torrent_from_info(&info, trackers, &piece_layers) {
         Ok(raw) => raw,
         Err(error) => {
             warn!(
@@ -1041,7 +1193,7 @@ async fn complete_metadata(
 
 #[allow(clippy::too_many_arguments)]
 async fn announce_trackers(
-    info_hash: [u8; 20],
+    info_hash: MetadataInfoHash,
     info_hash_hex: &str,
     trackers: &[String],
     listen_port: u16,
@@ -1182,7 +1334,7 @@ async fn announce_trackers(
 #[allow(clippy::too_many_arguments)]
 async fn announce_tracker(
     tracker_url: &str,
-    info_hash: [u8; 20],
+    info_hash: MetadataInfoHash,
     listen_port: u16,
     max_peers: usize,
     http_timeout: Duration,
@@ -1221,7 +1373,7 @@ async fn announce_tracker(
 #[allow(clippy::too_many_arguments)]
 async fn announce_http(
     tracker_url: &str,
-    info_hash: [u8; 20],
+    info_hash: MetadataInfoHash,
     listen_port: u16,
     max_peers: usize,
     http_timeout: Duration,
@@ -1270,7 +1422,7 @@ async fn announce_http(
 #[allow(clippy::too_many_arguments)]
 async fn announce_udp(
     tracker_url: &str,
-    info_hash: [u8; 20],
+    info_hash: MetadataInfoHash,
     listen_port: u16,
     max_peers: usize,
     udp_timeout: Duration,
@@ -1358,13 +1510,16 @@ async fn announce_udp(
 }
 
 fn metadata_announce_request(
-    info_hash: [u8; 20],
+    info_hash: MetadataInfoHash,
     listen_port: u16,
     max_peers: usize,
     event: TrackerEvent,
 ) -> AnnounceRequest {
     AnnounceRequest {
-        info_hash: InfoHash::V1(info_hash),
+        // BEP 52 tracker announces carry the truncated 20-byte v2 hash. The
+        // tracker codec's V1 variant is the wire representation here; the
+        // durable identity remains the full SHA-256 digest.
+        info_hash: InfoHash::V1(info_hash.wire_hash()),
         peer_id: crate::peer_id::our_peer_id(),
         port: listen_port,
         uploaded: 0,
@@ -1378,7 +1533,7 @@ fn metadata_announce_request(
 
 async fn fetch_from_outgoing_peer(
     addr: SocketAddr,
-    info_hash: [u8; 20],
+    info_hash: MetadataInfoHash,
     resources: ResourceGovernor,
 ) -> anyhow::Result<FetchedMetadata> {
     let stream = tokio::time::timeout(Duration::from_secs(10), TcpStream::connect(addr)).await??;
@@ -1387,13 +1542,14 @@ async fn fetch_from_outgoing_peer(
     write_handshake(&mut framed, info_hash).await?;
 
     let remote_hs = read_handshake(&mut framed).await?;
-    if remote_hs.info_hash != info_hash {
+    if remote_hs.info_hash != info_hash.wire_hash() {
         anyhow::bail!("info_hash mismatch from {addr}");
     }
     fetch_metadata(
         addr,
         framed,
         remote_hs.reserved.supports_extension_protocol(),
+        remote_hs.reserved.supports_v2(),
         info_hash,
         resources,
     )
@@ -1403,18 +1559,22 @@ async fn fetch_from_outgoing_peer(
 async fn fetch_from_incoming_peer(
     stream: TcpStream,
     addr: SocketAddr,
-    info_hash: [u8; 20],
+    info_hash: MetadataInfoHash,
     remote_hs: Handshake,
     resources: ResourceGovernor,
     _peer_permit: OwnedSemaphorePermit,
 ) -> anyhow::Result<FetchedMetadata> {
     stream.set_nodelay(true)?;
     let mut framed = Framed::with_capacity(stream, PeerCodec::with_resources(resources.clone()), 1);
+    if remote_hs.info_hash != info_hash.wire_hash() {
+        anyhow::bail!("info_hash mismatch from {addr}");
+    }
     write_handshake(&mut framed, info_hash).await?;
     fetch_metadata(
         addr,
         framed,
         remote_hs.reserved.supports_extension_protocol(),
+        remote_hs.reserved.supports_v2(),
         info_hash,
         resources,
     )
@@ -1423,14 +1583,14 @@ async fn fetch_from_incoming_peer(
 
 async fn fetch_from_outgoing_utp_peer(
     addr: SocketAddr,
-    info_hash: [u8; 20],
+    info_hash: MetadataInfoHash,
     resources: ResourceGovernor,
 ) -> anyhow::Result<FetchedMetadata> {
     let mut stream = UtpStream::connect(addr).await?;
     write_utp_handshake(&mut stream, info_hash).await?;
 
     let remote_hs = read_utp_handshake(&mut stream).await?;
-    if remote_hs.info_hash != info_hash {
+    if remote_hs.info_hash != info_hash.wire_hash() {
         anyhow::bail!("info_hash mismatch from {addr}");
     }
     fetch_metadata_over_io(
@@ -1440,6 +1600,7 @@ async fn fetch_from_outgoing_utp_peer(
             decoder: UtpFrameDecoder::new(resources.clone()),
         },
         remote_hs.reserved.supports_extension_protocol(),
+        remote_hs.reserved.supports_v2(),
         info_hash,
         resources,
     )
@@ -1449,11 +1610,14 @@ async fn fetch_from_outgoing_utp_peer(
 async fn fetch_from_incoming_utp_peer(
     mut stream: UtpStream,
     addr: SocketAddr,
-    info_hash: [u8; 20],
+    info_hash: MetadataInfoHash,
     remote_hs: Handshake,
     resources: ResourceGovernor,
     _peer_permit: OwnedSemaphorePermit,
 ) -> anyhow::Result<FetchedMetadata> {
+    if remote_hs.info_hash != info_hash.wire_hash() {
+        anyhow::bail!("info_hash mismatch from {addr}");
+    }
     write_utp_handshake(&mut stream, info_hash).await?;
     fetch_metadata_over_io(
         addr,
@@ -1462,6 +1626,7 @@ async fn fetch_from_incoming_utp_peer(
             decoder: UtpFrameDecoder::new(resources.clone()),
         },
         remote_hs.reserved.supports_extension_protocol(),
+        remote_hs.reserved.supports_v2(),
         info_hash,
         resources,
     )
@@ -1470,13 +1635,16 @@ async fn fetch_from_incoming_utp_peer(
 
 async fn write_handshake(
     framed: &mut Framed<TcpStream, PeerCodec>,
-    info_hash: [u8; 20],
+    info_hash: MetadataInfoHash,
 ) -> anyhow::Result<()> {
     use tokio::io::AsyncWriteExt;
     let hs = Handshake {
-        info_hash,
+        info_hash: info_hash.wire_hash(),
         peer_id: crate::peer_id::our_peer_id(),
-        reserved: ExtensionFlags::with_extension_protocol(),
+        // Advertise v2 capability even for a v1 magnet: the peer may return
+        // a hybrid info dictionary whose BEP 52 piece layers then need the
+        // hash-exchange extension.
+        reserved: ExtensionFlags::with_v2_support(),
     };
     timeout(
         METADATA_PEER_WRITE_TIMEOUT,
@@ -1498,11 +1666,14 @@ async fn read_handshake(framed: &mut Framed<TcpStream, PeerCodec>) -> anyhow::Re
     Ok(Handshake::parse(&hs_buf)?)
 }
 
-async fn write_utp_handshake(stream: &mut UtpStream, info_hash: [u8; 20]) -> anyhow::Result<()> {
+async fn write_utp_handshake(
+    stream: &mut UtpStream,
+    info_hash: MetadataInfoHash,
+) -> anyhow::Result<()> {
     let hs = Handshake {
-        info_hash,
+        info_hash: info_hash.wire_hash(),
         peer_id: crate::peer_id::our_peer_id(),
-        reserved: ExtensionFlags::with_extension_protocol(),
+        reserved: ExtensionFlags::with_v2_support(),
     };
     timeout(METADATA_PEER_WRITE_TIMEOUT, stream.write_all(&hs.encode()))
         .await
@@ -1527,13 +1698,15 @@ async fn fetch_metadata(
     addr: SocketAddr,
     framed: Framed<TcpStream, PeerCodec>,
     remote_supports_extension: bool,
-    expected_info_hash: [u8; 20],
+    remote_supports_v2: bool,
+    expected_info_hash: MetadataInfoHash,
     resources: ResourceGovernor,
 ) -> anyhow::Result<FetchedMetadata> {
     fetch_metadata_over_io(
         addr,
         MetadataPeerIo::Tcp(framed),
         remote_supports_extension,
+        remote_supports_v2,
         expected_info_hash,
         resources,
     )
@@ -1544,13 +1717,15 @@ async fn fetch_metadata_over_io(
     addr: SocketAddr,
     peer_io: MetadataPeerIo,
     remote_supports_extension: bool,
-    expected_info_hash: [u8; 20],
+    remote_supports_v2: bool,
+    expected_info_hash: MetadataInfoHash,
     resources: ResourceGovernor,
 ) -> anyhow::Result<FetchedMetadata> {
     fetch_metadata_over_io_with_timeout(
         addr,
         peer_io,
         remote_supports_extension,
+        remote_supports_v2,
         expected_info_hash,
         resources,
         METADATA_PEER_FETCH_TIMEOUT,
@@ -1562,7 +1737,8 @@ async fn fetch_metadata_over_io_with_timeout(
     addr: SocketAddr,
     peer_io: MetadataPeerIo,
     remote_supports_extension: bool,
-    expected_info_hash: [u8; 20],
+    remote_supports_v2: bool,
+    expected_info_hash: MetadataInfoHash,
     resources: ResourceGovernor,
     fetch_timeout: Duration,
 ) -> anyhow::Result<FetchedMetadata> {
@@ -1572,6 +1748,7 @@ async fn fetch_metadata_over_io_with_timeout(
             addr,
             peer_io,
             remote_supports_extension,
+            remote_supports_v2,
             expected_info_hash,
             resources,
         ),
@@ -1589,7 +1766,8 @@ async fn fetch_metadata_over_io_inner(
     addr: SocketAddr,
     mut peer_io: MetadataPeerIo,
     remote_supports_extension: bool,
-    expected_info_hash: [u8; 20],
+    remote_supports_v2: bool,
+    expected_info_hash: MetadataInfoHash,
     resources: ResourceGovernor,
 ) -> anyhow::Result<FetchedMetadata> {
     if !remote_supports_extension {
@@ -1606,13 +1784,16 @@ async fn fetch_metadata_over_io_inner(
     peer_io.send(Message::Interested).await?;
 
     let (remote_ext_id, metadata_size) = read_remote_metadata_handshake(addr, &mut peer_io).await?;
-    let lease = reserve_metadata_fetch_bytes(&resources, metadata_size)?;
+    let mut lease = reserve_metadata_fetch_bytes(&resources, metadata_size)?;
     let piece_count = metadata_size.div_ceil(METADATA_PIECE_SIZE as u32);
     // Requests are issued and validated in piece order, so retain only the
     // final metadata buffer and the one response currently being copied into
     // it. A BTreeMap here kept every piece allocation alive while a second
     // full-size buffer was assembled, exceeding the payload-only reservation.
-    let mut metadata = Vec::with_capacity(metadata_size as usize);
+    let mut metadata = Vec::new();
+    metadata
+        .try_reserve_exact(metadata_size as usize)
+        .map_err(|error| anyhow::anyhow!("metadata allocation failed: {error}"))?;
 
     for piece in 0..piece_count {
         peer_io
@@ -1640,8 +1821,35 @@ async fn fetch_metadata_over_io_inner(
     metadata.truncate(metadata_size as usize);
     decode(&metadata).context("fetched metadata is not valid bencode")?;
     validate_metadata_info_hash(&metadata, expected_info_hash)?;
+    if expected_info_hash.is_v2() && !remote_supports_v2 {
+        anyhow::bail!("pure-v2 metadata peer does not advertise BEP 52 support");
+    }
+
+    let requirements = v2_piece_layer_requirements(&metadata)
+        .context("fetched metadata has an invalid v2 file tree")?;
+    let mut piece_layers = Vec::new();
+    if let Some(requirements) = requirements {
+        if !requirements.files.is_empty() && !remote_supports_v2 {
+            anyhow::bail!("peer does not advertise BEP 52 support for piece layers");
+        }
+        let layer_bytes = v2_piece_layer_bytes(&requirements.files)?;
+        let additional_memory = layer_bytes
+            .checked_mul(2)
+            .ok_or_else(|| anyhow::anyhow!("v2 piece-layer memory estimate overflowed"))?;
+        if !lease.try_grow(additional_memory) {
+            anyhow::bail!("v2 piece-layer allocation of {additional_memory} bytes denied");
+        }
+        piece_layers = fetch_v2_piece_layers(
+            addr,
+            &mut peer_io,
+            requirements.piece_length,
+            &requirements.files,
+        )
+        .await?;
+    }
     Ok(FetchedMetadata {
         bytes: metadata,
+        piece_layers,
         _lease: lease,
     })
 }
@@ -1694,17 +1902,33 @@ fn reserve_metadata_fetch_bytes(
 
 fn validate_metadata_info_hash(
     metadata: &[u8],
-    expected_info_hash: [u8; 20],
+    expected_info_hash: MetadataInfoHash,
 ) -> anyhow::Result<()> {
-    let mut hasher = Sha1::new();
-    hasher.update(metadata);
-    let actual: [u8; 20] = hasher.finalize().into();
-    if actual != expected_info_hash {
-        anyhow::bail!(
-            "fetched metadata infohash {} does not match expected {}",
-            hex::encode(actual),
-            hex::encode(expected_info_hash)
-        );
+    match expected_info_hash {
+        MetadataInfoHash::V1(expected) => {
+            let mut hasher = Sha1::new();
+            hasher.update(metadata);
+            let actual: [u8; 20] = hasher.finalize().into();
+            if actual != expected {
+                anyhow::bail!(
+                    "fetched metadata infohash {} does not match expected {}",
+                    hex::encode(actual),
+                    hex::encode(expected)
+                );
+            }
+        }
+        MetadataInfoHash::V2(expected) => {
+            let mut hasher = Sha256::new();
+            hasher.update(metadata);
+            let actual: [u8; 32] = hasher.finalize().into();
+            if actual != expected {
+                anyhow::bail!(
+                    "fetched metadata infohash {} does not match expected {}",
+                    hex::encode(actual),
+                    hex::encode(expected)
+                );
+            }
+        }
     }
     Ok(())
 }
@@ -1805,12 +2029,370 @@ fn validate_metadata_piece(
     Ok(())
 }
 
-fn build_torrent_from_info(info: &[u8], trackers: &[String]) -> Result<Vec<u8>, String> {
+const MAX_METADATA_HASH_REQUEST_LENGTH: u32 = 512;
+
+fn v2_piece_layer_bytes(requirements: &[V2PieceLayerRequirement]) -> anyhow::Result<u64> {
+    let mut bytes = 0u64;
+    for requirement in requirements {
+        if requirement.hash_count < 2 {
+            anyhow::bail!("v2 layered file has fewer than two piece-layer hashes");
+        }
+        let requirement_bytes = u64::try_from(requirement.hash_count)
+            .ok()
+            .and_then(|count| count.checked_mul(32))
+            .ok_or_else(|| anyhow::anyhow!("v2 piece-layer byte count overflowed"))?;
+        bytes = bytes
+            .checked_add(requirement_bytes)
+            .ok_or_else(|| anyhow::anyhow!("v2 piece-layer byte count overflowed"))?;
+    }
+    // A completed magnet is persisted as a normal metainfo blob, whose
+    // parser has the same 64 MiB raw-torrent ceiling. Refuse an impossible
+    // layer set before opening a sequence of network requests for it.
+    if bytes > rt_metainfo::MAX_TORRENT_BYTES as u64 {
+        anyhow::bail!(
+            "v2 piece layers require {bytes} bytes, above the {}-byte metainfo limit",
+            rt_metainfo::MAX_TORRENT_BYTES
+        );
+    }
+    Ok(bytes)
+}
+
+fn v2_piece_layer_shape(
+    requirement: &V2PieceLayerRequirement,
+    piece_length: u64,
+) -> anyhow::Result<(u32, u32, u64)> {
+    if piece_length < V2_BLOCK_SIZE as u64
+        || !piece_length.is_power_of_two()
+        || !piece_length.is_multiple_of(V2_BLOCK_SIZE as u64)
+    {
+        anyhow::bail!("invalid v2 piece length {piece_length} for hash exchange");
+    }
+    let blocks_per_piece = piece_length / V2_BLOCK_SIZE as u64;
+    let base_layer = blocks_per_piece.trailing_zeros();
+    let leaf_count = requirement
+        .file_length
+        .checked_add(V2_BLOCK_SIZE as u64 - 1)
+        .ok_or_else(|| anyhow::anyhow!("v2 leaf count overflowed"))?
+        / V2_BLOCK_SIZE as u64;
+    let leaf_count = leaf_count.max(1);
+    let padded_leaf_count = leaf_count
+        .checked_next_power_of_two()
+        .ok_or_else(|| anyhow::anyhow!("v2 Merkle tree is too large"))?;
+    let tree_height = padded_leaf_count.trailing_zeros();
+    if base_layer >= tree_height {
+        anyhow::bail!("v2 piece layer base {base_layer} is not below tree height {tree_height}");
+    }
+    let layer_len = padded_leaf_count
+        .checked_shr(base_layer)
+        .ok_or_else(|| anyhow::anyhow!("v2 piece-layer width overflowed"))?;
+    let hash_count = u64::try_from(requirement.hash_count)
+        .map_err(|_| anyhow::anyhow!("v2 piece-layer count does not fit in u64"))?;
+    if hash_count == 0 || hash_count > layer_len {
+        anyhow::bail!("v2 piece-layer count {hash_count} exceeds padded layer width {layer_len}");
+    }
+    let proof_layers = tree_height
+        .checked_sub(base_layer + 1)
+        .ok_or_else(|| anyhow::anyhow!("v2 proof-layer count underflowed"))?;
+    Ok((base_layer, proof_layers, layer_len))
+}
+
+fn v2_hash_request_length(remaining: usize) -> anyhow::Result<u32> {
+    let length = if remaining > MAX_METADATA_HASH_REQUEST_LENGTH as usize {
+        MAX_METADATA_HASH_REQUEST_LENGTH
+    } else {
+        u32::try_from(remaining.next_power_of_two().max(2))
+            .map_err(|_| anyhow::anyhow!("v2 piece-layer request length overflowed"))?
+    };
+    Ok(length)
+}
+
+async fn fetch_v2_piece_layers(
+    addr: SocketAddr,
+    peer_io: &mut MetadataPeerIo,
+    piece_length: u64,
+    requirements: &[V2PieceLayerRequirement],
+) -> anyhow::Result<Vec<([u8; 32], Vec<[u8; 32]>)>> {
+    let mut layers = Vec::new();
+    layers
+        .try_reserve_exact(requirements.len())
+        .map_err(|error| anyhow::anyhow!("v2 piece-layer result allocation failed: {error}"))?;
+    for requirement in requirements {
+        let layer = fetch_v2_piece_layer(addr, peer_io, piece_length, requirement).await?;
+        layers.push((requirement.pieces_root, layer));
+    }
+    Ok(layers)
+}
+
+async fn fetch_v2_piece_layer(
+    addr: SocketAddr,
+    peer_io: &mut MetadataPeerIo,
+    piece_length: u64,
+    requirement: &V2PieceLayerRequirement,
+) -> anyhow::Result<Vec<[u8; 32]>> {
+    let (base_layer, proof_layers, layer_len) = v2_piece_layer_shape(requirement, piece_length)?;
+    let mut layer = Vec::new();
+    layer
+        .try_reserve_exact(requirement.hash_count)
+        .map_err(|error| anyhow::anyhow!("v2 piece-layer allocation failed: {error}"))?;
+    let mut cursor = 0usize;
+    while cursor < requirement.hash_count {
+        let remaining = requirement.hash_count - cursor;
+        let request_length = v2_hash_request_length(remaining)?;
+        let request_index = u32::try_from(cursor)
+            .map_err(|_| anyhow::anyhow!("v2 piece-layer request index overflowed"))?;
+        if request_index % request_length != 0
+            || u64::from(request_index) + u64::from(request_length) > layer_len
+        {
+            anyhow::bail!(
+                "v2 piece-layer request index {request_index} and length {request_length} exceed layer width {layer_len}"
+            );
+        }
+        let request = Message::HashRequest {
+            pieces_root: requirement.pieces_root,
+            base_layer,
+            index: request_index,
+            length: request_length,
+            proof_layers,
+        };
+        peer_io.send(request).await?;
+        let hashes = read_v2_hashes_response(
+            addr,
+            peer_io,
+            requirement.pieces_root,
+            base_layer,
+            request_index,
+            request_length,
+            proof_layers,
+            requirement.file_length,
+            piece_length,
+        )
+        .await?;
+        let take = remaining.min(request_length as usize);
+        layer.extend_from_slice(&hashes[..take]);
+        cursor += take;
+        if take < request_length as usize {
+            break;
+        }
+    }
+    if layer.len() != requirement.hash_count || merkle_root(&layer) != requirement.pieces_root {
+        anyhow::bail!(
+            "v2 piece layer for {} does not reconstruct its pieces root",
+            hex::encode(requirement.pieces_root)
+        );
+    }
+    Ok(layer)
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn read_v2_hashes_response(
+    addr: SocketAddr,
+    peer_io: &mut MetadataPeerIo,
+    pieces_root: [u8; 32],
+    base_layer: u32,
+    index: u32,
+    length: u32,
+    proof_layers: u32,
+    file_length: u64,
+    piece_length: u64,
+) -> anyhow::Result<Vec<[u8; 32]>> {
+    loop {
+        let msg = tokio::time::timeout(Duration::from_secs(15), peer_io.next())
+            .await??
+            .ok_or_else(|| anyhow::anyhow!("peer closed during v2 piece-layer transfer"))?;
+        match msg {
+            Message::Hashes {
+                pieces_root: response_root,
+                base_layer: response_base,
+                index: response_index,
+                length: response_length,
+                proof_layers: response_proof,
+                hashes,
+            } => {
+                if (
+                    response_root,
+                    response_base,
+                    response_index,
+                    response_length,
+                    response_proof,
+                ) != (pieces_root, base_layer, index, length, proof_layers)
+                {
+                    anyhow::bail!("peer returned a mismatched v2 hashes response from {addr}");
+                }
+                validate_v2_hashes_response(
+                    pieces_root,
+                    base_layer,
+                    index,
+                    length,
+                    proof_layers,
+                    file_length,
+                    piece_length,
+                    &hashes,
+                )?;
+                return Ok(hashes);
+            }
+            Message::HashReject {
+                pieces_root: response_root,
+                base_layer: response_base,
+                index: response_index,
+                length: response_length,
+                proof_layers: response_proof,
+            } if (
+                response_root,
+                response_base,
+                response_index,
+                response_length,
+                response_proof,
+            ) == (pieces_root, base_layer, index, length, proof_layers) =>
+            {
+                anyhow::bail!("peer rejected v2 piece-layer request from {addr}");
+            }
+            _ => {}
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn validate_v2_hashes_response(
+    pieces_root: [u8; 32],
+    base_layer: u32,
+    index: u32,
+    length: u32,
+    proof_layers: u32,
+    file_length: u64,
+    piece_length: u64,
+    hashes: &[[u8; 32]],
+) -> anyhow::Result<()> {
+    if length < 2
+        || !length.is_power_of_two()
+        || !index.is_multiple_of(length)
+        || length > MAX_METADATA_HASH_REQUEST_LENGTH
+    {
+        anyhow::bail!("peer returned invalid v2 hash request coordinates");
+    }
+    let blocks_per_piece = piece_length
+        .checked_div(V2_BLOCK_SIZE as u64)
+        .filter(|blocks| blocks.is_power_of_two())
+        .ok_or_else(|| anyhow::anyhow!("invalid v2 piece length in hash response"))?;
+    let expected_base = blocks_per_piece.trailing_zeros();
+    if base_layer != expected_base {
+        anyhow::bail!("peer returned an unexpected v2 hash base layer");
+    }
+    let leaf_count = file_length
+        .checked_add(V2_BLOCK_SIZE as u64 - 1)
+        .ok_or_else(|| anyhow::anyhow!("v2 leaf count overflowed"))?
+        / V2_BLOCK_SIZE as u64;
+    let padded_leaf_count = leaf_count
+        .max(1)
+        .checked_next_power_of_two()
+        .ok_or_else(|| anyhow::anyhow!("v2 Merkle tree is too large"))?;
+    let tree_height = padded_leaf_count.trailing_zeros();
+    let layer_len = padded_leaf_count
+        .checked_shr(base_layer)
+        .ok_or_else(|| anyhow::anyhow!("v2 hash base layer is too large"))?;
+    let end = u64::from(index)
+        .checked_add(u64::from(length))
+        .ok_or_else(|| anyhow::anyhow!("v2 hash range overflowed"))?;
+    if base_layer >= tree_height || end > layer_len {
+        anyhow::bail!("peer returned v2 hash coordinates outside the file tree");
+    }
+    let expected_proof_layers = tree_height
+        .checked_sub(base_layer + 1)
+        .ok_or_else(|| anyhow::anyhow!("v2 proof-layer count underflowed"))?;
+    if proof_layers != expected_proof_layers {
+        anyhow::bail!("peer returned an incomplete v2 hash proof");
+    }
+    let omitted_layers = length.trailing_zeros();
+    let proof_hash_count = if omitted_layers <= proof_layers {
+        usize::try_from(proof_layers - omitted_layers + 1)
+            .map_err(|_| anyhow::anyhow!("v2 proof hash count does not fit usize"))?
+    } else {
+        0
+    };
+    let requested_hash_count = usize::try_from(length)
+        .map_err(|_| anyhow::anyhow!("v2 requested hash count does not fit usize"))?;
+    let expected_hash_count = requested_hash_count
+        .checked_add(proof_hash_count)
+        .ok_or_else(|| anyhow::anyhow!("v2 response hash count overflowed"))?;
+    if hashes.len() != expected_hash_count {
+        anyhow::bail!(
+            "v2 hashes response contains {}, expected {expected_hash_count}",
+            hashes.len()
+        );
+    }
+
+    let mut nodes = hashes[..requested_hash_count].to_vec();
+    while nodes.len() > 1 {
+        let mut next = Vec::with_capacity(nodes.len() / 2);
+        for pair in nodes.as_chunks::<2>().0 {
+            next.push(hash_pair(pair[0], pair[1]));
+        }
+        nodes = next;
+    }
+    let mut current = nodes[0];
+    for (offset, sibling) in hashes[requested_hash_count..].iter().enumerate() {
+        let depth = omitted_layers
+            .checked_add(
+                u32::try_from(offset).map_err(|_| anyhow::anyhow!("v2 proof offset overflowed"))?,
+            )
+            .ok_or_else(|| anyhow::anyhow!("v2 proof depth overflowed"))?;
+        let node_index = u64::from(index) >> depth;
+        current = if node_index & 1 == 0 {
+            hash_pair(current, *sibling)
+        } else {
+            hash_pair(*sibling, current)
+        };
+    }
+    if current != pieces_root {
+        anyhow::bail!("v2 hashes response proof does not match pieces root");
+    }
+    Ok(())
+}
+
+fn build_torrent_from_info(
+    info: &[u8],
+    trackers: &[String],
+    piece_layers: &[([u8; 32], Vec<[u8; 32]>)],
+) -> Result<Vec<u8>, String> {
+    let mut sorted_layers = piece_layers.iter().collect::<Vec<_>>();
+    sorted_layers.sort_by_key(|(root, _)| *root);
+    for pair in sorted_layers.windows(2) {
+        if pair[0].0 == pair[1].0 {
+            return Err("duplicate v2 piece-layer root".to_owned());
+        }
+    }
+    let piece_layers_capacity = if sorted_layers.is_empty() {
+        0
+    } else {
+        let entries = sorted_layers
+            .iter()
+            .try_fold(0usize, |total, (root, hashes)| {
+                let hash_bytes = hashes
+                    .len()
+                    .checked_mul(32)
+                    .ok_or_else(|| "v2 piece-layer byte count overflowed".to_owned())?;
+                total
+                    .checked_add(bencoded_bytes_len(root.len()))
+                    .and_then(|value| value.checked_add(bencoded_bytes_len(hash_bytes)))
+                    .ok_or_else(|| "v2 piece-layer encoding size overflowed".to_owned())
+            })?;
+        bencoded_bytes_len(b"piece layers".len())
+            .checked_add(1)
+            .and_then(|value| value.checked_add(entries))
+            .and_then(|value| value.checked_add(1))
+            .ok_or_else(|| "v2 piece-layer encoding size overflowed".to_owned())?
+    };
     let capacity = 1usize
         .saturating_add(metadata_completion_tracker_bytes(trackers))
         .saturating_add(bencoded_bytes_len(b"info".len()))
         .saturating_add(info.len())
+        .saturating_add(piece_layers_capacity)
         .saturating_add(1);
+    if capacity > rt_metainfo::MAX_TORRENT_BYTES {
+        return Err(format!(
+            "raw metainfo requires {capacity} bytes, above the {}-byte limit",
+            rt_metainfo::MAX_TORRENT_BYTES
+        ));
+    }
     let mut out = Vec::new();
     out.try_reserve(capacity)
         .map_err(|error| format!("raw metainfo allocation of {capacity} bytes failed: {error}"))?;
@@ -1829,6 +2411,22 @@ fn build_torrent_from_info(info: &[u8], trackers: &[String]) -> Result<Vec<u8>, 
     }
     write_bytes_key(&mut out, b"info");
     out.extend_from_slice(info);
+    if !sorted_layers.is_empty() {
+        write_bytes_key(&mut out, b"piece layers");
+        out.push(b'd');
+        for (root, hashes) in sorted_layers {
+            write_bytes(&mut out, root);
+            let hash_bytes = hashes
+                .len()
+                .checked_mul(32)
+                .ok_or_else(|| "v2 piece-layer byte count overflowed".to_owned())?;
+            write_bytes_len(&mut out, hash_bytes);
+            for hash in hashes {
+                out.extend_from_slice(hash);
+            }
+        }
+        out.push(b'e');
+    }
     out.push(b'e');
     debug_assert_eq!(out.len(), capacity);
     Ok(out)
@@ -1839,14 +2437,19 @@ fn write_bytes_key(out: &mut Vec<u8>, key: &[u8]) {
 }
 
 fn write_bytes(out: &mut Vec<u8>, bytes: &[u8]) {
-    out.extend_from_slice(bytes.len().to_string().as_bytes());
-    out.push(b':');
+    write_bytes_len(out, bytes.len());
     out.extend_from_slice(bytes);
+}
+
+fn write_bytes_len(out: &mut Vec<u8>, len: usize) {
+    out.extend_from_slice(len.to_string().as_bytes());
+    out.push(b':');
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rt_bencode::{encode, BValue};
     use rt_utp::{UtpListener, UtpTransportConfig};
     use std::sync::Arc;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -1870,8 +2473,8 @@ mod tests {
         hasher.update(info);
         let expected: [u8; 20] = hasher.finalize().into();
 
-        validate_metadata_info_hash(info, expected).unwrap();
-        assert!(validate_metadata_info_hash(info, [0; 20]).is_err());
+        validate_metadata_info_hash(info, MetadataInfoHash::V1(expected)).unwrap();
+        assert!(validate_metadata_info_hash(info, MetadataInfoHash::V1([0; 20])).is_err());
     }
 
     #[test]
@@ -1992,7 +2595,7 @@ mod tests {
             "udp://tracker.example:6969".to_owned(),
         ];
         let info = b"d4:name4:test6:lengthi1ee";
-        let raw = build_torrent_from_info(info, &trackers).unwrap();
+        let raw = build_torrent_from_info(info, &trackers, &[]).unwrap();
         let tracker_prefix = metadata_completion_tracker_bytes(&trackers);
         let expected_len = 1 + tracker_prefix + bencoded_bytes_len(b"info".len()) + info.len() + 1;
 
@@ -2036,7 +2639,7 @@ mod tests {
     fn metadata_task_reservation_covers_tracker_and_retry_state() {
         let trackers =
             compact_metadata_task_trackers(vec!["https://tracker.example/announce".to_owned()]);
-        let bytes = metadata_task_memory_bytes(&trackers, trackers.capacity(), 100) as u64;
+        let bytes = metadata_task_memory_bytes(&trackers, trackers.capacity(), 0, 100) as u64;
         let mut caps = [0; rt_metrics::MEMORY_CLASS_COUNT];
         caps[MemoryClass::Metadata as usize] = bytes;
         let governor = ResourceGovernor::new(rt_metrics::ResourceGovernorConfig {
@@ -2059,6 +2662,67 @@ mod tests {
         );
     }
 
+    #[test]
+    fn direct_peer_hash_exchange_requests_never_use_invalid_length_one() {
+        assert_eq!(v2_hash_request_length(1).unwrap(), 2);
+        assert_eq!(v2_hash_request_length(2).unwrap(), 2);
+        assert_eq!(v2_hash_request_length(3).unwrap(), 4);
+        assert_eq!(
+            v2_hash_request_length(MAX_METADATA_HASH_REQUEST_LENGTH as usize).unwrap(),
+            MAX_METADATA_HASH_REQUEST_LENGTH
+        );
+        assert_eq!(
+            v2_hash_request_length(MAX_METADATA_HASH_REQUEST_LENGTH as usize + 1).unwrap(),
+            MAX_METADATA_HASH_REQUEST_LENGTH
+        );
+    }
+
+    #[test]
+    fn v2_hash_exchange_proof_is_authenticated_and_tamper_resistant() {
+        let leaves = (0u8..8)
+            .map(|value| rt_hash::BlockHash::of(&[value]).0)
+            .collect::<Vec<_>>();
+        let layer_one = leaves
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|pair| hash_pair(pair[0], pair[1]))
+            .collect::<Vec<_>>();
+        let layer_two = layer_one
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|pair| hash_pair(pair[0], pair[1]))
+            .collect::<Vec<_>>();
+        let pieces_root = merkle_root(&leaves);
+        let response = vec![leaves[0], leaves[1], layer_one[1], layer_two[1]];
+        validate_v2_hashes_response(
+            pieces_root,
+            0,
+            0,
+            2,
+            2,
+            8 * V2_BLOCK_SIZE as u64,
+            V2_BLOCK_SIZE as u64,
+            &response,
+        )
+        .unwrap();
+
+        let mut tampered = response;
+        tampered[3][0] ^= 1;
+        assert!(validate_v2_hashes_response(
+            pieces_root,
+            0,
+            0,
+            2,
+            2,
+            8 * V2_BLOCK_SIZE as u64,
+            V2_BLOCK_SIZE as u64,
+            &tampered,
+        )
+        .is_err());
+    }
+
     #[tokio::test]
     async fn metadata_task_pause_interrupts_incoming_peer_fetch() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -2070,7 +2734,7 @@ mod tests {
         let (cmd_tx, cmd_rx) = mpsc::channel(8);
         let (engine_tx, _engine_rx) = mpsc::channel(8);
         let task = tokio::spawn(run_metadata_task(
-            [0; 20],
+            MetadataInfoHash::V1([0; 20]),
             "00".repeat(40),
             Vec::new(),
             task_memory,
@@ -2156,7 +2820,7 @@ mod tests {
         let (cmd_tx, cmd_rx) = mpsc::channel(8);
         let (engine_tx, _engine_rx) = mpsc::channel(8);
         let task = tokio::spawn(run_metadata_task(
-            [0; 20],
+            MetadataInfoHash::V1([0; 20]),
             "00".repeat(40),
             trackers,
             task_memory,
@@ -2227,7 +2891,7 @@ mod tests {
         let (cmd_tx, cmd_rx) = mpsc::channel(8);
         let (engine_tx, _engine_rx) = mpsc::channel(8);
         let task = tokio::spawn(run_metadata_task(
-            [0; 20],
+            MetadataInfoHash::V1([0; 20]),
             "00".repeat(40),
             trackers,
             task_memory,
@@ -2349,7 +3013,7 @@ mod tests {
 
         assert!(
             try_fetch_from_peers(
-                info_hash,
+                MetadataInfoHash::V1(info_hash),
                 &info_hash_hex,
                 &[],
                 vec![peer_addr],
@@ -2371,6 +3035,169 @@ mod tests {
             }
             other => panic!("unexpected engine command: {other:?}"),
         }
+        peer.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn pure_v2_magnet_fetches_and_verifies_piece_layers_from_direct_peer() {
+        let piece_length = 16 * 1024i64;
+        let file_length = piece_length * 3;
+        let piece_hashes = (0u8..3)
+            .map(|value| rt_hash::BlockHash::of(&[value]).0)
+            .collect::<Vec<_>>();
+        let pieces_root = rt_hash::merkle_root(&piece_hashes);
+        let leaf = BValue::Dict(vec![
+            (b"length".as_slice(), BValue::Int(file_length)),
+            (b"pieces root".as_slice(), BValue::Bytes(&pieces_root)),
+        ]);
+        let file_node = BValue::Dict(vec![(b"".as_slice(), leaf)]);
+        let file_tree = BValue::Dict(vec![(b"payload.bin".as_slice(), file_node)]);
+        let info = encode(&BValue::Dict(vec![
+            (b"file tree".as_slice(), file_tree),
+            (b"meta version".as_slice(), BValue::Int(2)),
+            (b"name".as_slice(), BValue::Bytes(b"v2-test")),
+            (b"piece length".as_slice(), BValue::Int(piece_length)),
+        ]));
+        let mut hasher = Sha256::new();
+        hasher.update(&info);
+        let expected_hash: [u8; 32] = hasher.finalize().into();
+        let info_hash_hex = hex::encode(expected_hash);
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let peer_addr = listener.local_addr().unwrap();
+        let peer_info = info.clone();
+        let peer_hashes = piece_hashes.clone();
+        let peer = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut handshake = [0u8; 68];
+            stream.read_exact(&mut handshake).await.unwrap();
+            let remote = Handshake::parse(&handshake).unwrap();
+            assert_eq!(remote.info_hash, expected_hash[..20]);
+            assert!(remote.reserved.supports_v2());
+            let response = Handshake {
+                info_hash: remote.info_hash,
+                peer_id: [b'P'; 20],
+                reserved: ExtensionFlags::with_v2_support(),
+            };
+            stream.write_all(&response.encode()).await.unwrap();
+
+            let mut framed = Framed::new(stream, PeerCodec::default());
+            framed
+                .send(Message::Extended {
+                    ext_id: EXT_HANDSHAKE_ID,
+                    payload: ExtensionHandshake::new(Some(peer_info.len() as u32))
+                        .with_ut_metadata(7)
+                        .encode(),
+                })
+                .await
+                .unwrap();
+            while let Some(message) = framed.next().await {
+                match message.unwrap() {
+                    Message::Extended { ext_id: 7, payload } => {
+                        let UtMetadataMessage::Request { piece } =
+                            UtMetadataMessage::parse(&payload).unwrap()
+                        else {
+                            continue;
+                        };
+                        let start = piece as usize * METADATA_PIECE_SIZE;
+                        let end = (start + METADATA_PIECE_SIZE).min(peer_info.len());
+                        framed
+                            .send(Message::Extended {
+                                ext_id: LOCAL_UT_METADATA_ID,
+                                payload: UtMetadataMessage::Data {
+                                    piece,
+                                    total_size: peer_info.len() as u32,
+                                    data: peer_info[start..end].to_vec(),
+                                }
+                                .encode(),
+                            })
+                            .await
+                            .unwrap();
+                    }
+                    Message::HashRequest {
+                        pieces_root: requested_root,
+                        base_layer,
+                        index,
+                        length,
+                        proof_layers,
+                    } => {
+                        assert_eq!(requested_root, pieces_root);
+                        assert_eq!(base_layer, 0);
+                        assert_eq!(index, 0);
+                        assert_eq!(length, 4);
+                        assert_eq!(proof_layers, 1);
+                        let mut hashes = peer_hashes.clone();
+                        hashes.push([0; 32]);
+                        framed
+                            .send(Message::Hashes {
+                                pieces_root,
+                                base_layer,
+                                index,
+                                length,
+                                proof_layers,
+                                hashes,
+                            })
+                            .await
+                            .unwrap();
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+        });
+
+        let mut caps = [0; rt_metrics::MEMORY_CLASS_COUNT];
+        caps[MemoryClass::Metadata as usize] = 1024 * 1024;
+        caps[MemoryClass::PeerBuffer as usize] = 64 * 1024;
+        let governor = ResourceGovernor::new(rt_metrics::ResourceGovernorConfig {
+            total_cap_bytes: 1024 * 1024,
+            class_caps_bytes: caps,
+            pressure_constrained_pct: 75,
+            pressure_critical_pct: 90,
+        });
+        let (engine_tx, mut engine_rx) = mpsc::channel(1);
+        let (task_tx, task_rx) = mpsc::channel(8);
+        let (_, task_memory) =
+            prepare_metadata_task_memory_with_peers(&governor, Vec::new(), vec![peer_addr], 8)
+                .unwrap();
+        let task = tokio::spawn(run_metadata_task(
+            MetadataInfoHash::V2(expected_hash),
+            info_hash_hex.clone(),
+            Vec::new(),
+            task_memory,
+            task_rx,
+            engine_tx,
+            task_tx.clone(),
+            governor,
+            6881,
+            8,
+            1,
+            1,
+            false,
+            OutboundEgressPolicy {
+                allow_loopback: true,
+                ..OutboundEgressPolicy::default()
+            },
+            GlobalNetworkBudget::unlimited(),
+        ));
+
+        let command = timeout(Duration::from_secs(2), engine_rx.recv())
+            .await
+            .expect("direct x.pe peer should complete metadata")
+            .expect("metadata task should emit completion");
+        let EngineCmd::CompleteMagnet { raw, .. } = command else {
+            panic!("unexpected engine command")
+        };
+        let rt_metainfo::TorrentMeta::V2(meta) = rt_metainfo::parse_torrent(&raw).unwrap() else {
+            panic!("expected pure-v2 metainfo")
+        };
+        assert_eq!(meta.info_hash_v2, expected_hash);
+        assert_eq!(meta.piece_layers.get(&pieces_root), Some(&piece_hashes));
+        task_tx.send(TorrentCmd::Shutdown).await.unwrap();
+        timeout(Duration::from_secs(1), task)
+            .await
+            .expect("metadata task should stop after completion shutdown")
+            .unwrap();
         peer.await.unwrap();
     }
 
@@ -2399,6 +3226,7 @@ mod tests {
                 &trackers,
                 FetchedMetadata {
                     bytes: info,
+                    piece_layers: Vec::new(),
                     _lease: lease,
                 },
             )
@@ -2472,7 +3300,8 @@ mod tests {
             peer_addr,
             MetadataPeerIo::Tcp(Framed::new(stream, PeerCodec::default())),
             true,
-            [0; 20],
+            false,
+            MetadataInfoHash::V1([0; 20]),
             governor,
             Duration::from_millis(50),
         )

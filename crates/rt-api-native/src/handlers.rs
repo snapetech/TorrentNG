@@ -4687,7 +4687,7 @@ fn torrentng_client_capabilities() -> serde_json::Value {
             "torrent_files": true,
             "magnets": true,
             "pure_v2_metadata_placeholders": true,
-            "pure_v2_metadata_completion": false,
+            "pure_v2_metadata_completion": true,
             "pure_v2_transfer": true,
         },
         "session": {
@@ -4767,6 +4767,7 @@ fn torrentng_client_capabilities() -> serde_json::Value {
                 "durable_session",
                 "durable_jobs",
                 "storage_plan_controls",
+                "pure_v2_metadata_completion",
                 "dht_resource_bounds",
                 "peer_ban_enforcement",
                 "seed_limit_enforcement",
@@ -4778,7 +4779,6 @@ fn torrentng_client_capabilities() -> serde_json::Value {
             },
             "certified": [],
             "experimental": [
-                "pure_v2_metadata_completion",
                 "pure_v2_transfer",
                 "descriptor_relative_storage_authority",
                 "storage_throttling",
@@ -8121,7 +8121,7 @@ mod tests {
         assert_eq!(capabilities["torrent_identity"]["v2"], true);
         assert_eq!(
             capabilities["metadata"]["pure_v2_metadata_completion"],
-            false
+            true
         );
         assert_eq!(capabilities["metadata"]["pure_v2_transfer"], true);
         assert_eq!(capabilities["session"]["crash_restore"], true);

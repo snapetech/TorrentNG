@@ -247,6 +247,24 @@ impl MemoryLease {
     pub fn bytes(&self) -> u64 {
         self.bytes
     }
+
+    /// Extend an existing reservation while keeping ownership in one lease.
+    /// This is used when a bounded protocol response reveals a second
+    /// allocation whose size could not be known at admission time.
+    pub fn try_grow(&mut self, additional: u64) -> bool {
+        let Some(new_bytes) = self.bytes.checked_add(additional) else {
+            return false;
+        };
+        if additional == 0 {
+            return true;
+        }
+        let Some(lease) = self.governor.try_acquire(self.class, additional) else {
+            return false;
+        };
+        self.bytes = new_bytes;
+        std::mem::forget(lease);
+        true
+    }
 }
 
 impl Drop for MemoryLease {
@@ -290,6 +308,21 @@ mod tests {
         let lease = governor.try_acquire(MemoryClass::StorageFrame, 40).unwrap();
         assert_eq!(lease.bytes(), 40);
         assert_eq!(governor.snapshot().total_used_bytes, 40);
+        drop(lease);
+        assert_eq!(governor.snapshot().total_used_bytes, 0);
+    }
+
+    #[test]
+    fn lease_growth_is_bounded_and_releases_as_one_reservation() {
+        let governor = ResourceGovernor::new(config());
+        let mut lease = governor.try_acquire(MemoryClass::Metadata, 40).unwrap();
+
+        assert!(lease.try_grow(30));
+        assert_eq!(lease.bytes(), 70);
+        assert_eq!(governor.snapshot().total_used_bytes, 70);
+        assert!(!lease.try_grow(20));
+        assert_eq!(lease.bytes(), 70);
+        assert_eq!(governor.snapshot().total_used_bytes, 70);
         drop(lease);
         assert_eq!(governor.snapshot().total_used_bytes, 0);
     }

@@ -60,7 +60,8 @@ use crate::db_worker::DbWorker;
 use crate::dht_task::{run_dht, DhtCommand, DhtTorrent};
 use crate::egress_policy::OutboundEgressPolicy;
 use crate::metadata_task::{
-    compact_metadata_task_trackers, prepare_metadata_task_memory, run_metadata_task,
+    compact_metadata_task_trackers, parse_metadata_info_hash_hex, prepare_metadata_task_memory,
+    prepare_metadata_task_memory_with_peers, run_metadata_task, MetadataInfoHash,
     MetadataTaskMemory,
 };
 use crate::network_budget::GlobalNetworkBudget;
@@ -154,6 +155,7 @@ const MAX_ENGINE_META_WEBSEEDS: usize = 4_096;
 const MAX_ENGINE_META_WEBSEED_BYTES: usize = 32 * 1024 * 1024;
 const MAX_ENGINE_META_PATH_BYTES: usize = rt_db::MAX_TORRENT_FILE_PATH_BYTES;
 const MAX_ENGINE_META_PATH_TOTAL_BYTES: usize = rt_db::MAX_TORRENT_FILE_RESULT_BYTES;
+const MAX_ENGINE_MAGNET_PEERS: usize = 256;
 const MAX_ENGINE_CATEGORY_BYTES: usize = MAX_ENGINE_LABEL_BYTES;
 const MAX_ENGINE_SAVE_PATH_BYTES: usize = 16 * 1024;
 const MAX_ENGINE_STORAGE_OPERATION_BYTES: usize = 16;
@@ -2000,7 +2002,24 @@ fn validate_magnet_input(magnet: &MagnetLink) -> CmdResult<()> {
     if let Some(display_name) = magnet.display_name.as_ref() {
         validate_text_bytes(display_name, MAX_ENGINE_NAME_BYTES, "magnet display name")?;
     }
-    validate_tracker_urls(&magnet.trackers)
+    validate_tracker_urls(&magnet.trackers)?;
+    if magnet.peer_addresses.len() > MAX_ENGINE_MAGNET_PEERS {
+        return Err(format!(
+            "magnet contains {} direct peers; maximum is {MAX_ENGINE_MAGNET_PEERS}",
+            magnet.peer_addresses.len()
+        ));
+    }
+    if let Some((index, _)) = magnet
+        .peer_addresses
+        .iter()
+        .enumerate()
+        .find(|(_, peer)| peer.port() == 0)
+    {
+        return Err(format!(
+            "magnet direct peer at index {index} has a zero port"
+        ));
+    }
+    Ok(())
 }
 
 pub(crate) fn validate_tracker_snapshot_size(count: u64, bytes: u64) -> CmdResult<()> {
@@ -6080,11 +6099,17 @@ impl Engine {
         validate_tracker_urls(&magnet.trackers)?;
         validate_command_item_len(tags.len(), MAX_ENGINE_MUTATION_ITEMS, "torrent tag list")?;
         validate_label_bytes(&tags, "torrent tag list")?;
+        let metadata_identity = magnet
+            .info_hash_v1
+            .map(MetadataInfoHash::V1)
+            .or_else(|| magnet.info_hash_v2.map(MetadataInfoHash::V2));
         let tracker_input = std::mem::take(&mut magnet.trackers);
-        let (trackers, metadata_task_memory) = if magnet.info_hash_v1.is_some() {
-            let (trackers, memory) = prepare_metadata_task_memory(
+        let direct_peer_input = std::mem::take(&mut magnet.peer_addresses);
+        let (trackers, metadata_task_memory) = if metadata_identity.is_some() {
+            let (trackers, memory) = prepare_metadata_task_memory_with_peers(
                 &self.services.resources,
                 tracker_input,
+                direct_peer_input,
                 self.config.network.max_peers,
             )?;
             (trackers, Some(memory))
@@ -6186,12 +6211,12 @@ impl Engine {
             return Err(error);
         }
 
-        if let Some(info_hash) = magnet.info_hash_v1 {
+        if let Some(metadata_identity) = metadata_identity {
             let Some(metadata_task_memory) = metadata_task_memory else {
-                return Err("v1 magnet add lost its metadata task memory reservation".to_owned());
+                return Err("magnet add lost its metadata task memory reservation".to_owned());
             };
             let _cmd_tx = self.spawn_metadata_task(
-                info_hash,
+                metadata_identity,
                 info_hash_hex.clone(),
                 trackers,
                 paused,
@@ -6203,7 +6228,8 @@ impl Engine {
                 metadata_task_memory,
             );
             if !paused {
-                self.register_dht_torrent(info_hash, &info_hash_hex).await;
+                self.register_dht_torrent(metadata_identity.wire_hash(), &info_hash_hex)
+                    .await;
             }
         }
         info!(
@@ -6820,7 +6846,7 @@ impl Engine {
 
     fn spawn_metadata_task(
         &mut self,
-        info_hash: [u8; 20],
+        info_hash: MetadataInfoHash,
         info_hash_hex: String,
         trackers: Vec<String>,
         paused: bool,
@@ -8234,7 +8260,7 @@ impl Engine {
                     },
                 );
                 let mut restored = false;
-                if let Ok(info_hash) = parse_info_hash_hex(&row.info_hash) {
+                if let Ok(info_hash) = parse_metadata_info_hash_hex(&row.info_hash) {
                     if start_task {
                         match prepare_metadata_task_memory(
                             &self.services.resources,
@@ -8263,7 +8289,11 @@ impl Engine {
                                 // later; completion also removes the
                                 // provisional registration in that case.
                                 if should_register_dht_on_restore(state) {
-                                    self.register_dht_torrent(info_hash, &row.info_hash).await;
+                                    self.register_dht_torrent(
+                                        info_hash.wire_hash(),
+                                        &row.info_hash,
+                                    )
+                                    .await;
                                 }
                             }
                             Err(error) => {
@@ -8285,7 +8315,7 @@ impl Engine {
                         serde_json::json!({
                             "state": row.state,
                             "metadata_pending": true,
-                            "v2_only": false,
+                            "v2_only": row.info_hash.len() == 64,
                         }),
                     );
                     restored = true;
@@ -14738,8 +14768,8 @@ impl Engine {
         if !is_metadata_placeholder_projection_for(&self.config, &projection) {
             return Err(format!("torrent {info_hash_hex} not running"));
         }
-        let info_hash =
-            parse_info_hash_hex(info_hash_hex).map_err(|_| "invalid info hash".to_owned())?;
+        let info_hash = parse_metadata_info_hash_hex(info_hash_hex)
+            .map_err(|_| "invalid info hash".to_owned())?;
         let state = state_from_str(&projection.state);
         let (trackers, task_memory) = prepare_metadata_task_memory(
             &self.services.resources,
@@ -20239,6 +20269,7 @@ mod tests {
             info_hash_v2: None,
             display_name: Some("m".repeat(MAX_ENGINE_NAME_BYTES + 1)),
             trackers: Vec::new(),
+            peer_addresses: Vec::new(),
         };
         let error = validate_magnet_input(&oversized_magnet).unwrap_err();
         assert!(error.contains("maximum is 4096"));
@@ -23138,6 +23169,7 @@ mod tests {
             info_hash_v2: Some([0x22; 32]),
             display_name: Some("v2-only".to_owned()),
             trackers: vec!["https://tracker.example/announce".to_owned()],
+            peer_addresses: Vec::new(),
         };
 
         let hash = engine
@@ -23153,7 +23185,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(hash, hex::encode([0x22; 32]));
-        assert!(engine.runtime.torrent_chans.is_empty());
+        assert!(engine.runtime.torrent_chans.contains_key(&hash));
         let reg = registry.read().await;
         let entry = reg.get(&hash).unwrap();
         assert_eq!(entry.name, "v2-only");
@@ -23236,7 +23268,7 @@ mod tests {
                 .await
         );
         rx.await.unwrap().unwrap();
-        assert!(engine.runtime.torrent_chans.is_empty());
+        assert!(engine.runtime.torrent_chans.contains_key(&hash));
     }
 
     #[tokio::test]
@@ -23287,6 +23319,7 @@ mod tests {
             }),
             display_name: Some("placeholder".to_owned()),
             trackers: vec!["https://tracker.example/announce".to_owned()],
+            peer_addresses: Vec::new(),
         };
 
         let added = engine
@@ -23514,6 +23547,7 @@ mod tests {
                     info_hash_v2: None,
                     display_name: Some("mismatched.bin".to_owned()),
                     trackers: Vec::new(),
+                    peer_addresses: Vec::new(),
                 },
                 test_metadata_lease(1),
                 Some(engine.config.storage.download_dir.clone()),
@@ -23667,6 +23701,7 @@ mod tests {
                     info_hash_v2: None,
                     display_name: Some("delayed.bin".to_owned()),
                     trackers: Vec::new(),
+                    peer_addresses: Vec::new(),
                 },
                 test_metadata_lease(1),
                 Some(engine.config.storage.download_dir.clone()),
@@ -23815,6 +23850,7 @@ mod tests {
             info_hash_v2: None,
             display_name: Some("private.bin".to_owned()),
             trackers: vec!["http://tracker.example.com/announce".to_owned()],
+            peer_addresses: Vec::new(),
         };
 
         // A v1 magnet has to use DHT while metadata is pending because its
@@ -28629,7 +28665,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn load_persisted_v2_rows_restore_taskless_registry_and_trackers() {
+    async fn load_persisted_v2_rows_restore_metadata_task_registry_and_trackers() {
         let temp = tempfile::tempdir().unwrap();
         let mut config = Config::default();
         config.storage.download_dir = temp.path().join("downloads");
@@ -28726,7 +28762,7 @@ mod tests {
 
         engine.load_persisted_torrents().await.unwrap();
 
-        assert!(engine.runtime.torrent_chans.is_empty());
+        assert!(engine.runtime.torrent_chans.contains_key(&placeholder_hash));
         let reg = registry.read().await;
         assert_eq!(reg.get(&info_hash).unwrap().state, TorrentState::Paused);
         assert_eq!(
@@ -28734,18 +28770,22 @@ mod tests {
             TorrentState::MetadataPending
         );
         drop(reg);
-        let db = engine.db.lock().unwrap();
-        let trackers = rt_db::list_torrent_trackers(&db, &info_hash).unwrap();
-        assert_eq!(trackers[0].url, "http://tracker.example/v2");
-        let placeholder_trackers = rt_db::list_torrent_trackers(&db, &placeholder_hash).unwrap();
-        assert_eq!(
-            placeholder_trackers[0].url,
-            "https://tracker.example/v2-placeholder"
-        );
-        let events = rt_db::list_session_events(&db, Some(&placeholder_hash), 10).unwrap();
-        assert!(events
-            .iter()
-            .any(|event| event.payload.contains("\"v2_only\":true")));
+        {
+            let db = engine.db.lock().unwrap();
+            let trackers = rt_db::list_torrent_trackers(&db, &info_hash).unwrap();
+            assert_eq!(trackers[0].url, "http://tracker.example/v2");
+            let placeholder_trackers =
+                rt_db::list_torrent_trackers(&db, &placeholder_hash).unwrap();
+            assert_eq!(
+                placeholder_trackers[0].url,
+                "https://tracker.example/v2-placeholder"
+            );
+            let events = rt_db::list_session_events(&db, Some(&placeholder_hash), 10).unwrap();
+            assert!(events
+                .iter()
+                .any(|event| event.payload.contains("\"v2_only\":true")));
+        }
+        engine.shutdown_torrent_tasks().await;
     }
 
     #[test]
