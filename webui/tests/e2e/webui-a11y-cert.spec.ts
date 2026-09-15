@@ -282,6 +282,10 @@ test('transient dialogs keep focus contained and have no serious automated acces
   test.skip(isMobile, 'desktop dialog certification uses the full workspace controls')
 
   async function assertDialogIsAccessible() {
+    // Axe must inspect the settled dialog. The modal entrance animation
+    // changes opacity for 140 ms; sampling during that transition blends the
+    // dialog text with the backdrop and creates a false contrast violation.
+    await expect(page.locator('[role="dialog"]').last()).toHaveCSS('opacity', '1')
     const results = await new AxeBuilder({ page })
       .include('[role="dialog"]')
       .withTags(['wcag2a', 'wcag2aa', 'wcag21a', 'wcag21aa'])
