@@ -4,21 +4,31 @@ services:
     build:
       context: ../..
       dockerfile: deploy/docker/Dockerfile
+      args:
+        TNG_UID: "${PUID:-1000}"
+        TNG_GID: "${PGID:-1000}"
+    user: "${PUID:-1000}:${PGID:-1000}"
     restart: unless-stopped
+    cap_drop:
+      - ALL
     security_opt:
-      - seccomp:unconfined
+      - no-new-privileges:true
     ports:
-      - "8080:8080"       # compatible-client WebUI/API (put nginx in front for production)
+      - "127.0.0.1:8080:8080" # compatible-client WebUI/API; use TLS for remote access
       - "50000:50000"     # rTorrent incoming port (adjust to match rtorrent.rc)
       - "50000:50000/udp"
     volumes:
-      - ./config:/config
+      - ./config:/config:ro
       - downloads:/data
       - session:/session
+      - torrentng-state:/var/lib/torrentng
     environment:
+      PUID: "${PUID:-1000}"
+      PGID: "${PGID:-1000}"
       TORRENTNG_CONFIG: /config/config.toml
       RTORRENT_INCOMING_PORT: "50000"
       RTORRENT_SCGI_SOCKET: /run/rtorrent/rpc.sock
+      TNG_RTORRENT_OVERLAY: /var/lib/torrentng/rtorrent-ui-overlay.rc
       TNG_SECRET_KEY: "${TNG_SECRET_KEY:?TNG_SECRET_KEY must be set to a random secret}"
       TNG_API_TOKENS: "${TNG_API_TOKENS:?TNG_API_TOKENS must be set to one or more tokens}"
       TNG_USER_AGENT: "${TNG_USER_AGENT:-rtorrent/0.16.11/0.16.11}"
@@ -35,144 +45,11 @@ services:
       timeout: 5s
       retries: 3
 
-  torrentng-qbittorrent:
-    image: torrentng:latest
-    profiles: ["qbittorrent"]
-    build:
-      context: ../..
-      dockerfile: deploy/docker/Dockerfile
-    restart: unless-stopped
-    ports:
-      - "8082:8080"
-    volumes:
-      - ./config-qbittorrent:/config
-      - downloads:/data
-    environment:
-      TORRENTNG_CONFIG: /config/config.toml
-      TNG_BACKEND: qbittorrent
-      TNG_QBITTORRENT_URL: http://qbittorrent:8080
-      TNG_QBITTORRENT_USERNAME: "${QBITTORRENT_USERNAME:-admin}"
-      TNG_QBITTORRENT_PASSWORD: "${QBITTORRENT_PASSWORD:-adminadmin}"
-      TNG_SECRET_KEY: "${TNG_SECRET_KEY:?TNG_SECRET_KEY must be set to a random secret}"
-      TNG_API_TOKENS: "${TNG_API_TOKENS:?TNG_API_TOKENS must be set to one or more tokens}"
-    depends_on:
-      - qbittorrent
-    healthcheck:
-      test: ["CMD", "/bin/sh", "-c", "wget -qO- http://localhost:8080/health >/dev/null"]
-      interval: 15s
-      timeout: 5s
-      retries: 3
-
-  qbittorrent:
-    image: lscr.io/linuxserver/qbittorrent:latest
-    profiles: ["qbittorrent"]
-    restart: unless-stopped
-    environment:
-      PUID: "1000"
-      PGID: "1000"
-      TZ: "${TZ:-UTC}"
-      WEBUI_PORT: "8080"
-    volumes:
-      - qbittorrent_config:/config
-      - downloads:/downloads
-    ports:
-      - "8081:8080"
-      - "6881:6881"
-      - "6881:6881/udp"
-
-  torrentng-transmission:
-    image: torrentng:latest
-    profiles: ["transmission"]
-    build:
-      context: ../..
-      dockerfile: deploy/docker/Dockerfile
-    restart: unless-stopped
-    ports:
-      - "8083:8080"
-    volumes:
-      - ./config-transmission:/config
-      - downloads:/data
-    environment:
-      TORRENTNG_CONFIG: /config/config.toml
-      TNG_BACKEND: transmission
-      TNG_TRANSMISSION_URL: http://transmission:9091/transmission/rpc
-      TNG_TRANSMISSION_USERNAME: "${TRANSMISSION_USERNAME:-}"
-      TNG_TRANSMISSION_PASSWORD: "${TRANSMISSION_PASSWORD:-}"
-      TNG_SECRET_KEY: "${TNG_SECRET_KEY:?TNG_SECRET_KEY must be set to a random secret}"
-      TNG_API_TOKENS: "${TNG_API_TOKENS:?TNG_API_TOKENS must be set to one or more tokens}"
-    depends_on:
-      - transmission
-    healthcheck:
-      test: ["CMD", "/bin/sh", "-c", "wget -qO- http://localhost:8080/health >/dev/null"]
-      interval: 15s
-      timeout: 5s
-      retries: 3
-
-  transmission:
-    image: lscr.io/linuxserver/transmission:latest
-    profiles: ["transmission"]
-    restart: unless-stopped
-    environment:
-      PUID: "1000"
-      PGID: "1000"
-      TZ: "${TZ:-UTC}"
-    volumes:
-      - transmission_config:/config
-      - downloads:/downloads
-    ports:
-      - "9091:9091"
-      - "51413:51413"
-      - "51413:51413/udp"
-
-  torrentng-deluge:
-    image: torrentng:latest
-    profiles: ["deluge"]
-    build:
-      context: ../..
-      dockerfile: deploy/docker/Dockerfile
-    restart: unless-stopped
-    ports:
-      - "8084:8080"
-    volumes:
-      - ./config-deluge:/config
-      - downloads:/data
-    environment:
-      TORRENTNG_CONFIG: /config/config.toml
-      TNG_BACKEND: deluge
-      TNG_DELUGE_URL: http://deluge:8112/json
-      TNG_DELUGE_PASSWORD: "${DELUGE_PASSWORD:-deluge}"
-      TNG_SECRET_KEY: "${TNG_SECRET_KEY:?TNG_SECRET_KEY must be set to a random secret}"
-      TNG_API_TOKENS: "${TNG_API_TOKENS:?TNG_API_TOKENS must be set to one or more tokens}"
-    depends_on:
-      - deluge
-    healthcheck:
-      test: ["CMD", "/bin/sh", "-c", "wget -qO- http://localhost:8080/health >/dev/null"]
-      interval: 15s
-      timeout: 5s
-      retries: 3
-
-  deluge:
-    image: lscr.io/linuxserver/deluge:latest
-    profiles: ["deluge"]
-    restart: unless-stopped
-    environment:
-      PUID: "1000"
-      PGID: "1000"
-      TZ: "${TZ:-UTC}"
-    volumes:
-      - deluge_config:/config
-      - downloads:/downloads
-    ports:
-      - "8112:8112"
-      - "58846:58846"
-      - "58946:58946"
-      - "58946:58946/udp"
-
   nginx:
     image: nginx:alpine
     restart: unless-stopped
     ports:
-      - "80:80"
+      - "127.0.0.1:80:80" # HTTP-only front door; terminate TLS before remote exposure
     volumes:
       - ../nginx/nginx.conf:/etc/nginx/conf.d/default.conf:ro
     depends_on:
@@ -181,6 +58,4 @@ services:
 volumes:
   downloads:
   session:
-  qbittorrent_config:
-  transmission_config:
-  deluge_config:
+  torrentng-state:

@@ -128,9 +128,13 @@ whether each app's own connection test accepts TorrentNG.
 
 | Host | Container | Service |
 |---|---:|---|
-| `18080` | `8080` | TorrentNG compatible-client service/WebUI |
-| `18989` | `8989` | Sonarr |
-| `17878` | `7878` | Radarr |
-| `19696` | `9696` | Prowlarr |
-| `17474` | `7474` | autobrr |
-| `12468` | `2468` | cross-seed |
+| `127.0.0.1:18080` | `8080` | TorrentNG compatible-client service/WebUI |
+| `127.0.0.1:18989` | `8989` | Sonarr |
+| `127.0.0.1:17878` | `7878` | Radarr |
+| `127.0.0.1:19696` | `9696` | Prowlarr |
+| `127.0.0.1:17474` | `7474` | autobrr |
+| `127.0.0.1:12468` | `2468` | cross-seed |
+
+These are local certification services with test-oriented credentials, so their
+management interfaces bind to loopback. The BitTorrent peer port remains
+published for transfer tests.

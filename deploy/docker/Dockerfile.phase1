@@ -36,11 +36,15 @@ RUN cd rtorrent && autoreconf -fi && \
 
 # Runtime image
 FROM base AS runtime
+ARG TNG_UID=1000
+ARG TNG_GID=1000
 
 RUN apk add --no-cache \
     php83 php83-fpm php83-json php83-session php83-curl php83-posix \
-    nginx curl ca-certificates tzdata \
-    libcurl ncurses tinyxml2 openssl zlib
+    nginx curl ca-certificates tini tzdata \
+    libcurl ncurses tinyxml2 openssl zlib \
+    && case "$TNG_UID" in ''|*[!0-9]*) echo "TNG_UID must be a nonzero numeric ID" >&2; exit 1;; *[1-9]*) :;; *) echo "TNG_UID must be a nonzero numeric ID" >&2; exit 1;; esac \
+    && case "$TNG_GID" in ''|*[!0-9]*) echo "TNG_GID must be a nonzero numeric ID" >&2; exit 1;; *[1-9]*) :;; *) echo "TNG_GID must be a nonzero numeric ID" >&2; exit 1;; esac
 
 # Copy built rTorrent (overrides distro package)
 COPY --from=rtorrent-build /usr/local/bin/rtorrent  /usr/local/bin/rtorrent
@@ -62,9 +66,24 @@ COPY deploy/docker/rtorrent.rc      /etc/rtorrent/rtorrent.rc
 COPY engine-profile/rtorrent.rc     /etc/rtorrent/profile.rc
 COPY deploy/nginx/nginx.phase1.conf /etc/nginx/http.d/default.conf
 COPY deploy/docker/entrypoint.phase1.sh /entrypoint.sh
-RUN chmod +x /entrypoint.sh
+RUN chmod +x /entrypoint.sh \
+    && sed -i '/^[[:space:]]*user[[:space:]]/d; s#^[[:space:]]*pid[[:space:]].*;#pid /run/nginx/nginx.pid;#' /etc/nginx/nginx.conf \
+    && sed -i 's/^worker_processes auto;/worker_processes 2;/' /etc/nginx/nginx.conf \
+    && sed -i '/^[[:space:]]*user[[:space:]]*=/d; /^[[:space:]]*group[[:space:]]*=/d' /etc/php83/php-fpm.d/www.conf \
+    && if ! grep -q '^[[:space:]]*pid[[:space:]]' /etc/nginx/nginx.conf; then \
+        sed -i '/^[[:space:]]*worker_processes/i pid /run/nginx/nginx.pid;' /etc/nginx/nginx.conf; \
+    fi \
+    && mkdir -p /data /session /config /run/rtorrent /run/nginx /run/php-fpm83 \
+        /var/log/rtorrent /var/log/nginx /var/log/php83 /var/lib/nginx /var/lib/php83/sessions \
+        /var/www/rutorrent/share/users \
+    && chown -R "$TNG_UID:$TNG_GID" /data /session /config /run/rtorrent /run/nginx \
+        /run/php-fpm83 /var/log/rtorrent /var/log/nginx /var/log/php83 /var/lib/nginx \
+        /var/lib/php83 /var/www/rutorrent/share \
+    && chmod 0750 /run/rtorrent /run/nginx /run/php-fpm83 /var/log/rtorrent \
+    && chmod -R u+rwX,g+rwX /var/www/rutorrent/share
 
 VOLUME ["/data", "/session", "/config"]
-EXPOSE 80 50000 50000/udp
+EXPOSE 8080 50000 50000/udp
 
-ENTRYPOINT ["/entrypoint.sh"]
+USER 1000:1000
+ENTRYPOINT ["/sbin/tini", "-g", "--", "/entrypoint.sh"]

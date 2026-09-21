@@ -3,25 +3,33 @@ services:
     build:
       context: ../..
       dockerfile: deploy/docker/Dockerfile.phase1
+      args:
+        TNG_UID: "${PUID:-1000}"
+        TNG_GID: "${PGID:-1000}"
+    user: "${PUID:-1000}:${PGID:-1000}"
     image: torrentng-phase1:latest
     container_name: torrentng-phase1
     restart: unless-stopped
+    cap_drop:
+      - ALL
     security_opt:
-      - seccomp:unconfined
+      - no-new-privileges:true
     ports:
-      - "${PHASE1_HTTP_PORT:-8080}:80"                       # ruTorrent web UI
-      - "${PHASE1_INCOMING_PORT:-50000}:50000"               # rTorrent incoming
-      - "${PHASE1_INCOMING_PORT:-50000}:50000/udp"
+      - "${PHASE1_HTTP_BIND:-127.0.0.1}:${PHASE1_HTTP_PORT:-8080}:8080" # unauthenticated ruTorrent UI: local by default
+      - "${PHASE1_INCOMING_PORT:-50000}:${PHASE1_CONTAINER_INCOMING_PORT:-50000}" # host:container rTorrent incoming
+      - "${PHASE1_INCOMING_PORT:-50000}:${PHASE1_CONTAINER_INCOMING_PORT:-50000}/udp"
     volumes:
-      - ./config:/config          # optional user config overlay
+      - ./config:/config:ro       # optional user config overlay
       - downloads:/data           # download directory
       - session:/session          # rTorrent session
     environment:
       TZ: UTC
-      RTORRENT_INCOMING_PORT: "${PHASE1_INCOMING_PORT:-50000}"
+      PUID: "${PUID:-1000}"
+      PGID: "${PGID:-1000}"
+      RTORRENT_INCOMING_PORT: "${PHASE1_CONTAINER_INCOMING_PORT:-50000}"
       RTORRENT_SCGI_SOCKET: /run/rtorrent/rpc.sock
     healthcheck:
-      test: ["CMD", "/bin/sh", "-c", "test -S /run/rtorrent/rpc.sock && curl -sf http://127.0.0.1/ >/dev/null"]
+      test: ["CMD", "/bin/sh", "-c", "test -S /run/rtorrent/rpc.sock && curl -sf http://127.0.0.1:8080/ >/dev/null && curl -sf http://127.0.0.1:8080/php/getsettings.php >/dev/null"]
       interval: 30s
       timeout: 10s
       retries: 3

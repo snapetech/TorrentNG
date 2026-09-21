@@ -6,7 +6,7 @@ services:
       dockerfile: deploy/native/Dockerfile
     restart: unless-stopped
     ports:
-      - "28082:8080"
+      - "127.0.0.1:28082:8080"
       - "44444:44444"
       - "44444:44444/udp"
     volumes:
@@ -30,7 +30,7 @@ services:
     profiles: ["observability"]
     restart: unless-stopped
     ports:
-      - "9090:9090"
+      - "127.0.0.1:9090:9090"
     volumes:
       - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
       - ./torrentngd.rules.yml:/etc/prometheus/torrentngd.rules.yml:ro
@@ -44,7 +44,7 @@ services:
     profiles: ["observability"]
     restart: unless-stopped
     ports:
-      - "3000:3000"
+      - "127.0.0.1:3000:3000"
     volumes:
       - grafana-data:/var/lib/grafana
       - ./grafana/provisioning:/etc/grafana/provisioning:ro

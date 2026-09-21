@@ -22,6 +22,7 @@ read_from_start = false
 secret_key = "change-me"
 api_tokens = []
 trust_proxy_header = false
+secure_cookies = true
 
 [logging]
 format = "json"

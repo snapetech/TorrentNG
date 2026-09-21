@@ -70,7 +70,11 @@ RUN cd rtorrent && autoreconf -fi && \
 
 # Stage 4: Runtime
 FROM alpine:3.20
-RUN apk add --no-cache ca-certificates curl libcurl ncurses openssl socat tinyxml2 tzdata zlib
+ARG TNG_UID=1000
+ARG TNG_GID=1000
+RUN apk add --no-cache ca-certificates curl libcurl ncurses openssl socat tinyxml2 tini tzdata zlib \
+    && case "$TNG_UID" in ''|*[!0-9]*) echo "TNG_UID must be a nonzero numeric ID" >&2; exit 1;; *[1-9]*) :;; *) echo "TNG_UID must be a nonzero numeric ID" >&2; exit 1;; esac \
+    && case "$TNG_GID" in ''|*[!0-9]*) echo "TNG_GID must be a nonzero numeric ID" >&2; exit 1;; *[1-9]*) :;; *) echo "TNG_GID must be a nonzero numeric ID" >&2; exit 1;; esac
 
 COPY --from=torrentng-service-build /src/sidecar/target/release/torrentng /usr/local/bin/torrentng
 COPY --from=webui-build   /sidecar/static /usr/share/torrentng/webui
@@ -81,7 +85,10 @@ COPY deploy/docker/rtorrent.rc    /etc/rtorrent/rtorrent.rc
 COPY engine-profile/rtorrent.rc   /etc/rtorrent/profile.rc
 COPY deploy/docker/sidecar.config.toml /etc/torrentng/config.toml
 COPY deploy/docker/entrypoint.sh  /entrypoint.sh
-RUN chmod +x /entrypoint.sh
+RUN chmod +x /entrypoint.sh \
+    && mkdir -p /data /session /config /var/lib/torrentng /var/log/rtorrent /run/rtorrent \
+    && chown -R "$TNG_UID:$TNG_GID" /data /session /config /var/lib/torrentng /var/log/rtorrent /run/rtorrent \
+    && chmod 0750 /run/rtorrent /var/log/rtorrent
 
 ENV TNG_STATIC_DIR=/usr/share/torrentng/webui
 ENV LD_LIBRARY_PATH=/usr/local/lib
@@ -92,7 +99,8 @@ ENV TNG_RTORRENT_PATCHES=rtorrent-0.16.11-user-agent-command,rtorrent-0.16.11-lo
 LABEL org.opencontainers.image.title="TorrentNG Compatible-Client Service" \
       org.opencontainers.image.description="TorrentNG compatible-client WebUI/API service for existing qBittorrent, rTorrent, Transmission, and Deluge deployments."
 
-VOLUME ["/data", "/session", "/config"]
+VOLUME ["/data", "/session", "/config", "/var/lib/torrentng"]
 EXPOSE 8080 50000 50000/udp
 
-ENTRYPOINT ["/entrypoint.sh"]
+USER 1000:1000
+ENTRYPOINT ["/sbin/tini", "-g", "--", "/entrypoint.sh"]

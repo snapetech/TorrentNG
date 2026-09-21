@@ -1,23 +1,73 @@
 #!/bin/sh
 set -e
 
+if [ "$(id -u)" -eq 0 ]; then
+  echo "Refusing to run the compatible-client service as root" >&2
+  exit 1
+fi
+
 RTORRENT_SOCKET=${RTORRENT_SCGI_SOCKET:-/run/rtorrent/rpc.sock}
-CONFIG_FILE=${TORRENTNG_CONFIG:-${RTORRENTNG_CONFIG:-/config/config.toml}}
+CONFIG_FILE=${TORRENTNG_CONFIG:-/config/config.toml}
 INCOMING_PORT=${RTORRENT_INCOMING_PORT:-50000}
 BACKEND=${TNG_BACKEND:-rtorrent}
 export TERM="${TERM:-xterm}"
+umask 0002
 
 mkdir -p /run/rtorrent /session /data /var/lib/torrentng /var/log/rtorrent /config
 rm -f "$RTORRENT_SOCKET" /session/rtorrent.lock
 
-if [ -f /config/rtorrent.rc ]; then
-  cp /config/rtorrent.rc /etc/rtorrent/user.rc
+if [ -r /config/rtorrent.rc ]; then
+  cp /config/rtorrent.rc /run/rtorrent/user.rc
 else
-  : > /etc/rtorrent/user.rc
+  : > /run/rtorrent/user.rc
 fi
 
-if [ ! -f "$CONFIG_FILE" ]; then
-  cp /etc/torrentng/config.toml "$CONFIG_FILE"
+if [ "$BACKEND" = "rtorrent" ] && [ -n "${TNG_RTORRENT_OVERLAY:-}" ]; then
+  RTORRENT_UI_OVERLAY=$TNG_RTORRENT_OVERLAY
+  case "$RTORRENT_UI_OVERLAY" in
+    /*) ;;
+    *)
+      echo "TNG_RTORRENT_OVERLAY must be an absolute path" >&2
+      exit 1
+      ;;
+  esac
+  case "$RTORRENT_UI_OVERLAY" in
+    *[!A-Za-z0-9_./-]*)
+      echo "TNG_RTORRENT_OVERLAY contains unsupported path characters" >&2
+      exit 1
+      ;;
+  esac
+  if [ "${#RTORRENT_UI_OVERLAY}" -gt 4096 ]; then
+    echo "TNG_RTORRENT_OVERLAY exceeds the path length limit" >&2
+    exit 1
+  fi
+  if [ -L "$RTORRENT_UI_OVERLAY" ]; then
+    echo "TNG_RTORRENT_OVERLAY must not be a symlink" >&2
+    exit 1
+  elif [ ! -e "$RTORRENT_UI_OVERLAY" ]; then
+    if ! (umask 0077; set -C; : > "$RTORRENT_UI_OVERLAY") 2>/dev/null; then
+      if [ ! -f "$RTORRENT_UI_OVERLAY" ] || [ -L "$RTORRENT_UI_OVERLAY" ]; then
+        echo "Cannot create TNG_RTORRENT_OVERLAY" >&2
+        exit 1
+      fi
+    fi
+  fi
+  if [ ! -f "$RTORRENT_UI_OVERLAY" ] || [ -L "$RTORRENT_UI_OVERLAY" ]; then
+    echo "TNG_RTORRENT_OVERLAY must be a regular file" >&2
+    exit 1
+  fi
+  if ! grep -Fqx "import = $RTORRENT_UI_OVERLAY" /run/rtorrent/user.rc; then
+    printf '\nimport = %s\n' "$RTORRENT_UI_OVERLAY" >> /run/rtorrent/user.rc
+  fi
+fi
+
+if [ ! -r "$CONFIG_FILE" ]; then
+  if [ "$CONFIG_FILE" = /config/config.toml ]; then
+    CONFIG_FILE=/etc/torrentng/config.toml
+  else
+    echo "TorrentNG config is missing or unreadable: $CONFIG_FILE" >&2
+    exit 1
+  fi
 fi
 
 if [ "$BACKEND" = "rtorrent" ]; then

@@ -7,7 +7,7 @@ storage_roots = ["/data"]
 type = "rtorrent"
 
 [rtorrent]
-scgi_socket = "/run/rtorrent/rpc.sock"
+    scgi_socket = "/run/rtorrent/rpc.sock"
 timeout_secs = 10
 identity_timeout_secs = 300
 user_agent = "rtorrent/0.16.11/0.16.11"
@@ -25,6 +25,7 @@ read_from_start = false
 secret_key = "change-me"
 api_tokens = []
 trust_proxy_header = false
+secure_cookies = true
 
 [logging]
 format = "json"

@@ -1,0 +1,59 @@
+services:
+  torrentng-deluge:
+    image: torrentng:latest
+    profiles: ["deluge"]
+    build:
+      context: ../..
+      dockerfile: deploy/docker/Dockerfile
+      args:
+        TNG_UID: "${PUID:-1000}"
+        TNG_GID: "${PGID:-1000}"
+    user: "${PUID:-1000}:${PGID:-1000}"
+    restart: unless-stopped
+    cap_drop: [ALL]
+    security_opt:
+      - no-new-privileges:true
+    ports:
+      - "127.0.0.1:8084:8080"
+    volumes:
+      - ./config-deluge:/config:ro
+      - downloads:/data
+      - torrentng-deluge-state:/var/lib/torrentng
+    environment:
+      PUID: "${PUID:-1000}"
+      PGID: "${PGID:-1000}"
+      TORRENTNG_CONFIG: /config/config.toml
+      TNG_BACKEND: deluge
+      TNG_DELUGE_URL: http://deluge:8112/json
+      TNG_DELUGE_PASSWORD: "${DELUGE_PASSWORD:?DELUGE_PASSWORD must be set for this profile}"
+      TNG_SECRET_KEY: "${TNG_SECRET_KEY:?TNG_SECRET_KEY must be set to a random secret}"
+      TNG_API_TOKENS: "${TNG_API_TOKENS:?TNG_API_TOKENS must be set to one or more tokens}"
+    depends_on:
+      - deluge
+    healthcheck:
+      test: ["CMD", "/bin/sh", "-c", "wget -qO- http://localhost:8080/health >/dev/null"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+
+  deluge:
+    image: lscr.io/linuxserver/deluge:latest
+    profiles: ["deluge"]
+    restart: unless-stopped
+    environment:
+      PUID: "${PUID:-1000}"
+      PGID: "${PGID:-1000}"
+      TZ: "${TZ:-UTC}"
+    volumes:
+      - deluge_config:/config
+      - downloads:/downloads
+    ports:
+      - "127.0.0.1:8112:8112"
+      - "127.0.0.1:58846:58846"
+      - "58946:58946"
+      - "58946:58946/udp"
+
+volumes:
+  downloads:
+  torrentng-deluge-state:
+  deluge_config:
