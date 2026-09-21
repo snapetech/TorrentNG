@@ -2,6 +2,8 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# shellcheck source=scripts/curl_policy.sh
+source "$ROOT/scripts/curl_policy.sh"
 OUT="${1:-$ROOT/certification/reports/native-engine-$(date -u +%Y%m%dT%H%M%SZ).md}"
 
 mkdir -p "$(dirname "$OUT")"

@@ -2,6 +2,8 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# shellcheck source=scripts/curl_policy.sh
+source "$ROOT/scripts/curl_policy.sh"
 OUT="${1:-$ROOT/certification/reports/phase1-cert-$(date -u +%Y%m%dT%H%M%SZ).md}"
 CONTAINER="${PHASE1_CONTAINER:-torrentng-phase1}"
 HTTP_URL="${PHASE1_HTTP_URL:-http://localhost:${PHASE1_HTTP_PORT:-8080}}"
@@ -10,25 +12,26 @@ EXPECTED_RUTORRENT="${PHASE1_EXPECTED_RUTORRENT:-5.3.1}"
 CONTAINER_INCOMING_PORT="${PHASE1_CONTAINER_INCOMING_PORT:-50000}"
 HOST_INCOMING_PORT="${PHASE1_INCOMING_PORT:-50000}"
 BODY="$(mktemp)"
+HEADERS="$(mktemp)"
 
 mkdir -p "$(dirname "$OUT")"
 
-mapped_http="$(docker port "$CONTAINER" 80/tcp 2>/dev/null | sed -n 's/.*:\([0-9][0-9]*\)$/\1/p' | head -1 || true)"
+mapped_http="$(docker port "$CONTAINER" 8080/tcp 2>/dev/null | sed -n 's/.*:\([0-9][0-9]*\)$/\1/p' | head -1 || true)"
 if [[ -n "$mapped_http" && "$HTTP_URL" == http://localhost:* ]]; then
   HTTP_URL="http://localhost:$mapped_http"
 fi
 
-mapped_incoming="$(docker port "$CONTAINER" 50000/tcp 2>/dev/null | sed -n 's/.*:\([0-9][0-9]*\)$/\1/p' | head -1 || true)"
-if [[ -n "$mapped_incoming" ]]; then
-  HOST_INCOMING_PORT="$mapped_incoming"
-fi
 container_env_port="$(docker exec "$CONTAINER" sh -lc 'printf "%s" "${RTORRENT_INCOMING_PORT:-}"' 2>/dev/null || true)"
 if [[ "$container_env_port" =~ ^[0-9]+$ ]]; then
   CONTAINER_INCOMING_PORT="$container_env_port"
 fi
+mapped_incoming="$(docker port "$CONTAINER" "$CONTAINER_INCOMING_PORT/tcp" 2>/dev/null | sed -n 's/.*:\([0-9][0-9]*\)$/\1/p' | head -1 || true)"
+if [[ -n "$mapped_incoming" ]]; then
+  HOST_INCOMING_PORT="$mapped_incoming"
+fi
 
 cleanup() {
-  rm -f "$BODY"
+  rm -f "$BODY" "$HEADERS"
 }
 trap cleanup EXIT
 
@@ -51,7 +54,7 @@ container_exec() {
 }
 
 http_code() {
-  curl -ksS -o "$BODY" -w '%{http_code}' "$HTTP_URL$1" || true
+  curl -q -sS --noproxy "*" -D "$HEADERS" -o "$BODY" -w '%{http_code}' "$HTTP_URL$1" || true
 }
 
 {
@@ -73,9 +76,11 @@ http_code() {
 
 if docker inspect "$CONTAINER" >/dev/null 2>&1; then
   health="$(docker inspect -f '{{if .State.Health}}{{.State.Health.Status}}{{else}}{{.State.Status}}{{end}}' "$CONTAINER" 2>/dev/null || true)"
-  [[ "$health" == "healthy" || "$health" == "running" ]] \
-    && mark "container health" "PASS" "$health" \
-    || mark "container health" "FAIL" "${health:-unknown}"
+  if [[ "$health" == "healthy" || "$health" == "running" ]]; then
+    mark "container health" "PASS" "$health"
+  else
+    mark "container health" "FAIL" "${health:-unknown}"
+  fi
 else
   mark "container exists" "FAIL" "$CONTAINER not found"
   echo >> "$OUT"
@@ -91,11 +96,21 @@ else
   mark "ruTorrent HTTP" "FAIL" "HTTP $code"
 fi
 
+code="$(http_code /php/getsettings.php)"
+content_type="$(sed -n 's/^[Cc]ontent-[Tt]ype:[[:space:]]*//p' "$HEADERS" | tr -d '\r' | tail -1)"
+if [[ "$code" == "200" && "$content_type" == application/json* ]] && grep -Eq '^[[:space:]]*[{]' "$BODY" && ! grep -qi '<?php' "$BODY"; then
+  mark "ruTorrent PHP runtime" "PASS" "HTTP 200 JSON from PHP-FPM ($content_type)"
+else
+  mark "ruTorrent PHP runtime" "FAIL" "HTTP $code, content type ${content_type:-unknown}, or PHP response was invalid"
+fi
+
 rt_version="$(container_exec "rtorrent -h 2>&1 | sed -n 's/^Rakshasa.*version \\([0-9.]*\\).*/\\1/p' | head -1")"
 rt_version="${rt_version%.}"
-[[ "$rt_version" == "$EXPECTED_RTORRENT" ]] \
-  && mark "rTorrent version" "PASS" "$rt_version" \
-  || mark "rTorrent version" "FAIL" "expected $EXPECTED_RTORRENT got ${rt_version:-unknown}"
+if [[ "$rt_version" == "$EXPECTED_RTORRENT" ]]; then
+  mark "rTorrent version" "PASS" "$rt_version"
+else
+  mark "rTorrent version" "FAIL" "expected $EXPECTED_RTORRENT got ${rt_version:-unknown}"
+fi
 
 lib_version="$(container_exec "strings /usr/local/lib/libtorrent.so* 2>/dev/null | grep -m1 -E '^$EXPECTED_RTORRENT$' || true")"
 if [[ "$lib_version" == "$EXPECTED_RTORRENT" ]]; then
@@ -112,19 +127,37 @@ else
 fi
 
 php_version="$(container_exec "php -r 'echo PHP_VERSION;'")"
-[[ "$php_version" == 8.3.* ]] \
-  && mark "PHP version" "PASS" "$php_version" \
-  || mark "PHP version" "FAIL" "expected 8.3.x got ${php_version:-unknown}"
+if [[ "$php_version" == 8.3.* ]]; then
+  mark "PHP version" "PASS" "$php_version"
+else
+  mark "PHP version" "FAIL" "expected 8.3.x got ${php_version:-unknown}"
+fi
 
 nginx_version="$(container_exec "nginx -v 2>&1")"
-[[ "$nginx_version" == *"nginx/"* ]] \
-  && mark "nginx version" "PASS" "$nginx_version" \
-  || mark "nginx version" "FAIL" "${nginx_version:-unknown}"
+if [[ "$nginx_version" == *"nginx/"* ]]; then
+  mark "nginx version" "PASS" "$nginx_version"
+else
+  mark "nginx version" "FAIL" "${nginx_version:-unknown}"
+fi
 
 if container_exec "test -S /run/rtorrent/rpc.sock && test -r /run/rtorrent/rpc.sock && test -w /run/rtorrent/rpc.sock && echo ok" | grep -q '^ok$'; then
   mark "SCGI socket" "PASS" "/run/rtorrent/rpc.sock readable/writable socket"
 else
   mark "SCGI socket" "FAIL" "missing or inaccessible /run/rtorrent/rpc.sock"
+fi
+
+runtime_uid="$(container_exec 'id -u')"
+if [[ "$runtime_uid" =~ ^[1-9][0-9]*$ ]]; then
+  mark "non-root runtime" "PASS" "UID $runtime_uid"
+else
+  mark "non-root runtime" "FAIL" "expected a nonzero UID, got ${runtime_uid:-unknown}"
+fi
+
+nginx_processes="$(container_exec "pgrep nginx | wc -l | tr -d '[:space:]'")"
+if [[ "$nginx_processes" =~ ^[0-9]+$ ]] && (( nginx_processes <= 3 )); then
+  mark "bounded nginx workers" "PASS" "$nginx_processes total nginx processes"
+else
+  mark "bounded nginx workers" "FAIL" "expected at most 3 nginx processes, got ${nginx_processes:-unknown}"
 fi
 
 for proc in rtorrent nginx php-fpm83; do

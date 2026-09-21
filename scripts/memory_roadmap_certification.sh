@@ -34,7 +34,7 @@ row() {
 report_link() {
   local file="$1"
   if [[ -n "$file" ]]; then
-    printf '%s' "${file#$ROOT/}"
+    printf '%s' "${file#"$ROOT"/}"
   else
     printf 'missing'
   fi

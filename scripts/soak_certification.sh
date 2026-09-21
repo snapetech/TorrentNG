@@ -2,6 +2,8 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# shellcheck source=scripts/curl_policy.sh
+source "$ROOT/scripts/curl_policy.sh"
 OUT="${1:-$ROOT/certification/reports/soak-$(date -u +%Y%m%dT%H%M%SZ).md}"
 TNG_HOST_URL="${TNG_HOST_URL:-http://localhost:${TNG_HOST_PORT:-18080}}"
 TNG_API_TOKEN="${TNG_API_TOKEN:-local-cert-api-token-20260904}"
@@ -21,18 +23,39 @@ BODY="$(mktemp)"
 HEALTH_BODY="$(mktemp)"
 METRICS_BODY="$(mktemp)"
 TORRENTS_BODY="$(mktemp)"
+AUTH_HEADER_FILE="$(mktemp)"
 
-mkdir -p "$(dirname "$OUT")"
+cleanup() {
+  rm -f "$COOKIE_JAR" "$BODY" "$HEALTH_BODY" "$METRICS_BODY" "$TORRENTS_BODY" "$AUTH_HEADER_FILE"
+}
+trap cleanup EXIT
+
+if [[ ! "$TNG_CONTAINER" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$ ]]; then
+  echo "TNG_CONTAINER must be a Docker container name or ID" >&2
+  exit 2
+fi
+if [[ "$SOAK_DATA_PATH" != /* || "$SOAK_DATA_PATH" == *$'\n'* || "$SOAK_DATA_PATH" == *$'\r'* ]]; then
+  echo "SOAK_DATA_PATH must be an absolute path without line breaks" >&2
+  exit 2
+fi
 
 mapped="$(docker port "$TNG_CONTAINER" 8080/tcp 2>/dev/null | sed -n 's/.*:\([0-9][0-9]*\)$/\1/p' | head -1 || true)"
 if [[ -n "$mapped" && "$TNG_HOST_URL" == http://localhost:* ]]; then
   TNG_HOST_URL="http://localhost:$mapped"
 fi
 
-cleanup() {
-  rm -f "$COOKIE_JAR" "$BODY" "$HEALTH_BODY" "$METRICS_BODY" "$TORRENTS_BODY"
+python3 "$ROOT/scripts/protected_target.py" "$TNG_HOST_URL"
+if [[ "$TNG_API_TOKEN" == *$'\n'* || "$TNG_API_TOKEN" == *$'\r'* ]]; then
+  echo "TNG_API_TOKEN must not contain line breaks" >&2
+  exit 2
+fi
+printf 'Authorization: Bearer %s\n' "$TNG_API_TOKEN" > "$AUTH_HEADER_FILE"
+chmod 0600 "$AUTH_HEADER_FILE"
+
+curl_protected() {
+  curl -q --silent --show-error --noproxy '*' \
+    --connect-timeout 5 --max-time 20 --proto '=http,https' "$@"
 }
-trap cleanup EXIT
 
 status="PASS"
 
@@ -60,7 +83,7 @@ fd_count() {
 }
 
 disk_free_mb() {
-  docker exec "$TNG_CONTAINER" df -Pm "$SOAK_DATA_PATH" |
+  docker exec "$TNG_CONTAINER" df -Pm -- "$SOAK_DATA_PATH" |
     awk 'NR == 2 {print $4; exit}'
 }
 
@@ -86,7 +109,12 @@ disk_free_mb() {
   echo "|---|---|---|"
 } > "$OUT"
 
-code="$(curl -ksS -o "$BODY" -w '%{http_code}' "$TNG_HOST_URL/api/qb/v2/auth/login" -X POST -d "username=$TNG_API_TOKEN" -d "password=$TNG_API_TOKEN" -c "$COOKIE_JAR")"
+auth_payload="$(python3 -c 'import os; from urllib.parse import urlencode; token = os.environ["TNG_API_TOKEN"]; print(urlencode({"username": token, "password": token}))')"
+code="$(printf '%s' "$auth_payload" | curl_protected -o "$BODY" -w '%{http_code}' \
+  "$TNG_HOST_URL/api/qb/v2/auth/login" -X POST \
+  -H 'Content-Type: application/x-www-form-urlencoded' \
+  --data-binary @- -c "$COOKIE_JAR" || true)"
+unset auth_payload
 if [[ "$code" == "200" ]]; then
   mark "qBit auth" "PASS" "session cookie accepted"
 else
@@ -110,9 +138,9 @@ bad_sync=0
 bad_expected=0
 while (( SECONDS < deadline || samples == 0 )); do
   now="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-  health="$(curl -ksS -o "$HEALTH_BODY" -w '%{http_code}' \
-    -H "Authorization: Bearer $TNG_API_TOKEN" "$TNG_HOST_URL/health" || true)"
-  curl -ksS -o "$TORRENTS_BODY" -b "$COOKIE_JAR" \
+  health="$(curl_protected -o "$HEALTH_BODY" -w '%{http_code}' \
+    -H "@$AUTH_HEADER_FILE" "$TNG_HOST_URL/health" || true)"
+  curl_protected -o "$TORRENTS_BODY" -b "$COOKIE_JAR" \
     "$TNG_HOST_URL/api/qb/v2/torrents/info?limit=$SOAK_LIST_LIMIT" || true
   torrents="$(jq 'length' "$TORRENTS_BODY" 2>/dev/null || echo 0)"
   if [[ -n "$SOAK_EXPECTED_TORRENT_NAME" ]]; then
@@ -129,9 +157,9 @@ while (( SECONDS < deadline || samples == 0 )); do
       bad_expected=$((bad_expected + 1))
     fi
   fi
-  sync_code="$(curl -ksS -o "$BODY" -w '%{http_code}' -b "$COOKIE_JAR" "$TNG_HOST_URL/api/qb/v2/sync/maindata?rid=0" || true)"
-  metrics_code="$(curl -ksS -o "$METRICS_BODY" -w '%{http_code}' \
-    -H "Authorization: Bearer $TNG_API_TOKEN" "$TNG_HOST_URL/metrics" || true)"
+  sync_code="$(curl_protected -o "$BODY" -w '%{http_code}' -b "$COOKIE_JAR" "$TNG_HOST_URL/api/qb/v2/sync/maindata?rid=0" || true)"
+  metrics_code="$(curl_protected -o "$METRICS_BODY" -w '%{http_code}' \
+    -H "@$AUTH_HEADER_FILE" "$TNG_HOST_URL/metrics" || true)"
   rss="$(rss_mb)"
   fds="$(fd_count)"
   threads="$(process_field Threads:)"

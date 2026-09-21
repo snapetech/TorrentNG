@@ -2,9 +2,11 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# shellcheck source=scripts/curl_policy.sh
+source "$ROOT/scripts/curl_policy.sh"
 ENV_FILE="${CERT_ENV_FILE:-$ROOT/deploy/certification/.env}"
 COMPOSE_FILE="${CERT_COMPOSE_FILE:-$ROOT/deploy/certification/compose.yml}"
-OUT="${1:-$ROOT/certification/reports/live-cert-$(date -u +%Y%m%dT%H%M%SZ).md}"
+OUT="${1:-$ROOT/certification/reports/live-cert-$(date -u +%Y%m%dT%H%M%SZ)-$$.md}"
 
 ENV_TNG_HOST_URL="${TNG_HOST_URL:-}"
 ENV_SONARR_HOST_URL="${SONARR_HOST_URL:-}"
@@ -28,12 +30,26 @@ PROWLARR_HOST_URL="${ENV_PROWLARR_HOST_URL:-${PROWLARR_HOST_URL:-http://localhos
 AUTOBRR_HOST_URL="${ENV_AUTOBRR_HOST_URL:-${AUTOBRR_HOST_URL:-http://localhost:${AUTOBRR_HOST_PORT:-17474}}}"
 CROSS_SEED_HOST_URL="${ENV_CROSS_SEED_HOST_URL:-${CROSS_SEED_HOST_URL:-http://localhost:${CROSS_SEED_HOST_PORT:-12468}}}"
 
+for protected_url in "$TNG_HOST_URL" "$SONARR_HOST_URL" "$RADARR_HOST_URL" \
+  "$PROWLARR_HOST_URL" "$AUTOBRR_HOST_URL" "$CROSS_SEED_HOST_URL"; do
+  python3 "$ROOT/scripts/protected_target.py" "$protected_url"
+done
+
+BODY="$(mktemp "${TMPDIR:-/tmp}/tng-cert-body.XXXXXX")"
+COOKIE_JAR="$(mktemp "${TMPDIR:-/tmp}/tng-cert-cookies.XXXXXX")"
+AUTH_BODY_FILE="$(mktemp "${TMPDIR:-/tmp}/tng-cert-auth.XXXXXX")"
+cleanup() {
+  rm -f -- "$BODY" "$COOKIE_JAR" "$AUTH_BODY_FILE"
+}
+trap cleanup EXIT
+tng_write_qbit_login_body "$TNG_API_TOKEN" "$AUTH_BODY_FILE"
+
 mkdir -p "$(dirname "$OUT")"
 
 if [[ "${CERT_START_STACK:-0}" == "1" ]]; then
   docker compose --env-file "$ENV_FILE" -f "$COMPOSE_FILE" up -d --build
   for _ in $(seq 1 30); do
-    code="$(curl -ksS -o /dev/null -w '%{http_code}' "$TNG_HOST_URL/health" || true)"
+    code="$(curl -q -sS --noproxy "*" -o /dev/null -w '%{http_code}' "$TNG_HOST_URL/health" || true)"
     [[ "$code" == "200" || "$code" == "503" ]] && break
     sleep 1
   done
@@ -54,7 +70,7 @@ mark() {
 http_code() {
   local url="$1"
   shift || true
-  curl -ksS -o /tmp/tng-cert-body.txt -w '%{http_code}' "$@" "$url" || true
+  curl -q -sS --noproxy "*" -o "$BODY" -w '%{http_code}' "$@" "$url" || true
 }
 
 {
@@ -78,8 +94,8 @@ else
   mark "compatible-client service health endpoint" "FAIL" "HTTP $code"
 fi
 
-code="$(http_code "$TNG_HOST_URL/api/qb/v2/auth/login" -X POST -d "username=$TNG_API_TOKEN" -d "password=$TNG_API_TOKEN" -c /tmp/tng-cert-cookies.txt)"
-body="$(cat /tmp/tng-cert-body.txt 2>/dev/null || true)"
+code="$(http_code "$TNG_HOST_URL/api/qb/v2/auth/login" -X POST --data-binary "@$AUTH_BODY_FILE" -c "$COOKIE_JAR")"
+body="$(cat "$BODY" 2>/dev/null || true)"
 if [[ "$code" == "200" && "$body" == "Ok." ]]; then
   mark "qBit auth login" "PASS" "session cookie accepted"
 else
@@ -95,7 +111,7 @@ for endpoint in \
   "/api/qb/v2/torrents/categories" \
   "/api/qb/v2/torrents/tags" \
   "/api/qb/v2/sync/maindata"; do
-  code="$(http_code "$TNG_HOST_URL$endpoint" -b /tmp/tng-cert-cookies.txt)"
+  code="$(http_code "$TNG_HOST_URL$endpoint" -b "$COOKIE_JAR")"
   if [[ "$code" == "200" ]]; then
     mark "qBit $endpoint" "PASS" "HTTP 200"
   else
@@ -112,7 +128,7 @@ fi
 
 code="$(http_code "$TNG_HOST_URL/api/v1/settings/user-agent" -H "Authorization: Bearer $TNG_API_TOKEN")"
 if [[ "$code" == "200" ]]; then
-  body="$(cat /tmp/tng-cert-body.txt 2>/dev/null || true)"
+  body="$(cat "$BODY" 2>/dev/null || true)"
   mark "rTorrent tracker user-agent control" "PASS" "current ${body:-unknown}"
 else
   mark "rTorrent tracker user-agent control" "BLOCKED" "HTTP $code; bundled rTorrent may not expose network.http.user_agent"
@@ -138,7 +154,7 @@ done
   echo "## Integration Gates"
   echo
   echo "- Run \`scripts/configure_certification_clients.sh\` to configure and test Sonarr/Radarr/Prowlarr/autobrr qBittorrent clients against \`torrentng:8080\`."
-  echo "- Configure cross-seed qBittorrent URL as \`http://$TNG_API_TOKEN:$TNG_API_TOKEN@torrentng:8080\` where supported."
+  echo '- Configure cross-seed qBittorrent URL as `http://<token>:<token>@torrentng:8080` where supported.'
   echo "- Use tracker/indexer or local fixture releases for full add-torrent job certification."
   echo
   echo "Overall status: $status"

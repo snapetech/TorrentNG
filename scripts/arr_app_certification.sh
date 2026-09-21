@@ -2,8 +2,10 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# shellcheck source=scripts/curl_policy.sh
+source "$ROOT/scripts/curl_policy.sh"
 ENV_FILE="${CERT_ENV_FILE:-$ROOT/deploy/certification/.env}"
-OUT="${1:-$ROOT/certification/reports/arr-app-$(date -u +%Y%m%dT%H%M%SZ).md}"
+OUT="${1:-$ROOT/certification/reports/arr-app-$(date -u +%Y%m%dT%H%M%SZ)-$$.md}"
 
 if [[ -f "$ENV_FILE" ]]; then
   set -a
@@ -15,20 +17,44 @@ fi
 TNG_CONTAINER="${TNG_CONTAINER:-certification-torrentng-1}"
 SONARR_CONTAINER="${SONARR_CONTAINER:-certification-sonarr-1}"
 RADARR_CONTAINER="${RADARR_CONTAINER:-certification-radarr-1}"
+TNG_API_TOKEN="${TNG_API_TOKEN:-local-cert-api-token-20260904}"
 NETWORK="${CERT_DOCKER_NETWORK:-certification_default}"
 DOWNLOADS_VOLUME="${CERT_DOWNLOADS_VOLUME:-certification_downloads}"
 FIXTURE_BYTES="${FIXTURE_BYTES:-1048576}"
 ARR_GRAB="${ARR_GRAB:-0}"
-FIXTURE_ID="arr-$(date -u +%Y%m%dT%H%M%SZ)"
+if [[ ! "$FIXTURE_BYTES" =~ ^[0-9]{1,8}$ ]]; then
+  echo "FIXTURE_BYTES must be an integer between 1 and 67108864" >&2
+  exit 2
+fi
+FIXTURE_BYTES=$((10#$FIXTURE_BYTES))
+if (( FIXTURE_BYTES < 1 || FIXTURE_BYTES > 67108864 )); then
+  echo "FIXTURE_BYTES must be an integer between 1 and 67108864" >&2
+  exit 2
+fi
+if [[ "$ARR_GRAB" != "0" && "$ARR_GRAB" != "1" ]]; then
+  echo "ARR_GRAB must be 0 or 1" >&2
+  exit 2
+fi
+FIXTURE_ID="arr-$(date -u +%Y%m%dT%H%M%S)-$$"
+FIXTURE_DOWNLOAD_DIR="cert-arr-fixture-$FIXTURE_ID"
 TRACKER_NAME="tng-arr-tracker-$FIXTURE_ID"
 SONARR_SEEDER_NAME="tng-arr-sonarr-seeder-$FIXTURE_ID"
 RADARR_SEEDER_NAME="tng-arr-radarr-seeder-$FIXTURE_ID"
-SONARR_INDEXER_NAME="TorrentNG Sonarr Fixture"
-RADARR_INDEXER_NAME="TorrentNG Radarr Fixture"
+SONARR_INDEXER_NAME="TorrentNG Sonarr Fixture $FIXTURE_ID"
+RADARR_INDEXER_NAME="TorrentNG Radarr Fixture $FIXTURE_ID"
+SONARR_FIXTURE_FILE="tng-sonarr-$FIXTURE_ID.bin"
+RADARR_FIXTURE_FILE="tng-radarr-$FIXTURE_ID.bin"
+SONARR_RELEASE_TITLE="Breaking.Bad.S01E01.1080p.WEB-DL-TNG-$FIXTURE_ID"
+RADARR_RELEASE_TITLE="The.Matrix.1999.1080p.WEB-DL-TNG-$FIXTURE_ID"
 SONARR_INDEXER_CONTAINER="tng-sonarr-indexer-$FIXTURE_ID"
 RADARR_INDEXER_CONTAINER="tng-radarr-indexer-$FIXTURE_ID"
-COOKIE_JAR="$(mktemp)"
-BODY="$(mktemp)"
+COOKIE_JAR="$(mktemp "${TMPDIR:-/tmp}/tng-arr-cookies.XXXXXX")"
+BODY="$(mktemp "${TMPDIR:-/tmp}/tng-arr-body.XXXXXX")"
+AUTH_BODY_FILE="$(mktemp "${TMPDIR:-/tmp}/tng-arr-auth.XXXXXX")"
+SONARR_BASE=""
+RADARR_BASE=""
+SONARR_KEY=""
+RADARR_KEY=""
 
 mkdir -p "$(dirname "$OUT")"
 
@@ -45,10 +71,22 @@ mark() {
 }
 
 cleanup() {
+  if [[ -s "$COOKIE_JAR" && -n "${TNG_HOST_URL:-}" ]]; then
+    delete_tng_fixture_torrents || true
+  fi
+  if [[ -n "${SONARR_BASE:-}" && -n "${SONARR_KEY:-}" ]]; then
+    delete_named_indexer "$SONARR_BASE" "$SONARR_KEY" "$SONARR_INDEXER_NAME" || true
+  fi
+  if [[ -n "${RADARR_BASE:-}" && -n "${RADARR_KEY:-}" ]]; then
+    delete_named_indexer "$RADARR_BASE" "$RADARR_KEY" "$RADARR_INDEXER_NAME" || true
+  fi
   docker rm -f "$TRACKER_NAME" "$SONARR_SEEDER_NAME" "$RADARR_SEEDER_NAME" "$SONARR_INDEXER_CONTAINER" "$RADARR_INDEXER_CONTAINER" >/dev/null 2>&1 || true
-  rm -f "$COOKIE_JAR" "$BODY"
+  docker run --rm -v "$DOWNLOADS_VOLUME:/downloads" alpine:3.20 \
+    sh -c "rm -rf -- /downloads/$FIXTURE_DOWNLOAD_DIR" >/dev/null 2>&1 || true
+  rm -f -- "$COOKIE_JAR" "$BODY" "$AUTH_BODY_FILE"
 }
 trap cleanup EXIT
+tng_write_qbit_login_body "$TNG_API_TOKEN" "$AUTH_BODY_FILE"
 
 api_key_from_container() {
   docker exec "$1" sh -lc "sed -n 's:.*<ApiKey>\\(.*\\)</ApiKey>.*:\\1:p' /config/config.xml | head -1"
@@ -69,7 +107,7 @@ delete_named_indexer() {
   curl -fsS -H "X-Api-Key: $key" "$base/api/v3/indexer" \
     | jq -r --arg name "$name" '.[] | select(.name==$name) | .id' \
     | while read -r id; do
-        [[ -n "$id" ]] && curl -ksS -o /dev/null -H "X-Api-Key: $key" -X DELETE "$base/api/v3/indexer/$id"
+        [[ -n "$id" ]] && curl -q -sS --noproxy "*" -o /dev/null -H "X-Api-Key: $key" -X DELETE "$base/api/v3/indexer/$id"
       done
 }
 
@@ -78,17 +116,27 @@ ensure_root_folder() {
   local base="$2"
   local key="$3"
   local path="$4"
-  local container="$5"
-  docker exec "$container" sh -lc "chown -R abc:abc '$path' /downloads || true"
   if curl -fsS -H "X-Api-Key: $key" "$base/api/v3/rootfolder" | jq -e --arg path "$path" '.[] | select(.path==$path)' >/dev/null; then
     mark "$label root folder" "PASS" "$path already configured"
     return
   fi
-  code="$(curl -ksS -o "$BODY" -w '%{http_code}' -H "X-Api-Key: $key" -H 'Content-Type: application/json' -X POST -d "{\"path\":\"$path\"}" "$base/api/v3/rootfolder")"
+  code="$(curl -q -sS --noproxy "*" -o "$BODY" -w '%{http_code}' -H "X-Api-Key: $key" -H 'Content-Type: application/json' -X POST -d "{\"path\":\"$path\"}" "$base/api/v3/rootfolder")"
   if [[ "$code" == "200" || "$code" == "201" ]]; then
     mark "$label root folder" "PASS" "$path"
   else
     mark "$label root folder" "FAIL" "HTTP $code $(tr '\n' ' ' <"$BODY")"
+  fi
+}
+
+delete_tng_fixture_torrents() {
+  local hashes
+  hashes="$(curl -q -sS --noproxy "*" -b "$COOKIE_JAR" "$TNG_HOST_URL/api/qb/v2/torrents/info" \
+    | jq -r --arg sonarr "$SONARR_FIXTURE_FILE" --arg radarr "$RADARR_FIXTURE_FILE" \
+      '.[] | select(.name==$sonarr or .name==$radarr) | .hash' | paste -sd '|' -)"
+  if [[ -n "$hashes" ]]; then
+    curl -q -sS --noproxy "*" -b "$COOKIE_JAR" -X POST \
+      --data-urlencode "hashes=$hashes" --data-urlencode 'deleteFiles=true' \
+      "$TNG_HOST_URL/api/qb/v2/torrents/delete" >/dev/null || true
   fi
 }
 
@@ -110,7 +158,7 @@ ensure_sonarr_series() {
     mark "Sonarr series" "FAIL" "Breaking Bad lookup unavailable"
     return
   fi
-  code="$(curl -ksS -o "$BODY" -w '%{http_code}' -H "X-Api-Key: $key" -H 'Content-Type: application/json' -X POST -d "$series" "$base/api/v3/series")"
+  code="$(curl -q -sS --noproxy "*" -o "$BODY" -w '%{http_code}' -H "X-Api-Key: $key" -H 'Content-Type: application/json' -X POST -d "$series" "$base/api/v3/series")"
   if [[ "$code" == "200" || "$code" == "201" ]]; then
     mark "Sonarr series" "PASS" "Breaking Bad"
   else
@@ -136,7 +184,7 @@ ensure_radarr_movie() {
     mark "Radarr movie" "FAIL" "The Matrix lookup unavailable"
     return
   fi
-  code="$(curl -ksS -o "$BODY" -w '%{http_code}' -H "X-Api-Key: $key" -H 'Content-Type: application/json' -X POST -d "$movie" "$base/api/v3/movie")"
+  code="$(curl -q -sS --noproxy "*" -o "$BODY" -w '%{http_code}' -H "X-Api-Key: $key" -H 'Content-Type: application/json' -X POST -d "$movie" "$base/api/v3/movie")"
   if [[ "$code" == "200" || "$code" == "201" ]]; then
     mark "Radarr movie" "PASS" "The Matrix"
   else
@@ -168,7 +216,7 @@ create_indexer() {
         elif .name=="minimumSeeders" then .value=1
         else . end
       )')"
-  code="$(curl -ksS -o "$BODY" -w '%{http_code}' -H "X-Api-Key: $key" -H 'Content-Type: application/json' -X POST -d "$payload" "$base/api/v3/indexer")"
+  code="$(curl -q -sS --noproxy "*" -o "$BODY" -w '%{http_code}' -H "X-Api-Key: $key" -H 'Content-Type: application/json' -X POST -d "$payload" "$base/api/v3/indexer")"
   if [[ "$code" == "200" || "$code" == "201" ]]; then
     id="$(jq -r '.id' "$BODY")"
     mark "$label indexer" "PASS" "id=$id"
@@ -197,7 +245,7 @@ wait_for_torrent() {
   local name="$1"
   local deadline=$((SECONDS + 150))
   while (( SECONDS < deadline )); do
-    row="$(curl -ksS -b "$COOKIE_JAR" "$TNG_HOST_URL/api/qb/v2/torrents/info" \
+    row="$(curl -q -sS --noproxy "*" -b "$COOKIE_JAR" "$TNG_HOST_URL/api/qb/v2/torrents/info" \
       | jq -c --arg name "$name" '.[] | select(.name==$name) | select((.progress // 0) >= 1)' | head -1)"
     if [[ -n "$row" ]]; then
       printf '%s\n' "$row"
@@ -216,7 +264,7 @@ grab_release() {
   local release="$5"
   local code row
 
-  code="$(curl -ksS -o "$BODY" -w '%{http_code}' -H "X-Api-Key: $key" -H 'Content-Type: application/json' -X POST -d "$release" "$base/api/v3/release")"
+  code="$(curl -q -sS --noproxy "*" -o "$BODY" -w '%{http_code}' -H "X-Api-Key: $key" -H 'Content-Type: application/json' -X POST -d "$release" "$base/api/v3/release")"
   if [[ "$code" == "200" || "$code" == "201" || "$code" == "202" ]]; then
     mark "$label release grab" "PASS" "submitted to qBittorrent-compatible TorrentNG client"
   else
@@ -245,50 +293,53 @@ grab_release() {
 
 SONARR_BASE="$(mapped_host_url "$SONARR_CONTAINER" 8989)"
 RADARR_BASE="$(mapped_host_url "$RADARR_CONTAINER" 7878)"
-TNG_API_TOKEN="${TNG_API_TOKEN:-local-cert-api-token-20260904}"
 TNG_HOST_URL="${TNG_HOST_URL:-http://localhost:${TNG_HOST_PORT:-18080}}"
 TNG_HOST_URL="$(mapped_host_url "$TNG_CONTAINER" 8080)"
+python3 "$ROOT/scripts/protected_target.py" "$TNG_HOST_URL"
+python3 "$ROOT/scripts/protected_target.py" "$SONARR_BASE"
+python3 "$ROOT/scripts/protected_target.py" "$RADARR_BASE"
 SONARR_KEY="${SONARR_API_KEY_OVERRIDE:-$(api_key_from_container "$SONARR_CONTAINER")}"
 RADARR_KEY="${RADARR_API_KEY_OVERRIDE:-$(api_key_from_container "$RADARR_CONTAINER")}"
 
 docker run -d --rm --name "$TRACKER_NAME" --network "$NETWORK" lednerb/opentracker-docker >/dev/null
 docker run --rm --network "$NETWORK" -v "$DOWNLOADS_VOLUME:/downloads" alpine:3.20 sh -lc "
   apk add --no-cache mktorrent >/dev/null
-  rm -rf /downloads/cert-arr-fixture
-  mkdir -p /downloads/cert-arr-fixture/sonarr-seed /downloads/cert-arr-fixture/radarr-seed
-  dd if=/dev/urandom of=/downloads/cert-arr-fixture/sonarr-seed/tng-sonarr-fixture.bin bs=$FIXTURE_BYTES count=1 status=none
-  dd if=/dev/urandom of=/downloads/cert-arr-fixture/radarr-seed/tng-radarr-fixture.bin bs=$FIXTURE_BYTES count=1 status=none
-  mktorrent -a http://$TRACKER_NAME:6969/announce -o /downloads/cert-arr-fixture/tng-sonarr-fixture.torrent /downloads/cert-arr-fixture/sonarr-seed/tng-sonarr-fixture.bin >/dev/null
-  mktorrent -a http://$TRACKER_NAME:6969/announce -o /downloads/cert-arr-fixture/tng-radarr-fixture.torrent /downloads/cert-arr-fixture/radarr-seed/tng-radarr-fixture.bin >/dev/null
+  mkdir -p /downloads/$FIXTURE_DOWNLOAD_DIR/sonarr-seed /downloads/$FIXTURE_DOWNLOAD_DIR/radarr-seed
+  dd if=/dev/urandom of=/downloads/$FIXTURE_DOWNLOAD_DIR/sonarr-seed/$SONARR_FIXTURE_FILE bs=$FIXTURE_BYTES count=1 status=none
+  dd if=/dev/urandom of=/downloads/$FIXTURE_DOWNLOAD_DIR/radarr-seed/$RADARR_FIXTURE_FILE bs=$FIXTURE_BYTES count=1 status=none
+  mktorrent -a http://$TRACKER_NAME:6969/announce -o /downloads/$FIXTURE_DOWNLOAD_DIR/tng-sonarr-fixture.torrent /downloads/$FIXTURE_DOWNLOAD_DIR/sonarr-seed/$SONARR_FIXTURE_FILE >/dev/null
+  mktorrent -a http://$TRACKER_NAME:6969/announce -o /downloads/$FIXTURE_DOWNLOAD_DIR/tng-radarr-fixture.torrent /downloads/$FIXTURE_DOWNLOAD_DIR/radarr-seed/$RADARR_FIXTURE_FILE >/dev/null
 "
 docker run -d --rm --name "$SONARR_SEEDER_NAME" --network "$NETWORK" -v "$DOWNLOADS_VOLUME:/downloads" \
-  alpine:3.20 sh -lc 'apk add --no-cache transmission-cli >/dev/null && exec transmission-cli -w /downloads/cert-arr-fixture/sonarr-seed /downloads/cert-arr-fixture/tng-sonarr-fixture.torrent' >/dev/null
+  -e "FIXTURE_DOWNLOAD_DIR=$FIXTURE_DOWNLOAD_DIR" \
+  alpine:3.20 sh -lc 'apk add --no-cache transmission-cli >/dev/null && exec transmission-cli -w "/downloads/$FIXTURE_DOWNLOAD_DIR/sonarr-seed" "/downloads/$FIXTURE_DOWNLOAD_DIR/tng-sonarr-fixture.torrent"' >/dev/null
 docker run -d --rm --name "$RADARR_SEEDER_NAME" --network "$NETWORK" -v "$DOWNLOADS_VOLUME:/downloads" \
-  alpine:3.20 sh -lc 'apk add --no-cache transmission-cli >/dev/null && exec transmission-cli -w /downloads/cert-arr-fixture/radarr-seed /downloads/cert-arr-fixture/tng-radarr-fixture.torrent' >/dev/null
+  -e "FIXTURE_DOWNLOAD_DIR=$FIXTURE_DOWNLOAD_DIR" \
+  alpine:3.20 sh -lc 'apk add --no-cache transmission-cli >/dev/null && exec transmission-cli -w "/downloads/$FIXTURE_DOWNLOAD_DIR/radarr-seed" "/downloads/$FIXTURE_DOWNLOAD_DIR/tng-radarr-fixture.torrent"' >/dev/null
 mark "fixture torrents" "PASS" "separate $FIXTURE_BYTES byte Sonarr/Radarr torrents and stock seeders ready"
 
 docker run -d --rm --name "$SONARR_INDEXER_CONTAINER" --network "$NETWORK" \
   -v "$DOWNLOADS_VOLUME:/downloads" \
   -v "$ROOT/deploy/certification/fixture_indexer.py:/fixture_indexer.py:ro" \
   -e "FIXTURE_PUBLIC_BASE=http://$SONARR_INDEXER_CONTAINER:8082" \
-  -e "FIXTURE_TORRENT_PATH=/downloads/cert-arr-fixture/tng-sonarr-fixture.torrent" \
-  -e "FIXTURE_TITLE=Breaking.Bad.S01E01.1080p.WEB-DL-TNG" \
+  -e "FIXTURE_TORRENT_PATH=/downloads/$FIXTURE_DOWNLOAD_DIR/tng-sonarr-fixture.torrent" \
+  -e "FIXTURE_TITLE=$SONARR_RELEASE_TITLE" \
   -e "FIXTURE_GUID=$FIXTURE_ID-sonarr" \
   python:3-alpine python /fixture_indexer.py >/dev/null
 docker run -d --rm --name "$RADARR_INDEXER_CONTAINER" --network "$NETWORK" \
   -v "$DOWNLOADS_VOLUME:/downloads" \
   -v "$ROOT/deploy/certification/fixture_indexer.py:/fixture_indexer.py:ro" \
   -e "FIXTURE_PUBLIC_BASE=http://$RADARR_INDEXER_CONTAINER:8082" \
-  -e "FIXTURE_TORRENT_PATH=/downloads/cert-arr-fixture/tng-radarr-fixture.torrent" \
-  -e "FIXTURE_TITLE=The.Matrix.1999.1080p.WEB-DL-TNG" \
+  -e "FIXTURE_TORRENT_PATH=/downloads/$FIXTURE_DOWNLOAD_DIR/tng-radarr-fixture.torrent" \
+  -e "FIXTURE_TITLE=$RADARR_RELEASE_TITLE" \
   -e "FIXTURE_GUID=$FIXTURE_ID-radarr" \
   python:3-alpine python /fixture_indexer.py >/dev/null
 
 wait_for_indexer "Sonarr" "http://$SONARR_INDEXER_CONTAINER:8082" || true
 wait_for_indexer "Radarr" "http://$RADARR_INDEXER_CONTAINER:8082" || true
 
-ensure_root_folder "Sonarr" "$SONARR_BASE" "$SONARR_KEY" "/tv" "$SONARR_CONTAINER"
-ensure_root_folder "Radarr" "$RADARR_BASE" "$RADARR_KEY" "/movies" "$RADARR_CONTAINER"
+ensure_root_folder "Sonarr" "$SONARR_BASE" "$SONARR_KEY" "/tv"
+ensure_root_folder "Radarr" "$RADARR_BASE" "$RADARR_KEY" "/movies"
 ensure_sonarr_series "$SONARR_BASE" "$SONARR_KEY"
 ensure_radarr_movie "$RADARR_BASE" "$RADARR_KEY"
 
@@ -298,7 +349,7 @@ radarr_indexer_id="$(create_indexer "Radarr" "$RADARR_BASE" "$RADARR_KEY" "$RADA
 [[ -n "$radarr_indexer_id" ]] || status="FAIL"
 
 if [[ "$ARR_GRAB" == "1" ]]; then
-  code="$(curl -ksS -o "$BODY" -w '%{http_code}' "$TNG_HOST_URL/api/qb/v2/auth/login" -X POST -d "username=$TNG_API_TOKEN" -d "password=$TNG_API_TOKEN" -c "$COOKIE_JAR")"
+  code="$(curl -q -sS --noproxy "*" -o "$BODY" -w '%{http_code}' "$TNG_HOST_URL/api/qb/v2/auth/login" -X POST --data-binary "@$AUTH_BODY_FILE" -c "$COOKIE_JAR")"
   if [[ "$code" == "200" ]]; then
     mark "qBit auth" "PASS" "session cookie accepted for transfer verification"
   else
@@ -307,14 +358,14 @@ if [[ "$ARR_GRAB" == "1" ]]; then
 fi
 
 if [[ -n "$sonarr_indexer_id" ]]; then
-  eid="$(curl -fsS -H "X-Api-Key: $SONARR_KEY" "$SONARR_BASE/api/v3/episode?seriesId=1" | jq -r '.[] | select(.seasonNumber==1 and .episodeNumber==1) | .id' | head -1)"
-  code="$(curl -ksS -o "$BODY" -w '%{http_code}' -H "X-Api-Key: $SONARR_KEY" "$SONARR_BASE/api/v3/release?episodeId=$eid")"
+    eid="$(curl -fsS -H "X-Api-Key: $SONARR_KEY" "$SONARR_BASE/api/v3/episode?seriesId=1" | jq -r '.[] | select(.seasonNumber==1 and .episodeNumber==1) | .id' | head -1)"
+  code="$(curl -q -sS --noproxy "*" -o "$BODY" -w '%{http_code}' -H "X-Api-Key: $SONARR_KEY" "$SONARR_BASE/api/v3/release?episodeId=$eid")"
   releases="$(jq 'length' "$BODY" 2>/dev/null || echo 0)"
   if [[ "$code" == "200" && "$releases" -gt 0 ]]; then
     mark "Sonarr fixture search" "PASS" "releases=$releases"
     if [[ "$ARR_GRAB" == "1" ]]; then
       release="$(jq -c '.[0]' "$BODY")"
-      grab_release "Sonarr" "$SONARR_BASE" "$SONARR_KEY" "tng-sonarr-fixture.bin" "$release"
+      grab_release "Sonarr" "$SONARR_BASE" "$SONARR_KEY" "$SONARR_FIXTURE_FILE" "$release"
     fi
   else
     mark "Sonarr fixture search" "FAIL" "HTTP $code releases=$releases"
@@ -323,13 +374,13 @@ fi
 
 if [[ -n "$radarr_indexer_id" ]]; then
   movie_id="$(curl -fsS -H "X-Api-Key: $RADARR_KEY" "$RADARR_BASE/api/v3/movie" | jq -r '.[] | select(.title=="The Matrix") | .id' | head -1)"
-  code="$(curl -ksS -o "$BODY" -w '%{http_code}' -H "X-Api-Key: $RADARR_KEY" "$RADARR_BASE/api/v3/release?movieId=$movie_id")"
+  code="$(curl -q -sS --noproxy "*" -o "$BODY" -w '%{http_code}' -H "X-Api-Key: $RADARR_KEY" "$RADARR_BASE/api/v3/release?movieId=$movie_id")"
   releases="$(jq 'length' "$BODY" 2>/dev/null || echo 0)"
   if [[ "$code" == "200" && "$releases" -gt 0 ]]; then
     mark "Radarr fixture search" "PASS" "releases=$releases"
     if [[ "$ARR_GRAB" == "1" ]]; then
       release="$(jq -c '.[0]' "$BODY")"
-      grab_release "Radarr" "$RADARR_BASE" "$RADARR_KEY" "tng-radarr-fixture.bin" "$release"
+      grab_release "Radarr" "$RADARR_BASE" "$RADARR_KEY" "$RADARR_FIXTURE_FILE" "$release"
     fi
   else
     mark "Radarr fixture search" "FAIL" "HTTP $code releases=$releases"

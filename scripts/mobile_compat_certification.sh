@@ -2,12 +2,22 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-OUT="${1:-$ROOT/certification/reports/mobile-compat-$(date -u +%Y%m%dT%H%M%SZ).md}"
+# shellcheck source=scripts/curl_policy.sh
+source "$ROOT/scripts/curl_policy.sh"
+OUT="${1:-$ROOT/certification/reports/mobile-compat-$(date -u +%Y%m%dT%H%M%SZ)-$$.md}"
 TNG_HOST_URL="${TNG_HOST_URL:-http://localhost:${TNG_HOST_PORT:-18080}}"
 TNG_API_TOKEN="${TNG_API_TOKEN:-local-cert-api-token-20260904}"
 TNG_CONTAINER="${TNG_CONTAINER:-certification-torrentng-1}"
 MOBILE_LIST_LIMIT="${MOBILE_LIST_LIMIT:-50000}"
-BODY="$(mktemp)"
+if [[ ! "$MOBILE_LIST_LIMIT" =~ ^[0-9]{1,6}$ ]]; then
+  echo "MOBILE_LIST_LIMIT must be an integer between 1 and 100000" >&2
+  exit 2
+fi
+MOBILE_LIST_LIMIT=$((10#$MOBILE_LIST_LIMIT))
+if (( MOBILE_LIST_LIMIT < 1 || MOBILE_LIST_LIMIT > 100000 )); then
+  echo "MOBILE_LIST_LIMIT must be an integer between 1 and 100000" >&2
+  exit 2
+fi
 
 mkdir -p "$(dirname "$OUT")"
 
@@ -15,11 +25,17 @@ mapped="$(docker port "$TNG_CONTAINER" 8080/tcp 2>/dev/null | sed -n 's/.*:\([0-
 if [[ -n "$mapped" && "$TNG_HOST_URL" == http://localhost:* ]]; then
   TNG_HOST_URL="http://localhost:$mapped"
 fi
+python3 "$ROOT/scripts/protected_target.py" "$TNG_HOST_URL"
+BODY="$(mktemp "${TMPDIR:-/tmp}/tng-mobile-body.XXXXXX")"
+AUTH_BODY_FILE="$(mktemp "${TMPDIR:-/tmp}/tng-mobile-auth.XXXXXX")"
+COOKIE_DIR="$(mktemp -d "${TMPDIR:-/tmp}/tng-mobile-cookies.XXXXXX")"
 
 cleanup() {
-  rm -f "$BODY" /tmp/tng-mobile-*.cookies
+  rm -f -- "$BODY" "$AUTH_BODY_FILE"
+  rm -rf -- "$COOKIE_DIR"
 }
 trap cleanup EXIT
+tng_write_qbit_login_body "$TNG_API_TOKEN" "$AUTH_BODY_FILE"
 
 status="PASS"
 
@@ -36,7 +52,7 @@ mark() {
 http_code() {
   local url="$1"
   shift || true
-  curl -ksS -o "$BODY" -w '%{http_code}' "$@" "$url" || true
+  curl -q -sS --noproxy "*" -o "$BODY" -w '%{http_code}' "$@" "$url" || true
 }
 
 check_json_array_len() {
@@ -47,10 +63,10 @@ run_profile() {
   local label="$1"
   local prefix="$2"
   local user_agent="$3"
-  local cookie="/tmp/tng-mobile-${label//[^A-Za-z0-9]/-}.cookies"
+  local cookie="$COOKIE_DIR/${label//[^A-Za-z0-9]/-}.cookies"
   local code len hash rid delta_len
 
-  code="$(http_code "$TNG_HOST_URL$prefix/auth/login" -A "$user_agent" -X POST -d "username=$TNG_API_TOKEN" -d "password=$TNG_API_TOKEN" -c "$cookie")"
+  code="$(http_code "$TNG_HOST_URL$prefix/auth/login" -A "$user_agent" -X POST --data-binary "@$AUTH_BODY_FILE" -c "$cookie")"
   if [[ "$code" == "200" && "$(cat "$BODY")" == "Ok." ]]; then
     mark "$label login" "PASS" "$prefix auth cookie accepted"
   else

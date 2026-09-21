@@ -88,7 +88,7 @@ result_for_report() {
     echo "| _none_ | storage |  |  |  |  | INFO |"
   else
     for report in "${reports[@]}"; do
-      rel="${report#$ROOT/}"
+      rel="${report#"$ROOT"/}"
       generated="$(field_from_report Generated "$report")"
       host="$(field_from_report Host "$report")"
       commit="$(field_from_report Commit "$report")"

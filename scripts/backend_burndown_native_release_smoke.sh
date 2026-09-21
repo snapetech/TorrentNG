@@ -2,6 +2,8 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# shellcheck source=scripts/curl_policy.sh
+source "$ROOT/scripts/curl_policy.sh"
 REPORT_DIR="${REPORT_DIR:-$ROOT/certification/reports}"
 BIN="${TNG_RELEASE_BINARY:-$ROOT/target/release/torrentngd}"
 CONFIG="${TNG_RELEASE_CONFIG:-$REPORT_DIR/backend-burndown-native-config-20260902.toml}"

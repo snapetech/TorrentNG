@@ -2,6 +2,8 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# shellcheck source=scripts/curl_policy.sh
+source "$ROOT/scripts/curl_policy.sh"
 SLSKR_ROOT="${SLSKR_ROOT:-/home/keith/Documents/code/slskR}"
 POOL_FILE="${SLSKR_PROTON_CREDENTIAL_POOL_FILE:-$SLSKR_ROOT/.secrets/proton-credential-pool.env}"
 LABEL="${TNG_PROTON_LABEL:-p1}"
@@ -197,7 +199,7 @@ sudo nsenter -t "$container_pid" -n ip route replace default via "$HOST_NS_IP" d
 mark "container VPN route" "PASS" "$CONTAINER_IP via $HOST_NS_IP -> $NS/wg0"
 
 for _ in $(seq 1 60); do
-  code="$(sudo ip netns exec "$NS" curl -ksS -o /dev/null -w '%{http_code}' "http://$CONTAINER_IP:8080/health" || true)"
+  code="$(sudo ip netns exec "$NS" curl -q -sS --noproxy "*" -o /dev/null -w '%{http_code}' "http://$CONTAINER_IP:8080/health" || true)"
   [[ "$code" == "200" || "$code" == "503" ]] && break
   sleep 1
 done
@@ -223,7 +225,7 @@ public_port="$(awk '/Mapped public port/ {for (i=1; i<=NF; i++) if ($i=="port") 
   || mark "Proton NAT-PMP mapping" "FAIL" "tcp_exit=$tcp_natpmp_status udp_exit=$udp_natpmp_status $(tr '\n' ' ' < "$TMP_OUTPUT")"
 
 DHT_REPORT="$ROOT/certification/reports/dht-cert-proton-tng-$(date -u +%Y%m%dT%H%M%SZ).md"
-if [[ -n "$public_ip" && -n "$public_port" ]] && sudo -E ip netns exec "$NS" env PATH="$PATH" TNG_HOST_URL="http://$CONTAINER_IP:8080" TNG_API_TOKEN="$API_TOKEN" TNG_CONTAINER="$CONTAINER" TNG_INCOMING_PORT="$PRIVATE_PORT" TNG_VPN_PUBLIC_PORT="$public_port" TNG_VPN_PUBLIC_IP="$public_ip" "$ROOT/scripts/dht_certification.sh" "$DHT_REPORT"; then
+if [[ -n "$public_ip" && -n "$public_port" ]] && sudo -E ip netns exec "$NS" env PATH="$PATH" TNG_HOST_URL="http://$CONTAINER_IP:8080" TNG_PROTECTED_LOCAL_HTTP_ORIGIN="http://$CONTAINER_IP:8080" TNG_API_TOKEN="$API_TOKEN" TNG_CONTAINER="$CONTAINER" TNG_INCOMING_PORT="$PRIVATE_PORT" TNG_VPN_PUBLIC_PORT="$public_port" TNG_VPN_PUBLIC_IP="$public_ip" "$ROOT/scripts/dht_certification.sh" "$DHT_REPORT"; then
   mark "DHT certification over Proton-routed TorrentNG" "PASS" "$(basename "$DHT_REPORT")"
 else
   mark "DHT certification over Proton-routed TorrentNG" "FAIL" "$(basename "$DHT_REPORT")"

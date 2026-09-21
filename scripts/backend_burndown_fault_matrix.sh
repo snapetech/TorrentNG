@@ -37,7 +37,8 @@ mark() {
 run_gate() {
   local name="$1"
   shift
-  local log="$REPORT_DIR/backend-burndown-fault-$(slug "$name").log"
+  local log
+  log="$REPORT_DIR/backend-burndown-fault-$(slug "$name").log"
   if (cd "$ROOT" && "$@") >"$log" 2>&1; then
     mark "$name" PASS "$(basename "$log")"
   else

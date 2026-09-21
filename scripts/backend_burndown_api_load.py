@@ -10,6 +10,7 @@ claim that a deployment can handle an arbitrary torrent count.
 from __future__ import annotations
 
 import json
+import math
 import os
 import statistics
 import hashlib
@@ -21,7 +22,12 @@ from http.client import HTTPException
 from pathlib import Path
 from typing import Any
 from urllib.error import HTTPError, URLError
-from urllib.request import Request, urlopen
+from urllib.request import HTTPRedirectHandler, ProxyHandler, Request, build_opener
+
+if __package__:
+    from .protected_target import validate_protected_target
+else:
+    from protected_target import validate_protected_target
 
 
 ENDPOINTS = (
@@ -35,20 +41,54 @@ ENDPOINTS = (
     "/api/qb/v2/sync/maindata?rid=0",
 )
 REPO_ROOT = Path(__file__).resolve().parents[1]
+MAX_LOAD_WORKERS = 96
 
 
-def env_int(name: str, default: int, minimum: int = 1) -> int:
-    try:
-        return max(minimum, int(os.environ.get(name, str(default))))
-    except ValueError:
+class NoRedirectHandler(HTTPRedirectHandler):
+    """Credential-bearing requests must not replay against a redirect target."""
+
+    def redirect_request(self, request, file_pointer, code, message, headers, new_url):
+        return None
+
+
+class NoProxyHandler(ProxyHandler):
+    def __init__(self) -> None:
+        super().__init__({})
+
+
+# The target must be validated separately; bypass ambient proxies so bearer
+# credentials are sent only to that target, never to a runner-configured proxy.
+HTTP = build_opener(NoProxyHandler, NoRedirectHandler)
+
+
+def env_int(name: str, default: int, minimum: int, maximum: int) -> int:
+    raw = os.environ.get(name)
+    if raw is None:
         return default
-
-
-def env_float(name: str, default: float, minimum: float = 0.1) -> float:
     try:
-        return max(minimum, float(os.environ.get(name, str(default))))
-    except ValueError:
+        value = int(raw)
+    except ValueError as error:
+        raise ValueError(f"{name} must be an integer") from error
+    if not minimum <= value <= maximum:
+        raise ValueError(f"{name} must be between {minimum} and {maximum}")
+    return value
+
+
+def env_float(name: str, default: float, minimum: float, maximum: float) -> float:
+    raw = os.environ.get(name)
+    if raw is None:
         return default
+    try:
+        value = float(raw)
+    except ValueError as error:
+        raise ValueError(f"{name} must be a number") from error
+    if not math.isfinite(value) or not minimum <= value <= maximum:
+        raise ValueError(f"{name} must be finite and between {minimum} and {maximum}")
+    return value
+
+
+def open_direct(request: Request, timeout: float):
+    return HTTP.open(request, timeout=timeout)
 
 
 class LoadStats:
@@ -97,7 +137,7 @@ def request_once(base: str, token: str, endpoint: str, stats: LoadStats, timeout
     status = 599
     size = 0
     try:
-        with urlopen(request, timeout=timeout) as response:
+        with open_direct(request, timeout) as response:
             status = int(response.status)
             body = response.read(8 * 1024 * 1024)
             size = len(body)
@@ -127,7 +167,7 @@ def slow_sse_client(base: str, token: str, deadline: float, delay: float, stats:
     request = Request(base + "/api/v1/events?batch_size=1", headers=headers, method="GET")
     stats.sse_update("started")
     try:
-        with urlopen(request, timeout=5.0) as response:
+        with open_direct(request, 5.0) as response:
             line = bytearray()
             while time.monotonic() < deadline:
                 chunk = response.read(1)
@@ -181,7 +221,7 @@ def metrics_snapshot(base: str, token: str) -> tuple[int, dict[str, str]]:
     if token:
         headers["Authorization"] = f"Bearer {token}"
     request = Request(base + "/metrics", headers=headers, method="GET")
-    with urlopen(request, timeout=5.0) as response:
+    with open_direct(request, 5.0) as response:
         body = response.read(8 * 1024 * 1024)
     names = (
         "torrentng_api_sse_clients",
@@ -334,12 +374,19 @@ def write_report(
 def main() -> int:
     report = sys.argv[1] if len(sys.argv) > 1 else os.environ.get("TNG_LOAD_REPORT", "backend-api-load.md")
     raw = os.environ.get("TNG_LOAD_RAW", report.removesuffix(".md") + ".json")
-    base = os.environ.get("TNG_BASE_URL", "http://127.0.0.1:28080").rstrip("/")
+    requested_base = os.environ.get("TNG_BASE_URL", "http://127.0.0.1:28080")
     token = os.environ.get("TNG_API_TOKEN", os.environ.get("TNG_RELEASE_TOKEN", ""))
-    duration = env_float("TNG_LOAD_DURATION_SECONDS", 30.0)
-    clients = env_int("TNG_LOAD_CLIENTS", 32)
-    sse_clients = env_int("TNG_LOAD_SSE_CLIENTS", 8, 0)
-    slow_delay_ms = env_int("TNG_LOAD_SLOW_DELAY_MS", 250, 0)
+    try:
+        base = validate_protected_target(requested_base)
+        duration = env_float("TNG_LOAD_DURATION_SECONDS", 30.0, 0.1, 1200.0)
+        clients = env_int("TNG_LOAD_CLIENTS", 32, 1, 64)
+        sse_clients = env_int("TNG_LOAD_SSE_CLIENTS", 8, 0, 32)
+        slow_delay_ms = env_int("TNG_LOAD_SLOW_DELAY_MS", 250, 0, 10000)
+        if clients + sse_clients > MAX_LOAD_WORKERS:
+            raise ValueError(f"combined API/SSE clients must not exceed {MAX_LOAD_WORKERS}")
+    except ValueError as error:
+        print(f"invalid API load configuration: {error}", file=sys.stderr)
+        return 2
     pid = os.environ.get("TNG_LOAD_PID", "")
     commit = os.environ.get("TNG_LOAD_COMMIT", "unknown (set TNG_LOAD_COMMIT)")
     binary = os.environ.get("TNG_LOAD_BINARY", "")
@@ -349,7 +396,7 @@ def main() -> int:
     preflight_error: str | None = None
     try:
         request = Request(base + "/health", headers={"Authorization": f"Bearer {token}"} if token else {})
-        with urlopen(request, timeout=5.0) as response:
+        with open_direct(request, 5.0) as response:
             if response.status != 200:
                 preflight_error = f"health returned HTTP {response.status}"
             else:

@@ -2,6 +2,8 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# shellcheck source=scripts/curl_policy.sh
+source "$ROOT/scripts/curl_policy.sh"
 ENV_FILE="${CERT_ENV_FILE:-$ROOT/deploy/certification/.env}"
 OUT="${1:-$ROOT/certification/reports/autobrr-$(date -u +%Y%m%dT%H%M%SZ).md}"
 
@@ -24,6 +26,7 @@ mapped="$(docker port "$AUTOBRR_CONTAINER" 7474/tcp 2>/dev/null | sed -n 's/.*:\
 if [[ -n "$mapped" && "$AUTOBRR_HOST_URL" == http://localhost:* ]]; then
   AUTOBRR_HOST_URL="http://localhost:$mapped"
 fi
+python3 "$ROOT/scripts/protected_target.py" "$AUTOBRR_HOST_URL"
 
 mkdir -p "$(dirname "$OUT")"
 
@@ -49,9 +52,9 @@ api() {
   local path="$2"
   local payload="${3:-}"
   if [[ -n "$payload" ]]; then
-    curl -ksS -b "$COOKIE_JAR" -o "$BODY" -w '%{http_code}' -H 'Content-Type: application/json' -X "$method" -d "$payload" "$AUTOBRR_HOST_URL$path"
+    curl -q -sS --noproxy "*" -b "$COOKIE_JAR" -o "$BODY" -w '%{http_code}' -H 'Content-Type: application/json' -X "$method" -d "$payload" "$AUTOBRR_HOST_URL$path"
   else
-    curl -ksS -b "$COOKIE_JAR" -o "$BODY" -w '%{http_code}' -X "$method" "$AUTOBRR_HOST_URL$path"
+    curl -q -sS --noproxy "*" -b "$COOKIE_JAR" -o "$BODY" -w '%{http_code}' -X "$method" "$AUTOBRR_HOST_URL$path"
   fi
 }
 
@@ -61,7 +64,7 @@ delete_named() {
   curl -fsS -b "$COOKIE_JAR" "$AUTOBRR_HOST_URL$path" \
     | jq -r "$jq_expr" \
     | while read -r id; do
-        [[ -n "$id" ]] && curl -ksS -b "$COOKIE_JAR" -o /dev/null -X DELETE "$AUTOBRR_HOST_URL$path/$id"
+        [[ -n "$id" ]] && curl -q -sS --noproxy "*" -b "$COOKIE_JAR" -o /dev/null -X DELETE "$AUTOBRR_HOST_URL$path/$id"
       done
 }
 
@@ -78,15 +81,15 @@ delete_named() {
   echo "|---|---|---|"
 } > "$OUT"
 
-code="$(curl -ksS -o "$BODY" -w '%{http_code}' "$AUTOBRR_HOST_URL/api/auth/onboard")"
+code="$(curl -q -sS --noproxy "*" -o "$BODY" -w '%{http_code}' "$AUTOBRR_HOST_URL/api/auth/onboard")"
 if [[ "$code" == "204" ]]; then
-  code="$(curl -ksS -o "$BODY" -w '%{http_code}' -H 'Content-Type: application/json' -X POST -d "{\"username\":\"$AUTOBRR_CERT_USER\",\"password\":\"$AUTOBRR_CERT_PASSWORD\"}" "$AUTOBRR_HOST_URL/api/auth/onboard")"
+  code="$(curl -q -sS --noproxy "*" -o "$BODY" -w '%{http_code}' -H 'Content-Type: application/json' -X POST -d "{\"username\":\"$AUTOBRR_CERT_USER\",\"password\":\"$AUTOBRR_CERT_PASSWORD\"}" "$AUTOBRR_HOST_URL/api/auth/onboard")"
   [[ "$code" == "204" ]] && mark "onboard" "PASS" "created cert user" || mark "onboard" "FAIL" "HTTP $code $(tr '\n' ' ' <"$BODY")"
 else
   mark "onboard" "PASS" "already initialized"
 fi
 
-code="$(curl -ksS -c "$COOKIE_JAR" -o "$BODY" -w '%{http_code}' -H 'Content-Type: application/json' -X POST -d "{\"username\":\"$AUTOBRR_CERT_USER\",\"password\":\"$AUTOBRR_CERT_PASSWORD\",\"remember_me\":true}" "$AUTOBRR_HOST_URL/api/auth/login")"
+code="$(curl -q -sS --noproxy "*" -c "$COOKIE_JAR" -o "$BODY" -w '%{http_code}' -H 'Content-Type: application/json' -X POST -d "{\"username\":\"$AUTOBRR_CERT_USER\",\"password\":\"$AUTOBRR_CERT_PASSWORD\",\"remember_me\":true}" "$AUTOBRR_HOST_URL/api/auth/login")"
 if [[ "$code" == "204" ]]; then
   mark "login" "PASS" "session cookie accepted"
 else

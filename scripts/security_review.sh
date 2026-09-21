@@ -21,7 +21,7 @@ emit() {
 
 value_for() {
   local key="$1"
-  sed -n "s/^[[:space:]]*$key[[:space:]]*=[[:space:]]*//p" "$CONFIG" | tail -1
+  sed -n "s/^[[:space:]]*${key}[[:space:]]*=[[:space:]]*//p" "$CONFIG" | tail -1
 }
 
 {

@@ -2,6 +2,8 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# shellcheck source=scripts/curl_policy.sh
+source "$ROOT/scripts/curl_policy.sh"
 ENV_FILE="${CERT_ENV_FILE:-$ROOT/deploy/certification/.env}"
 COMPOSE_FILE="${CERT_COMPOSE_FILE:-$ROOT/deploy/certification/compose.yml}"
 PROJECT="${CERT_GRAB_PROJECT:-certgrab}"
@@ -83,11 +85,11 @@ run_gate() {
 wait_for_stack() {
   local deadline=$((SECONDS + 240))
   while (( SECONDS < deadline )); do
-    code="$(curl -ksS -o /dev/null -w '%{http_code}' "$TNG_HOST_URL/health" || true)"
-    sonarr="$(curl -ksS -o /dev/null -w '%{http_code}' "$SONARR_HOST_URL/ping" || true)"
-    radarr="$(curl -ksS -o /dev/null -w '%{http_code}' "$RADARR_HOST_URL/ping" || true)"
-    prowlarr="$(curl -ksS -o /dev/null -w '%{http_code}' "$PROWLARR_HOST_URL/ping" || true)"
-    autobrr="$(curl -ksS -o /dev/null -w '%{http_code}' "$AUTOBRR_HOST_URL/" || true)"
+    code="$(curl -q -sS --noproxy "*" -o /dev/null -w '%{http_code}' "$TNG_HOST_URL/health" || true)"
+    sonarr="$(curl -q -sS --noproxy "*" -o /dev/null -w '%{http_code}' "$SONARR_HOST_URL/ping" || true)"
+    radarr="$(curl -q -sS --noproxy "*" -o /dev/null -w '%{http_code}' "$RADARR_HOST_URL/ping" || true)"
+    prowlarr="$(curl -q -sS --noproxy "*" -o /dev/null -w '%{http_code}' "$PROWLARR_HOST_URL/ping" || true)"
+    autobrr="$(curl -q -sS --noproxy "*" -o /dev/null -w '%{http_code}' "$AUTOBRR_HOST_URL/" || true)"
     if [[ "$code" =~ ^(200|503)$ && "$sonarr" == "200" && "$radarr" == "200" && "$prowlarr" == "200" && "$autobrr" =~ ^(200|401|403)$ ]]; then
       return 0
     fi
