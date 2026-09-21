@@ -89,6 +89,11 @@ docker compose -f deploy/native/compose.yml up --build
 docker compose -f deploy/native/compose.yml --profile observability up --build
 ```
 
+The TorrentNG API host port (`28082`) binds to `127.0.0.1` by default; the
+BitTorrent peer port remains published. The API listener is HTTP, so remote
+access requires a TLS-terminating authenticated reverse proxy or equivalent
+transport and access protection.
+
 The example config is [deploy/native/config.toml](../deploy/native/config.toml).
 The Compose example reads one newline-delimited token from the
 `TORRENTNG_API_TOKEN` environment variable through a Docker secret, so do not
@@ -98,6 +103,10 @@ put a token in `prometheus.yml` or duplicate it in the TOML file:
 export TORRENTNG_API_TOKEN="$(openssl rand -hex 32)"
 docker compose -f deploy/native/compose.yml --profile observability up --build
 ```
+
+The Prometheus and Grafana host ports bind to `127.0.0.1` by default. Use an
+authenticated reverse proxy or an explicit host-side access policy before
+making either monitoring UI remotely reachable.
 
 Change storage paths and the public peer port before using the example outside
 local testing. For systemd or a direct binary deployment, use a root-owned

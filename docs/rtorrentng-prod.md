@@ -47,8 +47,9 @@ They are written to the separate overlay selected by:
 TNG_RTORRENT_OVERLAY=/etc/rtorrent/tng-ui-overlay.rc
 ```
 
-The production `/etc/rtorrentng-prod/rtorrent.rc` must import that overlay after
-site defaults:
+The entrypoint appends an import for `TNG_RTORRENT_OVERLAY` after the copied
+user configuration. An explicit import in the production rTorrent config is
+also supported; the entrypoint avoids adding a duplicate exact import line:
 
 ```text
 # TorrentNG UI-managed overlay. Keep production defaults above this line.

@@ -44,6 +44,49 @@ passing drill as proof of session-backup choreography only; payload backup,
 filesystem snapshots, encryption, retention, and restore testing on the actual
 storage device remain deployment responsibilities.
 
+## Compatible-client sidecar state
+
+The compatible-client sidecar stores `cache.db` and `peer_id_suffix` under its
+configured `data_dir` (the packaged Compose default is `/var/lib/torrentng`).
+Keep that directory with the service's configuration and rTorrent session
+state. The Docker Compose files use separate named state volumes for each
+backend service; do not share one state volume between simultaneously running
+services.
+
+Older Compose deployments did not mount `/var/lib/torrentng`, so their state
+lived in the container's writable layer. Before the first update that adds the
+named volume, stop the old service and seed the new volume before starting its
+replacement. Run these commands with the same Compose project name and
+environment used by the deployment:
+
+```sh
+service=torrentng
+volume_key=torrentng-state
+container_id="$(docker compose -f deploy/docker/compose.yml ps -q "$service")"
+test -n "$container_id"
+state_export="$(mktemp -d)"
+docker compose -f deploy/docker/compose.yml stop "$service"
+docker cp "$container_id:/var/lib/torrentng/." "$state_export/"
+state_volume="$(docker compose -f deploy/docker/compose.yml config --format json | jq -r --arg key "$volume_key" '.volumes[$key].name')"
+if docker volume inspect "$state_volume" >/dev/null 2>&1; then
+  printf 'Refusing to overwrite existing volume %s\n' "$state_volume" >&2
+  exit 1
+fi
+docker volume create "$state_volume"
+docker run --rm \
+  --mount "type=volume,source=$state_volume,target=/state" \
+  --mount "type=bind,source=$state_export,target=/source,readonly" \
+  alpine:3.20 sh -ec 'cp -a /source/. /state/'
+docker compose -f deploy/docker/compose.yml up -d --build --force-recreate "$service"
+printf 'Keep the state export at %s until restore is verified.\n' "$state_export"
+```
+
+For the qBittorrent, Transmission, or Deluge profiles, set `service` to
+`torrentng-qbittorrent`, `torrentng-transmission`, or `torrentng-deluge`, and
+set `volume_key` to the corresponding `torrentng-*-state` key in
+`deploy/docker/compose.yml`. Keep the export until the service is healthy and
+the persisted identity is verified; it contains private application state.
+
 ## Restore
 
 1. Stop `torrentngd`.

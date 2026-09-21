@@ -4,25 +4,37 @@
 > wiring items below were the starting checklist, not the current state. The
 > current source disposition is maintained in
 > [`docs/BACKEND_AUDIT_BURN_DOWN.md`](BACKEND_AUDIT_BURN_DOWN.md), updated
-> 2026-09-03. Check that ledger before reapplying any item.
+> 2026-09-21. Check that ledger before reapplying any item.
 
-## Current disposition (2026-09-04)
+## Current disposition (2026-09-21)
 
 This handoff is retained as historical context, not as an active checklist.
 The storage-root authority, egress policy, shared HTTP transport, peer ingress,
 packed peer state, supervised persistence, snapshot/pagination, compatibility
 honesty, and metrics-privacy items described below are implemented in the
-current tree. The current verification set includes full TorrentNG-client/
-compatible-client service tests,
-warnings-denied clippy, MSRV runs, authenticated release smoke, live fault
-containment, and API/SSE load; see
+current tree. This continuation also closed TNG-124 through TNG-129: backend
+redirects are rejected; browser login/proxy-CSRF and legacy cookie fallback
+are hardened; configured-token login is throttled; and peer-ingress failure
+counters are exposed through `/metrics`. This continuation also closed
+TNG-131 through TNG-134: failed batched database commands roll back partial
+writes; native database-worker pressure/outcome/latency counters are exported;
+the primary storage scheduler uses the RLIMIT-derived retained-cache ceiling;
+checkpoint sync no longer opens every dirty file at once; and TNG-135 adds
+lifecycle-tied active-descriptor admission to each path-backed scheduler
+`FilePool`; TNG-136 applies a local lease cap to
+`StorageRuntime::HandleCache`. TNG-138 makes those caches share one
+process-level managed-storage budget; unrelated process descriptors remain
+outside that quota.
+Fresh evidence for those fixes is recorded in
 [`BACKEND_AUDIT_BURN_DOWN.md`](BACKEND_AUDIT_BURN_DOWN.md).
 
-Do not re-implement the old patch targets. Only external qualification remains
-open: hosted workflow observation, public/client traffic, target-device
-storage, hostile-network runs, and long soak. If a new failure is found, add a
-new dated ledger entry with a reproducer rather than reopening these historical
+Do not re-implement the old patch targets. External qualification gates remain
+open as tracked in the canonical ledger; no public-network run, torrent-count
+proof, or soak was performed in this continuation. If a new defect is found,
+add a dated ledger entry with a reproducer rather than reopening historical
 instructions by assumption.
+
+## Historical branch context
 
 This branch already contains several hardening primitives and safety fixes, but some of the highest-impact integrations require editing very large files (`crates/rt-engine/src/engine.rs`, `crates/rt-engine/src/torrent_task.rs`, and sometimes TorrentNG API handlers). The connector write API only supports whole-file replacement for those files. I intentionally did not reconstruct those giant files blindly without a local build/test loop.
 
@@ -290,9 +302,14 @@ match ingress.try_begin(peer_addr, Instant::now()) {
 
 Do same for uTP accept path.
 
-Metrics:
+Metrics (completed locally):
 
-Expose `PeerIngressStats` via engine stats or TorrentNG-client metrics.
+`EngineHandle::peer_ingress_stats()` now exposes the listener's shared
+`PeerIngressStats`, and TorrentNG-client `/metrics` exports admitted
+handshakes, global/per-IP/global-peer-budget rejections, handshake read errors,
+timeouts, and malformed protocol handshakes. Loopback unit tests exercise the
+timeout and malformed paths plus the Prometheus renderer. This is local
+instrumentation coverage, not public-network qualification evidence.
 
 Optimization:
 
@@ -383,11 +400,11 @@ Recommended phased patch:
 
 Do not attempt this as a tiny patch. It is a real architecture step.
 
-## 7. Topology-aware storage scheduler defaults and FD budget
+## 7. Topology-aware storage scheduler defaults
 
 Problem:
 
-Storage scheduler primitives are good, but defaults are static. Large deployments need topology-aware scaling and a global file descriptor budget.
+Storage scheduler primitives are good, but defaults are static. Large deployments may benefit from topology-aware scaling. The shared process-level managed-storage descriptor budget is implemented and tracked as TNG-138 in the canonical burn-down.
 
 Files:
 
@@ -401,31 +418,26 @@ Recommended patch:
 - For HDD/network mounts: low concurrency, larger elevator budget, careful read batching.
 - For SSD/NVMe: higher queue depth, more workers, less elevator delay.
 - For CoW filesystems: sparse preallocation default, avoid full preallocation unless explicitly requested.
-- Add global FD leasing: all schedulers draw from a daemon FD budget; file pool cannot exceed process safety cap.
 
 Required tests:
 
 - HDD profile picks conservative concurrency.
 - NVMe profile picks larger queue depth.
 - CoW profile avoids full preallocation in auto mode.
-- FD budget denies excessive pools and exposes metric.
+- The managed-storage FD budget's cross-cache admission, wakeup, and metrics regressions are recorded under TNG-138.
 
-## 8. Current branch caveats
+## 8. Historical branch caveats (superseded)
 
-- I did not run tests locally.
-- The branch has moved ahead with code additions, but it is still diverged from current `main`.
-- The egress policy module currently imports `rt_config::TrackerConfig`; `rt-engine` already depends on `rt-config`, so this should be fine.
-- The storage authority helper has tests that use `tempfile`; `rt-engine` already has `tempfile.workspace` in dev-dependencies.
-- The actual enforcement wiring in `engine.rs` and `torrent_task.rs` remains to be done by an agent with local checkout/build/test access.
+The bullets below describe the old handoff branch, not the current checkout:
+tests were not run there, the branch was reported diverged, and enforcement
+wiring was still listed as pending. The current implementation and fresh
+verification are tracked in `BACKEND_AUDIT_BURN_DOWN.md`; do not use those old
+caveats as a reason to repeat the integration work.
 
-## Suggested next-agent order
+## Historical suggested next-agent order (superseded)
 
-1. Rebase branch against current `main`.
-2. Run `cargo fmt` and fix formatting.
-3. Run `cargo test` and fix compile errors from the new primitives/config additions.
-4. Wire storage execution authority first.
-5. Wire egress policy second.
-6. Replace tracker HTTP client construction third.
-7. Wire peer ingress budget fourth.
-8. Replace peer availability Vec<bool> fifth.
-9. Plan DB actor and topology-aware storage as separate implementation PRs/branches.
+The sequencing below is retained as history only; the listed authority, egress,
+transport, ingress, and packed-peer-state wiring is already present. The DB
+worker is also implemented. Treat topology-aware scheduler tuning as a separate
+future optimization, not as an unfinished item from this handoff. Check the
+canonical ledger for current local defects and external gates.

@@ -20,11 +20,12 @@ full semantic parity; current TorrentNG-client, compatible-client, partial, and
 gap status is tracked in
 [CLIENT_COMPATIBILITY_MATRICES.md](CLIENT_COMPATIBILITY_MATRICES.md).
 
-The machine-readable contract for the TorrentNG REST surface is
-[API.openapi.json](API.openapi.json). It is intentionally scoped to the
-implemented `/api/v1` surface; qBittorrent, Transmission, Deluge, and rTorrent
-compatibility method matrices remain documented separately because their wire
-contracts are client-specific.
+The machine-readable contract for the direct `torrentngd` REST surface is
+[API.openapi.json](API.openapi.json). The compatible-client sidecar shares the
+`/api/v1` paths but has a few arrangement-specific request and response
+differences; those are called out below. qBittorrent, Transmission, Deluge, and
+rTorrent compatibility method matrices remain documented separately because
+their wire contracts are client-specific.
 
 For backend arrangement selection and TorrentNG-client versus compatible-client
 behavior, see
@@ -115,10 +116,10 @@ required for the TorrentNG client.
 | Method | Path | Description |
 |--------|------|-------------|
 | `GET`  | `/api/v1/torrents` | List torrents with filter/sort/page |
-| `GET`  | `/api/v1/torrents/live?hashes=...` | Read bounded live rates and bytes-left for explicitly requested visible torrents |
-| `POST` | `/api/v1/torrents` | Add torrent as JSON (`torrent_b64` or `magnet`, `save_path`, optional `category`, `tags`, `start`) |
+| `GET`  | `/api/v1/torrents/live?hashes=...` | Read bounded live rates and bytes-left for up to 128 explicitly requested visible torrents |
+| `POST` | `/api/v1/torrents` | Add a torrent. `torrentngd` accepts JSON (`torrent_b64` or `magnet`) or the WebUI's bounded multipart form and returns `201` with `{ info_hash }`; the compatible-client sidecar accepts multipart and returns empty `202 Accepted` |
 | `GET`  | `/api/v1/torrents/:hash` | Get single torrent by hash |
-| `PUT`  | `/api/v1/torrents/:hash` | Update torrent metadata (`{ name, save_path }`; at least one required) |
+| `PUT`  | `/api/v1/torrents/:hash` | Update torrent metadata. `torrentngd` accepts `{ name, save_path }` and can return `202` with a queued move job; the compatible-client sidecar accepts `{ save_path }` and returns `204` |
 | `DELETE` | `/api/v1/torrents/:hash` | Remove torrent (`?delete_files=true` queues an asynchronous payload delete and returns `{ job_id, state }`; otherwise `204`) |
 | `POST` | `/api/v1/torrents/:hash/start` | Start torrent |
 | `POST` | `/api/v1/torrents/:hash/resume` | Resume torrent (alias of `start`) |
@@ -135,7 +136,9 @@ required for the TorrentNG client.
 | `PUT`  | `/api/v1/torrents/:hash/limits` | Merge per-torrent limits (`download_limit`, `upload_limit`, `max_connections`, `seed_ratio_limit`, `seed_idle_limit`, `sequential_download`, `first_last_piece_prio`, `force_start`, `super_seeding`, `auto_tmm`, `auto_management`; use `null` for nullable limits) |
 | `POST` | `/api/v1/torrents/:hash/peers` | Add explicit peers (`{ peers: ["host:port"] }`) |
 | `POST` | `/api/v1/torrents/queue` | Move torrents in queue order (`{ hashes: ["..."], move: "up" \| "down" \| "top" \| "bottom" }`) |
+| `POST` | `/api/v1/torrents/:hash/tags` | Add tags (`{ tags: ["a"] }`) |
 | `PATCH` | `/api/v1/torrents/:hash/tags` | Add/remove tags (`{ add: ["a"], remove: ["b"] }`); the TorrentNG client routes tag changes through its engine label update path |
+| `DELETE` | `/api/v1/torrents/:hash/tags` | Remove tags (`{ tags: ["a"] }`) |
 | `GET` | `/api/v1/events` | Server-sent torrent delta stream; accepts `last_known_revision` for incremental reconnects |
 | `GET` | `/api/v1/jobs` | List active durable engine jobs with progress, checkpoint, and last-error fields |
 | `GET` | `/api/v1/session-events` | Recent durable TorrentNG session events; query: `limit`, `torrent`, `kind`, `level`, `last_known_id` |
@@ -144,7 +147,16 @@ required for the TorrentNG client.
 | `GET` | `/api/v1/transfer/limits` | Read global transfer limits and speed-limits mode |
 | `PUT` | `/api/v1/transfer/limits` | Merge global transfer limits (`download_limit`, `upload_limit`, `speed_limits_mode`) |
 | `GET` | `/api/v1/session/features` | Read runtime network feature switches (`dht`, `pex`) |
-| `PUT` | `/api/v1/session/features` | Merge runtime network feature switches; DHT starts/stops at runtime and PEX affects future peer extension handshakes |
+| `PUT` | `/api/v1/session/features` | Merge runtime network feature switches; `torrentngd` returns empty `204`, while the compatible-client sidecar returns the updated fields as JSON (`200`); DHT starts/stops at runtime and PEX affects future peer extension handshakes |
+
+For `torrentngd`, torrent-add JSON accepts `save_path`, exactly one of
+`torrent_b64` or `magnet`, and optional `category`, `tags`, and `start` fields.
+The same daemon also accepts the WebUI multipart form: exactly one `magnet` or
+`torrent` field, with optional `save_path`, `category`, and `start`; torrent
+payloads are limited to 64 MiB. The compatible-client sidecar accepts this
+multipart form only and does not accept `tags` on torrent add. Its outer HTTP
+request-body cap is 65 MiB, leaving bounded room for multipart headers and
+other fields around a full 64 MiB torrent payload.
 
 `/api/v1/logs` returns retained operator events newest-first. Important `kind` values include `sidecar_started`, `rtorrent_log`, `rtorrent_log_ingest_error`, `rtorrent_log_ingest_recovered`, `rtorrent_sync_error`, `rtorrent_sync_recovered`, `rtorrent_stats_error`, `rtorrent_stats_recovered`, `rtorrent_user_agent_error`, `rtorrent_peer_id_error`, `torrent_added`, `torrent_removed`, `torrent_updated`, `categories_updated`, `tags_updated`, `saved_views_updated`, `ratio_groups_updated`, `rss_rules_updated`, `workflows_updated`, `workflow_runs_updated`, `settings_changed`, and `admin_restart_requested`. The `rtorrent_sync_*` and `rtorrent_stats_*` names are retained as legacy event kinds, but their payloads include the selected backend. Payloads are sanitized: magnet URLs, auth material, full filesystem paths, and raw user-agent strings are not stored.
 
@@ -185,7 +197,9 @@ were an immutable multi-request snapshot.
 #### `GET /api/v1/torrents/live`
 
 Pass a comma-separated `hashes` query parameter containing at most 128
-40/64-character hexadecimal info hashes. The WebUI sends only incomplete,
+40/64-character hexadecimal info hashes, within an 8,320-byte query-value
+limit. The raw non-empty entry count is checked before deduplication, so
+repeated hashes count toward the limit. The WebUI sends only incomplete,
 active rows intersecting the current viewport. The response is
 `{ sampled_at, torrents: [{ hash, amount_left, download_rate, upload_rate, sampled_at }] }`.
 The TorrentNG client queries only the requested promoted torrent tasks with
@@ -204,10 +218,14 @@ After the first generation, list snapshot refreshes use the mutation journal
 when it still covers the cached revision; the server falls back to a full
 registry projection only when the journal or base snapshot is unavailable.
 
-`PUT /api/v1/torrents/:hash` returns `202 Accepted` with `{ job_id, state }`
-when changing `save_path` requires a filesystem move. The move is executed by
-the bounded storage worker pool; inspect `/api/v1/jobs` using the returned id.
-Name-only updates and already-local metadata changes retain `204 No Content`.
+For direct `torrentngd`, `PUT /api/v1/torrents/:hash` returns `202 Accepted`
+with `{ job_id, state }` when changing `save_path` queues a filesystem move;
+inspect `/api/v1/jobs` using that id. Name-only updates and location changes
+that do not queue a move return `204 No Content`. The compatible-client
+sidecar accepts only `{ save_path }` on this route and returns `204` after its
+backend location update; it does not expose a move-job id here. Durable native
+storage-plan jobs are also available through `/api/v1/storage/execute` and
+`/api/v1/jobs`.
 
 TorrentNG REST list, delta-stream, and torrent-detail snapshots are charged to the
 `api_snapshot` memory class. When that budget is exhausted the API returns
@@ -287,8 +305,36 @@ Notes:
 | Method | Path | Description |
 |--------|------|-------------|
 | `GET`  | `/api/v1/tags` | List all tag names |
-| `POST` | `/api/v1/tags` | Create tag (`{ name }`) |
+| `POST` | `/api/v1/tags` | Create tag (`{ name }`); `torrentngd` returns empty `204`, while the compatible-client sidecar returns empty `201 Created` |
 | `DELETE` | `/api/v1/tags/:name` | Delete tag (also removes from all torrents) |
+
+Category and tag names are limited to 256 UTF-8 bytes; category `save_path`
+is limited to 4,096 bytes. A torrent tag mutation may contain at most 1,024
+names, each within the same 256-byte limit. The native REST API rejects an
+oversized tag array during JSON deserialization (422); invalid category/tag
+fields return 400. The compatible-client sidecar applies the same field bounds.
+Sidecar JSON tag mutations retain at most 1,024 tag strings of at most 256 bytes
+during deserialization; over-limit arrays are rejected with `400`.
+
+In the compatible-client sidecar, the persistent category and tag dictionaries
+are each capped at 16,384 names and 4 MiB of retained UTF-8 data; category
+save paths count toward that byte bound. A torrent is limited to 1,024 assigned
+tags, and the cache is limited to 1,000,000 tag assignments / 64 MiB of
+assigned tag text across all torrents. A write that would exceed these cache
+limits returns `429`; list/delta projections fail with `503` rather than
+truncating over-limit legacy cache data. Single-torrent detail projections
+remain independently bounded. Trigger-maintained totals make mutation checks
+read the aggregate totals in constant time, and startup rebuilds them from the
+authoritative assignment rows. qBittorrent multi-hash tag writes preflight the
+combined request before backend mutation. The cache transaction rechecks
+capacity after route preflight, so a concurrent external-backend update can
+still win that race and be rejected from the cache.
+
+The compatible-client sidecar's native-API and qBittorrent torrent-add
+multipart fields are read incrementally under per-field byte limits; torrent
+files are capped at 64 MiB and the outer request body at 65 MiB for framing
+overhead. This avoids materializing a request-sized text field before
+validating its category, path, URL, tag, or option limit.
 
 ### Storage
 
@@ -307,37 +353,74 @@ Notes:
 | Method | Path | Description |
 |---|---|---|
 | `GET` | `/api/v1/saved-views` | List saved torrent filter/sort views |
-| `POST` | `/api/v1/saved-views` | Create/update saved view (`{ id, name, params }`) |
-| `DELETE` | `/api/v1/saved-views/:id` | Delete saved view |
+| `POST` | `/api/v1/saved-views` | Create/update saved view (`{ id, name, params }`); returns the saved-view list as JSON (`200`) |
+| `DELETE` | `/api/v1/saved-views/:id` | Delete saved view; returns the updated list as JSON (`200`) |
 
 ### Ratio Groups
 
 | Method | Path | Description |
 |---|---|---|
 | `GET` | `/api/v1/ratio-groups` | List configured ratio groups |
-| `POST` | `/api/v1/ratio-groups` | Create/update ratio group (`{ name, ratio_limit, seeding_time_limit, category, tracker, enabled }`) |
-| `POST` | `/api/v1/ratio-groups/:name` | Apply ratio group to matching cached torrents (`{ dry_run }`) |
+| `POST` | `/api/v1/ratio-groups` | Create/update ratio group (`{ name, ratio_limit, seeding_time_limit, category, tracker, enabled }`); returns the updated list as JSON (`200`) |
+| `POST` | `/api/v1/ratio-groups/:name` | Apply ratio group to matching cached torrents (`{ dry_run }`); matching selections are capped at 10,000 (`413` before mutation if exceeded), and invalid oversized native rules return `400`. Direct `torrentngd` responses return at most 32 samples per result array plus full totals and 512-byte error samples; compatible-client sidecar responses return the full bounded result arrays |
 | `DELETE` | `/api/v1/ratio-groups/:name` | Delete ratio group |
+
+For direct `torrentngd`, JSON-backed ratio groups are capped at 4,096 entries
+and 1 MiB serialized; invalid item shapes return `400`, a new entry beyond the
+count cap returns `429`, and aggregate overflow returns `413`. Native IDs, names,
+and category filters are limited to 256 UTF-8 bytes; tracker filters are limited
+to 8,192 bytes. In the compatible-client sidecar, ratio groups are capped at
+1,024 entries and 8 MiB serialized. Sidecar names and category filters are
+limited to 256 UTF-8 bytes; tracker filters are limited to 8,192 bytes. Existing
+entries remain updateable at the count cap, and aggregate overflow returns `413`
+without replacing state.
 
 ### Workflow Rules
 
 | Method | Path | Description |
 |---|---|---|
 | `GET` | `/api/v1/workflows` | List workflow rules |
-| `POST` | `/api/v1/workflows` | Create/update workflow rule for `completed`, `added`, or `category_changed` events |
-| `POST` | `/api/v1/workflows/:id` | Run workflow rule (`{ dry_run }`); TorrentNG-client category/location actions execute. TorrentNG-client webhook and script actions are recorded as unsupported; a compatible-client integration may execute them only when its own backend/configuration allows it |
+| `POST` | `/api/v1/workflows` | Create/update workflow rule for `completed`, `added`, or `category_changed` events; `category` filters matches and `target_category` is the destination for `set_category` actions (legacy category-only rules are migrated on read); returns the updated list as JSON (`200`) |
+| `POST` | `/api/v1/workflows/:id` | Run workflow rule (`{ dry_run }`); matching selections are capped at 10,000 (`413` before actions if exceeded), and invalid oversized/incomplete native rules return `400`. Direct `torrentngd` responses return at most 32 samples per result array plus full totals and 512-byte error samples; compatible-client sidecar responses return the full bounded result arrays. TorrentNG-client category/location actions execute. TorrentNG-client webhook and script actions are recorded as unsupported; a compatible-client integration may execute them only when its own backend/configuration allows it |
 | `DELETE` | `/api/v1/workflows/:id` | Delete workflow rule |
-| `GET` | `/api/v1/workflow-runs` | List the most recent workflow run audit records, capped to the latest 200 |
+| `GET` | `/api/v1/workflow-runs` | List recent run records. Both backends retain at most 200 entries and 32 `matched`/`applied`/`errors` samples per entry, preserve full `*_total` counts, and cap error samples at 512 UTF-8 bytes. `torrentngd` evicts oldest rows to stay within 1 MiB; the sidecar uses an 8 MiB cap |
+
+For direct `torrentngd`, JSON-backed workflows are capped at 4,096 entries and
+1 MiB serialized; invalid item shapes return `400`, a new entry beyond the
+count cap returns `429`, and aggregate overflow returns `413`. Native IDs,
+names, and category/target-category values are limited to 256 UTF-8 bytes;
+event/action values to 64; tracker/filter/command/URL text to 8,192; and paths
+to 4,096. A set-category rule requires a non-empty `target_category`. Older
+category-only rules are migrated on read so that their category becomes the
+destination rather than a match filter. Oversized legacy rules remain listable
+but fail closed with `400` when executed until updated. In the sidecar, workflow
+rules are capped at 1,024 entries and 8 MiB serialized. Sidecar string limits
+are: id 128 bytes, name 256, event/action 64, category/target_category 256,
+tracker/command/url 8,192, and target_path 4,096. Existing rules remain
+updateable at capacity; oversized fields return `400`, and aggregate overflow
+returns `413` without replacing stored rules.
 
 ### RSS Rules
 
 | Method | Path | Description |
 |---|---|---|
 | `GET` | `/api/v1/rss-rules` | List RSS automation rules |
-| `POST` | `/api/v1/rss-rules` | Create/update RSS rule (`{ id, name, enabled, feed_url, include, exclude, category, save_path, tags, start }`) |
-| `POST` | `/api/v1/rss-rules/test` | Test a sample `{ title, link }` against configured rules |
-| `POST` | `/api/v1/rss-rules/apply` | Preview or apply a sample `{ title, link, dry_run }`; TorrentNG-client runs accept magnet links through the client. HTTP torrent downloads are implemented only by the compatible-client service |
-| `DELETE` | `/api/v1/rss-rules/:id` | Delete RSS rule |
+| `POST` | `/api/v1/rss-rules` | Create/update RSS rule (`{ id, name, enabled, feed_url, include, exclude, category, save_path, tags, start }`); returns the updated list as JSON (`200`) |
+| `POST` | `/api/v1/rss-rules/test` | Test a sample `{ title, link }` against configured rules; each string is limited to 8,192 UTF-8 bytes during JSON deserialization, empty titles return `400`, and oversized legacy rules fail closed |
+| `POST` | `/api/v1/rss-rules/apply` | Preview or apply a sample `{ title, link, dry_run }`; title and link are each limited to 8,192 UTF-8 bytes, and an empty title returns `400`. No matching rules is a zero-action success and does not require a link or live client. Direct `torrentngd` returns at most 32 matched rule-name/applied/error samples with full totals and 512-byte error samples; non-dry runs are recorded in workflow history. TorrentNG-client runs accept magnet links through the client. HTTP torrent downloads are implemented only by the compatible-client service |
+| `DELETE` | `/api/v1/rss-rules/:id` | Delete RSS rule; returns the updated list as JSON (`200`) |
+
+For direct `torrentngd`, JSON-backed RSS rules are capped at 4,096 entries and
+1 MiB serialized; invalid item shapes return `400`, a new entry beyond the
+count cap returns `429`, and aggregate overflow returns `413`. Native IDs,
+names, and categories are limited to 256 UTF-8 bytes; rule text and feed URLs to
+8,192; save paths to 4,096; and tags to 1,024 entries of at most 256 bytes each.
+Oversized legacy rules remain listable but fail closed when tested or applied.
+In the sidecar, RSS rules are capped at 1,024 entries and 8 MiB serialized.
+Sidecar rule fields are limited to 8,192 bytes; IDs to 128 bytes; names to 256
+bytes; and tags to 1,024 entries of at most 256 bytes each. New sidecar rules
+beyond the count cap return `429`, while aggregate overflow returns `413`
+without replacing state.
 
 ### Bulk operations
 
@@ -349,8 +432,19 @@ Actions: `start`, `stop`, `recheck`, `reannounce`, `set-category`, `set-location
 
 Body: `{ hashes: ["abc123", ...], dry_run: false }`
 
-For `set-category`, include `category` (empty string clears it). For `set-location`,
-include non-empty `save_path`.
+Each request accepts at most 10,000 hashes, with each value limited to 256
+characters. Larger lists return `413`; oversized hash values return `400`.
+This is a per-request resource bound, not a limit on the number of torrents
+the service can manage; split larger selections across requests.
+
+The cross-seed helper accepts at most 10,000 hash strings (up to 1,024 UTF-8
+bytes each) and 1,024 tracker URLs (up to 8,192 bytes each). A non-dry-run
+request is rejected with `413` if the hash/tracker/reannounce combination would
+perform more than 10,000 backend operations.
+
+For `set-category`, include `category` (empty string clears it; maximum 256
+characters). For `set-location`, include non-empty `save_path` (maximum 4,096
+characters). Oversized values return `400`.
 
 Response: `{ applied: ["abc123"], errors: [], dry_run: false }`
 
@@ -460,7 +554,7 @@ Implements the qBittorrent Web API v2. By default it advertises qBittorrent `5.0
 | `POST` | `/api/qb/v2/torrents/setShareLimits` | Form: `hashes`, `ratioLimit`, `seedingTimeLimit` |
 | `POST` | `/api/qb/v2/torrents/setLocation` | Form: `hashes`, `location` |
 | `POST` | `/api/qb/v2/torrents/setSavePath` | Form: `hashes`, `location` |
-| `POST` | `/api/qb/v2/torrents/addTrackers` | Form: `hashes`, `urls` (newline-separated) |
+| `POST` | `/api/qb/v2/torrents/addTrackers` | Form: `hashes`, `urls` (newline-separated); total hash/URL mutations are capped at 10,000 |
 | `POST` | `/api/qb/v2/torrents/setAutoTMM` | Backend-backed where supported |
 | `POST` | `/api/qb/v2/torrents/editTracker` | Form: `hash`, `origUrl`, `newUrl` |
 | `POST` | `/api/qb/v2/torrents/removeTrackers` | Form: `hash`, `urls` (pipe-separated) |
@@ -474,6 +568,50 @@ Implements the qBittorrent Web API v2. By default it advertises qBittorrent `5.0
 | `POST` | `/api/qb/v2/torrents/setForceStart` | Backend-backed where supported |
 | `POST` | `/api/qb/v2/torrents/setSuperSeeding` | Backend-backed where supported |
 | `POST` | `/api/qb/v2/torrents/toggleFirstLastPiecePrio` | Backend-backed where supported |
+
+Explicit qBittorrent `hashes` lists accept at most 10,000 raw pipe-separated
+entries, each an ASCII value of at most 256 bytes; excess or malformed lists
+return `400`. `hashes=all` is supported up to the same 10,000-torrent limit;
+the sidecar reads at most 10,001 cache rows to detect an excess before
+materializing the full selection.
+The `addPeers` form accepts at most 4,096 socket addresses; `transfer/banPeers`
+accepts at most 65,536. Each address is limited to 128 bytes, and invalid or
+over-limit lists return `400`.
+
+Nested qBittorrent mutations (`addTrackers`, `addTags`, `removeTags`, `setTags`,
+and `addPeers`) cap the product of selected torrents and per-torrent URLs,
+tags, or peers at 10,000. Larger fan-outs return `413` before backend mutation.
+
+Other qBittorrent delimited inputs are parsed incrementally and bounded before
+backend work: category and tracker lists accept at most 1,024 entries (category
+names at most 256 bytes, tracker URLs at most 8,192); tag lists accept at most
+1,024 entries of at most 256 bytes with a 512 KiB raw-list ceiling; `filePrio`
+accepts at most 4,096 decimal indices of at most 20 bytes. Torrent-add URL
+lists accept at most 1,024 URLs, each at most 8,192 bytes, with an
+8,390,656-byte raw-list ceiling. Invalid or over-limit values return `400`
+without beginning the list operation. Torrent-add multipart requests accept at
+most 16 uniquely named fields; duplicate or excess fields return `400`.
+The native daemon and compatible-client sidecar multipart add routes accept at
+most five unique fields and exactly one of `magnet` or `torrent`; category,
+save-path, and magnet values are limited to 256, 4,096, and 8,192 UTF-8 bytes
+respectively.
+
+Search plugin state is process-local and capped at 256 records. Install requests
+accept at most 256 sources of at most 2,048 bytes; plugin names are limited to
+256 bytes. Search-job history retains at most 256 jobs and evicts the oldest
+numeric ID when a new job arrives; patterns are limited to 4,096 bytes and the
+stored plugin/category filters to 4,096 bytes each. A no-ID results query selects
+the greatest numeric job ID, not the lexicographically greatest key.
+
+RSS folder/feed items and RSS rules are durable in the sidecar SQLite cache.
+The aggregate RSS item map is capped at 8 MiB of serialized JSON and 1,024
+entries; item paths and feed URLs are each limited to 8,192 bytes. RSS rules
+are capped at 1,024 names and 8 MiB of serialized JSON; names are limited to
+256 bytes, rule fields to 8,192 bytes, each rule JSON to 64 KiB, and rule tags
+to 1,024 entries of at most 256 bytes. `setRule` updates an existing rule by
+name rather than creating another record. New state beyond a retained-count cap
+returns `429`; aggregate-state overflow returns `413`; oversized or malformed
+input returns `400`.
 
 For a response containing more than 200 torrents, the direct TorrentNG qBittorrent
 facade does not issue per-torrent actor queries for transient tracker, swarm,
@@ -562,7 +700,7 @@ point; see [RTORRENT_LIBRARY_API.md](RTORRENT_LIBRARY_API.md).
 
 ### Log / Search / RSS
 
-These compatibility endpoints are present so qBittorrent clients can probe them safely. Search keeps plugin and job lifecycle state while returning inert local result sets. RSS folder, feed, and rule state is durable through the engine settings store when a TorrentNG client is attached; no-client test/facade instances use process-local state. RSS automation is limited to the documented TorrentNG-client magnet path; unsupported external actions fail explicitly.
+These compatibility endpoints are present so qBittorrent clients can probe them safely. Search keeps bounded, process-local plugin and job lifecycle state while returning inert local result sets. RSS folder, feed, and rule state is durable in the sidecar SQLite cache. RSS automation is limited to the documented TorrentNG-client magnet path; unsupported external actions fail explicitly.
 
 | Method | Path | Notes |
 |--------|------|-------|
@@ -582,10 +720,10 @@ These compatibility endpoints are present so qBittorrent clients can probe them 
 | `GET` | `/api/qb/v2/rss/items` | Returns compatibility folder/feed state |
 | `GET` | `/api/qb/v2/rss/rules` | Returns compatibility qBit-shaped rule map |
 | `GET` | `/api/qb/v2/rss/matchingArticles` | Returns known rule names |
-| `POST` | `/api/qb/v2/rss/setRule` | Creates/updates bounded RSS rule JSON; state is durable with the TorrentNG client attached |
+| `POST` | `/api/qb/v2/rss/setRule` | Creates or updates bounded RSS rule JSON by name; state is durable in the sidecar SQLite cache |
 | `POST` | `/api/qb/v2/rss/renameRule` | Renames compatibility RSS rule |
 | `POST` | `/api/qb/v2/rss/removeRule` | Deletes compatibility RSS rule |
-| `POST` | `/api/qb/v2/rss/addFolder`, `/addFeed`, `/removeItem`, `/moveItem`, `/markAsRead`, `/refreshItem` | Maintains bounded qBit-shaped folder/feed item state, durable with the TorrentNG client attached and process-local otherwise |
+| `POST` | `/api/qb/v2/rss/addFolder`, `/addFeed`, `/removeItem`, `/moveItem`, `/markAsRead`, `/refreshItem` | Maintains bounded qBit-shaped folder/feed item state in the sidecar SQLite cache |
 
 ---
 
@@ -621,7 +759,10 @@ sync-loop counters because it polls the selected client adapter.
 | `torrentng_api_sse_clients` | gauge | Active TorrentNG SSE clients |
 | `torrentng_api_response_bytes_estimated_total` | counter | Estimated bytes emitted by bounded list and SSE responses; an estimate, not wire accounting |
 | `torrentng_dht_*` | gauge | TorrentNG-client DHT routing table, lookup, tracked torrent, and announced peer cache counts |
-| `torrentng_storage_file_pool_*` | gauge/counter | TorrentNG-client scheduler open-file cache capacity, open files, metadata bytes, hits, misses, evictions, and idle closes |
+| `torrentng_storage_file_pool_*` | gauge/counter | Scheduler-pool capacity, cached entries, active descriptor leases, metadata bytes, hits, misses, evictions, and idle closes; shared-resource snapshots are de-duplicated |
+| `torrentng_storage_handles_{open,active}` | gauge | Cached entries and active descriptor leases in the separate global storage-runtime cache; leases share the process managed-storage quota |
+| `torrentng_storage_descriptor_leases_{active,capacity}` | gauge | Current use and capacity of the shared process-level managed-storage descriptor quota |
+| `torrentng_storage_descriptor_budget_waits_total` | counter | Storage descriptor admission attempts delayed by the shared quota |
 | `torrentng_storage_*_queue_depth` | gauge | TorrentNG-client disk I/O and hashing queue depths |
 | `torrentng_storage_device_queue_{capacity,available}` | gauge | Process-level per-device storage queue permits across running torrent schedulers |
 | `torrentng_storage_queued_disk_bytes` | gauge | Process-owned payload bytes currently reserved by queued or active disk, hash, and peer-read elevator jobs |
@@ -655,7 +796,7 @@ sync-loop counters because it polls the selected client adapter.
 | `torrentng_hot_torrent_peer_buffer_bytes{rank,info_hash}` | gauge | Peer rx/tx buffer portion of each hot-torrent memory estimate |
 | `torrentng_hot_torrent_tracker_peer_bytes{rank,info_hash}` | gauge | Tracker peer-cache portion of each hot-torrent memory estimate |
 | `torrentng_hot_torrent_peer_command_queue_bytes{rank,info_hash}` | gauge | Peer command queue portion of each hot-torrent memory estimate |
-| `torrentng_hot_torrent_storage_cache_bytes{rank,info_hash}` | gauge | Per-torrent storage cache portion of each hot-torrent memory estimate |
+| `torrentng_hot_torrent_storage_cache_bytes{rank,info_hash}` | gauge | Torrent-local storage cache portion of each hot-torrent estimate; shared scheduler cache memory is excluded and reported in aggregate pool metrics |
 | `torrentng_memory_*` | gauge/counter | Resource governor cap, current process-owned usage, pressure state, per-class caps/usage, and denied allocations, including the `queued_disk` class |
 | `torrentng_api_requests_total` | counter | API requests served |
 | `torrentng_sync_cycles_total` | counter | Compatible-client backend sync cycles completed |

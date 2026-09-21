@@ -24,6 +24,9 @@ Runtime behavior:
 
 - The compatible-client service refuses script actions unless `allow_scripts` is true.
 - Script commands must use an absolute executable path. The path is canonicalized before launch and must live under one of the configured allowlist directories. Workflow webhooks use address-pinned, no-redirect HTTP with bounded responses and reject private/local destinations unless `allow_private_webhooks` is explicitly enabled.
+- qBittorrent, Transmission, Deluge, and TorrentNG backend API clients do not follow redirects; configure the final API/RPC URL directly so an upstream cannot redirect authenticated operations to another endpoint.
+- Browser-marked login/logout requests are same-origin checked, and cookie- or trusted-proxy-authenticated mutations and WebSocket handshakes require same-origin evidence. Explicit Bearer-token requests remain exempt from cookie CSRF checks.
+- With API tokens configured, unauthenticated login routes allow 10 submissions per TCP peer per 60 seconds, then return 429 with `Retry-After`; a successful login clears the peer bucket. The service does not trust `X-Forwarded-For`, so reverse-proxy clients share the proxy peer bucket and may need an edge limit.
 - The compatible-client service passes torrent context through environment variables instead of interpolating values into the command:
   - `TNG_WORKFLOW_ID`
   - `TNG_WORKFLOW_NAME`
@@ -65,8 +68,15 @@ applies the same token gate to `/metrics`; deployments must still keep the route
 internal/protected network.
 
 The compatible-client service's `trust_proxy_header` mode is loopback-only. A reverse proxy must
-strip inbound `X-Remote-User` values before forwarding; public binds fail
-configuration validation when this mode is enabled.
+authenticate the request, strip inbound `X-Remote-User` values, and set its
+own identity value; public binds fail configuration validation when this mode
+is enabled. The bundled `deploy/nginx/nginx.conf` explicitly drops that header
+on every proxied route. Custom proxy configurations still require the same
+sanitization.
+
+Signed sidecar session cookies carry `HttpOnly`, `SameSite=Lax`, and `Secure`
+by default. Disabling `auth.secure_cookies` is permitted only on a loopback
+listener for trusted plain-HTTP development.
 
 Remaining deployment review is operator-owned: verify the actual reverse proxy
 strips spoofable identity headers, the rendered secret is non-placeholder, and

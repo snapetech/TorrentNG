@@ -398,21 +398,25 @@ INTEROP_KEEP_STACK=1 scripts/interop_matrix.sh --local
 | `INTEROP_KEEP_PUBLIC_DATA` | `0` | Preserve public torrent payloads after report generation |
 | `INTEROP_CURL_MAX_TIME` | `10` | Per-control-plane curl timeout |
 | `INTEROP_WORKDIR` | `certification/interop` | Matrix working directory |
+| `INTEROP_QBITTORRENT_USERNAME` | `admin` | qBittorrent WebUI account for the local runner |
+| `INTEROP_QBITTORRENT_PASSWORD` | unset | Existing lab password; otherwise the runner reads qBittorrent's temporary startup password |
 
 Host ports can be overridden with the `INTEROP_*_HOST_PORT` and
 `INTEROP_*_PEER_PORT` variables used by `deploy/interop/compose.yml`.
+The Web/API, tracker, and fixture HTTP ports bind to `127.0.0.1`; peer ports
+remain exposed for the transfer matrix.
 
 Default host ports avoid the common Linux ephemeral range:
 
 | Service | Host port |
 |---|---:|
-| Rust API | `28180` |
-| qBittorrent Web API | `28181` |
-| Transmission RPC | `28191` |
-| Deluge Web | `28212` |
+| Rust API | `127.0.0.1:28180` |
+| qBittorrent Web API | `127.0.0.1:28181` |
+| Transmission RPC | `127.0.0.1:28191` |
+| Deluge Web | `127.0.0.1:28212` |
 | rTorrent peer | `29185` |
-| opentracker | `26969` |
-| fixture HTTP | `28188` |
+| opentracker | `127.0.0.1:26969` |
+| fixture HTTP | `127.0.0.1:28188` |
 
 ## Release Gate
 

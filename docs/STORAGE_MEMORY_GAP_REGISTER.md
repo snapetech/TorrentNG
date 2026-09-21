@@ -15,8 +15,11 @@ Implemented and covered by automated tests:
 
 - Positioned storage I/O through `MountScheduler` with bounded dedicated disk
   workers instead of Tokio's shared blocking pool.
-- Path-keyed open-file cache with hit/miss/eviction/idle-close counters and
-  Unix fd-limit clamping.
+- Path-keyed open-file caches with hit/miss/eviction/idle-close counters and
+  RLIMIT-derived 60% per-cache ceilings (capped at 65,536 entries). Both the
+  path-backed scheduler `FilePool` and `StorageRuntime::HandleCache` apply
+  lifecycle leases across cached and in-flight backend ownership, and both
+  draw from one shared process-level managed-storage lease quota.
 - Per-file preparation in torrent tasks so parent creation and allocation are
   outside the per-block hot path.
 - `PreallocationMode::Auto` topology policy: full allocation only for local
@@ -32,6 +35,9 @@ Implemented and covered by automated tests:
 - TorrentNG-client metrics for hot-torrent memory attribution and queued disk bytes.
 - Dirty-path tracking survives open-file cache eviction: checkpoint sync
   reopens and syncs dirty files that are no longer cached.
+- `sync_all_open_files` merges dirty and cached writable paths, then opens and
+  syncs them sequentially; a large dirty set no longer holds one descriptor per
+  file at checkpoint time.
 - Per-device storage latency has bounded Prometheus histograms for
   read/write/sync/hash work, labeled by resolved device and profile.
 - Queued disk/hash/elevator work reserves actual queued payload bytes before
@@ -40,12 +46,22 @@ Implemented and covered by automated tests:
   Prometheus stats.
 - Schedulers that resolve to the same storage device share a process-level
   device queue semaphore for all positioned disk submissions.
+
+Descriptor accounting is bounded per storage cache and across managed storage.
+The path-backed scheduler
+`FilePool` lease follows each open file through cache, caller, and backend-job
+ownership, including cancellation and pending `io_uring` completion (TNG-135).
+`StorageRuntime::HandleCache` independently applies the same lifecycle rule,
+with async waiters that do not block executor workers (TNG-136). TNG-138 adds a
+shared admission budget across those caches; descriptors opened outside
+`rt-storage` remain outside the quota. The checkpoint path separately syncs
+dirty files sequentially rather than holding a descriptor per dirty path.
 - Move/import/delete plans have a conservative executor with no-overwrite
   admission, parent creation, copy-length verification, staged rollback cleanup,
   recursive directory copy/delete support, copy-based move source cleanup after
-  verified rename, copy-based import staging before final rename, symlink
-  rejection for rename/copy/hardlink-import sources, symlink-safe no-overwrite
-  checks, symlink-safe delete, and dry-run no-op behavior.
+  verified rename, copy-based import staging before final rename, reparse-point
+  rejection for rename/copy/hardlink-import sources, no-follow no-overwrite
+  checks, reparse-point-safe delete on Windows, and dry-run no-op behavior.
 - Move/import/delete execution has an opt-in storage-root confinement entry
   point that validates source, destination, and rollback paths before applying
   any filesystem change.
@@ -113,7 +129,7 @@ Implemented and covered by automated tests:
 | Deterministic LVM PV placement control | The kspls0 extent probe shows the pool can allocate independent files on multiple rotational PVs, but ordinary path writes still do not let TorrentNG choose a specific PV. | Cross-PV behavior inside the LVM pool is allocator-dependent, so path-level scheduling cannot promise physical-drive affinity. | Still open. Use LVM extent mapping for evidence, or add lower-level PV-targeted probes only if release claims require deterministic per-drive placement. |
 | `io_uring` hardware graduation | Satisfied on kspls0 LVM (HDD, `dm-0`) as of 2026-09-10: forced `uring` selected with `registered_files=true`, `fixed_buffers=true`, `fixed_buffer_strategy=frame_pool_slots`, 205.67 MiB/s read vs. 199.89 MiB/s for `pread`; graduation gate `uring selected` = PASS. | Results are for this host/kernel/filesystem combination; a materially different target (different kernel, filesystem, or storage class) is new evidence, not a re-read of this one. | Evidence on file: `certification/reports/storage-uring-graduation-kspls0-lvm-20260910-final.md`. Re-run `scripts/storage_uring_graduation.sh` when the target hardware or kernel changes. |
 | Move/import certification | Satisfied on kspls0 LVM as of 2026-09-10: 36/36 `rt-storage` planner/executor unit tests plus the real-root hardware fixture (64 files, 1 MiB each) passed against `/mnt/datapool_lvm_media`. | Representative multi-TB operator libraries are still larger than the fixture size exercised here; this evidence bounds correctness, not throughput at full operator scale. | Evidence on file: `certification/reports/storage-move-import-kspls0-lvm-20260910-final.md`. Re-run with larger `TNG_STORAGE_MOVE_IMPORT_FILES`/`_MIB_PER_FILE` before claiming multi-TB throughput specifically. |
-| Non-Unix (Windows) storage-plan executor path authority | `plan.rs`'s `cfg(not(unix))` fallback executor now re-checks every ancestor directory component for a symlink immediately before each mutating syscall (`reject_symlink_ancestors`), narrowing the TOCTOU window between the once-up-front `validate_plan_paths_under_roots` check and each step's actual filesystem call. It has unit test coverage (`plan::tests::portable_*`) and `windows-smoke.yml` now runs `cargo test -p rt-storage` on a real Windows runner. | This is a narrowed race window, not the eliminated one the Unix `secure_fs` executor achieves via `O_NOFOLLOW`-anchored descriptors: a symlink swap that lands between the recheck and the syscall it guards is still possible. Windows has no direct `O_NOFOLLOW` equivalent; closing this fully needs a Windows-native descriptor-anchoring implementation (e.g. relative opens with reparse-point rejection). | Open. Do not claim Windows storage-plan execution has the same TOCTOU guarantee as Unix. Track a Windows descriptor-anchoring implementation as a distinct follow-up rather than reusing this row's evidence for that claim. |
+| Non-Unix (Windows) storage-plan executor path authority | `plan.rs`'s `cfg(not(unix))` fallback rejects Windows reparse points (including directory links), fails closed when ancestor metadata cannot be inspected, and checks controls during copy, content verification, and recursive deletion. Runtime opens use reparse-point-aware handles. Windows moves use atomic no-replace semantics; copy/hash opens and exclusive destination creation do not follow reparse points. Imports use verified copies on Windows instead of path-based hard-link creation. Recursive copy, verification, length traversal, deletion, and pruning retain no-delete-share ancestor/current-directory handles, preventing directory replacement while those traversals use path-based operations. | The executor is still path-based rather than fully handle-relative; retaining directory handles narrows directory replacement races but does not provide the descriptor-anchored authority of Unix `secure_fs` or prove native Windows race semantics. Wine runs all 56 plan tests, but two full-suite unlink/recreate identity tests fail at Wine's unimplemented deletion-disposition call. | Open. Do not claim Windows storage-plan execution has the same TOCTOU guarantee as Unix or native Windows qualification. Track a handle-relative executor and native Windows validation as distinct follow-ups. |
 
 ## Verification Commands
 

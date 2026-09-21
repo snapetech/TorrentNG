@@ -114,6 +114,23 @@ enqueue and released on queue rejection, cancellation, or completion.
 | `http_timeout_secs` | `30` | HTTP announce timeout |
 | `udp_timeout_secs` | `15` | UDP announce timeout |
 | `min_interval_secs` | `0` | Minimum announce interval override; `0` uses tracker values |
+| `allow_http_trackers` | `true` | Permit HTTP tracker announces |
+| `allow_https_trackers` | `true` | Permit HTTPS tracker announces |
+| `allow_udp_trackers` | `true` | Permit UDP tracker announces |
+| `allow_http_webseeds` | `true` | Permit HTTP webseed requests |
+| `allow_https_webseeds` | `true` | Permit HTTPS webseed requests |
+| `allow_loopback_egress` | `false` | Permit outbound tracker, webseed, DHT, and peer traffic to loopback IPs |
+| `allow_private_egress` | `false` | Permit outbound tracker, webseed, DHT, and peer traffic to private/ULA/CGNAT IPs |
+| `allow_link_local_egress` | `false` | Permit outbound tracker, webseed, DHT, and peer traffic to link-local IPs |
+| `allow_multicast_egress` | `false` | Permit outbound tracker, webseed, DHT, and peer traffic to multicast IPs |
+| `allow_unspecified_egress` | `false` | Permit outbound tracker, webseed, DHT, and peer traffic to unspecified IPs |
+
+The address-policy switches apply to every outbound peer connection, not only
+tracker and webseed traffic: DHT bootstrap/routing traffic and peer addresses
+from trackers, DHT, PEX, or manual requests use the same policy. Leave these
+switches disabled for public-swarm isolation; enable only the address classes
+needed for a deliberate LAN/private deployment. Denied destinations are
+skipped and counted by the egress-policy metrics.
 
 ### `[dht]`
 
@@ -132,7 +149,7 @@ external endpoint.
 
 | Key | Default | Description |
 |---|---|---|
-| `path` | `session_dir/state.db` | SQLite database path; leave empty to use the session directory |
+| `path` | `session_dir/state.db` | SQLite database path; leave empty to use the session directory. Relative custom paths are resolved under `session_dir`; absolute paths are used as given. |
 | `wal_checkpoint_pages` | `1000` | SQLite WAL checkpoint threshold |
 
 ### `[auth]`
@@ -263,6 +280,11 @@ deployments.
 |---|---|---|---|
 | `type` | `rtorrent` | `TNG_BACKEND` | Backend adapter: `rtorrent`, `qbittorrent`, `transmission`, `deluge`, or `torrentng`. The former `native` value is accepted only as a legacy alias for `torrentng`. |
 
+The qBittorrent, Transmission, Deluge, and TorrentNG adapters treat their
+configured API/RPC URLs as final endpoints and do not follow HTTP redirects.
+Point each URL directly at the API endpoint, including the required path and
+scheme, rather than relying on an HTTP-to-HTTPS or path redirect.
+
 ```toml
 [backend]
 type = "rtorrent"
@@ -318,10 +340,13 @@ type = "qbittorrent"
 
 [qbittorrent]
 url = "http://127.0.0.1:8080"
-username = "admin"
-password = "adminadmin"
+username = "REPLACE_WITH_QBITTORRENT_WEBUI_USERNAME"
+password = "REPLACE_WITH_QBITTORRENT_WEBUI_PASSWORD"
 timeout_secs = 10
 ```
+
+These are placeholders, not working defaults. Configure authentication on the
+backend and keep the real credentials out of source control.
 
 ### Service `[transmission]`
 
@@ -360,8 +385,11 @@ type = "deluge"
 
 [deluge]
 url = "http://127.0.0.1:8112/json"
-password = "deluge"
+password = "REPLACE_WITH_DELUGE_WEBUI_PASSWORD"
 ```
+
+The password above is a placeholder. Change Deluge's default WebUI password
+before allowing access beyond a trusted local host.
 
 ### Service `[torrentng]`
 
@@ -496,7 +524,20 @@ Use these only for lab compatibility testing. Tracker-facing identity is still c
 |---|---|---|---|
 | `secret_key` | - | `TNG_SECRET_KEY` | Secret for signing expiring compatibility session cookies. Required for public binds. |
 | `api_tokens` | `[]` | `TNG_API_TOKENS` | Comma-separated pre-shared bearer tokens for automation tools; public binds require tokens of at least 16 characters |
-| `trust_proxy_header` | `false` | - | Trust a non-empty `X-Remote-User` only on a loopback listener; the reverse proxy must strip inbound copies before forwarding |
+| `trust_proxy_header` | `false` | - | Trust a non-empty `X-Remote-User` only on a loopback listener; the proxy must authenticate the request and discard client-supplied copies before setting its own identity (the bundled Nginx config clears this header) |
+| `secure_cookies` | `true` | - | Add `Secure` to issued and cleared session cookies; required for non-loopback listeners. Set `false` only for trusted loopback HTTP setups. |
+
+Requests authenticated by `X-Remote-User` require same-origin evidence for
+browser mutations and WebSocket handshakes. Automation clients should use an
+API-token Bearer credential instead.
+
+When API tokens are configured, unauthenticated login submissions are limited
+to 10 per TCP peer per 60 seconds. Further attempts receive `429 Too Many
+Requests` with `Retry-After`; a successful token login clears that peer's
+counter. The limiter uses the socket peer address, not caller-supplied
+`X-Forwarded-For`. Clients arriving through the same reverse proxy therefore
+share its bucket; configure an additional login limit at the proxy if that
+traffic should be separated.
 
 For compatibility with older installed `rtorrentng-prod` units, the service
 also accepts the former `RTNG_*` spelling for environment overrides. When both
@@ -538,15 +579,34 @@ scgi_socket = "/run/rtorrent/rpc.sock"
 
 See [deploy/docker/sidecar.config.toml](../deploy/docker/sidecar.config.toml) for the Phase 1 container-oriented compatible-client service config.
 
-The Docker compose stack also includes a qBittorrent profile:
+The default Compose file contains only the rTorrent-backed service. Each
+optional external backend has its own overlay and requires backend credentials
+in the Compose environment. The backend management UI/RPC ports are bound to
+`127.0.0.1`; BitTorrent peer ports remain published for inbound peers.
+
+For qBittorrent, first start the backend and use its temporary first-start
+password from the container logs to set the permanent WebUI credentials to the
+same values as `QBITTORRENT_USERNAME` and `QBITTORRENT_PASSWORD`. For Deluge,
+change its default WebUI password to `DELUGE_PASSWORD`. Transmission's profile
+passes `TRANSMISSION_USERNAME` and `TRANSMISSION_PASSWORD` to the image's
+supported `USER`/`PASS` settings. Keep these values in an untracked, protected
+environment file; do not commit them.
+
+Start one profile with the matching overlay:
 
 ```sh
-docker compose -f deploy/docker/compose.yml --profile qbittorrent up torrentng-qbittorrent qbittorrent
-docker compose -f deploy/docker/compose.yml --profile transmission up torrentng-transmission transmission
-docker compose -f deploy/docker/compose.yml --profile deluge up torrentng-deluge deluge
+docker compose --env-file .env -f deploy/docker/compose.yml -f deploy/docker/compose.qbittorrent.yml --profile qbittorrent up torrentng-qbittorrent qbittorrent
+docker compose --env-file .env -f deploy/docker/compose.yml -f deploy/docker/compose.transmission.yml --profile transmission up torrentng-transmission transmission
+docker compose --env-file .env -f deploy/docker/compose.yml -f deploy/docker/compose.deluge.yml --profile deluge up torrentng-deluge deluge
 ```
 
-Those profiles expose TorrentNG on host ports `8082`, `8083`, and `8084` respectively. The compatible clients' own WebUIs remain exposed on their usual profile ports for troubleshooting.
+Those profiles expose the authenticated TorrentNG adapters on host ports
+`8082`, `8083`, and `8084` respectively, bound to `127.0.0.1` by default.
+Backend management ports are available only on the local host (`8081`, `9091`,
+and `8112`); the peer ports remain available to remote peers. The base
+compatible-client stack similarly binds its HTTP/API (`8080`) and HTTP-only
+Nginx (`80`) host ports to loopback. Use an authenticated TLS reverse proxy for
+remote WebUI/API access.
 
 ### Compatible-client service full example
 

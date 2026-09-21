@@ -20,9 +20,13 @@ Default ports:
 
 | Host port | Container | Purpose |
 |---|---|---|
-| `8080` | `80/tcp` | ruTorrent |
+| `127.0.0.1:8080` | `8080/tcp` | ruTorrent (loopback only by default) |
 | `50000` | `50000/tcp` | BitTorrent incoming TCP |
 | `50000` | `50000/udp` | BitTorrent incoming UDP |
+
+For Phase 1, `PHASE1_INCOMING_PORT` selects the host peer port and
+`PHASE1_CONTAINER_INCOMING_PORT` selects rTorrent's container listen port;
+Compose maps the former to the latter for both TCP and UDP.
 
 Volumes:
 
@@ -38,7 +42,12 @@ Put site-specific rTorrent overrides in:
 deploy/docker/config/rtorrent.rc
 ```
 
-The container imports `/etc/rtorrent/rtorrent.rc`, which imports `engine-profile/rtorrent.rc`, then imports `/etc/rtorrent/user.rc` when an overlay exists.
+The container imports `/etc/rtorrent/rtorrent.rc`, which imports `engine-profile/rtorrent.rc`, then imports `/run/rtorrent/user.rc` when a read-only config overlay exists.
+
+This bundle does not configure HTTP authentication for ruTorrent. Compose binds
+its WebUI to loopback by default; only set `PHASE1_HTTP_BIND` to a remotely
+reachable host address when an authenticated reverse proxy or equivalent
+access control protects it. The BitTorrent peer ports remain published.
 
 ## Diagnostics
 
@@ -75,12 +84,105 @@ starts rTorrent, and serves the WebUI from the `torrentng` service process.
 docker compose -f deploy/docker/compose.yml up --build
 ```
 
-The entrypoint creates `/config/config.toml` from
-`deploy/docker/sidecar.config.toml` when no config file exists. Set
+The `/config` bind is read-only. If `/config/config.toml` exists, the service
+uses it; otherwise it uses the packaged
+`deploy/docker/sidecar.config.toml` without writing into the bind mount. Set
 `TNG_SECRET_KEY` and `TNG_API_TOKENS` in the compose environment for
 production auth; `TNG_API_TOKENS` is a comma-separated list for automation
 clients. Override `TNG_STATIC_DIR` only if you mount WebUI assets somewhere
 other than `/usr/share/torrentng/webui`.
+
+The default rTorrent settings UI writes to the persistent
+`/var/lib/torrentng/rtorrent-ui-overlay.rc` file, not the read-only `/config`
+bind. The entrypoint creates it owner-only on first start and imports it after
+the copied user config. If `TNG_RTORRENT_OVERLAY` is customized, the path must
+be absolute, use only letters, digits, `_`, `.`, `/`, or `-`, and reside on a
+writable persistent mount; the entrypoint imports that configured path.
+
+The service's HTTP/API host port (`8080`) and the bundled HTTP-only Nginx
+front door (`80`) bind to `127.0.0.1` by default. Optional adapter ports
+`8082`–`8084` do the same. These listeners do not provide TLS: use an
+authenticated TLS reverse proxy for remote access, and do not override the
+loopback binds without equivalent transport and access protection. Incoming
+BitTorrent peer ports remain published separately. Compatibility session
+cookies carry `Secure` by default; disable `auth.secure_cookies` only for an
+explicitly trusted loopback HTTP setup.
+
+Both compatible-client images run without root privileges. `PUID` and `PGID`
+select the runtime and initial named-volume ownership (default `1000:1000`);
+set them in the Compose environment before building. The same values are
+passed to the LinuxServer backend containers so they can share downloads.
+
+For a volume created by an older root-running image, stop the TorrentNG
+service and every other process using shared downloads, make a backup, then
+migrate the named volumes once with the matching Compose files and `.env`:
+
+```sh
+docker compose -f deploy/docker/compose.yml run --rm --no-deps \
+  --user 0:0 --entrypoint /bin/sh torrentng \
+  -ec 'chown -R "$PUID:$PGID" /data /session /var/lib/torrentng'
+```
+
+For Phase 1, use the same procedure with
+`-f deploy/docker/compose.phase1.yml`, service `torrentng-phase1`, and
+`/data /session`. For a host bind mount, perform the equivalent ownership
+change on the exact configured storage root while all consumers are stopped;
+do not recursively change a shared mount until its target UID/GID and backup
+are confirmed. Read-only `/config` files only need to be readable by the
+selected UID/GID.
+
+Compose stores `/var/lib/torrentng` in a dedicated named volume for each
+compatible-client service. It contains the sidecar SQLite cache and the
+persisted per-install peer-ID suffix; keep the matching volume with the
+service's `/config` and `/session` state. For a pre-existing deployment that
+has no `/var/lib/torrentng` mount, export and seed this directory before
+recreating the container. The exact migration and backup steps are in
+[BACKUP_RESTORE.md](BACKUP_RESTORE.md).
+
+The compatible-client and Phase 1 images now run as the configured nonzero
+UID/GID, reject UID 0 at entrypoint, keep `/config` read-only, and use
+unprivileged container ports. Compose also drops all Linux capabilities and
+sets `no-new-privileges`; Docker's default seccomp profile remains enabled.
+Existing data volumes need the one-time ownership migration above before the
+new image can write them.
+
+### Optional qBittorrent, Transmission, and Deluge backends
+
+The backend profiles are split into `compose.qbittorrent.yml`,
+`compose.transmission.yml`, and `compose.deluge.yml` overlays. This keeps their
+required credentials from blocking the default rTorrent stack. Set the
+matching variables in a protected, untracked `.env` file alongside
+`TNG_SECRET_KEY` and `TNG_API_TOKENS`; Compose fails closed when a selected
+profile's adapter credentials are missing.
+
+Backend WebUI/RPC host ports and the compatible-client adapter host ports are
+loopback-only by default. Torrent peer ports remain published. Transmission's profile wires its credentials through the
+image's `USER` and `PASS` variables. The qBittorrent image generates a
+temporary password on first start; change it in the local WebUI to match the
+configured `QBITTORRENT_USERNAME` and `QBITTORRENT_PASSWORD` before starting
+the TorrentNG adapter. Deluge's password is stored by Deluge rather than
+configured through the image environment; change it in its local WebUI to
+match `DELUGE_PASSWORD`.
+
+Example for qBittorrent:
+
+```sh
+docker compose --env-file .env \
+  -f deploy/docker/compose.yml \
+  -f deploy/docker/compose.qbittorrent.yml \
+  --profile qbittorrent up -d qbittorrent
+```
+
+After setting the backend credentials, start both the backend and its adapter:
+
+```sh
+docker compose --env-file .env \
+  -f deploy/docker/compose.yml \
+  -f deploy/docker/compose.qbittorrent.yml \
+  --profile qbittorrent up -d qbittorrent torrentng-qbittorrent
+```
+
+Use the corresponding overlay and profile name for Transmission or Deluge.
 
 ### Home live-main updater
 
