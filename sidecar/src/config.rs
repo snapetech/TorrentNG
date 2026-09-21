@@ -1,6 +1,8 @@
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
-use std::{fs::File, io::Read, net::SocketAddr, path::PathBuf, time::Duration};
+use std::{io::Read, net::SocketAddr, path::PathBuf, time::Duration};
+
+use crate::safe_file::open_regular_read;
 
 const MAX_CONFIG_BYTES: u64 = 1024 * 1024;
 
@@ -173,12 +175,24 @@ pub struct RtorrentLogConfig {
     pub read_from_start: bool,
 }
 
-#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct AuthConfig {
     pub secret_key: Option<String>,
     pub api_tokens: Vec<String>,
     pub trust_proxy_header: bool,
+    pub secure_cookies: bool,
+}
+
+impl Default for AuthConfig {
+    fn default() -> Self {
+        Self {
+            secret_key: None,
+            api_tokens: Vec::new(),
+            trust_proxy_header: false,
+            secure_cookies: true,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -417,7 +431,7 @@ impl Config {
                     component = "config",
                     operation = "resolve_peer_id",
                     result = "error",
-                    data_dir = %dir.display(),
+                    data_dir = %crate::url_redaction::redact_display(&dir.display()),
                     %error,
                     "could not persist per-install peer id; using an unpersisted random one for this run"
                 );
@@ -652,6 +666,9 @@ impl Config {
         if self.auth.trust_proxy_header && !listen_addr.ip().is_loopback() {
             bail!("auth.trust_proxy_header requires a loopback listen_addr");
         }
+        if !self.auth.secure_cookies && !listen_addr.ip().is_loopback() {
+            bail!("auth.secure_cookies must be enabled for a non-loopback listen_addr");
+        }
         if !listen_addr.ip().is_loopback() {
             if self.auth.api_tokens.is_empty() {
                 bail!("public listen_addr requires at least one API token");
@@ -712,7 +729,7 @@ fn is_placeholder_secret(value: &str) -> bool {
 }
 
 fn read_bounded_text(path: &std::path::Path, max_bytes: u64) -> Result<String> {
-    let file = File::open(path)?;
+    let file = open_regular_read(path)?;
     let mut bytes = Vec::new();
     file.take(max_bytes.saturating_add(1))
         .read_to_end(&mut bytes)?;
@@ -860,6 +877,26 @@ mod tests {
 
         cfg.auth.secret_key = Some("sidecar-session-secret-20260904-0123456789abcdef".to_owned());
         cfg.validate().unwrap();
+
+        cfg.auth.secure_cookies = false;
+        assert!(cfg
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("auth.secure_cookies"));
+        cfg.auth.secure_cookies = true;
+        cfg.validate().unwrap();
+    }
+
+    #[test]
+    fn secure_session_cookies_default_on_and_can_be_disabled_explicitly() {
+        assert!(AuthConfig::default().secure_cookies);
+
+        let existing_config: AuthConfig = toml::from_str("api_tokens = []").unwrap();
+        assert!(existing_config.secure_cookies);
+
+        let local_http_config: AuthConfig = toml::from_str("secure_cookies = false").unwrap();
+        assert!(!local_http_config.secure_cookies);
     }
 
     #[test]

@@ -172,7 +172,7 @@ impl Client {
             .await
             .context("rTorrent RPC gate closed")?;
 
-        match self.call_json(method, args).await {
+        let result = match self.call_json(method, args).await {
             Ok(value) => Ok(value),
             Err(json_err) => {
                 if is_jsonrpc_unavailable(&json_err) {
@@ -181,15 +181,16 @@ impl Client {
                     Err(json_err)
                 }
             }
-        }
-        .inspect_err(|e| {
-            if priority == RpcPriority::Background && is_timeout_error(e) {
-                let pause = self.low_priority_pause_until.clone();
-                tokio::spawn(async move {
-                    *pause.lock().await = Some(Instant::now() + std::time::Duration::from_secs(15));
-                });
+        };
+        if priority == RpcPriority::Background {
+            if let Err(error) = &result {
+                if is_timeout_error(error) {
+                    *self.low_priority_pause_until.lock().await =
+                        Some(Instant::now() + std::time::Duration::from_secs(15));
+                }
             }
-        })
+        }
+        result
     }
 
     async fn call_json(&self, method: &str, args: &[XmlValue]) -> Result<XmlValue> {
@@ -789,5 +790,40 @@ mod multicall_tests {
         let response = XmlValue::Array(vec![]);
         let results = parse_multicall_response(response, 0, "d.stop").unwrap();
         assert!(results.is_empty());
+    }
+}
+
+#[cfg(all(test, unix))]
+mod circuit_breaker_tests {
+    use super::*;
+    use tokio::io::AsyncReadExt;
+
+    #[tokio::test]
+    async fn background_timeout_opens_circuit_before_returning() {
+        let directory = tempfile::tempdir().unwrap();
+        let socket_path = directory.path().join("rpc.sock");
+        let listener = tokio::net::UnixListener::bind(&socket_path).unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = [0_u8; 1024];
+            let _ = stream.read(&mut request).await;
+            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+        });
+        let client = Client::new_unix(socket_path.to_str().unwrap(), 1);
+
+        let timeout = client
+            .call_with_priority("d.name", &[], RpcPriority::Background)
+            .await
+            .expect_err("silent SCGI server should time out");
+        assert!(is_timeout_error(&timeout));
+
+        let next = client
+            .call_with_priority("d.name", &[], RpcPriority::Background)
+            .await
+            .expect_err("circuit should be open before timeout returns");
+        assert_eq!(next.to_string(), "rTorrent RPC circuit breaker is open");
+
+        server.abort();
+        let _ = server.await;
     }
 }

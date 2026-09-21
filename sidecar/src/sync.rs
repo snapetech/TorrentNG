@@ -40,6 +40,40 @@ struct BoundedSyncState {
     counts: SyncCounts,
 }
 
+const MAX_SYNC_HASH_BYTES: usize = 256;
+const MAX_SYNC_NAME_BYTES: usize = 8 * 1024;
+const MAX_SYNC_CATEGORY_BYTES: usize = 256;
+const MAX_SYNC_PATH_BYTES: usize = 4 * 1024;
+const MAX_SYNC_TRACKER_URL_BYTES: usize = 8 * 1024;
+const MAX_SYNC_MESSAGE_BYTES: usize = 8 * 1024;
+const MAX_SYNC_TAGS_BYTES: usize = 512 * 1024;
+
+fn validate_torrent_projection(torrent: &RawTorrent) -> anyhow::Result<()> {
+    fn check_field(name: &str, value: &str, maximum: usize) -> anyhow::Result<()> {
+        if value.len() > maximum {
+            bail!("backend torrent {name} exceeds the {maximum}-byte limit");
+        }
+        Ok(())
+    }
+
+    if torrent.hash.trim().is_empty() {
+        bail!("backend torrent hash must not be empty");
+    }
+    check_field("hash", &torrent.hash, MAX_SYNC_HASH_BYTES)?;
+    check_field("name", &torrent.name, MAX_SYNC_NAME_BYTES)?;
+    check_field("category", &torrent.category, MAX_SYNC_CATEGORY_BYTES)?;
+    check_field("base_path", &torrent.base_path, MAX_SYNC_PATH_BYTES)?;
+    check_field("directory", &torrent.directory, MAX_SYNC_PATH_BYTES)?;
+    check_field(
+        "tracker_url",
+        &torrent.tracker_url,
+        MAX_SYNC_TRACKER_URL_BYTES,
+    )?;
+    check_field("message", &torrent.message, MAX_SYNC_MESSAGE_BYTES)?;
+    check_field("tags", &torrent.tags, MAX_SYNC_TAGS_BYTES)?;
+    Ok(())
+}
+
 pub async fn run(
     backend: Arc<dyn TorrentBackend>,
     db: Arc<Db>,
@@ -155,12 +189,15 @@ pub async fn run(
 /// "bounded_torrent_sync <view> offset=<n> limit=<n>" wrapper - the actual
 /// backend fault (the useful part for diagnosing *why* it failed) is one or
 /// more levels deeper and was previously invisible in both the tracing log
-/// and the persisted operator-log event.
+/// and the persisted operator-log event. Recognized credentials, paths, and
+/// terminal controls are redacted before callers emit the chain to a log.
 pub(crate) fn error_chain(e: &anyhow::Error) -> String {
-    e.chain()
+    let chain = e
+        .chain()
         .map(|cause| cause.to_string())
         .collect::<Vec<_>>()
-        .join(" -> caused by: ")
+        .join(" -> caused by: ");
+    crate::url_redaction::redact_display(&chain)
 }
 
 async fn append_app_event_async(
@@ -190,7 +227,7 @@ async fn append_app_event_async(
             operation = "append",
             kind,
             result = "error",
-            error = %e,
+            error = %crate::url_redaction::redact_display(&e),
             "failed to append sync app event"
         );
     }
@@ -219,26 +256,44 @@ async fn tick_full(
         );
     }
     let now = chrono::Utc::now().timestamp();
+    let mut sync_error = None;
+    let mut valid_torrents = Vec::with_capacity(torrents.len());
+    for torrent in torrents {
+        if let Err(error) = validate_torrent_projection(&torrent) {
+            warn!(
+                component = backend.backend_type().as_str(),
+                operation = "validate_torrent_projection",
+                result = "rejected",
+                error = %crate::url_redaction::redact_display(&error),
+                "backend sync rejected a torrent with an oversized or invalid field"
+            );
+            sync_error.get_or_insert(error);
+        } else {
+            valid_torrents.push(torrent);
+        }
+    }
 
     // Info hashes are hexadecimal identifiers and all supported clients treat
     // them case-insensitively. Compare logical hashes, not the spelling a
     // backend happened to return this cycle; otherwise a casing-only refresh
     // looks like a removal and can delete a live cache row.
-    let seen: HashSet<String> = torrents.iter().map(|t| logical_hash(&t.hash)).collect();
+    let seen: HashSet<String> = valid_torrents
+        .iter()
+        .map(|t| logical_hash(&t.hash))
+        .collect();
 
     let mut counts = SyncCounts::default();
 
-    let mut sync_error = None;
-    for t in &torrents {
+    for t in &valid_torrents {
         if let Err(error) =
             upsert_torrent(db, tx, t, now, &mut counts, &mut tracker_cache, sync_tags).await
         {
             warn!(
                 component = backend.backend_type().as_str(),
                 operation = "upsert_torrent",
-                torrent = %t.hash,
+                torrent = %crate::url_redaction::redact_display(&t.hash),
                 result = "error",
-                error = %error,
+                error = %crate::url_redaction::redact_display(&error),
                 "backend sync could not persist torrent projection"
             );
             sync_error.get_or_insert(error);
@@ -267,9 +322,9 @@ async fn tick_full(
                     warn!(
                         component = backend.backend_type().as_str(),
                         operation = "delete_torrent",
-                        torrent = %hash,
+                        torrent = %crate::url_redaction::redact_display(&hash),
                         result = "error",
-                        error = %error,
+                        error = %crate::url_redaction::redact_display(&error),
                         "backend sync could not delete a stale torrent projection"
                     );
                     sync_error.get_or_insert(error);
@@ -304,6 +359,18 @@ async fn tick_bounded(
         Ok(summary) => {
             write_live_speeds(summary.rates.download, summary.rates.upload).await;
             for t in &summary.moving {
+                if let Err(error) = validate_torrent_projection(t) {
+                    bounded.full_cycle_had_errors = true;
+                    warn!(
+                        component = backend.backend_type().as_str(),
+                        operation = "validate_torrent_projection",
+                        result = "rejected",
+                        error = %crate::url_redaction::redact_display(&error),
+                        "live summary contained a torrent with an oversized or invalid field"
+                    );
+                    sync_error.get_or_insert(error);
+                    continue;
+                }
                 // The live-summary view and the paged main view are separate
                 // backend reads. Protect a torrent reported by the former
                 // from end-of-list cleanup if the latter is temporarily
@@ -322,9 +389,9 @@ async fn tick_bounded(
                             warn!(
                                 component = backend.backend_type().as_str(),
                                 operation = "upsert_torrent",
-                                torrent = %t.hash,
+                                torrent = %crate::url_redaction::redact_display(&t.hash),
                                 result = "error",
-                                error = %error,
+                                error = %crate::url_redaction::redact_display(&error),
                                 "live summary torrent projection could not be persisted"
                             );
                             sync_error.get_or_insert(error);
@@ -374,6 +441,18 @@ async fn tick_bounded(
     }
 
     for t in &fetched.torrents {
+        if let Err(error) = validate_torrent_projection(t) {
+            bounded.full_cycle_had_errors = true;
+            warn!(
+                component = backend.backend_type().as_str(),
+                operation = "validate_torrent_projection",
+                result = "rejected",
+                error = %crate::url_redaction::redact_display(&error),
+                "bounded page contained a torrent with an oversized or invalid field"
+            );
+            sync_error.get_or_insert(error);
+            continue;
+        }
         let logical = logical_hash(&t.hash);
         bounded.full_cycle_seen.insert(logical.clone());
         if !touched.contains(&logical) {
@@ -386,9 +465,9 @@ async fn tick_bounded(
                     warn!(
                         component = backend.backend_type().as_str(),
                         operation = "upsert_torrent",
-                        torrent = %t.hash,
+                        torrent = %crate::url_redaction::redact_display(&t.hash),
                         result = "error",
-                        error = %error,
+                        error = %crate::url_redaction::redact_display(&error),
                         "paged torrent projection could not be persisted"
                     );
                     sync_error.get_or_insert(error);
@@ -443,9 +522,9 @@ async fn tick_bounded(
                             warn!(
                                 component = backend.backend_type().as_str(),
                                 operation = "delete_torrent",
-                                torrent = %hash,
+                                torrent = %crate::url_redaction::redact_display(&hash),
                                 result = "error",
-                                error = %error,
+                                error = %crate::url_redaction::redact_display(&error),
                                 "backend sync could not delete a stale torrent projection"
                             );
                             sync_error.get_or_insert(error);
@@ -609,7 +688,16 @@ async fn session_tracker_url_async(
         session_tracker_url(&hash, &mut cache)
     })
     .await
-    .unwrap_or_default();
+    .unwrap_or_else(|error| {
+        warn!(
+            component = "sync",
+            operation = "session_tracker_url",
+            result = "worker_failed",
+            error = %crate::task_join_error_summary("session tracker lookup worker", &error),
+            "session tracker lookup worker failed"
+        );
+        String::new()
+    });
     tracker_cache.insert(normalized, (!tracker.is_empty()).then(|| tracker.clone()));
     tracker
 }
@@ -623,6 +711,7 @@ async fn upsert_torrent(
     tracker_cache: &mut HashMap<String, Option<String>>,
     sync_tags: bool,
 ) -> anyhow::Result<()> {
+    validate_torrent_projection(t)?;
     let state = normalized_cache_state(t.state, t.is_active, &t.message);
     let tracker_url = if t.tracker_url.is_empty() {
         session_tracker_url_async(&t.hash, tracker_cache).await
@@ -711,41 +800,117 @@ async fn write_live_speeds(download: i64, upload: i64) {
         "updated_at": chrono::Utc::now().timestamp(),
     })
     .to_string();
-    let tmp_path = format!("{path}.tmp");
     let target = std::path::Path::new(&path)
         .file_name()
         .and_then(|name| name.to_str())
         .unwrap_or("live-speeds.json")
         .to_owned();
-    let cleanup_path = tmp_path.clone();
-    let result = match tokio::task::spawn_blocking(move || {
-        let result =
-            std::fs::write(&tmp_path, body).and_then(|_| std::fs::rename(&tmp_path, &path));
-        if result.is_err() {
-            let _ = std::fs::remove_file(cleanup_path);
-        }
-        result
-    })
-    .await
-    {
-        Ok(result) => result.map_err(|e| e.to_string()),
-        Err(e) => Err(format!("blocking live speed writer failed: {e}")),
-    };
+    let path = std::path::PathBuf::from(path);
+    let result =
+        match tokio::task::spawn_blocking(move || write_live_speeds_file(&path, &body)).await {
+            Ok(result) => result.map_err(|e| e.to_string()),
+            Err(error) => Err(crate::task_join_error_summary(
+                "blocking live speed writer",
+                &error,
+            )),
+        };
     if let Err(e) = result {
         warn!(
             component = "stats",
             operation = "write_live_speeds",
             target,
             result = "error",
-            error = %e,
+            error = %crate::url_redaction::redact_display(&e),
             "live speed cache write failed"
         );
     }
 }
 
+fn write_live_speeds_file(path: &std::path::Path, body: &str) -> std::io::Result<()> {
+    use std::io::Write;
+
+    let file_name = path.file_name().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "live speed file path has no file name",
+        )
+    })?;
+    let temp_name = format!(
+        ".{}.{}.tmp",
+        file_name.to_string_lossy(),
+        uuid::Uuid::new_v4()
+    );
+    let temp_path = path.with_file_name(temp_name);
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&temp_path)?;
+
+    if let Err(error) = file.write_all(body.as_bytes()) {
+        drop(file);
+        let _ = std::fs::remove_file(&temp_path);
+        return Err(error);
+    }
+    drop(file);
+
+    if let Err(error) = std::fs::rename(&temp_path, path) {
+        let _ = std::fs::remove_file(&temp_path);
+        return Err(error);
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn live_speed_writer_does_not_follow_preplanted_temp_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("live-speeds.json");
+        let victim = dir.path().join("victim.txt");
+        let legacy_temp = dir.path().join("live-speeds.json.tmp");
+        let body = r#"{"download":12,"upload":3}"#;
+        std::fs::write(&victim, "preserve me").unwrap();
+        symlink(&victim, &legacy_temp).unwrap();
+
+        write_live_speeds_file(&target, body).unwrap();
+
+        assert_eq!(std::fs::read_to_string(&victim).unwrap(), "preserve me");
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), body);
+        assert!(std::fs::symlink_metadata(legacy_temp)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+    }
+
+    #[test]
+    fn backend_error_chains_are_redacted_before_operator_logging() {
+        let error = anyhow::anyhow!(
+            "backend rejected https://chain-user:chain-password@tracker.example/announce?token=chain-url-secret /srv/private/error.log passkey=split-line-secret\ncontinued \u{001b}[31m\u{202e}spoof"
+        )
+        .context("bounded sync failed");
+
+        let chain = error_chain(&error);
+        assert!(chain.contains("https://tracker.example/"));
+        assert!(chain.contains("[redacted-path:error.log]"));
+        assert!(chain.contains("passkey=[redacted]"));
+        assert!(chain.contains("\\u{1b}"));
+        assert!(chain.contains("\\u{202e}"));
+        assert!(!chain.chars().any(char::is_control));
+        for secret in [
+            "chain-user",
+            "chain-password",
+            "chain-url-secret",
+            "/srv/private",
+            "split-line-secret",
+        ] {
+            assert!(!chain.contains(secret), "{chain}");
+        }
+    }
 
     #[tokio::test]
     async fn append_app_event_persists_sync_failure_shape() {
@@ -782,6 +947,102 @@ mod tests {
     fn logical_hash_collapses_hex_case_for_sync_identity() {
         assert_eq!(logical_hash("ABCdef0123"), "abcdef0123");
         assert_eq!(logical_hash("abcdef0123"), logical_hash("ABCDEF0123"));
+    }
+
+    #[test]
+    fn torrent_projection_rejects_oversized_backend_strings() {
+        fn valid_torrent() -> RawTorrent {
+            RawTorrent {
+                hash: "valid-hash".to_owned(),
+                name: "valid name".to_owned(),
+                size_bytes: 0,
+                bytes_done: 0,
+                down_rate: 0,
+                up_rate: 0,
+                up_total: 0,
+                down_total: 0,
+                ratio: 0,
+                is_active: false,
+                is_open: false,
+                complete: false,
+                state: 0,
+                priority: 0,
+                category: String::new(),
+                base_path: String::new(),
+                directory: String::new(),
+                creation_date: 0,
+                timestamp_finished: 0,
+                tracker_focus: 0,
+                peers_connected: 0,
+                peers_complete: 0,
+                message: String::new(),
+                tracker_url: String::new(),
+                tags: String::new(),
+            }
+        }
+
+        let mut torrent = valid_torrent();
+        torrent.hash = "a".repeat(MAX_SYNC_HASH_BYTES + 1);
+        assert!(validate_torrent_projection(&torrent)
+            .unwrap_err()
+            .to_string()
+            .contains("hash"));
+
+        let mut torrent = valid_torrent();
+        torrent.name = "x".repeat(MAX_SYNC_NAME_BYTES + 1);
+        assert!(validate_torrent_projection(&torrent)
+            .unwrap_err()
+            .to_string()
+            .contains("name"));
+
+        let mut torrent = valid_torrent();
+        torrent.category = "x".repeat(MAX_SYNC_CATEGORY_BYTES + 1);
+        assert!(validate_torrent_projection(&torrent)
+            .unwrap_err()
+            .to_string()
+            .contains("category"));
+
+        for path_field in ["base_path", "directory"] {
+            let mut torrent = valid_torrent();
+            let oversized = "x".repeat(MAX_SYNC_PATH_BYTES + 1);
+            if path_field == "base_path" {
+                torrent.base_path = oversized;
+            } else {
+                torrent.directory = oversized;
+            }
+            assert!(validate_torrent_projection(&torrent)
+                .unwrap_err()
+                .to_string()
+                .contains(path_field));
+        }
+
+        let mut torrent = valid_torrent();
+        torrent.tracker_url = "x".repeat(MAX_SYNC_TRACKER_URL_BYTES + 1);
+        assert!(validate_torrent_projection(&torrent)
+            .unwrap_err()
+            .to_string()
+            .contains("tracker_url"));
+
+        let mut torrent = valid_torrent();
+        torrent.message = "x".repeat(MAX_SYNC_MESSAGE_BYTES + 1);
+        assert!(validate_torrent_projection(&torrent)
+            .unwrap_err()
+            .to_string()
+            .contains("message"));
+
+        let mut torrent = valid_torrent();
+        torrent.tags = "x".repeat(MAX_SYNC_TAGS_BYTES + 1);
+        assert!(validate_torrent_projection(&torrent)
+            .unwrap_err()
+            .to_string()
+            .contains("tags"));
+
+        let mut torrent = valid_torrent();
+        torrent.hash = " \t ".to_owned();
+        assert!(validate_torrent_projection(&torrent)
+            .unwrap_err()
+            .to_string()
+            .contains("must not be empty"));
     }
 
     #[test]

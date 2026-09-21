@@ -1,6 +1,6 @@
 use axum::{
     body::Body,
-    extract::{ConnectInfo, MatchedPath},
+    extract::{ConnectInfo, DefaultBodyLimit, MatchedPath},
     http::{header, HeaderMap, HeaderName, HeaderValue, Request},
     middleware,
     response::Response,
@@ -37,7 +37,7 @@ pub struct AppState {
     pub qbit_search_plugins: Arc<RwLock<serde_json::Map<String, serde_json::Value>>>,
     pub qbit_search_jobs: Arc<RwLock<serde_json::Map<String, serde_json::Value>>>,
     pub qbit_next_search_id: Arc<AtomicU64>,
-    pub qbit_rss_items: Arc<RwLock<serde_json::Map<String, serde_json::Value>>>,
+    pub login_attempt_limiter: crate::auth::LoginAttemptLimiter,
     /// Serializes read-modify-write control-plane records stored as one JSON
     /// value in the cache database. The Db mutex protects individual SQL
     /// statements; this lock protects the multi-statement operation.
@@ -57,7 +57,11 @@ pub fn build_router(state: AppState) -> Router {
         .route("/api/v1/auth/logout", post(crate::qbcompat::auth_logout))
         .route(
             "/api/v1/torrents",
-            get(handlers::list_torrents).post(handlers::add_torrent),
+            get(handlers::list_torrents)
+                .post(handlers::add_torrent)
+                .layer(DefaultBodyLimit::max(
+                    crate::multipart::MAX_MULTIPART_REQUEST_BODY_BYTES,
+                )),
         )
         .route(
             "/api/v1/torrents/live",
@@ -180,7 +184,9 @@ pub fn build_router(state: AppState) -> Router {
             ServeDir::new(&static_dir)
                 .not_found_service(ServeFile::new(format!("{static_dir}/index.html"))),
         )
-        .layer(RequestBodyLimitLayer::new(64 * 1024 * 1024))
+        .layer(RequestBodyLimitLayer::new(
+            crate::multipart::MAX_MULTIPART_REQUEST_BODY_BYTES,
+        ))
         .layer(middleware::from_fn(request_log))
         .layer(middleware::from_fn_with_state(state.clone(), require_auth))
         .with_state(state)
@@ -220,9 +226,9 @@ async fn request_log(req: Request<Body>, next: middleware::Next) -> Response {
     tracing::info!(
         component = "http",
         operation = "request",
-        request_id = %request_id,
-        method = %method,
-        path = %path,
+        request_id = %crate::url_redaction::redact_display(&request_id),
+        method = %crate::url_redaction::redact_display(&method),
+        path = %crate::url_redaction::redact_display(&path),
         route = route.as_deref(),
         remote_addr = remote_addr.map(|addr| addr.to_string()).as_deref(),
         status = status.as_u16(),

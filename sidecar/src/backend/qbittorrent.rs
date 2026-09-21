@@ -26,7 +26,7 @@ pub struct QbittorrentBackend {
 
 impl QbittorrentBackend {
     pub fn new(cfg: &QbittorrentConfig) -> Result<Self> {
-        let client = reqwest::Client::builder()
+        let client = super::backend_client_builder()
             .cookie_store(true)
             .timeout(std::time::Duration::from_secs(cfg.timeout_secs.max(1)))
             .danger_accept_invalid_certs(cfg.accept_invalid_certs)
@@ -57,6 +57,7 @@ impl QbittorrentBackend {
             .form(&[("username", username.as_str()), ("password", password)])
             .send()
             .await
+            .map_err(reqwest::Error::without_url)
             .context("qBittorrent login request")?;
         let status = response.status();
         let body = super::response_bytes_bounded(
@@ -82,6 +83,7 @@ impl QbittorrentBackend {
                 .get(self.url(path)?)
                 .send()
                 .await
+                .map_err(reqwest::Error::without_url)
                 .with_context(|| format!("qBittorrent GET {path}"))?,
             MAX_BACKEND_JSON_BYTES,
             &format!("qBittorrent GET {path}"),
@@ -97,6 +99,7 @@ impl QbittorrentBackend {
             .form(form)
             .send()
             .await
+            .map_err(reqwest::Error::without_url)
             .with_context(|| format!("qBittorrent POST {path}"))?;
         let body = response_bytes_bounded(response, 16 * 1024, &format!("qBittorrent POST {path}"))
             .await?;
@@ -114,6 +117,7 @@ impl QbittorrentBackend {
                 .get(url)
                 .send()
                 .await
+                .map_err(reqwest::Error::without_url)
                 .with_context(|| format!("qBittorrent GET {path}"))?,
             MAX_BACKEND_JSON_BYTES,
             &format!("qBittorrent GET {path}"),
@@ -286,6 +290,7 @@ impl TorrentBackend for QbittorrentBackend {
                 .get(url)
                 .send()
                 .await
+                .map_err(reqwest::Error::without_url)
                 .context("qBittorrent paged torrents/info request")?,
             MAX_BACKEND_JSON_BYTES,
             "qBittorrent paged torrents/info",
@@ -336,6 +341,7 @@ impl TorrentBackend for QbittorrentBackend {
             .multipart(form)
             .send()
             .await
+            .map_err(reqwest::Error::without_url)
             .context("qBittorrent POST api/v2/torrents/add")?;
         let body =
             response_bytes_bounded(response, 16 * 1024, "qBittorrent POST api/v2/torrents/add")
@@ -354,6 +360,7 @@ impl TorrentBackend for QbittorrentBackend {
                 ))?)
                 .send()
                 .await
+                .map_err(reqwest::Error::without_url)
                 .context("qBittorrent GET api/v2/torrents/export")?,
             MAX_BACKEND_JSON_BYTES,
             "qBittorrent GET api/v2/torrents/export",
@@ -720,6 +727,7 @@ impl TorrentBackend for QbittorrentBackend {
                 .get(url)
                 .send()
                 .await
+                .map_err(reqwest::Error::without_url)
                 .context("qBittorrent torrent tag lookup")?,
             MAX_BACKEND_JSON_BYTES,
             "qBittorrent torrent tag lookup",
@@ -896,7 +904,7 @@ fn map_tracker((idx, tracker): (usize, QbitTracker)) -> Result<RawTracker> {
             idx,
             "num_downloaded",
         )?,
-        message: tracker.msg.unwrap_or_default(),
+        message: crate::url_redaction::redact_sensitive_text(&tracker.msg.unwrap_or_default()),
     })
 }
 
@@ -981,6 +989,23 @@ mod tests {
         assert!(validate_qbit_mutation_body(b"unexpected", "api/v2/torrents/pause").is_err());
     }
 
+    #[tokio::test]
+    async fn qbit_api_redirects_are_rejected_without_following() {
+        super::super::assert_backend_redirect_rejected(|base_url| async move {
+            let config = QbittorrentConfig {
+                url: base_url,
+                no_auth: true,
+                ..QbittorrentConfig::default()
+            };
+            let backend = QbittorrentBackend::new(&config)?;
+            backend
+                .get_json::<serde_json::Value>("api/v2/app/version")
+                .await
+                .map(|_| ())
+        })
+        .await;
+    }
+
     #[test]
     fn parses_qbit_peer_response() {
         let response = serde_json::json!({
@@ -1034,8 +1059,42 @@ mod tests {
         assert!(!paused_complete.is_active);
         assert!(paused_complete.complete);
 
-        let uploading_with_short_progress = map_torrent(torrent_fixture("uploading", 100, 25)).unwrap();
+        let uploading_with_short_progress =
+            map_torrent(torrent_fixture("uploading", 100, 25)).unwrap();
         assert_eq!(uploading_with_short_progress.bytes_done, 100);
+    }
+
+    #[test]
+    fn qbit_tracker_messages_redact_echoed_announce_credentials() {
+        let mapped = map_tracker((
+            0,
+            QbitTracker {
+                url: "https://tracker.example/announce".to_owned(),
+                status: Some(4),
+                msg: Some(
+                    "HTTP 401 https://user:password@tracker.example/short-passkey?signature=query-secret authkey=auth-secret"
+                        .to_owned(),
+                ),
+                num_seeds: None,
+                num_leeches: None,
+                num_downloaded: None,
+            },
+        ))
+        .unwrap();
+
+        assert_eq!(
+            mapped.message,
+            "HTTP 401 https://tracker.example/ authkey=[redacted]"
+        );
+        for secret in [
+            "user",
+            "password",
+            "short-passkey",
+            "query-secret",
+            "auth-secret",
+        ] {
+            assert!(!mapped.message.contains(secret), "{}", mapped.message);
+        }
     }
 
     #[test]

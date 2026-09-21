@@ -11,6 +11,7 @@ use tokio::time::sleep;
 use crate::{
     cache::{AppEventRow, Db},
     config::RtorrentLogConfig,
+    safe_file::open_regular_read,
 };
 
 const MAX_LOG_BYTES_PER_POLL: u64 = 1024 * 1024;
@@ -31,11 +32,12 @@ pub async fn run(db: Arc<Db>, config: RtorrentLogConfig, retention: usize) {
         })
         .await;
         if let Err(error) = poll {
+            let safe_error = crate::task_join_error_summary("rTorrent log poll worker", &error);
             tracing::warn!(
                 component = "rtorrent_logs",
                 operation = "poll",
                 result = "error",
-                error = %error,
+                error = %safe_error,
                 "rTorrent log poll worker failed"
             );
         }
@@ -48,33 +50,37 @@ fn poll_paths(db: &Db, paths: &[PathBuf], retention: usize, read_from_start: boo
         match ingest_path(db, path, retention, read_from_start) {
             Ok(()) => {
                 if let Err(e) = record_ingest_recovery(db, path, retention) {
+                    let source = crate::url_redaction::redact_sensitive_text(log_source(path));
+                    let safe_error = crate::url_redaction::redact_display(&e);
                     tracing::warn!(
                         component = "rtorrent_logs",
                         operation = "record_recovery",
-                        source = log_source(path),
+                        source = %source,
                         result = "error",
-                        error = %e,
+                        error = %safe_error,
                         "failed to record rtorrent log ingest recovery"
                     );
                 }
             }
             Err(e) => {
-                let source = log_source(path);
+                let source = crate::url_redaction::redact_sensitive_text(log_source(path));
+                let safe_error = crate::url_redaction::redact_display(&e);
                 tracing::warn!(
                     component = "rtorrent_logs",
                     operation = "ingest",
-                    source,
+                    source = %source,
                     result = "error",
-                    error = %e,
+                    error = %safe_error,
                     "failed to ingest rtorrent log"
                 );
                 if let Err(event_error) = record_ingest_failure(db, path, &e, retention) {
+                    let safe_error = crate::url_redaction::redact_display(&event_error);
                     tracing::warn!(
                         component = "rtorrent_logs",
                         operation = "record_failure",
-                        source,
+                        source = %source,
                         result = "error",
-                        error = %event_error,
+                        error = %safe_error,
                         "failed to record rtorrent log ingest failure"
                     );
                 }
@@ -101,7 +107,7 @@ fn ingest_path(db: &Db, path: &Path, retention: usize, read_from_start: bool) ->
         return Ok(());
     }
 
-    let mut file = std::fs::File::open(path).with_context(|| format!("open {}", path.display()))?;
+    let mut file = open_regular_read(path).with_context(|| format!("open {}", path.display()))?;
     file.seek(SeekFrom::Start(offset))?;
     let mut buf = Vec::new();
     file.take(MAX_LOG_BYTES_PER_POLL).read_to_end(&mut buf)?;
@@ -245,63 +251,7 @@ fn classify_level(line: &str) -> &'static str {
 }
 
 fn redact_log_line(line: &str) -> String {
-    line.split_whitespace()
-        .map(redact_token)
-        .collect::<Vec<_>>()
-        .join(" ")
-}
-
-fn redact_token(token: &str) -> String {
-    let lower = token.to_ascii_lowercase();
-    if lower.starts_with("magnet:?") {
-        return "[redacted-magnet]".to_owned();
-    }
-    if lower.contains("passkey=")
-        || lower.contains("apikey=")
-        || lower.contains("api_key=")
-        || lower.contains("token=")
-        || lower.contains("cookie=")
-    {
-        return redact_query_token(token);
-    }
-    if looks_like_path(token) {
-        return redact_path_token(token);
-    }
-    token.to_owned()
-}
-
-fn redact_query_token(token: &str) -> String {
-    let separators = ['&', ';'];
-    let mut out = token.to_owned();
-    for key in ["passkey", "apikey", "api_key", "token", "cookie"] {
-        let needle = format!("{key}=");
-        if let Some(pos) = out.to_ascii_lowercase().find(&needle) {
-            let value_start = pos + needle.len();
-            let value_end = out[value_start..]
-                .find(separators)
-                .map(|idx| value_start + idx)
-                .unwrap_or(out.len());
-            out.replace_range(value_start..value_end, "[redacted]");
-        }
-    }
-    out
-}
-
-fn looks_like_path(token: &str) -> bool {
-    let trimmed = token.trim_matches(|c: char| matches!(c, '"' | '\'' | ',' | ';' | ')' | '('));
-    trimmed.starts_with('/')
-        || trimmed.starts_with("~/")
-        || trimmed.starts_with("./")
-        || trimmed.starts_with("../")
-}
-
-fn redact_path_token(token: &str) -> String {
-    let trimmed = token.trim_matches(|c: char| matches!(c, '"' | '\'' | ',' | ';' | ')' | '('));
-    let suffix = Path::new(trimmed)
-        .file_name()
-        .and_then(|s| s.to_str())
-        .unwrap_or("path");
-    token.replace(trimmed, &format!("[redacted-path:{suffix}]"))
+    crate::url_redaction::redact_sensitive_text(line)
 }
 
 #[cfg(test)]
@@ -324,6 +274,76 @@ mod tests {
         let redacted = redact_log_line("tracker?passkey=secret;token=also-secret&x=1");
         assert!(!redacted.contains("secret"));
         assert!(redacted.contains("passkey=[redacted];token=[redacted]&x=1"));
+
+        let redacted = redact_log_line("authkey=auth-secret signature=sig-secret ordinary=visible");
+        assert_eq!(
+            redacted,
+            "authkey=[redacted] signature=[redacted] ordinary=visible"
+        );
+
+        let redacted = redact_log_line("Authorization: Bearer header-secret\nnext line remains");
+        assert!(!redacted.contains("header-secret"));
+        assert!(redacted.contains("next line remains"));
+
+        let redacted = redact_log_line("/srv/private/announce/passkey?pid=peer-secret");
+        assert!(redacted.starts_with("[redacted-path]?pid=[redacted]"));
+        assert!(!redacted.contains("/srv/private"));
+        assert!(!redacted.contains("peer-secret"));
+    }
+
+    #[test]
+    fn redacts_embedded_tracker_urls_without_relying_on_credential_names() {
+        let line = "announce=https://user:auth-secret@tracker.example:8443/short-passkey/announce?signature=query-secret#fragment-secret";
+        let redacted = redact_log_line(line);
+        assert_eq!(redacted, "announce=https://tracker.example:8443/");
+        for secret in [
+            "user",
+            "auth-secret",
+            "short-passkey",
+            "query-secret",
+            "fragment-secret",
+        ] {
+            assert!(!redacted.contains(secret), "{redacted}");
+        }
+
+        assert_eq!(
+            redact_log_line(
+                "tracker=udp://user:password@tracker.example:6969/private/key?pid=secret"
+            ),
+            "tracker=udp://tracker.example:6969/"
+        );
+        assert_eq!(
+            redact_log_line(
+                "remote=ftp://user:password@files.example/private/key?signature=secret"
+            ),
+            "remote=ftp://files.example/"
+        );
+        assert_eq!(
+            redact_log_line("source=magnet:?xt=urn:btih:secret&tr=https%3A%2F%2Ftracker%2Fkey"),
+            "[redacted-magnet]"
+        );
+    }
+
+    #[test]
+    fn persisted_log_lines_sanitize_terminal_and_bidi_controls() {
+        let dir = tempfile::tempdir().unwrap();
+        let log_path = dir.path().join("rtorrent.log");
+        let db = Db::open(&dir.path().join("cache.db")).unwrap();
+        std::fs::write(
+            &log_path,
+            "warning bell\u{7} escape\u{1b}[31mred\u{202e}spoof\u{2066}text\n",
+        )
+        .unwrap();
+
+        ingest_path(&db, &log_path, 10, true).unwrap();
+
+        let events = db.list_app_events(10).unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(
+            events[0].message,
+            "warning bell\\u{7} escape\\u{1b}[31mred\\u{202e}spoof\\u{2066}text"
+        );
+        assert!(!events[0].message.chars().any(char::is_control));
     }
 
     #[test]

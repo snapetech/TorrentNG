@@ -10,7 +10,13 @@
 //! client running many simultaneous instances.
 
 use anyhow::{Context, Result};
-use std::{fs::File, io::Read, path::Path};
+use std::{
+    fs::OpenOptions,
+    io::{Read, Write},
+    path::Path,
+};
+
+use crate::safe_file::open_regular_read_no_follow;
 
 pub const PEER_ID_PREFIX: &str = "-lt100B-";
 const PEER_ID_SUFFIX_FILE: &str = "peer_id_suffix";
@@ -30,13 +36,13 @@ pub fn load_or_generate_peer_id(data_dir: &Path) -> Result<String> {
     let suffix = random_suffix();
     std::fs::create_dir_all(data_dir)
         .with_context(|| format!("create data dir {}", data_dir.display()))?;
-    std::fs::write(&path, &suffix)
+    persist_suffix_atomically(&path, &suffix)
         .with_context(|| format!("persist peer id suffix to {}", path.display()))?;
     Ok(format!("{PEER_ID_PREFIX}{suffix}"))
 }
 
 fn read_bounded_text(path: &Path, max_bytes: u64) -> std::io::Result<String> {
-    let file = File::open(path)?;
+    let file = open_regular_read_no_follow(path)?;
     let mut bytes = Vec::new();
     file.take(max_bytes.saturating_add(1))
         .read_to_end(&mut bytes)?;
@@ -52,6 +58,54 @@ fn read_bounded_text(path: &Path, max_bytes: u64) -> std::io::Result<String> {
             "peer id suffix file is not valid UTF-8",
         )
     })
+}
+
+fn persist_suffix_atomically(path: &Path, suffix: &str) -> std::io::Result<()> {
+    let temporary = path.with_file_name(format!(
+        ".{PEER_ID_SUFFIX_FILE}.{}.tmp",
+        uuid::Uuid::new_v4()
+    ));
+    let write_result = (|| {
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let mut file = options.open(&temporary)?;
+        file.write_all(suffix.as_bytes())?;
+        file.sync_all()?;
+        drop(file);
+        #[cfg(windows)]
+        remove_destination_reparse_point(path)?;
+        std::fs::rename(&temporary, path)
+    })();
+    if write_result.is_err() {
+        let _ = std::fs::remove_file(&temporary);
+    }
+    write_result
+}
+
+#[cfg(windows)]
+fn remove_destination_reparse_point(path: &Path) -> std::io::Result<()> {
+    use std::os::windows::fs::MetadataExt;
+
+    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0400;
+
+    let metadata = match std::fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error),
+    };
+    if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT == 0 {
+        return Ok(());
+    }
+    if metadata.is_dir() {
+        std::fs::remove_dir(path)
+    } else {
+        std::fs::remove_file(path)
+    }
 }
 
 fn valid_suffix(suffix: &str) -> bool {
@@ -134,5 +188,63 @@ mod tests {
         let id = load_or_generate_peer_id(dir.path()).expect("replace oversized suffix");
         let suffix = id.strip_prefix(PEER_ID_PREFIX).expect("prefix");
         assert!(valid_suffix(suffix));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn invalid_suffix_symlink_replacement_does_not_overwrite_its_target() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join(PEER_ID_SUFFIX_FILE);
+        let target = dir.path().join("outside.txt");
+        std::fs::write(&target, "preserve this file").unwrap();
+        symlink(&target, &path).unwrap();
+
+        let id = load_or_generate_peer_id(dir.path()).expect("replace symlink");
+        let suffix = id.strip_prefix(PEER_ID_PREFIX).expect("prefix");
+
+        assert!(valid_suffix(suffix));
+        assert_eq!(
+            std::fs::read_to_string(target).unwrap(),
+            "preserve this file"
+        );
+        assert!(!std::fs::symlink_metadata(&path)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert_eq!(std::fs::read_to_string(path).unwrap(), suffix);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn invalid_suffix_reparse_point_replacement_does_not_overwrite_its_target() {
+        use std::os::windows::fs::symlink_file;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join(PEER_ID_SUFFIX_FILE);
+        let target = dir.path().join("outside.txt");
+        std::fs::write(&target, "preserve this file").unwrap();
+        if let Err(error) = symlink_file(&target, &path) {
+            if error.kind() == std::io::ErrorKind::PermissionDenied {
+                eprintln!("Windows runner does not permit creating a test symlink: {error}");
+                return;
+            }
+            panic!("failed to create test reparse point: {error}");
+        }
+
+        let id = load_or_generate_peer_id(dir.path()).expect("replace reparse point");
+        let suffix = id.strip_prefix(PEER_ID_PREFIX).expect("prefix");
+
+        assert!(valid_suffix(suffix));
+        assert_eq!(
+            std::fs::read_to_string(target).unwrap(),
+            "preserve this file"
+        );
+        assert!(!std::fs::symlink_metadata(&path)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert_eq!(std::fs::read_to_string(path).unwrap(), suffix);
     }
 }

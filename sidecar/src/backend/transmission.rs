@@ -24,7 +24,7 @@ pub struct TransmissionBackend {
 
 impl TransmissionBackend {
     pub fn new(cfg: &TransmissionConfig) -> Result<Self> {
-        let client = reqwest::Client::builder()
+        let client = super::backend_client_builder()
             .timeout(std::time::Duration::from_secs(cfg.timeout_secs.max(1)))
             .danger_accept_invalid_certs(cfg.accept_invalid_certs)
             .build()
@@ -51,6 +51,7 @@ impl TransmissionBackend {
             let response = req
                 .send()
                 .await
+                .map_err(reqwest::Error::without_url)
                 .with_context(|| format!("Transmission RPC {method}"))?;
             if response.status() == reqwest::StatusCode::CONFLICT {
                 if let Some(value) = response
@@ -486,7 +487,7 @@ impl TransmissionBackend {
             .into_iter()
             .find(|tracker| tracker.url == url)
             .map(|tracker| tracker.id)
-            .with_context(|| format!("Transmission tracker not found: {url}"))
+            .context("Transmission tracker not found")
     }
 }
 
@@ -586,7 +587,7 @@ fn map_torrent(t: &Value) -> Result<RawTorrent> {
         tracker_focus: 0,
         peers_connected: required_nonnegative_i64(t, "peersConnected")?,
         peers_complete: 0,
-        message: error,
+        message: crate::url_redaction::redact_sensitive_text(&error),
         tracker_url: tracker,
         tags: String::new(),
     })
@@ -600,10 +601,10 @@ fn transmission_state_projection(status: i64, has_error: bool) -> (i64, bool, bo
         return (3, false, false);
     }
     match status {
-        0 => (0, false, false), // stopped
+        0 => (0, false, false),         // stopped
         1 | 3 | 5 => (5, false, false), // check/download/seed wait
-        2 => (2, true, true),   // checking
-        4 | 6 => (1, true, true), // downloading/seeding
+        2 => (2, true, true),           // checking
+        4 | 6 => (1, true, true),       // downloading/seeding
         _ => (1, true, true),
     }
 }
@@ -629,7 +630,10 @@ fn map_tracker((index, tracker): (usize, &Value)) -> Result<RawTracker> {
         scrape_incomplete: required_nonnegative_i64(tracker, "leecherCount")?,
         scrape_complete: required_nonnegative_i64(tracker, "seederCount")?,
         scrape_downloaded: required_nonnegative_i64(tracker, "downloadCount")?,
-        message: optional_string(tracker, "lastAnnounceResult")?,
+        message: crate::url_redaction::redact_sensitive_text(&optional_string(
+            tracker,
+            "lastAnnounceResult",
+        )?),
     })
 }
 
@@ -723,6 +727,19 @@ mod tests {
         assert!(!capabilities.supports_peer_ban);
     }
 
+    #[tokio::test]
+    async fn transmission_rpc_redirects_are_rejected_without_following() {
+        super::super::assert_backend_redirect_rejected(|base_url| async move {
+            let config = TransmissionConfig {
+                url: base_url,
+                ..TransmissionConfig::default()
+            };
+            let backend = TransmissionBackend::new(&config)?;
+            backend.rpc("session-get", json!({})).await.map(|_| ())
+        })
+        .await;
+    }
+
     #[test]
     fn maps_transmission_tracker_ids_for_mutation_calls() {
         let tracker = json!({
@@ -744,6 +761,38 @@ mod tests {
         assert_eq!(mapped.group, 2);
         assert!(mapped.is_open);
         assert_eq!(mapped.scrape_complete, 4);
+    }
+
+    #[test]
+    fn transmission_tracker_results_redact_echoed_announce_credentials() {
+        let tracker = json!({
+            "announce": "https://tracker.example/announce",
+            "id": 17,
+            "tier": 2,
+            "lastAnnounceSucceeded": false,
+            "lastAnnounceTime": 100,
+            "nextAnnounceTime": 200,
+            "lastAnnounceResult": "HTTP 401 https://user:password@tracker.example/short-passkey?signature=query-secret authkey=auth-secret",
+            "leecherCount": 3,
+            "seederCount": 4,
+            "downloadCount": 5
+        });
+
+        let mapped = map_tracker((0, &tracker)).unwrap();
+
+        assert_eq!(
+            mapped.message,
+            "HTTP 401 https://tracker.example/ authkey=[redacted]"
+        );
+        for secret in [
+            "user",
+            "password",
+            "short-passkey",
+            "query-secret",
+            "auth-secret",
+        ] {
+            assert!(!mapped.message.contains(secret), "{}", mapped.message);
+        }
     }
 
     #[test]
@@ -785,5 +834,36 @@ mod tests {
 
         assert!(mapped.complete);
         assert_eq!(mapped.bytes_done, 100);
+    }
+
+    #[test]
+    fn transmission_error_messages_redact_tracker_credentials() {
+        let torrent = json!({
+            "percentDone": 0.5,
+            "status": 4,
+            "trackerStats": [],
+            "totalSize": 100,
+            "sizeWhenDone": 100,
+            "haveValid": 50,
+            "errorString": "Tracker rejected https://user:password@tracker.example/short-passkey?signature=query-secret",
+            "hashString": "transmission-hash",
+            "name": "downloading",
+            "rateDownload": 0,
+            "rateUpload": 0,
+            "uploadedEver": 0,
+            "downloadedEver": 50,
+            "uploadRatio": 0.0,
+            "downloadDir": "/downloads",
+            "addedDate": 10,
+            "doneDate": 0,
+            "peersConnected": 0
+        });
+
+        let mapped = map_torrent(&torrent).unwrap();
+
+        assert_eq!(mapped.message, "Tracker rejected https://tracker.example/");
+        for secret in ["user", "password", "short-passkey", "query-secret"] {
+            assert!(!mapped.message.contains(secret), "{}", mapped.message);
+        }
     }
 }

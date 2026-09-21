@@ -1,5 +1,5 @@
 use axum::{
-    extract::{Form, Multipart, Query, State},
+    extract::{ConnectInfo, DefaultBodyLimit, Extension, Form, Multipart, Query, State},
     http::{header, HeaderMap, HeaderValue, StatusCode},
     response::{AppendHeaders, IntoResponse},
     routing::{get, post},
@@ -8,7 +8,7 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     fmt,
     net::SocketAddr,
     sync::{atomic::Ordering, Arc},
@@ -20,13 +20,49 @@ use tokio::task::JoinSet;
 // its compatibility response bounded and reject an over-limit sync instead
 // of returning a truncated object that claims to be a full update.
 const MAX_QBIT_SYNC_ENTRIES: usize = 10_000;
+const MAX_QBIT_HASH_SELECTIONS: usize = 10_000;
+const MAX_QBIT_BATCH_OPERATIONS: usize = 10_000;
+const MAX_QBIT_HASH_BYTES: usize = 256;
+const MAX_QBIT_MANUAL_PEERS: usize = 4_096;
+const MAX_QBIT_BANNED_PEERS: usize = 65_536;
+const MAX_QBIT_PEER_ADDRESS_BYTES: usize = 128;
+const MAX_QBIT_LIST_ENTRIES: usize = 1_024;
+const MAX_QBIT_LIST_VALUE_BYTES: usize = 8_192;
+const MAX_QBIT_CATEGORY_NAME_BYTES: usize = 256;
+const MAX_QBIT_CATEGORY_PATH_BYTES: usize = 4_096;
+const MAX_QBIT_TAG_ENTRIES: usize = 1_024;
+const MAX_QBIT_TAG_BYTES: usize = 256;
+const MAX_QBIT_TAG_LIST_BYTES: usize = 512 * 1_024;
+const MAX_QBIT_FILE_IDS: usize = 4_096;
+const MAX_QBIT_FILE_ID_BYTES: usize = 20;
+const MAX_QBIT_SEARCH_PLUGINS: usize = 256;
+const MAX_QBIT_SEARCH_PLUGIN_SOURCE_BYTES: usize = 2_048;
+const MAX_QBIT_SEARCH_PLUGIN_NAME_BYTES: usize = 256;
+const MAX_QBIT_SEARCH_JOBS: usize = 256;
+const MAX_QBIT_SEARCH_PATTERN_BYTES: usize = 4_096;
+const MAX_QBIT_SEARCH_FILTER_BYTES: usize = 4_096;
+const MAX_QBIT_RSS_ITEMS: usize = 1_024;
+const MAX_QBIT_RSS_ITEM_PATH_BYTES: usize = 8_192;
+const MAX_QBIT_RSS_URL_BYTES: usize = 8_192;
+const MAX_QBIT_RSS_RULE_NAME_BYTES: usize = 256;
+const MAX_QBIT_RSS_RULE_FIELD_BYTES: usize = 8_192;
+const MAX_QBIT_RSS_RULE_TAGS: usize = 1_024;
+const MAX_QBIT_RSS_RULE_TAG_BYTES: usize = 256;
+const MAX_QBIT_RSS_RULE_JSON_BYTES: usize = 64 * 1_024;
+const MAX_QBIT_TORRENT_ADD_URLS: usize = 1_024;
+const MAX_QBIT_TORRENT_ADD_URL_BYTES: usize = 8_192;
+const MAX_QBIT_TORRENT_ADD_FIELDS: usize = 16;
+const MAX_QBIT_TORRENT_ADD_URL_LIST_BYTES: usize =
+    MAX_QBIT_TORRENT_ADD_URLS * (MAX_QBIT_TORRENT_ADD_URL_BYTES + 2);
+const MAX_QBIT_TORRENT_ADD_OPTION_BYTES: usize = 64;
 
 use crate::{
     api::{server::AppState, ws::Event},
     backend::{ratio_milli, BackendPeer, BackendPieceState, BackendStatus, QueueMove},
     cache::{
-        bounded_page_limit, validate_page_offset, AppEventRow, ListParams, RssRule,
-        RssRuleRenameResult, TorrentRow,
+        bounded_page_limit, is_automation_state_capacity_error, is_category_tag_capacity_error,
+        is_qbit_rss_item_capacity_error, validate_page_offset, AppEventRow, ListParams, RssRule,
+        RssRuleRenameResult, RssRuleUpsertResult, TorrentRow,
     },
     rtorrent::TransferRates,
 };
@@ -37,6 +73,70 @@ fn backend_error_status(error: &anyhow::Error) -> StatusCode {
     } else {
         StatusCode::SERVICE_UNAVAILABLE
     }
+}
+
+fn qbit_batch_work_within_limit(torrent_count: usize, items_per_torrent: usize) -> bool {
+    torrent_count.saturating_mul(items_per_torrent.max(1)) <= MAX_QBIT_BATCH_OPERATIONS
+}
+
+fn metadata_write_status(error: &anyhow::Error) -> StatusCode {
+    if is_category_tag_capacity_error(error) {
+        StatusCode::TOO_MANY_REQUESTS
+    } else {
+        StatusCode::INTERNAL_SERVER_ERROR
+    }
+}
+
+fn metadata_read_status(error: &anyhow::Error) -> StatusCode {
+    if is_category_tag_capacity_error(error) {
+        StatusCode::SERVICE_UNAVAILABLE
+    } else {
+        StatusCode::INTERNAL_SERVER_ERROR
+    }
+}
+
+fn rss_item_write_status(error: &anyhow::Error) -> StatusCode {
+    if is_qbit_rss_item_capacity_error(error) || is_automation_state_capacity_error(error) {
+        StatusCode::PAYLOAD_TOO_LARGE
+    } else {
+        StatusCode::INTERNAL_SERVER_ERROR
+    }
+}
+
+fn automation_state_write_status(error: &anyhow::Error) -> StatusCode {
+    if is_automation_state_capacity_error(error) {
+        StatusCode::PAYLOAD_TOO_LARGE
+    } else {
+        StatusCode::INTERNAL_SERVER_ERROR
+    }
+}
+
+async fn preflight_qbit_torrent_tags(
+    state: &AppState,
+    hashes: &[String],
+    tags: &[&str],
+    append: bool,
+) -> anyhow::Result<()> {
+    let hashes = hashes.to_vec();
+    let tags = tags.iter().map(|tag| (*tag).to_owned()).collect::<Vec<_>>();
+    state
+        .db
+        .run_blocking("qbit_preflight_torrent_tags", move |db| {
+            let tag_refs = tags.iter().map(String::as_str).collect::<Vec<_>>();
+            crate::cache::categories::ensure_torrent_tag_capacities(db, &hashes, &tag_refs, append)
+        })
+        .await
+}
+
+async fn preflight_qbit_tag_names(state: &AppState, tags: &[&str]) -> anyhow::Result<()> {
+    let tags = tags.iter().map(|tag| (*tag).to_owned()).collect::<Vec<_>>();
+    state
+        .db
+        .run_blocking("qbit_preflight_tag_names", move |db| {
+            let tag_refs = tags.iter().map(String::as_str).collect::<Vec<_>>();
+            crate::cache::categories::ensure_tag_name_capacity(db, &tag_refs)
+        })
+        .await
 }
 
 fn is_unsupported_error(error: &anyhow::Error) -> bool {
@@ -87,7 +187,12 @@ pub fn build_router(_state: AppState) -> Router<AppState> {
         // Torrents
         .route("/torrents/info", get(torrents_info))
         .route("/torrents/properties", get(torrents_properties))
-        .route("/torrents/add", post(torrents_add))
+        .route(
+            "/torrents/add",
+            post(torrents_add).layer(DefaultBodyLimit::max(
+                crate::multipart::MAX_MULTIPART_REQUEST_BODY_BYTES,
+            )),
+        )
         .route("/torrents/start", post(torrents_resume))
         .route("/torrents/stop", post(torrents_pause))
         .route("/torrents/pause", post(torrents_pause))
@@ -188,11 +293,14 @@ pub fn build_router(_state: AppState) -> Router<AppState> {
 
 pub(crate) async fn auth_login(
     State(s): State<AppState>,
+    peer: Option<Extension<ConnectInfo<SocketAddr>>>,
     Form(f): Form<HashMap<String, String>>,
 ) -> impl IntoResponse {
     if s.cfg.auth.api_tokens.is_empty() {
         return "Ok.".into_response();
     }
+
+    let peer_ip = peer.map(|Extension(ConnectInfo(addr))| addr.ip());
 
     let candidate = f
         .get("password")
@@ -206,13 +314,21 @@ pub(crate) async fn auth_login(
         .iter()
         .any(|token| crate::auth::tokens_match(token, candidate))
     {
+        s.login_attempt_limiter.clear(peer_ip).await;
         // API tokens are operator-provided strings, not cookie-safe strings.
         // Encode the value before putting it in a header; the auth middleware
         // decodes it again before comparison.
         let cookie_value =
             crate::auth::session_cookie_value(s.cfg.auth.secret_key.as_deref(), candidate);
-        let tng_cookie = format!("tng_session={cookie_value}; Path=/; HttpOnly; SameSite=Lax");
-        let sid_cookie = format!("SID={cookie_value}; Path=/; HttpOnly; SameSite=Lax");
+        let secure_attribute = if s.cfg.auth.secure_cookies {
+            "; Secure"
+        } else {
+            ""
+        };
+        let tng_cookie =
+            format!("tng_session={cookie_value}; Path=/; HttpOnly; SameSite=Lax{secure_attribute}");
+        let sid_cookie =
+            format!("SID={cookie_value}; Path=/; HttpOnly; SameSite=Lax{secure_attribute}");
         (
             AppendHeaders([
                 (header::SET_COOKIE, tng_cookie),
@@ -225,16 +341,23 @@ pub(crate) async fn auth_login(
         "Fails.".into_response()
     }
 }
-pub(crate) async fn auth_logout() -> impl IntoResponse {
+pub(crate) async fn auth_logout(State(s): State<AppState>) -> impl IntoResponse {
+    let secure_attribute = if s.cfg.auth.secure_cookies {
+        "; Secure"
+    } else {
+        ""
+    };
     (
         AppendHeaders([
             (
                 header::SET_COOKIE,
-                "tng_session=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0",
+                format!(
+                    "tng_session=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0{secure_attribute}"
+                ),
             ),
             (
                 header::SET_COOKIE,
-                "SID=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0",
+                format!("SID=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0{secure_attribute}"),
             ),
         ]),
         StatusCode::OK,
@@ -290,7 +413,7 @@ async fn log_main(State(s): State<AppState>, Query(q): Query<LogMainQuery>) -> i
                     component = "api",
                     operation = "log_main",
                     result = "error",
-                    error = %e,
+                    error = %crate::url_redaction::redact_display(&e),
                     "failed to project app event"
                 );
                 StatusCode::SERVICE_UNAVAILABLE.into_response()
@@ -301,7 +424,7 @@ async fn log_main(State(s): State<AppState>, Query(q): Query<LogMainQuery>) -> i
                 component = "api",
                 operation = "log_main",
                 result = "error",
-                error = %e,
+                error = %crate::url_redaction::redact_display(&e),
                 "failed to read app events"
             );
             StatusCode::SERVICE_UNAVAILABLE.into_response()
@@ -337,7 +460,7 @@ async fn log_peers(State(s): State<AppState>) -> impl IntoResponse {
                 component = "api",
                 operation = "log_peers",
                 result = "error",
-                error = %e,
+                error = %crate::url_redaction::redact_display(&e),
                 "failed to read torrent cache for peer log"
             );
             return StatusCode::SERVICE_UNAVAILABLE.into_response();
@@ -384,7 +507,7 @@ async fn log_peers(State(s): State<AppState>) -> impl IntoResponse {
             component = "api",
             operation = "log_peers",
             result = "error",
-            error = %error,
+            error = %crate::url_redaction::redact_display(&error),
             "failed to read peer snapshots"
         );
         return backend_error_status(&error).into_response();
@@ -523,13 +646,33 @@ async fn search_install_plugin(
     State(s): State<AppState>,
     Form(f): Form<HashMap<String, String>>,
 ) -> StatusCode {
-    let sources = match required_qbit_form_list(&f, "sources") {
+    let sources = match required_qbit_form_list(
+        &f,
+        "sources",
+        MAX_QBIT_SEARCH_PLUGINS,
+        MAX_QBIT_SEARCH_PLUGIN_SOURCE_BYTES,
+    ) {
         Ok(sources) => sources,
         Err(status) => return status,
     };
-    let mut plugins = s.qbit_search_plugins.write().await;
+    let mut entries = Vec::with_capacity(sources.len());
     for source in sources {
         let name = plugin_name_from_source(&source);
+        if name.len() > MAX_QBIT_SEARCH_PLUGIN_NAME_BYTES {
+            return StatusCode::BAD_REQUEST;
+        }
+        entries.push((name, source));
+    }
+    let mut plugins = s.qbit_search_plugins.write().await;
+    let new_names = entries
+        .iter()
+        .map(|(name, _)| name)
+        .filter(|name| !plugins.contains_key(*name))
+        .collect::<std::collections::HashSet<_>>();
+    if plugins.len().saturating_add(new_names.len()) > MAX_QBIT_SEARCH_PLUGINS {
+        return StatusCode::TOO_MANY_REQUESTS;
+    }
+    for (name, source) in entries {
         plugins.insert(name.clone(), search_plugin_value(&name, &source, true));
     }
     StatusCode::OK
@@ -539,7 +682,12 @@ async fn search_uninstall_plugin(
     State(s): State<AppState>,
     Form(f): Form<HashMap<String, String>>,
 ) -> StatusCode {
-    let names = match required_qbit_form_list(&f, "names") {
+    let names = match required_qbit_form_list(
+        &f,
+        "names",
+        MAX_QBIT_SEARCH_PLUGINS,
+        MAX_QBIT_SEARCH_PLUGIN_NAME_BYTES,
+    ) {
         Ok(names) => names,
         Err(status) => return status,
     };
@@ -557,11 +705,23 @@ async fn search_enable_plugin(
     let Some(enabled) = f.get("enable").and_then(|value| parse_wire_bool(value)) else {
         return StatusCode::BAD_REQUEST;
     };
-    let names = match required_qbit_form_list(&f, "names") {
+    let names = match required_qbit_form_list(
+        &f,
+        "names",
+        MAX_QBIT_SEARCH_PLUGINS,
+        MAX_QBIT_SEARCH_PLUGIN_NAME_BYTES,
+    ) {
         Ok(names) => names,
         Err(status) => return status,
     };
     let mut plugins = s.qbit_search_plugins.write().await;
+    let new_names = names
+        .iter()
+        .filter(|name| !plugins.contains_key(*name))
+        .collect::<std::collections::HashSet<_>>();
+    if plugins.len().saturating_add(new_names.len()) > MAX_QBIT_SEARCH_PLUGINS {
+        return StatusCode::TOO_MANY_REQUESTS;
+    }
     for name in names {
         let entry = plugins
             .entry(name.clone())
@@ -581,25 +741,43 @@ async fn search_start(
     State(s): State<AppState>,
     Form(f): Form<HashMap<String, String>>,
 ) -> impl IntoResponse {
-    let Some(pattern) = f
-        .get("pattern")
-        .map(String::as_str)
-        .map(str::trim)
-        .filter(|pattern| !pattern.is_empty())
-    else {
+    let Some(raw_pattern) = f.get("pattern") else {
         return StatusCode::BAD_REQUEST.into_response();
     };
+    if raw_pattern.len() > MAX_QBIT_SEARCH_PATTERN_BYTES {
+        return StatusCode::BAD_REQUEST.into_response();
+    }
+    let pattern = raw_pattern.trim();
+    if pattern.is_empty() {
+        return StatusCode::BAD_REQUEST.into_response();
+    }
+    let plugins = f.get("plugins").map(String::as_str).unwrap_or("all");
+    let category = f.get("category").map(String::as_str).unwrap_or("all");
+    if plugins.len() > MAX_QBIT_SEARCH_FILTER_BYTES || category.len() > MAX_QBIT_SEARCH_FILTER_BYTES
+    {
+        return StatusCode::BAD_REQUEST.into_response();
+    }
     let id = s.qbit_next_search_id.fetch_add(1, Ordering::Relaxed);
     let job = json!({
         "id": id,
         "pattern": pattern,
-        "plugins": f.get("plugins").cloned().unwrap_or_else(|| "all".to_owned()),
-        "category": f.get("category").cloned().unwrap_or_else(|| "all".to_owned()),
+        "plugins": plugins,
+        "category": category,
         "status": "Stopped",
         "total": 0,
         "results": [],
     });
-    s.qbit_search_jobs.write().await.insert(id.to_string(), job);
+    let mut jobs = s.qbit_search_jobs.write().await;
+    if jobs.len() >= MAX_QBIT_SEARCH_JOBS {
+        let oldest = jobs
+            .keys()
+            .min_by_key(|key| key.parse::<u64>().unwrap_or(u64::MAX))
+            .cloned();
+        if let Some(oldest) = oldest {
+            jobs.remove(&oldest);
+        }
+    }
+    jobs.insert(id.to_string(), job);
     Json(json!({ "id": id })).into_response()
 }
 
@@ -649,7 +827,11 @@ async fn search_results(
     let jobs = s.qbit_search_jobs.read().await;
     let job = match requested_id.as_deref() {
         Some(id) => jobs.get(id),
-        None => jobs.iter().next_back().map(|(_, job)| job),
+        None => jobs
+            .iter()
+            .filter_map(|(id, job)| id.parse::<u64>().ok().map(|id| (id, job)))
+            .max_by_key(|(id, _)| *id)
+            .map(|(_, job)| job),
     };
     let Some(job) = job else {
         if requested_id.is_some() {
@@ -696,71 +878,178 @@ async fn search_delete(
     StatusCode::OK
 }
 
-async fn rss_items(State(s): State<AppState>) -> Json<serde_json::Value> {
-    Json(serde_json::Value::Object(
-        s.qbit_rss_items.read().await.clone(),
-    ))
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum QbitRssItemMutation {
+    Updated,
+    Missing,
+    Conflict,
+    Capacity,
+    Invalid,
+}
+
+async fn rss_items(State(s): State<AppState>) -> impl IntoResponse {
+    match s
+        .db
+        .run_blocking("qbit_list_rss_items", |db| db.list_qbit_rss_items())
+        .await
+    {
+        Ok(items) => Json(serde_json::Value::Object(items)).into_response(),
+        Err(error) => {
+            tracing::error!(
+                component = "qbcompat",
+                operation = "list_rss_items",
+                result = "error",
+                error = %crate::url_redaction::redact_display(&error),
+                "qBit RSS item listing failed"
+            );
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
+    }
 }
 
 async fn rss_add_folder(
     State(s): State<AppState>,
     Form(f): Form<HashMap<String, String>>,
 ) -> StatusCode {
-    let Some(path) = f.get("path").filter(|p| !p.trim().is_empty()) else {
+    let Some(path) = f
+        .get("path")
+        .filter(|path| path.len() <= MAX_QBIT_RSS_ITEM_PATH_BYTES && !path.trim().is_empty())
+    else {
         return StatusCode::BAD_REQUEST;
     };
-    s.qbit_rss_items.write().await.insert(
-        path.clone(),
-        json!({
-            "uid": path,
-            "name": rss_leaf_name(path),
-            "type": "folder",
-            "isLoading": false,
-            "hasError": false,
-            "articles": [],
-        }),
-    );
-    StatusCode::OK
+    let path = path.clone();
+    let item = json!({
+        "uid": path,
+        "name": rss_leaf_name(&path),
+        "type": "folder",
+        "isLoading": false,
+        "hasError": false,
+        "articles": [],
+    });
+    match s
+        .db
+        .run_blocking("qbit_add_rss_folder", move |db| {
+            db.update_qbit_rss_items(|items| {
+                if !items.contains_key(&path) && items.len() >= MAX_QBIT_RSS_ITEMS {
+                    return QbitRssItemMutation::Capacity;
+                }
+                items.insert(path, item);
+                QbitRssItemMutation::Updated
+            })
+        })
+        .await
+    {
+        Ok(QbitRssItemMutation::Updated) => StatusCode::OK,
+        Ok(QbitRssItemMutation::Capacity) => StatusCode::TOO_MANY_REQUESTS,
+        Ok(_) => StatusCode::INTERNAL_SERVER_ERROR,
+        Err(error) => {
+            tracing::error!(
+                component = "qbcompat",
+                operation = "add_rss_folder",
+                result = "error",
+                error = %crate::url_redaction::redact_display(&error),
+                "qBit RSS folder update failed"
+            );
+            rss_item_write_status(&error)
+        }
+    }
 }
 
 async fn rss_add_feed(
     State(s): State<AppState>,
     Form(f): Form<HashMap<String, String>>,
 ) -> StatusCode {
-    let Some(url) = f.get("url").filter(|u| !u.trim().is_empty()) else {
+    let Some(url) = f
+        .get("url")
+        .filter(|url| url.len() <= MAX_QBIT_RSS_URL_BYTES && !url.trim().is_empty())
+    else {
         return StatusCode::BAD_REQUEST;
     };
     let path = f
         .get("path")
-        .filter(|p| !p.trim().is_empty())
+        .filter(|path| path.len() <= MAX_QBIT_RSS_ITEM_PATH_BYTES && !path.trim().is_empty())
         .cloned()
         .unwrap_or_else(|| url.clone());
-    s.qbit_rss_items.write().await.insert(
-        path.clone(),
-        json!({
-            "uid": path,
-            "name": rss_leaf_name(&path),
-            "type": "feed",
-            "url": url,
-            "isLoading": false,
-            "hasError": false,
-            "articles": [],
-        }),
-    );
-    StatusCode::OK
+    if path.len() > MAX_QBIT_RSS_ITEM_PATH_BYTES {
+        return StatusCode::BAD_REQUEST;
+    }
+    let url = url.clone();
+    let item = json!({
+        "uid": path,
+        "name": rss_leaf_name(&path),
+        "type": "feed",
+        "url": url,
+        "isLoading": false,
+        "hasError": false,
+        "articles": [],
+    });
+    match s
+        .db
+        .run_blocking("qbit_add_rss_feed", move |db| {
+            db.update_qbit_rss_items(|items| {
+                if !items.contains_key(&path) && items.len() >= MAX_QBIT_RSS_ITEMS {
+                    return QbitRssItemMutation::Capacity;
+                }
+                items.insert(path, item);
+                QbitRssItemMutation::Updated
+            })
+        })
+        .await
+    {
+        Ok(QbitRssItemMutation::Updated) => StatusCode::OK,
+        Ok(QbitRssItemMutation::Capacity) => StatusCode::TOO_MANY_REQUESTS,
+        Ok(_) => StatusCode::INTERNAL_SERVER_ERROR,
+        Err(error) => {
+            tracing::error!(
+                component = "qbcompat",
+                operation = "add_rss_feed",
+                result = "error",
+                error = %crate::url_redaction::redact_display(&error),
+                "qBit RSS feed update failed"
+            );
+            rss_item_write_status(&error)
+        }
+    }
 }
 
 async fn rss_remove_item(
     State(s): State<AppState>,
     Form(f): Form<HashMap<String, String>>,
 ) -> StatusCode {
-    let Some(path) = f.get("path").filter(|path| !path.trim().is_empty()) else {
+    let Some(path) = f
+        .get("path")
+        .filter(|path| !path.trim().is_empty() && path.len() <= MAX_QBIT_RSS_ITEM_PATH_BYTES)
+    else {
         return StatusCode::BAD_REQUEST;
     };
-    if s.qbit_rss_items.write().await.remove(path).is_none() {
-        return StatusCode::NOT_FOUND;
+    let path = path.clone();
+    match s
+        .db
+        .run_blocking("qbit_remove_rss_item", move |db| {
+            db.update_qbit_rss_items(|items| {
+                if items.remove(&path).is_some() {
+                    QbitRssItemMutation::Updated
+                } else {
+                    QbitRssItemMutation::Missing
+                }
+            })
+        })
+        .await
+    {
+        Ok(QbitRssItemMutation::Updated) => StatusCode::OK,
+        Ok(QbitRssItemMutation::Missing) => StatusCode::NOT_FOUND,
+        Ok(_) => StatusCode::INTERNAL_SERVER_ERROR,
+        Err(error) => {
+            tracing::error!(
+                component = "qbcompat",
+                operation = "remove_rss_item",
+                result = "error",
+                error = %crate::url_redaction::redact_display(&error),
+                "qBit RSS item removal failed"
+            );
+            rss_item_write_status(&error)
+        }
     }
-    StatusCode::OK
 }
 
 async fn rss_move_item(
@@ -773,63 +1062,141 @@ async fn rss_move_item(
     let Some(dest_path) = f.get("destPath") else {
         return StatusCode::BAD_REQUEST;
     };
-    if item_path.trim().is_empty() || dest_path.trim().is_empty() {
+    if item_path.len() > MAX_QBIT_RSS_ITEM_PATH_BYTES
+        || dest_path.len() > MAX_QBIT_RSS_ITEM_PATH_BYTES
+        || item_path.trim().is_empty()
+        || dest_path.trim().is_empty()
+    {
         return StatusCode::BAD_REQUEST;
     }
-    let mut items = s.qbit_rss_items.write().await;
     if item_path == dest_path {
         return StatusCode::OK;
     }
-    if items.contains_key(dest_path) {
-        return StatusCode::CONFLICT;
+    let item_path = item_path.clone();
+    let dest_path = dest_path.clone();
+    match s
+        .db
+        .run_blocking("qbit_move_rss_item", move |db| {
+            db.update_qbit_rss_items(|items| {
+                if items.contains_key(&dest_path) {
+                    return QbitRssItemMutation::Conflict;
+                }
+                let Some(mut item) = items.remove(&item_path) else {
+                    return QbitRssItemMutation::Missing;
+                };
+                if let Some(map) = item.as_object_mut() {
+                    map.insert("uid".into(), dest_path.clone().into());
+                    map.insert("name".into(), rss_leaf_name(&dest_path).into());
+                }
+                items.insert(dest_path, item);
+                QbitRssItemMutation::Updated
+            })
+        })
+        .await
+    {
+        Ok(QbitRssItemMutation::Updated) => StatusCode::OK,
+        Ok(QbitRssItemMutation::Missing) => StatusCode::NOT_FOUND,
+        Ok(QbitRssItemMutation::Conflict) => StatusCode::CONFLICT,
+        Ok(_) => StatusCode::INTERNAL_SERVER_ERROR,
+        Err(error) => {
+            tracing::error!(
+                component = "qbcompat",
+                operation = "move_rss_item",
+                result = "error",
+                error = %crate::url_redaction::redact_display(&error),
+                "qBit RSS item move failed"
+            );
+            rss_item_write_status(&error)
+        }
     }
-    let Some(mut item) = items.remove(item_path) else {
-        return StatusCode::NOT_FOUND;
-    };
-    if let Some(map) = item.as_object_mut() {
-        map.insert("uid".into(), dest_path.clone().into());
-        map.insert("name".into(), rss_leaf_name(dest_path).into());
-    }
-    items.insert(dest_path.clone(), item);
-    StatusCode::OK
 }
 
 async fn rss_mark_as_read(
     State(s): State<AppState>,
     Form(f): Form<HashMap<String, String>>,
 ) -> StatusCode {
-    let Some(item_path) = f.get("itemPath").filter(|path| !path.trim().is_empty()) else {
+    let Some(item_path) = f
+        .get("itemPath")
+        .filter(|path| path.len() <= MAX_QBIT_RSS_ITEM_PATH_BYTES && !path.trim().is_empty())
+    else {
         return StatusCode::BAD_REQUEST;
     };
-    let mut items = s.qbit_rss_items.write().await;
-    let Some(item) = items.get_mut(item_path) else {
-        return StatusCode::NOT_FOUND;
-    };
-    if let Some(map) = item.as_object_mut() {
-        map.insert("read".into(), true.into());
-    } else {
-        return StatusCode::INTERNAL_SERVER_ERROR;
+    let item_path = item_path.clone();
+    match s
+        .db
+        .run_blocking("qbit_mark_rss_item_read", move |db| {
+            db.update_qbit_rss_items(|items| match items.get_mut(&item_path) {
+                Some(item) => match item.as_object_mut() {
+                    Some(map) => {
+                        map.insert("read".into(), true.into());
+                        QbitRssItemMutation::Updated
+                    }
+                    None => QbitRssItemMutation::Invalid,
+                },
+                None => QbitRssItemMutation::Missing,
+            })
+        })
+        .await
+    {
+        Ok(QbitRssItemMutation::Updated) => StatusCode::OK,
+        Ok(QbitRssItemMutation::Missing) => StatusCode::NOT_FOUND,
+        Ok(QbitRssItemMutation::Invalid) => StatusCode::INTERNAL_SERVER_ERROR,
+        Ok(_) => StatusCode::INTERNAL_SERVER_ERROR,
+        Err(error) => {
+            tracing::error!(
+                component = "qbcompat",
+                operation = "mark_rss_item_read",
+                result = "error",
+                error = %crate::url_redaction::redact_display(&error),
+                "qBit RSS item update failed"
+            );
+            rss_item_write_status(&error)
+        }
     }
-    StatusCode::OK
 }
 
 async fn rss_refresh_item(
     State(s): State<AppState>,
     Form(f): Form<HashMap<String, String>>,
 ) -> StatusCode {
-    let Some(item_path) = f.get("itemPath").filter(|path| !path.trim().is_empty()) else {
+    let Some(item_path) = f
+        .get("itemPath")
+        .filter(|path| path.len() <= MAX_QBIT_RSS_ITEM_PATH_BYTES && !path.trim().is_empty())
+    else {
         return StatusCode::BAD_REQUEST;
     };
-    let mut items = s.qbit_rss_items.write().await;
-    let Some(item) = items.get_mut(item_path) else {
-        return StatusCode::NOT_FOUND;
-    };
-    if let Some(map) = item.as_object_mut() {
-        map.insert("lastBuildDate".into(), now_unix_secs().into());
-    } else {
-        return StatusCode::INTERNAL_SERVER_ERROR;
+    let item_path = item_path.clone();
+    match s
+        .db
+        .run_blocking("qbit_refresh_rss_item", move |db| {
+            db.update_qbit_rss_items(|items| match items.get_mut(&item_path) {
+                Some(item) => match item.as_object_mut() {
+                    Some(map) => {
+                        map.insert("lastBuildDate".into(), now_unix_secs().into());
+                        QbitRssItemMutation::Updated
+                    }
+                    None => QbitRssItemMutation::Invalid,
+                },
+                None => QbitRssItemMutation::Missing,
+            })
+        })
+        .await
+    {
+        Ok(QbitRssItemMutation::Updated) => StatusCode::OK,
+        Ok(QbitRssItemMutation::Missing) => StatusCode::NOT_FOUND,
+        Ok(QbitRssItemMutation::Invalid) => StatusCode::INTERNAL_SERVER_ERROR,
+        Ok(_) => StatusCode::INTERNAL_SERVER_ERROR,
+        Err(error) => {
+            tracing::error!(
+                component = "qbcompat",
+                operation = "refresh_rss_item",
+                result = "error",
+                error = %crate::url_redaction::redact_display(&error),
+                "qBit RSS item update failed"
+            );
+            rss_item_write_status(&error)
+        }
     }
-    StatusCode::OK
 }
 
 async fn rss_rules(State(s): State<AppState>) -> impl IntoResponse {
@@ -865,7 +1232,7 @@ async fn rss_rules(State(s): State<AppState>) -> impl IntoResponse {
                 component = "qbcompat",
                 operation = "list_rss_rules",
                 result = "error",
-                error = %e,
+                error = %crate::url_redaction::redact_display(&e),
                 "qBit RSS rule listing failed"
             );
             StatusCode::INTERNAL_SERVER_ERROR.into_response()
@@ -883,17 +1250,22 @@ struct RssSetRuleForm {
 }
 
 async fn rss_set_rule(State(s): State<AppState>, Form(f): Form<RssSetRuleForm>) -> StatusCode {
-    let Some(name) = f
-        .rule_name
-        .as_deref()
-        .map(str::trim)
-        .filter(|v| !v.is_empty())
-    else {
+    let Some(raw_name) = f.rule_name.as_deref() else {
         return StatusCode::BAD_REQUEST;
     };
+    if raw_name.len() > MAX_QBIT_RSS_RULE_NAME_BYTES {
+        return StatusCode::BAD_REQUEST;
+    }
+    let name = raw_name.trim();
+    if name.is_empty() {
+        return StatusCode::BAD_REQUEST;
+    }
     let Some(raw) = f.rule.as_deref().or(f.rule_def.as_deref()) else {
         return StatusCode::BAD_REQUEST;
     };
+    if raw.len() > MAX_QBIT_RSS_RULE_JSON_BYTES {
+        return StatusCode::BAD_REQUEST;
+    }
     let value: serde_json::Value = match serde_json::from_str(raw) {
         Ok(value) => value,
         Err(e) => {
@@ -901,7 +1273,7 @@ async fn rss_set_rule(State(s): State<AppState>, Form(f): Form<RssSetRuleForm>) 
                 component = "qbcompat",
                 operation = "set_rss_rule",
                 result = "error",
-                error = %e,
+                error = %crate::url_redaction::redact_display(&e),
                 "qBit RSS rule JSON parse failed"
             );
             return StatusCode::BAD_REQUEST;
@@ -934,14 +1306,8 @@ async fn rss_set_rule(State(s): State<AppState>, Form(f): Form<RssSetRuleForm>) 
         Ok(save_path) => save_path.filter(|value| !value.trim().is_empty()),
         Err(()) => return StatusCode::BAD_REQUEST,
     };
-    let tags = match rss_optional_string(&value, "tags") {
-        Ok(tags) => tags
-            .unwrap_or_default()
-            .split(',')
-            .map(str::trim)
-            .filter(|tag| !tag.is_empty())
-            .map(str::to_owned)
-            .collect(),
+    let tags = match rss_optional_string(&value, "tags").and_then(rss_rule_tags) {
+        Ok(tags) => tags,
         Err(()) => return StatusCode::BAD_REQUEST,
     };
     let add_paused = match rss_optional_bool(&value, "addPaused", false) {
@@ -962,23 +1328,26 @@ async fn rss_set_rule(State(s): State<AppState>, Form(f): Form<RssSetRuleForm>) 
     };
     match s
         .db
-        .run_blocking("qbit_upsert_rss_rule", move |db| db.upsert_rss_rule(rule))
+        .run_blocking("qbit_upsert_rss_rule", move |db| {
+            db.upsert_qbit_rss_rule(rule)
+        })
         .await
     {
-        Ok(_) => {
+        Ok(RssRuleUpsertResult::Upserted(_)) => {
             emit(&s, Event::RssRulesUpdated).await;
             StatusCode::OK
         }
+        Ok(RssRuleUpsertResult::Capacity) => StatusCode::TOO_MANY_REQUESTS,
         Err(e) => {
             tracing::error!(
                 component = "qbcompat",
                 operation = "set_rss_rule",
-                rule = %name,
+                rule = %crate::url_redaction::redact_display(&name),
                 result = "error",
-                error = %e,
+                error = %crate::url_redaction::redact_display(&e),
                 "qBit RSS rule update failed"
             );
-            StatusCode::INTERNAL_SERVER_ERROR
+            automation_state_write_status(&e)
         }
     }
 }
@@ -998,7 +1367,7 @@ fn rss_required_feed_url(value: &serde_json::Value) -> Result<String, ()> {
         .first()
         .and_then(serde_json::Value::as_str)
         .ok_or(())?;
-    if feed.trim().is_empty() {
+    if feed.trim().is_empty() || feed.len() > MAX_QBIT_RSS_RULE_FIELD_BYTES {
         return Err(());
     }
     Ok(feed.to_owned())
@@ -1010,7 +1379,7 @@ fn rss_required_string_alias(value: &serde_json::Value, keys: &[&str]) -> Result
         .find_map(|key| value.get(*key))
         .and_then(serde_json::Value::as_str)
         .ok_or(())?;
-    if raw.trim().is_empty() {
+    if raw.trim().is_empty() || raw.len() > MAX_QBIT_RSS_RULE_FIELD_BYTES {
         return Err(());
     }
     Ok(raw.to_owned())
@@ -1019,8 +1388,32 @@ fn rss_required_string_alias(value: &serde_json::Value, keys: &[&str]) -> Result
 fn rss_optional_string(value: &serde_json::Value, key: &str) -> Result<Option<String>, ()> {
     match value.get(key) {
         None | Some(serde_json::Value::Null) => Ok(None),
-        Some(raw) => raw.as_str().map(|value| Some(value.to_owned())).ok_or(()),
+        Some(raw) => raw
+            .as_str()
+            .filter(|value| value.len() <= MAX_QBIT_RSS_RULE_FIELD_BYTES)
+            .map(|value| Some(value.to_owned()))
+            .ok_or(()),
     }
+}
+
+fn rss_rule_tags(raw: Option<String>) -> Result<Vec<String>, ()> {
+    let Some(raw) = raw else {
+        return Ok(Vec::new());
+    };
+    let mut tags = Vec::new();
+    for (index, tag) in raw.split(',').enumerate() {
+        if index >= MAX_QBIT_RSS_RULE_TAGS {
+            return Err(());
+        }
+        let tag = tag.trim();
+        if tag.len() > MAX_QBIT_RSS_RULE_TAG_BYTES {
+            return Err(());
+        }
+        if !tag.is_empty() {
+            tags.push(tag.to_owned());
+        }
+    }
+    Ok(tags)
 }
 
 fn rss_optional_bool(value: &serde_json::Value, key: &str, default: bool) -> Result<bool, ()> {
@@ -1045,6 +1438,7 @@ async fn rss_rename_rule(
     let Some(old_name) = f
         .rule_name
         .as_deref()
+        .filter(|value| value.len() <= MAX_QBIT_RSS_RULE_NAME_BYTES)
         .map(str::trim)
         .filter(|value| !value.is_empty())
     else {
@@ -1053,6 +1447,7 @@ async fn rss_rename_rule(
     let Some(new_name) = f
         .new_rule_name
         .as_deref()
+        .filter(|value| value.len() <= MAX_QBIT_RSS_RULE_NAME_BYTES)
         .map(str::trim)
         .filter(|v| !v.is_empty())
     else {
@@ -1077,13 +1472,13 @@ async fn rss_rename_rule(
             tracing::error!(
                 component = "qbcompat",
                 operation = "rename_rss_rule",
-                rule = %old_name,
-                new_rule = %new_name,
+                rule = %crate::url_redaction::redact_display(&old_name),
+                new_rule = %crate::url_redaction::redact_display(&new_name),
                 result = "error",
-                error = %e,
+                error = %crate::url_redaction::redact_display(&e),
                 "qBit RSS rule rename failed"
             );
-            StatusCode::INTERNAL_SERVER_ERROR
+            automation_state_write_status(&e)
         }
     }
 }
@@ -1101,6 +1496,7 @@ async fn rss_remove_rule(
     let Some(name) = f
         .rule_name
         .as_deref()
+        .filter(|value| value.len() <= MAX_QBIT_RSS_RULE_NAME_BYTES)
         .map(str::trim)
         .filter(|value| !value.is_empty())
     else {
@@ -1123,12 +1519,12 @@ async fn rss_remove_rule(
             tracing::error!(
                 component = "qbcompat",
                 operation = "remove_rss_rule",
-                rule = %name,
+                rule = %crate::url_redaction::redact_display(&name),
                 result = "error",
-                error = %e,
+                error = %crate::url_redaction::redact_display(&e),
                 "qBit RSS rule removal failed"
             );
-            StatusCode::INTERNAL_SERVER_ERROR
+            automation_state_write_status(&e)
         }
     }
 }
@@ -1169,7 +1565,7 @@ async fn rss_matching_articles(
                 component = "qbcompat",
                 operation = "match_rss_articles",
                 result = "error",
-                error = %e,
+                error = %crate::url_redaction::redact_display(&e),
                 "qBit RSS article matching failed"
             );
             StatusCode::INTERNAL_SERVER_ERROR.into_response()
@@ -1228,7 +1624,7 @@ async fn app_set_preferences(
                 component = "qbcompat",
                 operation = "set_preferences",
                 result = "error",
-                error = %e,
+                error = %crate::url_redaction::redact_display(&e),
                 "qBit preferences JSON parse failed"
             );
             return StatusCode::BAD_REQUEST;
@@ -1292,7 +1688,7 @@ async fn app_set_preferences(
                         setting,
                         enabled,
                         result = "unsupported",
-                        error = %e,
+                        error = %crate::url_redaction::redact_display(&e),
                         "qBit session feature preference could not be applied by backend"
                     );
                 }
@@ -1336,7 +1732,7 @@ async fn app_set_preferences(
                         component = "qbcompat",
                         operation = "set_user_agent",
                     result = "error",
-                        error = %e,
+                        error = %crate::url_redaction::redact_display(&e),
                         "qBit user-agent preference update failed"
                     );
                     record_operator_event(
@@ -1445,10 +1841,10 @@ async fn torrents_info(State(s): State<AppState>, Query(q): Query<InfoQuery>) ->
                 component = "qbcompat",
                 operation = "torrents_info",
                 result = "error",
-                error = %e,
+                error = %crate::url_redaction::redact_display(&e),
                 "qBit torrent list query failed"
             );
-            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+            metadata_read_status(&e).into_response()
         }
     }
 }
@@ -1519,12 +1915,12 @@ async fn torrents_properties(
             tracing::error!(
                 component = "qbcompat",
                 operation = "torrent_properties",
-                torrent = %hash,
+                torrent = %crate::url_redaction::redact_display(&hash),
                 result = "error",
-                error = %e,
+                error = %crate::url_redaction::redact_display(&e),
                 "qBit torrent properties query failed"
             );
-            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+            metadata_read_status(&e).into_response()
         }
     }
 }
@@ -1543,6 +1939,8 @@ async fn torrents_add(State(s): State<AppState>, mut multipart: Multipart) -> im
     let mut auto_tmm: Option<bool> = None;
     let mut ratio_limit: Option<f64> = None;
     let mut seeding_time_limit: Option<i64> = None;
+    let mut multipart_field_count = 0;
+    let mut seen_multipart_fields = HashSet::new();
 
     loop {
         let Some(field) = (match multipart.next_field().await {
@@ -1552,7 +1950,7 @@ async fn torrents_add(State(s): State<AppState>, mut multipart: Multipart) -> im
                     component = "qbcompat",
                     operation = "add_torrent",
                     result = "bad_request",
-                    error = %error,
+                    error = %crate::url_redaction::redact_display(&error),
                     "invalid qBit multipart request"
                 );
                 return (StatusCode::BAD_REQUEST, "Fails.").into_response();
@@ -1560,26 +1958,51 @@ async fn torrents_add(State(s): State<AppState>, mut multipart: Multipart) -> im
         }) else {
             break;
         };
+        multipart_field_count += 1;
+        if multipart_field_count > MAX_QBIT_TORRENT_ADD_FIELDS {
+            return (StatusCode::BAD_REQUEST, "Fails.").into_response();
+        }
         let name = field.name().map(str::to_owned);
+        if name
+            .as_ref()
+            .is_some_and(|name| !seen_multipart_fields.insert(name.clone()))
+        {
+            return (StatusCode::BAD_REQUEST, "Fails.").into_response();
+        }
         match name.as_deref() {
             Some("urls") => {
-                urls = Some(match field.text().await {
-                    Ok(value) => value,
-                    Err(error) => {
-                        tracing::warn!(
-                            component = "qbcompat",
-                            operation = "add_torrent",
-                            field = "urls",
-                            result = "bad_request",
-                            error = %error,
-                            "invalid qBit multipart text field"
-                        );
-                        return (StatusCode::BAD_REQUEST, "Fails.").into_response();
-                    }
-                });
+                if torrent_data.is_some() {
+                    return (StatusCode::BAD_REQUEST, "Fails.").into_response();
+                }
+                urls = Some(
+                    match crate::multipart::read_bounded_multipart_text(
+                        field,
+                        MAX_QBIT_TORRENT_ADD_URL_LIST_BYTES,
+                    )
+                    .await
+                    {
+                        Ok(value) => value,
+                        Err(error) => {
+                            tracing::warn!(
+                                component = "qbcompat",
+                                operation = "add_torrent",
+                                field = "urls",
+                                result = "bad_request",
+                                error = %crate::url_redaction::redact_display(&error),
+                                "invalid qBit multipart text field"
+                            );
+                            return (StatusCode::BAD_REQUEST, "Fails.").into_response();
+                        }
+                    },
+                );
             }
             Some("savepath") => {
-                save_path = match field.text().await {
+                save_path = match crate::multipart::read_bounded_multipart_text(
+                    field,
+                    MAX_QBIT_CATEGORY_PATH_BYTES,
+                )
+                .await
+                {
                     Ok(value) => value,
                     Err(error) => {
                         tracing::warn!(
@@ -1587,7 +2010,7 @@ async fn torrents_add(State(s): State<AppState>, mut multipart: Multipart) -> im
                             operation = "add_torrent",
                             field = "savepath",
                             result = "bad_request",
-                            error = %error,
+                            error = %crate::url_redaction::redact_display(&error),
                             "invalid qBit multipart text field"
                         );
                         return (StatusCode::BAD_REQUEST, "Fails.").into_response();
@@ -1595,7 +2018,12 @@ async fn torrents_add(State(s): State<AppState>, mut multipart: Multipart) -> im
                 };
             }
             Some("category") => {
-                category = match field.text().await {
+                category = match crate::multipart::read_bounded_multipart_text(
+                    field,
+                    MAX_QBIT_CATEGORY_NAME_BYTES,
+                )
+                .await
+                {
                     Ok(value) => value,
                     Err(error) => {
                         tracing::warn!(
@@ -1603,7 +2031,7 @@ async fn torrents_add(State(s): State<AppState>, mut multipart: Multipart) -> im
                             operation = "add_torrent",
                             field = "category",
                             result = "bad_request",
-                            error = %error,
+                            error = %crate::url_redaction::redact_display(&error),
                             "invalid qBit multipart text field"
                         );
                         return (StatusCode::BAD_REQUEST, "Fails.").into_response();
@@ -1611,7 +2039,7 @@ async fn torrents_add(State(s): State<AppState>, mut multipart: Multipart) -> im
                 };
             }
             Some("paused") => {
-                let value = match field.text().await {
+                let value = match crate::multipart::read_bounded_multipart_text(field, 5).await {
                     Ok(value) => value,
                     Err(error) => {
                         tracing::warn!(
@@ -1619,7 +2047,7 @@ async fn torrents_add(State(s): State<AppState>, mut multipart: Multipart) -> im
                             operation = "add_torrent",
                             field = "paused",
                             result = "bad_request",
-                            error = %error,
+                            error = %crate::url_redaction::redact_display(&error),
                             "invalid qBit multipart text field"
                         );
                         return (StatusCode::BAD_REQUEST, "Fails.").into_response();
@@ -1632,7 +2060,7 @@ async fn torrents_add(State(s): State<AppState>, mut multipart: Multipart) -> im
                 };
             }
             Some("stopped") => {
-                let value = match field.text().await {
+                let value = match crate::multipart::read_bounded_multipart_text(field, 5).await {
                     Ok(value) => value,
                     Err(error) => {
                         tracing::warn!(
@@ -1640,7 +2068,7 @@ async fn torrents_add(State(s): State<AppState>, mut multipart: Multipart) -> im
                             operation = "add_torrent",
                             field = "stopped",
                             result = "bad_request",
-                            error = %error,
+                            error = %crate::url_redaction::redact_display(&error),
                             "invalid qBit multipart text field"
                         );
                         return (StatusCode::BAD_REQUEST, "Fails.").into_response();
@@ -1653,23 +2081,30 @@ async fn torrents_add(State(s): State<AppState>, mut multipart: Multipart) -> im
                 };
             }
             Some("tags") => {
-                tags = Some(match field.text().await {
-                    Ok(value) => value,
-                    Err(error) => {
-                        tracing::warn!(
-                            component = "qbcompat",
-                            operation = "add_torrent",
-                            field = "tags",
-                            result = "bad_request",
-                            error = %error,
-                            "invalid qBit multipart text field"
-                        );
-                        return (StatusCode::BAD_REQUEST, "Fails.").into_response();
-                    }
-                });
+                tags = Some(
+                    match crate::multipart::read_bounded_multipart_text(
+                        field,
+                        MAX_QBIT_TAG_LIST_BYTES,
+                    )
+                    .await
+                    {
+                        Ok(value) => value,
+                        Err(error) => {
+                            tracing::warn!(
+                                component = "qbcompat",
+                                operation = "add_torrent",
+                                field = "tags",
+                                result = "bad_request",
+                                error = %crate::url_redaction::redact_display(&error),
+                                "invalid qBit multipart text field"
+                            );
+                            return (StatusCode::BAD_REQUEST, "Fails.").into_response();
+                        }
+                    },
+                );
             }
             Some("skip_checking") => {
-                let value = match field.text().await {
+                let value = match crate::multipart::read_bounded_multipart_text(field, 5).await {
                     Ok(value) => value,
                     Err(error) => {
                         tracing::warn!(
@@ -1677,7 +2112,7 @@ async fn torrents_add(State(s): State<AppState>, mut multipart: Multipart) -> im
                             operation = "add_torrent",
                             field = "skip_checking",
                             result = "bad_request",
-                            error = %error,
+                            error = %crate::url_redaction::redact_display(&error),
                             "invalid qBit multipart text field"
                         );
                         return (StatusCode::BAD_REQUEST, "Fails.").into_response();
@@ -1690,23 +2125,30 @@ async fn torrents_add(State(s): State<AppState>, mut multipart: Multipart) -> im
                 };
             }
             Some("contentLayout") => {
-                content_layout = Some(match field.text().await {
-                    Ok(value) => value,
-                    Err(error) => {
-                        tracing::warn!(
-                            component = "qbcompat",
-                            operation = "add_torrent",
-                            field = "contentLayout",
-                            result = "bad_request",
-                            error = %error,
-                            "invalid qBit multipart text field"
-                        );
-                        return (StatusCode::BAD_REQUEST, "Fails.").into_response();
-                    }
-                });
+                content_layout = Some(
+                    match crate::multipart::read_bounded_multipart_text(
+                        field,
+                        MAX_QBIT_TORRENT_ADD_OPTION_BYTES,
+                    )
+                    .await
+                    {
+                        Ok(value) => value,
+                        Err(error) => {
+                            tracing::warn!(
+                                component = "qbcompat",
+                                operation = "add_torrent",
+                                field = "contentLayout",
+                                result = "bad_request",
+                                error = %crate::url_redaction::redact_display(&error),
+                                "invalid qBit multipart text field"
+                            );
+                            return (StatusCode::BAD_REQUEST, "Fails.").into_response();
+                        }
+                    },
+                );
             }
             Some("autoTMM") => {
-                let value = match field.text().await {
+                let value = match crate::multipart::read_bounded_multipart_text(field, 5).await {
                     Ok(value) => value,
                     Err(error) => {
                         tracing::warn!(
@@ -1714,7 +2156,7 @@ async fn torrents_add(State(s): State<AppState>, mut multipart: Multipart) -> im
                             operation = "add_torrent",
                             field = "autoTMM",
                             result = "bad_request",
-                            error = %error,
+                            error = %crate::url_redaction::redact_display(&error),
                             "invalid qBit multipart text field"
                         );
                         return (StatusCode::BAD_REQUEST, "Fails.").into_response();
@@ -1727,7 +2169,12 @@ async fn torrents_add(State(s): State<AppState>, mut multipart: Multipart) -> im
                 });
             }
             Some("ratioLimit") => {
-                let value = match field.text().await {
+                let value = match crate::multipart::read_bounded_multipart_text(
+                    field,
+                    MAX_QBIT_TORRENT_ADD_OPTION_BYTES,
+                )
+                .await
+                {
                     Ok(value) => value,
                     Err(error) => {
                         tracing::warn!(
@@ -1735,7 +2182,7 @@ async fn torrents_add(State(s): State<AppState>, mut multipart: Multipart) -> im
                             operation = "add_torrent",
                             field = "ratioLimit",
                             result = "bad_request",
-                            error = %error,
+                            error = %crate::url_redaction::redact_display(&error),
                             "invalid qBit multipart text field"
                         );
                         return (StatusCode::BAD_REQUEST, "Fails.").into_response();
@@ -1753,7 +2200,12 @@ async fn torrents_add(State(s): State<AppState>, mut multipart: Multipart) -> im
                 };
             }
             Some("seedingTimeLimit") => {
-                let value = match field.text().await {
+                let value = match crate::multipart::read_bounded_multipart_text(
+                    field,
+                    MAX_QBIT_TORRENT_ADD_OPTION_BYTES,
+                )
+                .await
+                {
                     Ok(value) => value,
                     Err(error) => {
                         tracing::warn!(
@@ -1761,7 +2213,7 @@ async fn torrents_add(State(s): State<AppState>, mut multipart: Multipart) -> im
                             operation = "add_torrent",
                             field = "seedingTimeLimit",
                             result = "bad_request",
-                            error = %error,
+                            error = %crate::url_redaction::redact_display(&error),
                             "invalid qBit multipart text field"
                         );
                         return (StatusCode::BAD_REQUEST, "Fails.").into_response();
@@ -1773,34 +2225,42 @@ async fn torrents_add(State(s): State<AppState>, mut multipart: Multipart) -> im
                 };
             }
             Some("torrents") => {
-                torrent_data = Some(match field.bytes().await {
-                    Ok(value) => value.to_vec(),
-                    Err(error) => {
-                        tracing::warn!(
-                            component = "qbcompat",
-                            operation = "add_torrent",
-                            field = "torrents",
-                            result = "bad_request",
-                            error = %error,
-                            "invalid qBit multipart file field"
-                        );
-                        return (StatusCode::BAD_REQUEST, "Fails.").into_response();
-                    }
-                });
+                if urls.is_some() {
+                    return (StatusCode::BAD_REQUEST, "Fails.").into_response();
+                }
+                torrent_data = Some(
+                    match crate::multipart::read_bounded_multipart_bytes(
+                        field,
+                        crate::multipart::MAX_MULTIPART_TORRENT_BYTES,
+                    )
+                    .await
+                    {
+                        Ok(value) => value,
+                        Err(error) => {
+                            tracing::warn!(
+                                component = "qbcompat",
+                                operation = "add_torrent",
+                                field = "torrents",
+                                result = "bad_request",
+                                error = %crate::url_redaction::redact_display(&error),
+                                "invalid qBit multipart file field"
+                            );
+                            return (StatusCode::BAD_REQUEST, "Fails.").into_response();
+                        }
+                    },
+                );
             }
             Some(name) => {
-                let _ = field.text().await;
                 tracing::info!(
                     component = "qbcompat",
                     operation = "add_torrent",
-                    field = %name,
+                    field = %crate::url_redaction::redact_display(&name),
                     result = "unsupported",
                     "qBit add option has no compatible-client backend contract"
                 );
                 return (StatusCode::NOT_IMPLEMENTED, "Fails.").into_response();
             }
             None => {
-                let _ = field.text().await;
                 return (StatusCode::BAD_REQUEST, "multipart field is missing a name")
                     .into_response();
             }
@@ -1827,35 +2287,53 @@ async fn torrents_add(State(s): State<AppState>, mut multipart: Multipart) -> im
         );
         return (StatusCode::NOT_IMPLEMENTED, "Fails.").into_response();
     }
+    if save_path.len() > MAX_QBIT_CATEGORY_PATH_BYTES
+        || category.len() > MAX_QBIT_CATEGORY_NAME_BYTES
+    {
+        return (StatusCode::BAD_REQUEST, "Fails.").into_response();
+    }
+    let preflight_category = category.clone();
+    if let Err(error) =
+        s.db.run_blocking("qbit_preflight_add_category", move |db| {
+            crate::cache::categories::ensure_category_name_capacity(db, &preflight_category)
+        })
+        .await
+    {
+        tracing::warn!(
+            component = "cache",
+            operation = "preflight_add_category",
+            result = "error",
+            category = %crate::url_redaction::redact_display(&category),
+            error = %crate::url_redaction::redact_display(&error),
+            "qBit torrent add rejected before backend mutation"
+        );
+        return (metadata_write_status(&error), "Fails.").into_response();
+    }
 
     let start = !(paused || stopped);
 
     if let Some(url_list) = urls {
-        let mut added = false;
-        let normalized = url_list.replace("\r\n", "\n").replace('\r', "");
-        let lines = normalized.split('\n').collect::<Vec<_>>();
-        for (index, url) in lines.iter().enumerate() {
-            let url = url.trim();
-            if url.is_empty() {
-                if index + 1 != lines.len() {
-                    return (StatusCode::BAD_REQUEST, "Fails.").into_response();
+        let urls = match parse_qbit_torrent_add_urls(&url_list) {
+            Ok(urls) => urls,
+            Err(()) => return (StatusCode::BAD_REQUEST, "Fails.").into_response(),
+        };
+        if !urls.is_empty() {
+            for url in &urls {
+                if s.backend
+                    .add_url(url, &save_path, &category, start)
+                    .await
+                    .is_err()
+                {
+                    tracing::error!(
+                        component = "qbcompat",
+                        operation = "add_url",
+                        source = %redact_log_url(url),
+                        result = "error",
+                        "qb add url failed"
+                    );
+                    return "Fails.".into_response();
                 }
-                continue;
             }
-            added = true;
-            if let Err(e) = s.backend.add_url(url, &save_path, &category, start).await {
-                tracing::error!(
-                    component = "qbcompat",
-                    operation = "add_url",
-                    source = %redact_log_url(url),
-                result = "error",
-                    error = %e,
-                    "qb add url failed"
-                );
-                return "Fails.".into_response();
-            }
-        }
-        if added {
             return "Ok.".into_response();
         }
     }
@@ -1864,16 +2342,15 @@ async fn torrents_add(State(s): State<AppState>, mut multipart: Multipart) -> im
         if data.is_empty() {
             return (StatusCode::BAD_REQUEST, "Fails.").into_response();
         }
-        if let Err(e) = s
-            .backend
+        if s.backend
             .add_torrent(&data, &save_path, &category, start)
             .await
+            .is_err()
         {
             tracing::error!(
                 component = "qbcompat",
                 operation = "add_torrent",
                 result = "error",
-                error = %e,
                 "qb add torrent failed"
             );
             return "Fails.".into_response();
@@ -1918,18 +2395,25 @@ async fn torrents_add_peers(State(s): State<AppState>, Form(f): Form<AddPeersFor
                 component = "qbcompat",
                 operation = "resolve_hashes",
                 result = "error",
-                error = %e,
+                error = %crate::url_redaction::redact_display(&e),
                 "failed to resolve hashes for peer add"
             );
             return hash_resolution_status(&e);
         }
     };
-    let peers = match f.peers.as_deref().map(parse_peer_addrs) {
+    let peers = match f
+        .peers
+        .as_deref()
+        .map(|raw| parse_peer_addrs(raw, MAX_QBIT_MANUAL_PEERS))
+    {
         Some(Ok(peers)) => peers,
         Some(Err(_)) | None => return StatusCode::BAD_REQUEST,
     };
     if peers.is_empty() {
         return StatusCode::BAD_REQUEST;
+    }
+    if !qbit_batch_work_within_limit(hashes.len(), peers.len()) {
+        return StatusCode::PAYLOAD_TOO_LARGE;
     }
     if !s.backend.capabilities().supports_peer_add {
         return StatusCode::NOT_IMPLEMENTED;
@@ -1941,9 +2425,9 @@ async fn torrents_add_peers(State(s): State<AppState>, Form(f): Form<AddPeersFor
             tracing::warn!(
                 component = "qbcompat",
                 operation = "add_peers",
-                torrent = %hash,
+                torrent = %crate::url_redaction::redact_display(&hash),
                 result = "error",
-                error = %e,
+                error = %crate::url_redaction::redact_display(&e),
                 "qBit explicit peer add failed"
             );
         }
@@ -1989,7 +2473,7 @@ async fn torrents_update_queue_order(
                 component = "qbcompat",
                 operation = "resolve_hashes",
                 result = "error",
-                error = %e,
+                error = %crate::url_redaction::redact_display(&e),
                 "failed to resolve hashes for queue update"
             );
             return hash_resolution_status(&e);
@@ -2008,7 +2492,7 @@ async fn torrents_update_queue_order(
             component = "qbcompat",
             operation = "update_queue_order",
             result = "error",
-            error = %e,
+            error = %crate::url_redaction::redact_display(&e),
             "qBit queue order update failed"
         );
     }
@@ -2027,7 +2511,7 @@ async fn bulk_action(s: &AppState, hashes_str: &Option<String>, action: &str) ->
                 component = "qbcompat",
                 operation = "resolve_hashes",
                 result = "error",
-                error = %e,
+                error = %crate::url_redaction::redact_display(&e),
                 "failed to resolve hashes for bulk action"
             );
             return hash_resolution_status(&e);
@@ -2046,10 +2530,10 @@ async fn bulk_action(s: &AppState, hashes_str: &Option<String>, action: &str) ->
             failed = true;
             tracing::warn!(
                 component = "qbcompat",
-                operation = %action,
-                torrent = %hash,
+                operation = %crate::url_redaction::redact_display(&action),
+                torrent = %crate::url_redaction::redact_display(&hash),
                 result = "error",
-                error = %e,
+                error = %crate::url_redaction::redact_display(&e),
                 "qBit torrent action failed"
             );
         } else if let Err(error) = update_cached_lifecycle_state(s, &hash, action).await {
@@ -2057,10 +2541,10 @@ async fn bulk_action(s: &AppState, hashes_str: &Option<String>, action: &str) ->
             tracing::warn!(
                 component = "cache",
                 operation = "set_torrent_runtime_state",
-                torrent = %hash,
+                torrent = %crate::url_redaction::redact_display(&hash),
                 action,
                 result = "error",
-                error = %error,
+                error = %crate::url_redaction::redact_display(&error),
                 "qBit action succeeded but cache projection failed"
             );
         }
@@ -2094,7 +2578,7 @@ async fn torrents_delete(State(s): State<AppState>, Form(f): Form<DeleteForm>) -
                 component = "qbcompat",
                 operation = "resolve_hashes",
                 result = "error",
-                error = %e,
+                error = %crate::url_redaction::redact_display(&e),
                 "failed to resolve hashes for delete"
             );
             return hash_resolution_status(&e);
@@ -2108,10 +2592,10 @@ async fn torrents_delete(State(s): State<AppState>, Form(f): Form<DeleteForm>) -
             tracing::warn!(
                 component = "qbcompat",
                 operation = "delete_torrent",
-                torrent = %hash,
+                torrent = %crate::url_redaction::redact_display(&hash),
                 delete_files,
                 result = "error",
-                error = %e,
+                error = %crate::url_redaction::redact_display(&e),
                 "qBit delete failed"
             );
             continue;
@@ -2125,9 +2609,9 @@ async fn torrents_delete(State(s): State<AppState>, Form(f): Form<DeleteForm>) -
             tracing::warn!(
                 component = "cache",
                 operation = "delete_torrent",
-                torrent = %hash,
+                torrent = %crate::url_redaction::redact_display(&hash),
                 result = "error",
-                error = %e,
+                error = %crate::url_redaction::redact_display(&e),
                 "cache delete failed after qBit delete"
             );
         } else {
@@ -2182,9 +2666,9 @@ async fn torrents_trackers(
             tracing::error!(
                 component = "qbcompat",
                 operation = "list_trackers",
-                torrent = %hash,
+                torrent = %crate::url_redaction::redact_display(&hash),
                 result = "error",
-                error = %e,
+                error = %crate::url_redaction::redact_display(&e),
                 "qBit tracker listing failed"
             );
             StatusCode::INTERNAL_SERVER_ERROR.into_response()
@@ -2213,9 +2697,9 @@ async fn torrents_export(
             tracing::warn!(
                 component = "qbcompat",
                 operation = "torrent_export",
-                torrent = %hash,
+                torrent = %crate::url_redaction::redact_display(&hash),
                 result = "error",
-                error = %e,
+                error = %crate::url_redaction::redact_display(&e),
                 "qBit torrent export failed"
             );
             backend_error_status(&e).into_response()
@@ -2265,9 +2749,9 @@ async fn torrents_files(
             tracing::error!(
                 component = "qbcompat",
                 operation = "list_files",
-                torrent = %hash,
+                torrent = %crate::url_redaction::redact_display(&hash),
                 result = "error",
-                error = %e,
+                error = %crate::url_redaction::redact_display(&e),
                 "qBit file listing failed"
             );
             StatusCode::INTERNAL_SERVER_ERROR.into_response()
@@ -2296,9 +2780,9 @@ async fn torrents_webseeds(
             tracing::warn!(
                 component = "qbcompat",
                 operation = "list_webseeds",
-                torrent = %hash,
+                torrent = %crate::url_redaction::redact_display(&hash),
                 result = "error",
-                error = %e,
+                error = %crate::url_redaction::redact_display(&e),
                 "qBit webseed listing failed"
             );
             backend_error_status(&e).into_response()
@@ -2331,9 +2815,9 @@ async fn torrents_piece_states(
             tracing::warn!(
                 component = "qbcompat",
                 operation = "piece_states",
-                torrent = %hash,
+                torrent = %crate::url_redaction::redact_display(&hash),
                 result = "error",
-                error = %e,
+                error = %crate::url_redaction::redact_display(&e),
                 "qBit piece state query failed"
             );
             backend_error_status(&e).into_response()
@@ -2356,9 +2840,9 @@ async fn torrents_piece_hashes(
             tracing::warn!(
                 component = "qbcompat",
                 operation = "piece_hashes",
-                torrent = %hash,
+                torrent = %crate::url_redaction::redact_display(&hash),
                 result = "error",
-                error = %e,
+                error = %crate::url_redaction::redact_display(&e),
                 "qBit piece hash query failed"
             );
             backend_error_status(&e).into_response()
@@ -2389,10 +2873,10 @@ async fn categories(State(s): State<AppState>) -> impl IntoResponse {
                 component = "qbcompat",
                 operation = "list_categories",
                 result = "error",
-                error = %e,
+                error = %crate::url_redaction::redact_display(&e),
                 "qBit category listing failed"
             );
-            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+            metadata_read_status(&e).into_response()
         }
     }
 }
@@ -2409,10 +2893,10 @@ async fn tags(State(s): State<AppState>) -> impl IntoResponse {
                 component = "qbcompat",
                 operation = "list_tags",
                 result = "error",
-                error = %e,
+                error = %crate::url_redaction::redact_display(&e),
                 "qBit tag listing failed"
             );
-            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+            metadata_read_status(&e).into_response()
         }
     }
 }
@@ -2430,6 +2914,9 @@ async fn torrents_set_category(
     let Some(category) = f.category.as_deref() else {
         return StatusCode::BAD_REQUEST;
     };
+    if category.len() > MAX_QBIT_CATEGORY_NAME_BYTES {
+        return StatusCode::BAD_REQUEST;
+    }
     if !s.backend.capabilities().supports_categories {
         return StatusCode::NOT_IMPLEMENTED;
     }
@@ -2440,24 +2927,42 @@ async fn torrents_set_category(
                 component = "qbcompat",
                 operation = "resolve_hashes",
                 result = "error",
-                error = %e,
+                error = %crate::url_redaction::redact_display(&e),
                 "failed to resolve hashes for category update"
             );
             return hash_resolution_status(&e);
         }
     };
+    let preflight_category = category.to_owned();
+    if let Err(error) =
+        s.db.run_blocking("qbit_preflight_set_category", move |db| {
+            crate::cache::categories::ensure_category_name_capacity(db, &preflight_category)
+        })
+        .await
+    {
+        tracing::warn!(
+            component = "cache",
+            operation = "preflight_set_category",
+            result = "error",
+            category = %crate::url_redaction::redact_display(&category),
+            error = %crate::url_redaction::redact_display(&error),
+            "qBit category update rejected before backend mutation"
+        );
+        return metadata_write_status(&error);
+    }
     let mut backend_failed = false;
     let mut cache_failed = false;
+    let mut cache_capacity_failed = false;
     for hash in hashes {
         if let Err(e) = s.backend.set_category(&hash, category).await {
             backend_failed = true;
             tracing::warn!(
                 component = "backend",
                 operation = "set_category",
-                torrent = %hash,
-                category = %category,
+                torrent = %crate::url_redaction::redact_display(&hash),
+                category = %crate::url_redaction::redact_display(&category),
                 result = "error",
-                error = %e,
+                error = %crate::url_redaction::redact_display(&e),
                 "backend category update failed"
             );
             continue;
@@ -2471,13 +2976,14 @@ async fn torrents_set_category(
             .await
         {
             cache_failed = true;
+            cache_capacity_failed |= metadata_write_status(&e) == StatusCode::TOO_MANY_REQUESTS;
             tracing::warn!(
                 component = "cache",
                 operation = "set_category",
-                torrent = %hash,
-                category = %category,
+                torrent = %crate::url_redaction::redact_display(&hash),
+                category = %crate::url_redaction::redact_display(&category),
                 result = "error",
-                error = %e,
+                error = %crate::url_redaction::redact_display(&e),
                 "cache category update failed after backend update"
             );
         } else {
@@ -2485,7 +2991,9 @@ async fn torrents_set_category(
             emit(&s, Event::CategoriesUpdated).await;
         }
     }
-    if cache_failed {
+    if cache_capacity_failed {
+        StatusCode::TOO_MANY_REQUESTS
+    } else if cache_failed {
         StatusCode::INTERNAL_SERVER_ERROR
     } else if backend_failed {
         StatusCode::SERVICE_UNAVAILABLE
@@ -2515,23 +3023,37 @@ async fn torrents_add_tags(State(s): State<AppState>, Form(f): Form<TagsForm>) -
                 component = "qbcompat",
                 operation = "resolve_hashes",
                 result = "error",
-                error = %e,
+                error = %crate::url_redaction::redact_display(&e),
                 "failed to resolve hashes for tag add"
             );
             return hash_resolution_status(&e);
         }
     };
+    if !qbit_batch_work_within_limit(hashes.len(), tag_list.len()) {
+        return StatusCode::PAYLOAD_TOO_LARGE;
+    }
+    if let Err(error) = preflight_qbit_torrent_tags(&s, &hashes, &tag_list, true).await {
+        tracing::warn!(
+            component = "cache",
+            operation = "preflight_add_tags",
+            result = "error",
+            error = %crate::url_redaction::redact_display(&error),
+            "qBit tag update rejected before backend mutation"
+        );
+        return metadata_write_status(&error);
+    }
     let mut backend_failed = false;
     let mut cache_failed = false;
+    let mut cache_capacity_failed = false;
     for hash in hashes {
         if let Err(e) = s.backend.add_tags(&hash, &tag_list).await {
             backend_failed = true;
             tracing::warn!(
                 component = "qbcompat",
                 operation = "add_tags",
-                torrent = %hash,
+                torrent = %crate::url_redaction::redact_display(&hash),
                 result = "error",
-                error = %e,
+                error = %crate::url_redaction::redact_display(&e),
                 "backend tag add failed"
             );
             continue;
@@ -2549,12 +3071,13 @@ async fn torrents_add_tags(State(s): State<AppState>, Form(f): Form<TagsForm>) -
             .await
         {
             cache_failed = true;
+            cache_capacity_failed |= metadata_write_status(&e) == StatusCode::TOO_MANY_REQUESTS;
             tracing::warn!(
                 component = "cache",
                 operation = "add_tags",
-                torrent = %hash,
+                torrent = %crate::url_redaction::redact_display(&hash),
                 result = "error",
-                error = %e,
+                error = %crate::url_redaction::redact_display(&e),
                 "cache tag add failed after backend update"
             );
         } else {
@@ -2562,7 +3085,9 @@ async fn torrents_add_tags(State(s): State<AppState>, Form(f): Form<TagsForm>) -
             emit(&s, Event::TagsUpdated).await;
         }
     }
-    if cache_failed {
+    if cache_capacity_failed {
+        StatusCode::TOO_MANY_REQUESTS
+    } else if cache_failed {
         StatusCode::INTERNAL_SERVER_ERROR
     } else if backend_failed {
         StatusCode::SERVICE_UNAVAILABLE
@@ -2586,12 +3111,15 @@ async fn torrents_remove_tags(State(s): State<AppState>, Form(f): Form<TagsForm>
                 component = "qbcompat",
                 operation = "resolve_hashes",
                 result = "error",
-                error = %e,
+                error = %crate::url_redaction::redact_display(&e),
                 "failed to resolve hashes for tag removal"
             );
             return hash_resolution_status(&e);
         }
     };
+    if !qbit_batch_work_within_limit(hashes.len(), tag_list.len()) {
+        return StatusCode::PAYLOAD_TOO_LARGE;
+    }
     let mut backend_failed = false;
     let mut cache_failed = false;
     for hash in hashes {
@@ -2600,9 +3128,9 @@ async fn torrents_remove_tags(State(s): State<AppState>, Form(f): Form<TagsForm>
             tracing::warn!(
                 component = "qbcompat",
                 operation = "remove_tags",
-                torrent = %hash,
+                torrent = %crate::url_redaction::redact_display(&hash),
                 result = "error",
-                error = %e,
+                error = %crate::url_redaction::redact_display(&e),
                 "backend tag removal failed"
             );
             continue;
@@ -2623,9 +3151,9 @@ async fn torrents_remove_tags(State(s): State<AppState>, Form(f): Form<TagsForm>
             tracing::warn!(
                 component = "cache",
                 operation = "remove_tags",
-                torrent = %hash,
+                torrent = %crate::url_redaction::redact_display(&hash),
                 result = "error",
-                error = %e,
+                error = %crate::url_redaction::redact_display(&e),
                 "cache tag removal failed after backend update"
             );
         } else {
@@ -2657,23 +3185,37 @@ async fn torrents_set_tags(State(s): State<AppState>, Form(f): Form<TagsForm>) -
                 component = "qbcompat",
                 operation = "resolve_hashes",
                 result = "error",
-                error = %e,
+                error = %crate::url_redaction::redact_display(&e),
                 "failed to resolve hashes for tag replacement"
             );
             return hash_resolution_status(&e);
         }
     };
+    if !qbit_batch_work_within_limit(hashes.len(), tag_list.len()) {
+        return StatusCode::PAYLOAD_TOO_LARGE;
+    }
+    if let Err(error) = preflight_qbit_torrent_tags(&s, &hashes, &tag_list, false).await {
+        tracing::warn!(
+            component = "cache",
+            operation = "preflight_set_tags",
+            result = "error",
+            error = %crate::url_redaction::redact_display(&error),
+            "qBit tag replacement rejected before backend mutation"
+        );
+        return metadata_write_status(&error);
+    }
     let mut backend_failed = false;
     let mut cache_failed = false;
+    let mut cache_capacity_failed = false;
     for hash in hashes {
         if let Err(e) = s.backend.set_tags(&hash, &tag_list).await {
             backend_failed = true;
             tracing::warn!(
                 component = "qbcompat",
                 operation = "set_tags",
-                torrent = %hash,
+                torrent = %crate::url_redaction::redact_display(&hash),
                 result = "error",
-                error = %e,
+                error = %crate::url_redaction::redact_display(&e),
                 "backend tag replace failed"
             );
             continue;
@@ -2691,12 +3233,13 @@ async fn torrents_set_tags(State(s): State<AppState>, Form(f): Form<TagsForm>) -
             .await
         {
             cache_failed = true;
+            cache_capacity_failed |= metadata_write_status(&e) == StatusCode::TOO_MANY_REQUESTS;
             tracing::warn!(
                 component = "cache",
                 operation = "set_tags",
-                torrent = %hash,
+                torrent = %crate::url_redaction::redact_display(&hash),
                 result = "error",
-                error = %e,
+                error = %crate::url_redaction::redact_display(&e),
                 "cache tag replace failed after backend update"
             );
         } else {
@@ -2704,7 +3247,9 @@ async fn torrents_set_tags(State(s): State<AppState>, Form(f): Form<TagsForm>) -
             emit(&s, Event::TagsUpdated).await;
         }
     }
-    if cache_failed {
+    if cache_capacity_failed {
+        StatusCode::TOO_MANY_REQUESTS
+    } else if cache_failed {
         StatusCode::INTERNAL_SERVER_ERROR
     } else if backend_failed {
         StatusCode::SERVICE_UNAVAILABLE
@@ -2729,11 +3274,17 @@ async fn create_category(
     if !s.backend.capabilities().supports_categories {
         return StatusCode::NOT_IMPLEMENTED;
     }
-    let name = match f.category.as_deref().map(str::trim) {
-        Some(n) if !n.is_empty() => n,
+    let name = match f.category.as_deref() {
+        Some(name) if name.len() <= MAX_QBIT_CATEGORY_NAME_BYTES => name.trim(),
         _ => return StatusCode::BAD_REQUEST,
     };
+    if name.is_empty() {
+        return StatusCode::BAD_REQUEST;
+    }
     let save_path = f.save_path.as_deref().unwrap_or("");
+    if save_path.len() > MAX_QBIT_CATEGORY_PATH_BYTES {
+        return StatusCode::BAD_REQUEST;
+    }
     let category_name = name.to_owned();
     let category_path = save_path.to_owned();
     match s
@@ -2751,12 +3302,12 @@ async fn create_category(
             tracing::error!(
                 component = "qbcompat",
                 operation = "create_category",
-                category = %name,
+                category = %crate::url_redaction::redact_display(&name),
                 result = "error",
-                error = %e,
+                error = %crate::url_redaction::redact_display(&e),
                 "qBit category create failed"
             );
-            StatusCode::INTERNAL_SERVER_ERROR
+            metadata_write_status(&e)
         }
     }
 }
@@ -2765,11 +3316,17 @@ async fn edit_category(State(s): State<AppState>, Form(f): Form<CreateCategoryFo
     if !s.backend.capabilities().supports_categories {
         return StatusCode::NOT_IMPLEMENTED;
     }
-    let name = match f.category.as_deref().map(str::trim) {
-        Some(n) if !n.is_empty() => n,
+    let name = match f.category.as_deref() {
+        Some(name) if name.len() <= MAX_QBIT_CATEGORY_NAME_BYTES => name.trim(),
         _ => return StatusCode::BAD_REQUEST,
     };
+    if name.is_empty() {
+        return StatusCode::BAD_REQUEST;
+    }
     let save_path = f.save_path.as_deref().unwrap_or("");
+    if save_path.len() > MAX_QBIT_CATEGORY_PATH_BYTES {
+        return StatusCode::BAD_REQUEST;
+    }
     let category_name = name.to_owned();
     let category_path = save_path.to_owned();
     match s
@@ -2787,12 +3344,12 @@ async fn edit_category(State(s): State<AppState>, Form(f): Form<CreateCategoryFo
             tracing::error!(
                 component = "qbcompat",
                 operation = "edit_category",
-                category = %name,
+                category = %crate::url_redaction::redact_display(&name),
                 result = "error",
-                error = %e,
+                error = %crate::url_redaction::redact_display(&e),
                 "qBit category edit failed"
             );
-            StatusCode::INTERNAL_SERVER_ERROR
+            metadata_write_status(&e)
         }
     }
 }
@@ -2809,7 +3366,7 @@ async fn remove_categories(
     if !s.backend.capabilities().supports_categories {
         return StatusCode::NOT_IMPLEMENTED;
     }
-    let categories = match required_qbit_list(f.categories.as_deref()) {
+    let categories = match required_qbit_list(f.categories.as_deref(), MAX_QBIT_LIST_ENTRIES, 256) {
         Ok(categories) => categories,
         Err(_) => return StatusCode::BAD_REQUEST,
     };
@@ -2826,9 +3383,9 @@ async fn remove_categories(
             tracing::warn!(
                 component = "qbcompat",
                 operation = "remove_category",
-                category = %name,
+                category = %crate::url_redaction::redact_display(&name),
                 result = "error",
-                error = %e,
+                error = %crate::url_redaction::redact_display(&e),
                 "qBit category removal failed"
             );
         } else {
@@ -2856,7 +3413,18 @@ async fn create_tags(State(s): State<AppState>, Form(f): Form<CreateTagsForm>) -
         Ok(tags) => tags,
         Err(_) => return StatusCode::BAD_REQUEST,
     };
+    if let Err(error) = preflight_qbit_tag_names(&s, &tags).await {
+        tracing::warn!(
+            component = "cache",
+            operation = "preflight_create_tags",
+            result = "error",
+            error = %crate::url_redaction::redact_display(&error),
+            "qBit tag creation rejected before cache mutation"
+        );
+        return metadata_write_status(&error);
+    }
     let mut failed = false;
+    let mut capacity_failed = false;
     for tag in tags {
         let tag_name = tag.to_owned();
         if let Err(e) =
@@ -2864,19 +3432,22 @@ async fn create_tags(State(s): State<AppState>, Form(f): Form<CreateTagsForm>) -
                 .await
         {
             failed = true;
+            capacity_failed |= metadata_write_status(&e) == StatusCode::TOO_MANY_REQUESTS;
             tracing::warn!(
                 component = "qbcompat",
                 operation = "create_tag",
-                tag = %tag,
+                tag = %crate::url_redaction::redact_display(&tag),
                 result = "error",
-                error = %e,
+                error = %crate::url_redaction::redact_display(&e),
                 "qBit tag create failed"
             );
         } else {
             emit(&s, Event::TagsUpdated).await;
         }
     }
-    if failed {
+    if capacity_failed {
+        StatusCode::TOO_MANY_REQUESTS
+    } else if failed {
         StatusCode::INTERNAL_SERVER_ERROR
     } else {
         StatusCode::OK
@@ -2902,9 +3473,9 @@ async fn delete_tags(State(s): State<AppState>, Form(f): Form<CreateTagsForm>) -
             tracing::warn!(
                 component = "qbcompat",
                 operation = "delete_tag",
-                tag = %tag,
+                tag = %crate::url_redaction::redact_display(&tag),
                 result = "error",
-                error = %e,
+                error = %crate::url_redaction::redact_display(&e),
                 "qBit tag delete failed"
             );
         } else {
@@ -2941,29 +3512,39 @@ async fn torrents_file_prio(State(s): State<AppState>, Form(f): Form<FilePrioFor
         return StatusCode::NOT_IMPLEMENTED;
     }
     let ids = match f.id {
-        Some(ids) if !ids.trim().is_empty() => ids,
+        Some(ids)
+            if ids.len() <= MAX_QBIT_FILE_IDS * (MAX_QBIT_FILE_ID_BYTES + 1)
+                && !ids.trim().is_empty() =>
+        {
+            ids
+        }
         None | Some(_) => return StatusCode::BAD_REQUEST,
     };
-    let ids = match ids
-        .split('|')
-        .map(|id| id.trim().parse::<usize>().map_err(|_| ()))
-        .collect::<Result<Vec<_>, _>>()
-    {
-        Ok(ids) if !ids.is_empty() => ids,
-        _ => return StatusCode::BAD_REQUEST,
-    };
+    let mut parsed_ids = Vec::new();
+    for id in ids.split('|') {
+        if parsed_ids.len() >= MAX_QBIT_FILE_IDS || id.trim().len() > MAX_QBIT_FILE_ID_BYTES {
+            return StatusCode::BAD_REQUEST;
+        }
+        let Ok(id) = id.trim().parse::<usize>() else {
+            return StatusCode::BAD_REQUEST;
+        };
+        parsed_ids.push(id);
+    }
+    if parsed_ids.is_empty() {
+        return StatusCode::BAD_REQUEST;
+    }
     let mut failed = false;
-    for idx in ids {
+    for idx in parsed_ids {
         if let Err(e) = s.backend.set_file_priority(&hash, idx, priority).await {
             failed = true;
             tracing::warn!(
                 component = "qbcompat",
                 operation = "set_file_priority",
-                torrent = %hash,
+                torrent = %crate::url_redaction::redact_display(&hash),
                 file_index = idx,
                 priority,
                 result = "error",
-                error = %e,
+                error = %crate::url_redaction::redact_display(&e),
                 "qBit file priority update failed"
             );
         }
@@ -2985,7 +3566,11 @@ async fn torrents_add_trackers(
     State(s): State<AppState>,
     Form(f): Form<AddTrackersForm>,
 ) -> StatusCode {
-    let urls = match required_qbit_lines(f.urls.as_deref()) {
+    let urls = match required_qbit_lines(
+        f.urls.as_deref(),
+        MAX_QBIT_LIST_ENTRIES,
+        MAX_QBIT_LIST_VALUE_BYTES,
+    ) {
         Ok(urls) => urls,
         Err(_) => return StatusCode::BAD_REQUEST,
     };
@@ -2999,25 +3584,27 @@ async fn torrents_add_trackers(
                 component = "qbcompat",
                 operation = "resolve_hashes",
                 result = "error",
-                error = %e,
+                error = %crate::url_redaction::redact_display(&e),
                 "failed to resolve hashes for tracker add"
             );
             return hash_resolution_status(&e);
         }
     };
+    if !qbit_batch_work_within_limit(hashes.len(), urls.len()) {
+        return StatusCode::PAYLOAD_TOO_LARGE;
+    }
     let mut failed = false;
 
     for hash in hashes {
         for url in &urls {
-            if let Err(e) = s.backend.add_tracker(&hash, url).await {
+            if s.backend.add_tracker(&hash, url).await.is_err() {
                 failed = true;
                 tracing::warn!(
                     component = "qbcompat",
                     operation = "add_tracker",
-                    torrent = %hash,
+                    torrent = %crate::url_redaction::redact_display(&hash),
                     tracker = %redact_log_url(url),
-                result = "error",
-                    error = %e,
+                    result = "error",
                     "qb add tracker failed"
                 );
             }
@@ -3044,7 +3631,11 @@ async fn torrents_remove_trackers(
         Ok(hash) => hash,
         Err(status) => return status,
     };
-    let urls = match required_qbit_list(f.urls.as_deref()) {
+    let urls = match required_qbit_list(
+        f.urls.as_deref(),
+        MAX_QBIT_LIST_ENTRIES,
+        MAX_QBIT_LIST_VALUE_BYTES,
+    ) {
         Ok(urls) => urls,
         Err(_) => return StatusCode::BAD_REQUEST,
     };
@@ -3054,15 +3645,14 @@ async fn torrents_remove_trackers(
     let mut failed = false;
 
     for url in urls {
-        if let Err(e) = s.backend.remove_tracker(&hash, &url).await {
+        if s.backend.remove_tracker(&hash, &url).await.is_err() {
             failed = true;
             tracing::warn!(
                 component = "qbcompat",
                 operation = "remove_tracker",
-                torrent = %hash,
+                torrent = %crate::url_redaction::redact_display(&hash),
                 tracker = %redact_log_url(&url),
                 result = "error",
-                error = %e,
                 "qb remove tracker failed"
             );
         }
@@ -3100,15 +3690,18 @@ async fn torrents_edit_tracker(
     if !s.backend.capabilities().supports_tracker_edit {
         return StatusCode::NOT_IMPLEMENTED;
     }
-    if let Err(e) = s.backend.edit_tracker(&hash, &orig_url, &new_url).await {
+    if s.backend
+        .edit_tracker(&hash, &orig_url, &new_url)
+        .await
+        .is_err()
+    {
         tracing::warn!(
             component = "qbcompat",
             operation = "edit_tracker",
-            torrent = %hash,
+            torrent = %crate::url_redaction::redact_display(&hash),
             tracker = %redact_log_url(&orig_url),
             new_tracker = %redact_log_url(&new_url),
                 result = "error",
-            error = %e,
             "qBit tracker edit failed"
         );
         return StatusCode::SERVICE_UNAVAILABLE;
@@ -3137,9 +3730,9 @@ async fn torrents_rename(State(s): State<AppState>, Form(f): Form<RenameForm>) -
         tracing::warn!(
             component = "qbcompat",
             operation = "rename_torrent",
-            torrent = %hash,
+            torrent = %crate::url_redaction::redact_display(&hash),
                 result = "error",
-            error = %e,
+            error = %crate::url_redaction::redact_display(&e),
             "qBit torrent rename failed"
         );
         return StatusCode::SERVICE_UNAVAILABLE;
@@ -3175,10 +3768,10 @@ async fn torrents_rename_file(
         tracing::warn!(
             component = "qbcompat",
             operation = "rename_file",
-            torrent = %hash,
+            torrent = %crate::url_redaction::redact_display(&hash),
             file_index = id,
                 result = "error",
-            error = %e,
+            error = %crate::url_redaction::redact_display(&e),
             "qBit file rename failed"
         );
         return StatusCode::SERVICE_UNAVAILABLE;
@@ -3239,7 +3832,7 @@ async fn torrents_limit_map(
                     "resolve_upload_limit_hashes"
                 },
                 result = "error",
-                error = %e,
+                error = %crate::url_redaction::redact_display(&e),
                 "failed to resolve hashes for per-torrent limit read"
             );
             return hash_resolution_status(&e).into_response();
@@ -3261,7 +3854,7 @@ async fn torrents_limit_map(
                     "upload_limits"
                 },
                 result = "error",
-                error = %e,
+                error = %crate::url_redaction::redact_display(&e),
                 "qBit per-torrent limit read failed"
             );
             StatusCode::SERVICE_UNAVAILABLE.into_response()
@@ -3304,7 +3897,7 @@ async fn torrents_set_speed_limit(s: AppState, f: SpeedLimitForm, download: bool
                 component = "qbcompat",
                 operation = "resolve_hashes",
                 result = "error",
-                error = %e,
+                error = %crate::url_redaction::redact_display(&e),
                 "failed to resolve hashes for per-torrent limit update"
             );
             return hash_resolution_status(&e);
@@ -3321,9 +3914,9 @@ async fn torrents_set_speed_limit(s: AppState, f: SpeedLimitForm, download: bool
             tracing::warn!(
                 component = "qbcompat",
                 operation,
-                torrent = %hash,
+                torrent = %crate::url_redaction::redact_display(&hash),
                 result = "error",
-                error = %e,
+                error = %crate::url_redaction::redact_display(&e),
                 "qBit speed limit update failed"
             );
         }
@@ -3362,7 +3955,7 @@ async fn transfer_ban_peers(
     let Some(raw_peers) = f.get("peers") else {
         return StatusCode::BAD_REQUEST;
     };
-    let peers = match parse_peer_addrs(raw_peers) {
+    let peers = match parse_peer_addrs(raw_peers, MAX_QBIT_BANNED_PEERS) {
         Ok(peers) => peers,
         Err(_) => return StatusCode::BAD_REQUEST,
     };
@@ -3377,7 +3970,7 @@ async fn transfer_ban_peers(
             component = "qbcompat",
             operation = "ban_peers",
             result = "unsupported",
-            error = %e,
+            error = %crate::url_redaction::redact_display(&e),
             "qBit peer ban not supported by backend"
         );
         return StatusCode::SERVICE_UNAVAILABLE;
@@ -3407,7 +4000,7 @@ async fn transfer_set_speed_limit(s: AppState, limit: i64, download: bool) -> St
                 component = "qbcompat",
                 operation,
                 result = "error",
-                error = %e,
+                error = %crate::url_redaction::redact_display(&e),
                 "qBit global speed limit update failed"
             );
             StatusCode::SERVICE_UNAVAILABLE
@@ -3426,7 +4019,7 @@ async fn transfer_toggle_speed_limits_mode(State(s): State<AppState>) -> StatusC
                 component = "qbcompat",
                 operation = "toggle_global_speed_limits_mode",
                 result = "error",
-                error = %e,
+                error = %crate::url_redaction::redact_display(&e),
                 "qBit global speed-limit mode toggle failed"
             );
             StatusCode::SERVICE_UNAVAILABLE
@@ -3443,7 +4036,7 @@ async fn transfer_speed_limits_mode(State(s): State<AppState>) -> impl IntoRespo
                 component = "qbcompat",
                 operation = "speed_limits_mode",
                 result = "error",
-                error = %e,
+                error = %crate::url_redaction::redact_display(&e),
                 "qBit speed-limit mode read failed"
             );
             backend_error_status(&e).into_response()
@@ -3459,7 +4052,7 @@ async fn transfer_download_limit(State(s): State<AppState>) -> impl IntoResponse
                 component = "qbcompat",
                 operation = "download_limit",
                 result = "error",
-                error = %e,
+                error = %crate::url_redaction::redact_display(&e),
                 "qBit download-limit read failed"
             );
             backend_error_status(&e).into_response()
@@ -3475,7 +4068,7 @@ async fn transfer_upload_limit(State(s): State<AppState>) -> impl IntoResponse {
                 component = "qbcompat",
                 operation = "upload_limit",
                 result = "error",
-                error = %e,
+                error = %crate::url_redaction::redact_display(&e),
                 "qBit upload-limit read failed"
             );
             backend_error_status(&e).into_response()
@@ -3513,7 +4106,7 @@ async fn torrents_set_share_limits(
                 component = "qbcompat",
                 operation = "resolve_hashes",
                 result = "error",
-                error = %e,
+                error = %crate::url_redaction::redact_display(&e),
                 "failed to resolve hashes for share-limit update"
             );
             return hash_resolution_status(&e);
@@ -3529,9 +4122,9 @@ async fn torrents_set_share_limits(
             tracing::warn!(
                 component = "qbcompat",
                 operation = "set_share_limits",
-                torrent = %hash,
+                torrent = %crate::url_redaction::redact_display(&hash),
                 result = "error",
-                error = %e,
+                error = %crate::url_redaction::redact_display(&e),
                 "qBit share limit update failed"
             );
         }
@@ -3582,7 +4175,7 @@ async fn torrents_set_location(
                 component = "qbcompat",
                 operation = "resolve_hashes",
                 result = "error",
-                error = %e,
+                error = %crate::url_redaction::redact_display(&e),
                 "failed to resolve hashes for location update"
             );
             return hash_resolution_status(&e);
@@ -3594,9 +4187,9 @@ async fn torrents_set_location(
             tracing::warn!(
                 component = "backend",
                 operation = "set_location",
-                torrent = %hash,
+                torrent = %crate::url_redaction::redact_display(&hash),
                 result = "error",
-                error = %e,
+                error = %crate::url_redaction::redact_display(&e),
                 "backend location update failed"
             );
             continue;
@@ -3622,9 +4215,9 @@ async fn torrents_set_location(
                     tracing::warn!(
                             component = "cache",
                             operation = "set_location",
-                            torrent = %hash,
+                            torrent = %crate::url_redaction::redact_display(&hash),
                     result = "error",
-                            error = %e,
+                            error = %crate::url_redaction::redact_display(&e),
                             "cache location update failed"
                         );
                 } else {
@@ -3637,9 +4230,9 @@ async fn torrents_set_location(
                 tracing::warn!(
                     component = "cache",
                     operation = "exists",
-                    torrent = %hash,
+                    torrent = %crate::url_redaction::redact_display(&hash),
                     result = "error",
-                    error = %e,
+                    error = %crate::url_redaction::redact_display(&e),
                     "cache torrent existence check failed"
                 );
             }
@@ -3709,7 +4302,7 @@ async fn torrents_set_mode_flag(s: AppState, f: TorrentModeForm, operation: &str
                 component = "qbcompat",
                 operation = "resolve_hashes",
                 result = "error",
-                error = %e,
+                error = %crate::url_redaction::redact_display(&e),
                 "failed to resolve hashes for mode update"
             );
             return hash_resolution_status(&e);
@@ -3730,9 +4323,9 @@ async fn torrents_set_mode_flag(s: AppState, f: TorrentModeForm, operation: &str
             tracing::warn!(
                 component = "qbcompat",
                 operation,
-                torrent = %hash,
+                torrent = %crate::url_redaction::redact_display(&hash),
                 result = "error",
-                error = %e,
+                error = %crate::url_redaction::redact_display(&e),
                 "qBit torrent mode update failed"
             );
         }
@@ -3759,7 +4352,7 @@ async fn torrents_toggle_sequential_download(
                 component = "qbcompat",
                 operation = "resolve_hashes",
                 result = "error",
-                error = %e,
+                error = %crate::url_redaction::redact_display(&e),
                 "failed to resolve hashes for sequential toggle"
             );
             return hash_resolution_status(&e);
@@ -3771,9 +4364,9 @@ async fn torrents_toggle_sequential_download(
             tracing::warn!(
                 component = "qbcompat",
                 operation = "toggle_sequential_download",
-                torrent = %hash,
+                torrent = %crate::url_redaction::redact_display(&hash),
                 result = "error",
-                error = %e,
+                error = %crate::url_redaction::redact_display(&e),
                 "qBit sequential download toggle failed"
             );
         }
@@ -3800,7 +4393,7 @@ async fn torrents_toggle_first_last_piece_prio(
                 component = "qbcompat",
                 operation = "resolve_hashes",
                 result = "error",
-                error = %e,
+                error = %crate::url_redaction::redact_display(&e),
                 "failed to resolve hashes for first-last toggle"
             );
             return hash_resolution_status(&e);
@@ -3812,9 +4405,9 @@ async fn torrents_toggle_first_last_piece_prio(
             tracing::warn!(
                 component = "qbcompat",
                 operation = "toggle_first_last_piece_prio",
-                torrent = %hash,
+                torrent = %crate::url_redaction::redact_display(&hash),
                 result = "error",
-                error = %e,
+                error = %crate::url_redaction::redact_display(&e),
                 "qBit first/last piece priority toggle failed"
             );
         }
@@ -3850,10 +4443,10 @@ async fn sync_maindata(
                 component = "qbcompat",
                 operation = "sync_maindata_metadata",
                 result = "error",
-                error = %e,
+                error = %crate::url_redaction::redact_display(&e),
                 "qBit maindata metadata load failed"
             );
-            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+            return metadata_read_status(&e).into_response();
         }
     };
     let backend_status =
@@ -3904,7 +4497,7 @@ async fn sync_maindata(
                     component = "qbcompat",
                     operation = "sync_maindata_revision",
                     result = "error",
-                    error = %e,
+                    error = %crate::url_redaction::redact_display(&e),
                     "qBit maindata revision load failed"
                 );
                 return StatusCode::INTERNAL_SERVER_ERROR.into_response();
@@ -3941,7 +4534,7 @@ async fn sync_maindata(
                                     component = "qbcompat",
                                     operation = "sync_maindata_serialize",
                         result = "error",
-                                    error = %e,
+                                    error = %crate::url_redaction::redact_display(&e),
                                     "qBit maindata serialization failed"
                                 );
                         return StatusCode::INTERNAL_SERVER_ERROR.into_response();
@@ -3963,10 +4556,10 @@ async fn sync_maindata(
                     component = "qbcompat",
                     operation = "sync_maindata",
                 result = "error",
-                    error = %e,
+                    error = %crate::url_redaction::redact_display(&e),
                     "qBit maindata query failed"
                 );
-                StatusCode::INTERNAL_SERVER_ERROR.into_response()
+                metadata_read_status(&e).into_response()
             }
         }
     } else {
@@ -3985,7 +4578,7 @@ async fn sync_maindata(
                                     component = "qbcompat",
                                     operation = "sync_maindata_delta_serialize",
                         result = "error",
-                                    error = %e,
+                                    error = %crate::url_redaction::redact_display(&e),
                                     "qBit maindata delta serialization failed"
                                 );
                         return StatusCode::INTERNAL_SERVER_ERROR.into_response();
@@ -4025,10 +4618,10 @@ async fn sync_maindata(
                     component = "qbcompat",
                     operation = "sync_maindata_delta",
                 result = "error",
-                    error = %e,
+                    error = %crate::url_redaction::redact_display(&e),
                     "qBit maindata delta query failed"
                 );
-                StatusCode::INTERNAL_SERVER_ERROR.into_response()
+                metadata_read_status(&e).into_response()
             }
         }
     }
@@ -4108,7 +4701,7 @@ async fn transfer_info(State(s): State<AppState>) -> impl IntoResponse {
                     component = "qbcompat",
                     operation = "transfer_info",
                     result = "error",
-                    error = %e,
+                    error = %crate::url_redaction::redact_display(&e),
                     "global transfer limits unavailable"
                 );
                 return (
@@ -4160,10 +4753,44 @@ mod tests {
     };
 
     use super::{
-        cached_lifecycle_projection, is_status_filter, map_sort, qb_server_state, qbit_log_entry,
-        qbit_ratio_limit_milli, qbit_status_filter, resolve_hashes, split_hashes, to_qb_torrent,
-        LogMainQuery,
+        automation_state_write_status, bounded_qbit_values, cached_lifecycle_projection,
+        is_status_filter, map_sort, metadata_read_status, metadata_write_status,
+        parse_hash_selection, parse_peer_addrs, parse_qbit_torrent_add_urls, qb_server_state,
+        qbit_batch_work_within_limit, qbit_log_entry, qbit_ratio_limit_milli, qbit_status_filter,
+        resolve_all_hashes, resolve_hashes, rss_item_write_status, rss_rule_tags, split_hashes,
+        strict_tag_values, to_qb_torrent, LogMainQuery, MAX_QBIT_BANNED_PEERS,
+        MAX_QBIT_BATCH_OPERATIONS, MAX_QBIT_HASH_BYTES, MAX_QBIT_HASH_SELECTIONS,
+        MAX_QBIT_LIST_ENTRIES, MAX_QBIT_LIST_VALUE_BYTES, MAX_QBIT_MANUAL_PEERS,
+        MAX_QBIT_PEER_ADDRESS_BYTES, MAX_QBIT_RSS_RULE_TAGS, MAX_QBIT_TAG_BYTES,
+        MAX_QBIT_TAG_ENTRIES, MAX_QBIT_TORRENT_ADD_URLS, MAX_QBIT_TORRENT_ADD_URL_BYTES,
     };
+
+    #[test]
+    fn metadata_capacity_errors_map_to_bounded_service_statuses() {
+        let error = anyhow::Error::new(crate::cache::categories::CategoryTagCapacityError::new(
+            "tag",
+        ));
+        assert_eq!(metadata_write_status(&error), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(
+            metadata_read_status(&error),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+    }
+
+    #[test]
+    fn rss_item_capacity_errors_map_to_payload_too_large() {
+        let error = anyhow::Error::new(crate::cache::QbitRssItemCapacityError);
+        assert_eq!(rss_item_write_status(&error), StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
+    #[test]
+    fn automation_state_capacity_errors_map_to_payload_too_large() {
+        let error = anyhow::Error::new(crate::cache::AutomationStateCapacityError);
+        assert_eq!(
+            automation_state_write_status(&error),
+            StatusCode::PAYLOAD_TOO_LARGE
+        );
+    }
 
     #[test]
     fn is_status_filter_recognizes_every_bucket_build_where_handles() {
@@ -4222,6 +4849,114 @@ mod tests {
         assert_eq!(split_hashes(&db, Some("A| a |B|A|B")), vec!["A", "B"]);
         assert!(resolve_hashes(&db, Some("A||B")).is_err());
         assert!(resolve_hashes(&db, Some("all|A")).is_err());
+    }
+
+    #[test]
+    fn explicit_hash_selections_are_bounded_before_deduplication() {
+        let repeated = std::iter::repeat_n("same-hash", MAX_QBIT_HASH_SELECTIONS + 1)
+            .collect::<Vec<_>>()
+            .join("|");
+        let error = parse_hash_selection(&repeated).unwrap_err();
+        assert!(error.to_string().contains("at most 10000 entries"));
+
+        let oversized = "x".repeat(MAX_QBIT_HASH_BYTES + 1);
+        let error = parse_hash_selection(&oversized).unwrap_err();
+        assert!(error.to_string().contains("at most 256 bytes"));
+
+        assert!(parse_hash_selection("hash-λ").is_err());
+    }
+
+    #[test]
+    fn all_hash_selection_and_nested_batch_work_are_bounded() {
+        let dir = tempfile::tempdir().expect("create cache tempdir");
+        let db = crate::cache::Db::open(&dir.path().join("cache.db")).expect("open cache");
+        db.upsert(&torrent_row("all-a", false, false, false))
+            .unwrap();
+        db.upsert(&torrent_row("all-b", false, false, false))
+            .unwrap();
+
+        let error = resolve_all_hashes(&db, 1).expect_err("all must share the explicit cap");
+        assert!(error.downcast_ref::<super::InvalidHashTarget>().is_some());
+        assert_eq!(resolve_all_hashes(&db, 2).unwrap().len(), 2);
+
+        assert!(qbit_batch_work_within_limit(100, 100));
+        assert!(!qbit_batch_work_within_limit(101, 100));
+        assert!(!qbit_batch_work_within_limit(usize::MAX, 2));
+        assert!(qbit_batch_work_within_limit(MAX_QBIT_BATCH_OPERATIONS, 0));
+        assert!(!qbit_batch_work_within_limit(
+            MAX_QBIT_BATCH_OPERATIONS + 1,
+            0
+        ));
+    }
+
+    #[test]
+    fn peer_ban_lists_are_bounded_before_materialization() {
+        let manual_peers = std::iter::repeat_n("8.8.8.8:6881", MAX_QBIT_MANUAL_PEERS + 1)
+            .collect::<Vec<_>>()
+            .join("|");
+        assert!(parse_peer_addrs(&manual_peers, MAX_QBIT_MANUAL_PEERS).is_err());
+
+        let banned_peers = std::iter::repeat_n("8.8.8.8:6881", MAX_QBIT_BANNED_PEERS + 1)
+            .collect::<Vec<_>>()
+            .join("|");
+        assert!(parse_peer_addrs(&banned_peers, MAX_QBIT_BANNED_PEERS).is_err());
+        assert!(parse_peer_addrs(
+            &"x".repeat(MAX_QBIT_PEER_ADDRESS_BYTES + 1),
+            MAX_QBIT_MANUAL_PEERS
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn delimited_qbit_lists_are_bounded_before_materialization() {
+        let repeated = std::iter::repeat_n("tag", MAX_QBIT_LIST_ENTRIES + 1)
+            .collect::<Vec<_>>()
+            .join("|");
+        assert!(bounded_qbit_values(
+            repeated.split('|'),
+            MAX_QBIT_LIST_ENTRIES,
+            MAX_QBIT_LIST_VALUE_BYTES
+        )
+        .is_err());
+
+        let long_value = "x".repeat(MAX_QBIT_LIST_VALUE_BYTES + 1);
+        assert!(bounded_qbit_values(
+            [long_value.as_str()],
+            MAX_QBIT_LIST_ENTRIES,
+            MAX_QBIT_LIST_VALUE_BYTES
+        )
+        .is_err());
+
+        let tags = std::iter::repeat_n("tag", MAX_QBIT_TAG_ENTRIES + 1)
+            .collect::<Vec<_>>()
+            .join(",");
+        assert!(strict_tag_values(Some(&tags), false).is_err());
+        assert!(strict_tag_values(Some(&"x".repeat(MAX_QBIT_TAG_BYTES + 1)), false).is_err());
+
+        let rss_tags = Some(
+            std::iter::repeat_n("tag", MAX_QBIT_RSS_RULE_TAGS + 1)
+                .collect::<Vec<_>>()
+                .join(","),
+        );
+        assert!(rss_rule_tags(rss_tags).is_err());
+    }
+
+    #[test]
+    fn torrent_add_url_lists_are_bounded_and_fully_validated() {
+        assert_eq!(
+            parse_qbit_torrent_add_urls("magnet:first\r\nmagnet:second\r\n")
+                .expect("valid CRLF list"),
+            vec!["magnet:first", "magnet:second"]
+        );
+        assert!(parse_qbit_torrent_add_urls("magnet:first\n\nmagnet:second").is_err());
+        assert!(
+            parse_qbit_torrent_add_urls(&"x".repeat(MAX_QBIT_TORRENT_ADD_URL_BYTES + 1)).is_err()
+        );
+
+        let too_many = std::iter::repeat_n("magnet:x", MAX_QBIT_TORRENT_ADD_URLS + 1)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(parse_qbit_torrent_add_urls(&too_many).is_err());
     }
 
     #[test]
@@ -4363,18 +5098,12 @@ mod tests {
         let inactive_open = torrent_row("inactive-open", false, true, false);
         assert_eq!(to_qb_torrent(&inactive_open)["state"], "pausedDL");
         let inactive_open_complete = torrent_row("inactive-open-complete", false, true, true);
-        assert_eq!(
-            to_qb_torrent(&inactive_open_complete)["state"],
-            "pausedUP"
-        );
+        assert_eq!(to_qb_torrent(&inactive_open_complete)["state"], "pausedUP");
     }
 
     #[test]
     fn successful_start_projects_as_started_until_next_sync() {
-        assert_eq!(
-            cached_lifecycle_projection("start"),
-            Some((1, true, true))
-        );
+        assert_eq!(cached_lifecycle_projection("start"), Some((1, true, true)));
         assert_eq!(cached_lifecycle_projection("stop"), Some((0, false, false)));
         assert_eq!(cached_lifecycle_projection("recheck"), None);
     }
@@ -4419,7 +5148,11 @@ mod tests {
         );
         assert_eq!(
             super::redact_log_url("https://tracker.example/announce?passkey=secret#frag"),
-            "https://tracker.example/announce"
+            "https://tracker.example/"
+        );
+        assert_eq!(
+            super::redact_log_url("https://user:secret@tracker.example/key/announce"),
+            "https://tracker.example/"
         );
         assert_eq!(
             super::redact_log_url("/data/private/file.torrent"),
@@ -4473,11 +5206,23 @@ pub fn to_qb_torrent(t: &TorrentRow) -> serde_json::Value {
     } else if t.state == 4 {
         "metaDL"
     } else if t.state == 2 {
-        if t.complete { "checkingUP" } else { "checkingDL" }
+        if t.complete {
+            "checkingUP"
+        } else {
+            "checkingDL"
+        }
     } else if t.state == 5 || (t.state == 1 && !t.is_active && !t.is_open) {
-        if t.complete { "queuedUP" } else { "queuedDL" }
+        if t.complete {
+            "queuedUP"
+        } else {
+            "queuedDL"
+        }
     } else if !t.is_open || !t.is_active {
-        if t.complete { "pausedUP" } else { "pausedDL" }
+        if t.complete {
+            "pausedUP"
+        } else {
+            "pausedDL"
+        }
     } else if t.complete && t.is_active && up_rate > 0 {
         "uploading"
     } else if !t.complete && t.is_active && down_rate > 0 {
@@ -4540,32 +5285,10 @@ fn current_row_rates(t: &TorrentRow) -> (i64, i64) {
 fn resolve_hashes(db: &crate::cache::Db, s: Option<&str>) -> anyhow::Result<Vec<String>> {
     match s {
         None | Some("") => Ok(vec![]),
-        Some(s) if s.trim().eq_ignore_ascii_case("all") => match db.all_hashes() {
-            Ok(hashes) => Ok(hashes.into_iter().collect()),
-            Err(e) => Err(anyhow::anyhow!("failed to resolve hashes=all: {e}")),
-        },
-        Some(s) => {
-            let values = s.split('|').map(str::trim).collect::<Vec<_>>();
-            if values
-                .iter()
-                .any(|hash| hash.is_empty() || hash.eq_ignore_ascii_case("all"))
-            {
-                return Err(anyhow::Error::new(InvalidHashTarget(
-                    "hashes must contain non-empty torrent hashes or exactly 'all'".to_owned(),
-                )));
-            }
-            let mut seen = std::collections::HashSet::new();
-            Ok(values
-                .into_iter()
-                .filter_map(|hash| {
-                    if seen.insert(hash.to_ascii_lowercase()) {
-                        Some(hash.to_owned())
-                    } else {
-                        None
-                    }
-                })
-                .collect())
+        Some(s) if s.trim().eq_ignore_ascii_case("all") => {
+            resolve_all_hashes(db, MAX_QBIT_HASH_SELECTIONS)
         }
+        Some(s) => parse_hash_selection(s),
     }
 }
 
@@ -4575,34 +5298,57 @@ async fn resolve_hashes_async(
 ) -> anyhow::Result<Vec<String>> {
     match s {
         None | Some("") => Ok(vec![]),
-        Some(s) if s.trim().eq_ignore_ascii_case("all") => db
-            .run_blocking("resolve_hashes_all", |db| db.all_hashes())
+        Some(s) if s.trim().eq_ignore_ascii_case("all") => {
+            db.run_blocking("resolve_hashes_all", |db| {
+                resolve_all_hashes(db, MAX_QBIT_HASH_SELECTIONS)
+            })
             .await
-            .map(|hashes| hashes.into_iter().collect())
-            .map_err(|e| anyhow::anyhow!("failed to resolve hashes=all: {e}")),
-        Some(s) => {
-            let values = s.split('|').map(str::trim).collect::<Vec<_>>();
-            if values
-                .iter()
-                .any(|hash| hash.is_empty() || hash.eq_ignore_ascii_case("all"))
-            {
-                return Err(anyhow::Error::new(InvalidHashTarget(
-                    "hashes must contain non-empty torrent hashes or exactly 'all'".to_owned(),
-                )));
-            }
-            let mut seen = std::collections::HashSet::new();
-            Ok(values
-                .into_iter()
-                .filter_map(|hash| {
-                    if seen.insert(hash.to_ascii_lowercase()) {
-                        Some(hash.to_owned())
-                    } else {
-                        None
-                    }
-                })
-                .collect())
+        }
+        Some(s) => parse_hash_selection(s),
+    }
+}
+
+fn resolve_all_hashes(db: &crate::cache::Db, max_hashes: usize) -> anyhow::Result<Vec<String>> {
+    let hashes = db.all_hashes_bounded(max_hashes.saturating_add(1))?;
+    if hashes.len() > max_hashes {
+        return Err(InvalidHashTarget(format!(
+            "hashes=all may select at most {max_hashes} torrents"
+        ))
+        .into());
+    }
+    Ok(hashes)
+}
+
+fn parse_hash_selection(raw: &str) -> anyhow::Result<Vec<String>> {
+    let mut hashes = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for (index, value) in raw.split('|').enumerate() {
+        if index >= MAX_QBIT_HASH_SELECTIONS {
+            return Err(anyhow::Error::new(InvalidHashTarget(format!(
+                "hashes may contain at most {MAX_QBIT_HASH_SELECTIONS} entries"
+            ))));
+        }
+        if value.len() > MAX_QBIT_HASH_BYTES {
+            return Err(anyhow::Error::new(InvalidHashTarget(format!(
+                "each hash must be an ASCII value of at most {MAX_QBIT_HASH_BYTES} bytes"
+            ))));
+        }
+        let hash = value.trim();
+        if hash.is_empty() || hash.eq_ignore_ascii_case("all") {
+            return Err(anyhow::Error::new(InvalidHashTarget(
+                "hashes must contain non-empty torrent hashes or exactly 'all'".to_owned(),
+            )));
+        }
+        if hash.len() > MAX_QBIT_HASH_BYTES || !hash.is_ascii() {
+            return Err(anyhow::Error::new(InvalidHashTarget(format!(
+                "each hash must be an ASCII value of at most {MAX_QBIT_HASH_BYTES} bytes"
+            ))));
+        }
+        if seen.insert(hash.to_ascii_lowercase()) {
+            hashes.push(hash.to_owned());
         }
     }
+    Ok(hashes)
 }
 
 async fn required_resolved_hashes_async(
@@ -4712,15 +5458,22 @@ fn split_hashes(db: &crate::cache::Db, s: Option<&str>) -> Vec<String> {
     resolve_hashes(db, s).expect("test hash resolution should succeed")
 }
 
-fn parse_peer_addrs(values: &str) -> Result<Vec<SocketAddr>, ()> {
-    let peers = values.split('|').collect::<Vec<_>>();
-    if peers.is_empty() || peers.iter().any(|peer| peer.trim().is_empty()) {
-        return Err(());
+fn parse_peer_addrs(values: &str, max_addresses: usize) -> Result<Vec<SocketAddr>, ()> {
+    let mut peers = Vec::new();
+    for peer in values.split('|') {
+        if peers.len() >= max_addresses {
+            return Err(());
+        }
+        if peer.len() > MAX_QBIT_PEER_ADDRESS_BYTES {
+            return Err(());
+        }
+        let peer = peer.trim();
+        if peer.is_empty() {
+            return Err(());
+        }
+        peers.push(peer.parse::<SocketAddr>().map_err(|_| ())?);
     }
-    peers
-        .into_iter()
-        .map(|peer| peer.trim().parse::<SocketAddr>().map_err(|_| ()))
-        .collect()
+    Ok(peers)
 }
 
 async fn emit(s: &AppState, event: Event) {
@@ -4774,7 +5527,7 @@ async fn append_operator_event(
         })
         .await
     {
-        tracing::warn!(component = "app_events", operation = "append", result = "error", error = %e, "failed to append app event");
+        tracing::warn!(component = "app_events", operation = "append", result = "error", error = %crate::url_redaction::redact_display(&e), "failed to append app event");
     }
 }
 
@@ -4918,46 +5671,93 @@ fn plugin_name_from_source(source: &str) -> String {
 fn required_qbit_form_list(
     params: &HashMap<String, String>,
     key: &str,
+    max_items: usize,
+    max_value_bytes: usize,
 ) -> Result<Vec<String>, StatusCode> {
     let raw = params.get(key).ok_or(StatusCode::BAD_REQUEST)?;
-    let values = raw.split(['|', ',']).map(str::trim).collect::<Vec<_>>();
-    if values.is_empty() || values.iter().any(|value| value.is_empty()) {
-        return Err(StatusCode::BAD_REQUEST);
-    }
-    Ok(values.into_iter().map(str::to_owned).collect())
+    bounded_qbit_values(raw.split(['|', ',']), max_items, max_value_bytes)
+        .map(|values| values.into_iter().map(str::to_owned).collect())
+        .map_err(|_| StatusCode::BAD_REQUEST)
 }
 
-fn required_qbit_list(raw: Option<&str>) -> Result<Vec<String>, ()> {
+fn required_qbit_list(
+    raw: Option<&str>,
+    max_items: usize,
+    max_value_bytes: usize,
+) -> Result<Vec<String>, ()> {
     let raw = raw.ok_or(())?;
-    let values = raw
-        .split(['|', '\n', '\r'])
-        .map(str::trim)
-        .collect::<Vec<_>>();
-    if values.is_empty() || values.iter().any(|value| value.is_empty()) {
-        return Err(());
-    }
-    Ok(values.into_iter().map(str::to_owned).collect())
+    bounded_qbit_values(raw.split(['|', '\n', '\r']), max_items, max_value_bytes)
+        .map(|values| values.into_iter().map(str::to_owned).collect())
 }
 
-fn required_qbit_lines(raw: Option<&str>) -> Result<Vec<String>, ()> {
+fn required_qbit_lines(
+    raw: Option<&str>,
+    max_items: usize,
+    max_value_bytes: usize,
+) -> Result<Vec<String>, ()> {
     let raw = raw.ok_or(())?;
-    let values = raw.lines().map(str::trim).collect::<Vec<_>>();
-    if values.is_empty() || values.iter().any(|value| value.is_empty()) {
-        return Err(());
-    }
-    Ok(values.into_iter().map(str::to_owned).collect())
+    bounded_qbit_values(raw.lines(), max_items, max_value_bytes)
+        .map(|values| values.into_iter().map(str::to_owned).collect())
 }
 
 fn strict_tag_values(raw: Option<&str>, allow_empty: bool) -> Result<Vec<&str>, ()> {
     let raw = raw.ok_or(())?;
+    if raw.len() > MAX_QBIT_TAG_LIST_BYTES {
+        return Err(());
+    }
     if raw.trim().is_empty() {
         return if allow_empty { Ok(Vec::new()) } else { Err(()) };
     }
-    let values = raw.split(',').map(str::trim).collect::<Vec<_>>();
-    if values.iter().any(|value| value.is_empty()) {
+    bounded_qbit_values(raw.split(','), MAX_QBIT_TAG_ENTRIES, MAX_QBIT_TAG_BYTES)
+}
+
+fn bounded_qbit_values<'a>(
+    values: impl IntoIterator<Item = &'a str>,
+    max_items: usize,
+    max_value_bytes: usize,
+) -> Result<Vec<&'a str>, ()> {
+    let mut bounded = Vec::new();
+    for value in values {
+        if bounded.len() >= max_items || value.len() > max_value_bytes {
+            return Err(());
+        }
+        let value = value.trim();
+        if value.is_empty() {
+            return Err(());
+        }
+        bounded.push(value);
+    }
+    if bounded.is_empty() {
+        Err(())
+    } else {
+        Ok(bounded)
+    }
+}
+
+fn parse_qbit_torrent_add_urls(raw: &str) -> Result<Vec<String>, ()> {
+    if raw.len() > MAX_QBIT_TORRENT_ADD_URL_LIST_BYTES {
         return Err(());
     }
-    Ok(values)
+    let normalized = raw.replace("\r\n", "\n").replace('\r', "");
+    let mut urls = Vec::new();
+    let mut lines = normalized.split('\n').peekable();
+    while let Some(line) = lines.next() {
+        if line.len() > MAX_QBIT_TORRENT_ADD_URL_BYTES {
+            return Err(());
+        }
+        let url = line.trim();
+        if url.is_empty() {
+            if lines.peek().is_some() {
+                return Err(());
+            }
+            continue;
+        }
+        if urls.len() >= MAX_QBIT_TORRENT_ADD_URLS {
+            return Err(());
+        }
+        urls.push(url.to_owned());
+    }
+    Ok(urls)
 }
 
 fn parse_wire_bool(value: &str) -> Option<bool> {
@@ -4985,17 +5785,5 @@ fn now_unix_secs() -> i64 {
 }
 
 fn redact_log_url(value: &str) -> String {
-    let lower = value.to_ascii_lowercase();
-    if lower.starts_with("magnet:?") {
-        return "[redacted-magnet]".to_owned();
-    }
-    let without_query = value.split(['?', '#']).next().unwrap_or(value);
-    if without_query.starts_with('/')
-        || without_query.starts_with("~/")
-        || without_query.starts_with("./")
-        || without_query.starts_with("../")
-    {
-        return "[redacted-path]".to_owned();
-    }
-    without_query.to_owned()
+    crate::url_redaction::redact_log_url(value)
 }

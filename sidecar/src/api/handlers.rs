@@ -4,12 +4,14 @@ use axum::{
     response::IntoResponse,
     Json,
 };
-use serde::{Deserialize, Serialize};
+use serde::{
+    de::{self, IgnoredAny, SeqAccess, Visitor},
+    Deserialize, Deserializer, Serialize,
+};
 #[cfg(unix)]
 use std::ffi::CString;
 use std::{
-    collections::BTreeMap,
-    fs::File,
+    collections::{BTreeMap, HashSet},
     io::{Read, Write},
     path::{Path as FsPath, PathBuf},
     process::Stdio,
@@ -26,10 +28,60 @@ use super::server::AppState;
 use super::ws::Event;
 use crate::backend::{post_remote_json, ratio_milli, BackendHealth, BackendStatus};
 use crate::cache::{
-    bounded_page_limit, validate_page_offset, AppEventRow, Category, ListParams, RatioGroup,
-    RssRule, SavedView, TorrentLiveRow, WorkflowRule, WorkflowRun,
+    bounded_page_limit, is_automation_state_capacity_error, is_category_tag_capacity_error,
+    validate_page_offset, AppEventRow, Category, ListParams, RatioGroup, RssRule,
+    RssRuleUpsertResult, SavedView, TorrentLiveRow, WorkflowRule, WorkflowRun,
 };
 use crate::rtorrent::{engine::ProbeValue, XmlValue};
+use crate::safe_file::open_regular_read;
+
+const MAX_RSS_RULE_ID_BYTES: usize = 128;
+const MAX_RSS_RULE_NAME_BYTES: usize = 256;
+const MAX_RSS_RULE_FIELD_BYTES: usize = 8_192;
+const MAX_RSS_RULE_TAGS: usize = 1_024;
+const MAX_RSS_RULE_TAG_BYTES: usize = 256;
+const MAX_API_CATEGORY_NAME_BYTES: usize = 256;
+const MAX_API_CATEGORY_PATH_BYTES: usize = 4_096;
+const MAX_API_TAGS: usize = 1_024;
+const MAX_API_TAG_BYTES: usize = 256;
+const MAX_API_TORRENT_ADD_FIELDS: usize = 5;
+const MAX_API_MAGNET_BYTES: usize = 8_192;
+const MAX_API_TRACKER_MUTATIONS: usize = 1_024;
+const MAX_API_TRACKER_URL_BYTES: usize = 8_192;
+const MAX_API_FILE_PRIORITY_UPDATES: usize = 4_096;
+const MAX_CROSS_SEED_OPERATIONS: usize = 10_000;
+const MAX_RATIO_GROUPS: usize = 1_024;
+const MAX_RATIO_GROUP_NAME_BYTES: usize = 256;
+const MAX_WORKFLOW_RULES: usize = 1_024;
+const MAX_WORKFLOW_ID_BYTES: usize = 128;
+const MAX_WORKFLOW_NAME_BYTES: usize = 256;
+const MAX_WORKFLOW_TOKEN_BYTES: usize = 64;
+const MAX_WORKFLOW_TEXT_BYTES: usize = 8_192;
+const MAX_WORKFLOW_PATH_BYTES: usize = 4_096;
+
+fn metadata_write_status(error: &anyhow::Error) -> StatusCode {
+    if is_category_tag_capacity_error(error) {
+        StatusCode::TOO_MANY_REQUESTS
+    } else {
+        StatusCode::INTERNAL_SERVER_ERROR
+    }
+}
+
+fn metadata_read_status(error: &anyhow::Error) -> StatusCode {
+    if is_category_tag_capacity_error(error) {
+        StatusCode::SERVICE_UNAVAILABLE
+    } else {
+        StatusCode::INTERNAL_SERVER_ERROR
+    }
+}
+
+fn automation_state_write_status(error: &anyhow::Error) -> StatusCode {
+    if is_automation_state_capacity_error(error) {
+        StatusCode::PAYLOAD_TOO_LARGE
+    } else {
+        StatusCode::INTERNAL_SERVER_ERROR
+    }
+}
 
 // --- Health ---
 
@@ -50,7 +102,7 @@ pub async fn health(State(s): State<AppState>) -> impl IntoResponse {
                 component = "cache",
                 operation = "count",
                 result = "error",
-                error = %e,
+                error = %crate::url_redaction::redact_display(&e),
                 "compatible-client service cache health probe failed"
             );
             (0, false)
@@ -135,7 +187,7 @@ pub async fn storage_roots(State(s): State<AppState>) -> impl IntoResponse {
                 component = "api",
                 operation = "storage_roots",
                 result = "worker_failed",
-                error = %error,
+                error = %crate::task_join_error_summary("storage root probe worker", &error),
                 "storage root probe worker failed"
             );
             fallback_roots
@@ -216,7 +268,7 @@ pub async fn transfer_info(State(s): State<AppState>) -> impl IntoResponse {
                     component = "api",
                     operation = "transfer_info",
                     result = "error",
-                    error = %e,
+                    error = %crate::url_redaction::redact_display(&e),
                     "global transfer limits unavailable"
                 );
                 return (
@@ -280,7 +332,7 @@ pub async fn list_logs(
                 component = "api",
                 operation = "list_logs",
                 result = "error",
-                error = %e,
+                error = %crate::url_redaction::redact_display(&e),
                 "list logs failed"
             );
             StatusCode::INTERNAL_SERVER_ERROR.into_response()
@@ -296,7 +348,7 @@ pub async fn tracker_health(State(s): State<AppState>) -> impl IntoResponse {
     {
         Ok(trackers) => Json(serde_json::json!({ "trackers": trackers })).into_response(),
         Err(e) => {
-            tracing::error!(component = "api", operation = "tracker_health", result = "error", error = %e, "tracker health query failed");
+            tracing::error!(component = "api", operation = "tracker_health", result = "error", error = %crate::url_redaction::redact_display(&e), "tracker health query failed");
             StatusCode::INTERNAL_SERVER_ERROR.into_response()
         }
     }
@@ -313,7 +365,7 @@ pub async fn sidebar_facets(
     {
         Ok(facets) => Json(facets).into_response(),
         Err(e) => {
-            tracing::error!(component = "api", operation = "sidebar_facets", result = "error", error = %e, "sidebar facet query failed");
+            tracing::error!(component = "api", operation = "sidebar_facets", result = "error", error = %crate::url_redaction::redact_display(&e), "sidebar facet query failed");
             StatusCode::INTERNAL_SERVER_ERROR.into_response()
         }
     }
@@ -655,20 +707,18 @@ pub async fn get_rtorrent_settings(State(s): State<AppState>) -> impl IntoRespon
     let overlay_path_for_read = overlay_path.clone();
     let (saved, custom_rc, overlay_writable) = match tokio::task::spawn_blocking(move || {
         let value = read_rtorrent_overlay(&overlay_path_for_read)?;
-        let writable = overlay_path_for_read
-            .parent()
-            .is_some_and(|path| path.exists());
+        let writable = rtorrent_overlay_is_writable(&overlay_path_for_read);
         Ok::<_, std::io::Error>((value.0, value.1, writable))
     })
     .await
     {
         Ok(Ok(value)) => value,
         Ok(Err(e)) => {
-            tracing::error!(component = "api", operation = "read_rtorrent_overlay", result = "error", error = %e, "rTorrent overlay read failed");
+            tracing::error!(component = "api", operation = "read_rtorrent_overlay", result = "error", error = %crate::url_redaction::redact_display(&e), "rTorrent overlay read failed");
             return StatusCode::INTERNAL_SERVER_ERROR.into_response();
         }
         Err(e) => {
-            tracing::error!(component = "api", operation = "read_rtorrent_overlay", result = "worker_failed", error = %e, "rTorrent overlay read worker failed");
+            tracing::error!(component = "api", operation = "read_rtorrent_overlay", result = "worker_failed", error = %crate::task_join_error_summary("rTorrent overlay read worker", &e), "rTorrent overlay read worker failed");
             return StatusCode::INTERNAL_SERVER_ERROR.into_response();
         }
     };
@@ -757,11 +807,11 @@ pub async fn set_rtorrent_settings(
     {
         Ok(Ok(value)) => value,
         Ok(Err(e)) => {
-            tracing::error!(component = "api", operation = "write_rtorrent_overlay", result = "error", error = %e, "rTorrent overlay write failed");
+            tracing::error!(component = "api", operation = "write_rtorrent_overlay", result = "error", error = %crate::url_redaction::redact_display(&e), "rTorrent overlay write failed");
             return StatusCode::INTERNAL_SERVER_ERROR.into_response();
         }
         Err(e) => {
-            tracing::error!(component = "api", operation = "write_rtorrent_overlay", result = "worker_failed", error = %e, "rTorrent overlay write worker failed");
+            tracing::error!(component = "api", operation = "write_rtorrent_overlay", result = "worker_failed", error = %crate::task_join_error_summary("rTorrent overlay write worker", &e), "rTorrent overlay write worker failed");
             return StatusCode::INTERNAL_SERVER_ERROR.into_response();
         }
     };
@@ -923,9 +973,37 @@ fn rtorrent_overlay_path() -> PathBuf {
         .unwrap_or_else(|_| PathBuf::from("/config/rtorrent.rc"))
 }
 
+fn rtorrent_overlay_is_writable(path: &FsPath) -> bool {
+    let Some(parent) = path.parent() else {
+        return false;
+    };
+    let parent = if parent.as_os_str().is_empty() {
+        FsPath::new(".")
+    } else {
+        parent
+    };
+    if !parent.is_dir() {
+        return false;
+    }
+
+    let probe = parent.join(format!(".tng-overlay-probe.{}.tmp", uuid::Uuid::new_v4()));
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let Ok(file) = options.open(&probe) else {
+        return false;
+    };
+    drop(file);
+    std::fs::remove_file(probe).is_ok()
+}
+
 fn read_rtorrent_overlay(path: &FsPath) -> std::io::Result<(BTreeMap<String, String>, String)> {
     let mut bytes = Vec::new();
-    match File::open(path) {
+    match open_regular_read(path) {
         Ok(file) => {
             file.take(MAX_RTORRENT_OVERLAY_BYTES.saturating_add(1) as u64)
                 .read_to_end(&mut bytes)?;
@@ -1035,10 +1113,14 @@ fn write_rtorrent_overlay(
     };
     let temporary = path.with_file_name(format!(".{file_name}.{}.tmp", uuid::Uuid::new_v4()));
     let write_result = (|| {
-        let mut file = std::fs::OpenOptions::new()
-            .create_new(true)
-            .write(true)
-            .open(&temporary)?;
+        let mut options = std::fs::OpenOptions::new();
+        options.create_new(true).write(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let mut file = options.open(&temporary)?;
         file.write_all(out.as_bytes())?;
         file.sync_all()?;
         std::fs::rename(&temporary, path)
@@ -1112,7 +1194,7 @@ pub async fn set_session_features(
 
     if let Some(enabled) = patch.dht {
         if let Err(e) = s.backend.set_dht(enabled).await {
-            tracing::error!(component = "backend", operation = "set_dht_mode", result = "error", enabled, error = %e, "backend DHT mode update failed");
+            tracing::error!(component = "backend", operation = "set_dht_mode", result = "error", enabled, error = %crate::url_redaction::redact_display(&e), "backend DHT mode update failed");
             return StatusCode::BAD_GATEWAY.into_response();
         }
         dht = Some(enabled);
@@ -1120,7 +1202,7 @@ pub async fn set_session_features(
 
     if let Some(enabled) = patch.pex {
         if let Err(e) = s.backend.set_pex(enabled).await {
-            tracing::error!(component = "backend", operation = "set_pex", result = "error", enabled, error = %e, "backend PEX update failed");
+            tracing::error!(component = "backend", operation = "set_pex", result = "error", enabled, error = %crate::url_redaction::redact_display(&e), "backend PEX update failed");
             return StatusCode::BAD_GATEWAY.into_response();
         }
         pex = Some(enabled);
@@ -1147,7 +1229,7 @@ pub async fn list_saved_views(State(s): State<AppState>) -> impl IntoResponse {
     {
         Ok(views) => Json(views).into_response(),
         Err(e) => {
-            tracing::error!(component = "api", operation = "list_saved_views", result = "error", error = %e, "saved view listing failed");
+            tracing::error!(component = "api", operation = "list_saved_views", result = "error", error = %crate::url_redaction::redact_display(&e), "saved view listing failed");
             StatusCode::INTERNAL_SERVER_ERROR.into_response()
         }
     }
@@ -1172,7 +1254,7 @@ pub async fn upsert_saved_view(
             Json(views).into_response()
         }
         Err(e) => {
-            tracing::error!(component = "api", operation = "upsert_saved_view", result = "error", error = %e, "saved view upsert failed");
+            tracing::error!(component = "api", operation = "upsert_saved_view", result = "error", error = %crate::url_redaction::redact_display(&e), "saved view upsert failed");
             StatusCode::INTERNAL_SERVER_ERROR.into_response()
         }
     }
@@ -1196,7 +1278,7 @@ pub async fn delete_saved_view(
             Json(views).into_response()
         }
         Err(e) => {
-            tracing::error!(component = "api", operation = "delete_saved_view", result = "error", view_id = %id, error = %e, "saved view delete failed");
+            tracing::error!(component = "api", operation = "delete_saved_view", result = "error", view_id = %crate::url_redaction::redact_display(&id), error = %crate::url_redaction::redact_display(&e), "saved view delete failed");
             StatusCode::INTERNAL_SERVER_ERROR.into_response()
         }
     }
@@ -1212,7 +1294,7 @@ pub async fn list_ratio_groups(State(s): State<AppState>) -> impl IntoResponse {
     {
         Ok(groups) => Json(groups).into_response(),
         Err(e) => {
-            tracing::error!(component = "api", operation = "list_ratio_groups", result = "error", error = %e, "ratio group listing failed");
+            tracing::error!(component = "api", operation = "list_ratio_groups", result = "error", error = %crate::url_redaction::redact_display(&e), "ratio group listing failed");
             StatusCode::INTERNAL_SERVER_ERROR.into_response()
         }
     }
@@ -1222,6 +1304,18 @@ pub async fn upsert_ratio_group(
     State(s): State<AppState>,
     Json(mut group): Json<RatioGroup>,
 ) -> impl IntoResponse {
+    if group.name.len() > MAX_RATIO_GROUP_NAME_BYTES
+        || group
+            .category
+            .as_deref()
+            .is_some_and(|value| value.len() > MAX_API_CATEGORY_NAME_BYTES)
+        || group
+            .tracker
+            .as_deref()
+            .is_some_and(|value| value.len() > MAX_API_TRACKER_URL_BYTES)
+    {
+        return (StatusCode::BAD_REQUEST, "ratio group exceeds input limits").into_response();
+    }
     group.name = group.name.trim().to_owned();
     group.category = group
         .category
@@ -1253,6 +1347,23 @@ pub async fn upsert_ratio_group(
             .into_response();
     }
     let _write_guard = s.control_plane_write.lock().await;
+    let name_for_capacity = group.name.clone();
+    let existing = match s
+        .db
+        .run_blocking("check_ratio_group_capacity", |db| db.list_ratio_groups())
+        .await
+    {
+        Ok(groups) => groups,
+        Err(error) => {
+            tracing::error!(component = "api", operation = "check_ratio_group_capacity", result = "error", error = %crate::url_redaction::redact_display(&error), "ratio group capacity check failed");
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        }
+    };
+    if existing.len() >= MAX_RATIO_GROUPS
+        && !existing.iter().any(|entry| entry.name == name_for_capacity)
+    {
+        return StatusCode::TOO_MANY_REQUESTS.into_response();
+    }
     match s
         .db
         .run_blocking("upsert_ratio_group", move |db| db.upsert_ratio_group(group))
@@ -1263,8 +1374,8 @@ pub async fn upsert_ratio_group(
             Json(groups).into_response()
         }
         Err(e) => {
-            tracing::error!(component = "api", operation = "upsert_ratio_group", result = "error", error = %e, "ratio group upsert failed");
-            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+            tracing::error!(component = "api", operation = "upsert_ratio_group", result = "error", error = %crate::url_redaction::redact_display(&e), "ratio group upsert failed");
+            automation_state_write_status(&e).into_response()
         }
     }
 }
@@ -1287,8 +1398,8 @@ pub async fn delete_ratio_group(
             Json(groups).into_response()
         }
         Err(e) => {
-            tracing::error!(component = "api", operation = "delete_ratio_group", result = "error", ratio_group = %name, error = %e, "ratio group delete failed");
-            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+            tracing::error!(component = "api", operation = "delete_ratio_group", result = "error", ratio_group = %crate::url_redaction::redact_display(&name), error = %crate::url_redaction::redact_display(&e), "ratio group delete failed");
+            automation_state_write_status(&e).into_response()
         }
     }
 }
@@ -1315,28 +1426,34 @@ pub async fn apply_ratio_group(
         Ok(Some(group)) => group,
         Ok(None) => return StatusCode::NOT_FOUND.into_response(),
         Err(e) => {
-            tracing::error!(component = "api", operation = "get_ratio_group", result = "error", ratio_group = %name, error = %e, "ratio group lookup failed");
+            tracing::error!(component = "api", operation = "get_ratio_group", result = "error", ratio_group = %crate::url_redaction::redact_display(&name), error = %crate::url_redaction::redact_display(&e), "ratio group lookup failed");
             return StatusCode::INTERNAL_SERVER_ERROR.into_response();
         }
     };
     if !group.enabled {
         return (StatusCode::BAD_REQUEST, "ratio group is disabled").into_response();
     }
+    if !s.backend.capabilities().supports_share_limits {
+        return StatusCode::NOT_IMPLEMENTED.into_response();
+    }
 
     let group_for_hashes = group.clone();
     let hashes = match s
         .db
         .run_blocking("ratio_group_hashes", move |db| {
-            db.ratio_group_hashes(&group_for_hashes)
+            db.ratio_group_hashes(&group_for_hashes, MAX_BULK_TORRENTS.saturating_add(1))
         })
         .await
     {
         Ok(hashes) => hashes,
         Err(e) => {
-            tracing::error!(component = "api", operation = "ratio_group_hashes", result = "error", ratio_group = %name, error = %e, "ratio group hash query failed");
+            tracing::error!(component = "api", operation = "ratio_group_hashes", result = "error", ratio_group = %crate::url_redaction::redact_display(&name), error = %crate::url_redaction::redact_display(&e), "ratio group hash query failed");
             return StatusCode::INTERNAL_SERVER_ERROR.into_response();
         }
     };
+    if hashes.len() > MAX_BULK_TORRENTS {
+        return StatusCode::PAYLOAD_TOO_LARGE.into_response();
+    }
     if body.dry_run {
         return Json(BulkResult {
             applied: hashes,
@@ -1351,7 +1468,7 @@ pub async fn apply_ratio_group(
     let mut errors = Vec::new();
     for hash in hashes {
         match s
-            .rt
+            .backend
             .set_share_limits(&hash, ratio_limit_milli, group.seeding_time_limit)
             .await
         {
@@ -1378,7 +1495,7 @@ pub async fn list_workflows(State(s): State<AppState>) -> impl IntoResponse {
     {
         Ok(rules) => Json(rules).into_response(),
         Err(e) => {
-            tracing::error!(component = "api", operation = "list_workflows", result = "error", error = %e, "workflow rule listing failed");
+            tracing::error!(component = "api", operation = "list_workflows", result = "error", error = %crate::url_redaction::redact_display(&e), "workflow rule listing failed");
             StatusCode::INTERNAL_SERVER_ERROR.into_response()
         }
     }
@@ -1392,7 +1509,7 @@ pub async fn list_workflow_runs(State(s): State<AppState>) -> impl IntoResponse 
     {
         Ok(runs) => Json(runs).into_response(),
         Err(e) => {
-            tracing::error!(component = "api", operation = "list_workflow_runs", result = "error", error = %e, "workflow run listing failed");
+            tracing::error!(component = "api", operation = "list_workflow_runs", result = "error", error = %crate::url_redaction::redact_display(&e), "workflow run listing failed");
             StatusCode::INTERNAL_SERVER_ERROR.into_response()
         }
     }
@@ -1406,7 +1523,7 @@ pub async fn list_rss_rules(State(s): State<AppState>) -> impl IntoResponse {
     {
         Ok(rules) => Json(rules).into_response(),
         Err(e) => {
-            tracing::error!(component = "api", operation = "list_rss_rules", result = "error", error = %e, "RSS rule listing failed");
+            tracing::error!(component = "api", operation = "list_rss_rules", result = "error", error = %crate::url_redaction::redact_display(&e), "RSS rule listing failed");
             StatusCode::INTERNAL_SERVER_ERROR.into_response()
         }
     }
@@ -1416,6 +1533,30 @@ pub async fn upsert_rss_rule(
     State(s): State<AppState>,
     Json(mut rule): Json<RssRule>,
 ) -> impl IntoResponse {
+    if rule.id.len() > MAX_RSS_RULE_ID_BYTES
+        || rule.name.len() > MAX_RSS_RULE_NAME_BYTES
+        || rule.feed_url.len() > MAX_RSS_RULE_FIELD_BYTES
+        || rule.include.len() > MAX_RSS_RULE_FIELD_BYTES
+        || rule
+            .exclude
+            .as_deref()
+            .is_some_and(|value| value.len() > MAX_RSS_RULE_FIELD_BYTES)
+        || rule
+            .category
+            .as_deref()
+            .is_some_and(|value| value.len() > MAX_RSS_RULE_FIELD_BYTES)
+        || rule
+            .save_path
+            .as_deref()
+            .is_some_and(|value| value.len() > MAX_RSS_RULE_FIELD_BYTES)
+        || rule.tags.len() > MAX_RSS_RULE_TAGS
+        || rule
+            .tags
+            .iter()
+            .any(|tag| tag.len() > MAX_RSS_RULE_TAG_BYTES)
+    {
+        return (StatusCode::BAD_REQUEST, "rss rule exceeds input limits").into_response();
+    }
     rule.name = rule.name.trim().to_owned();
     rule.feed_url = rule.feed_url.trim().to_owned();
     rule.include = rule.include.trim().to_owned();
@@ -1454,13 +1595,14 @@ pub async fn upsert_rss_rule(
         .run_blocking("upsert_rss_rule", move |db| db.upsert_rss_rule(rule))
         .await
     {
-        Ok(rules) => {
+        Ok(RssRuleUpsertResult::Upserted(rules)) => {
             emit(&s, Event::RssRulesUpdated).await;
             Json(rules).into_response()
         }
+        Ok(RssRuleUpsertResult::Capacity) => StatusCode::TOO_MANY_REQUESTS.into_response(),
         Err(e) => {
-            tracing::error!(component = "api", operation = "upsert_rss_rule", result = "error", error = %e, "RSS rule upsert failed");
-            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+            tracing::error!(component = "api", operation = "upsert_rss_rule", result = "error", error = %crate::url_redaction::redact_display(&e), "RSS rule upsert failed");
+            automation_state_write_status(&e).into_response()
         }
     }
 }
@@ -1481,16 +1623,35 @@ pub async fn delete_rss_rule(
             Json(rules).into_response()
         }
         Err(e) => {
-            tracing::error!(component = "api", operation = "delete_rss_rule", result = "error", rule_id = %id, error = %e, "RSS rule delete failed");
-            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+            tracing::error!(component = "api", operation = "delete_rss_rule", result = "error", rule_id = %crate::url_redaction::redact_display(&id), error = %crate::url_redaction::redact_display(&e), "RSS rule delete failed");
+            automation_state_write_status(&e).into_response()
         }
     }
 }
 
 #[derive(Deserialize)]
 pub struct TestRssRuleBody {
+    #[serde(deserialize_with = "deserialize_rss_sample_text")]
     pub title: String,
+    #[serde(default, deserialize_with = "deserialize_optional_rss_sample_text")]
     pub link: Option<String>,
+}
+
+fn deserialize_rss_sample_text<'de, D>(deserializer: D) -> std::result::Result<String, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    BoundedJsonString::<MAX_RSS_RULE_FIELD_BYTES>::deserialize(deserializer).map(|value| value.0)
+}
+
+fn deserialize_optional_rss_sample_text<'de, D>(
+    deserializer: D,
+) -> std::result::Result<Option<String>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    Option::<BoundedJsonString<MAX_RSS_RULE_FIELD_BYTES>>::deserialize(deserializer)
+        .map(|value| value.map(|value| value.0))
 }
 
 pub async fn test_rss_rules(
@@ -1512,7 +1673,7 @@ pub async fn test_rss_rules(
     {
         Ok(matches) => Json(serde_json::json!({ "matches": matches })).into_response(),
         Err(e) => {
-            tracing::error!(component = "api", operation = "test_rss_rules", result = "error", error = %e, "RSS rule test failed");
+            tracing::error!(component = "api", operation = "test_rss_rules", result = "error", error = %crate::url_redaction::redact_display(&e), "RSS rule test failed");
             StatusCode::INTERNAL_SERVER_ERROR.into_response()
         }
     }
@@ -1547,7 +1708,7 @@ pub async fn apply_rss_rules(
     {
         Ok(matches) => matches,
         Err(e) => {
-            tracing::error!(component = "api", operation = "apply_rss_rules", result = "error", error = %e, "RSS rule apply failed");
+            tracing::error!(component = "api", operation = "apply_rss_rules", result = "error", error = %crate::url_redaction::redact_display(&e), "RSS rule apply failed");
             return StatusCode::INTERNAL_SERVER_ERROR.into_response();
         }
     };
@@ -1572,7 +1733,7 @@ pub async fn apply_rss_rules(
             .await
         {
             Ok(()) => applied.push(rule_match.rule_name),
-            Err(e) => errors.push(format!("{}: {e}", rule_match.rule_name)),
+            Err(_) => errors.push(rss_magnet_failure_summary(&rule_match.rule_name)),
         }
     }
 
@@ -1586,8 +1747,9 @@ pub async fn apply_rss_rules(
 
 #[derive(Deserialize)]
 pub struct CrossSeedBody {
+    #[serde(deserialize_with = "deserialize_cross_seed_hashes")]
     pub hashes: Vec<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_cross_seed_trackers")]
     pub trackers: Vec<String>,
     #[serde(default)]
     pub reannounce: bool,
@@ -1595,19 +1757,58 @@ pub struct CrossSeedBody {
     pub dry_run: bool,
 }
 
+fn deserialize_cross_seed_hashes<'de, D>(
+    deserializer: D,
+) -> std::result::Result<Vec<String>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    deserialize_bounded_strings::<D, MAX_BULK_TORRENTS, { MAX_BULK_HASH_CHARS * 4 }>(deserializer)
+}
+
+fn deserialize_cross_seed_trackers<'de, D>(
+    deserializer: D,
+) -> std::result::Result<Vec<String>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    deserialize_bounded_strings::<D, MAX_API_TRACKER_MUTATIONS, MAX_API_TRACKER_URL_BYTES>(
+        deserializer,
+    )
+}
+
 pub async fn cross_seed_helper(
     State(s): State<AppState>,
     Json(body): Json<CrossSeedBody>,
 ) -> impl IntoResponse {
-    let hashes = normalized_nonempty(&body.hashes);
+    let mut seen_hashes = HashSet::new();
+    let hashes = normalized_nonempty(&body.hashes)
+        .into_iter()
+        .filter(|hash| seen_hashes.insert(hash.to_ascii_lowercase()))
+        .collect::<Vec<_>>();
     if hashes.is_empty() {
         return (StatusCode::BAD_REQUEST, "hashes must not be empty").into_response();
     }
-    let trackers = normalized_nonempty(&body.trackers);
+    let mut seen_trackers = HashSet::new();
+    let trackers = normalized_nonempty(&body.trackers)
+        .into_iter()
+        .filter(|tracker| seen_trackers.insert((*tracker).to_owned()))
+        .collect::<Vec<_>>();
     if trackers.is_empty() && !body.reannounce {
         return (
             StatusCode::BAD_REQUEST,
             "trackers or reannounce must be provided",
+        )
+            .into_response();
+    }
+    let backend_operations = hashes
+        .len()
+        .saturating_mul(trackers.len())
+        .saturating_add(if body.reannounce { hashes.len() } else { 0 });
+    if !body.dry_run && backend_operations > MAX_CROSS_SEED_OPERATIONS {
+        return (
+            StatusCode::PAYLOAD_TOO_LARGE,
+            format!("cross-seed request exceeds {MAX_CROSS_SEED_OPERATIONS} backend operations"),
         )
             .into_response();
     }
@@ -1625,8 +1826,8 @@ pub async fn cross_seed_helper(
     for hash in hashes {
         let mut hash_errors = Vec::new();
         for tracker in &trackers {
-            if let Err(e) = s.backend.add_tracker(hash, tracker).await {
-                hash_errors.push(format!("add tracker {tracker}: {e}"));
+            if s.backend.add_tracker(hash, tracker).await.is_err() {
+                hash_errors.push(tracker_failure_summary("add tracker", tracker));
             }
         }
         if body.reannounce {
@@ -1652,7 +1853,9 @@ pub async fn cross_seed_helper(
 
 #[derive(Deserialize)]
 pub struct ApplyRssRuleBody {
+    #[serde(deserialize_with = "deserialize_rss_sample_text")]
     pub title: String,
+    #[serde(default, deserialize_with = "deserialize_optional_rss_sample_text")]
     pub link: Option<String>,
     #[serde(default)]
     pub dry_run: bool,
@@ -1662,6 +1865,14 @@ pub async fn upsert_workflow(
     State(s): State<AppState>,
     Json(mut rule): Json<WorkflowRule>,
 ) -> impl IntoResponse {
+    if workflow_rule_exceeds_input_limits(&rule) {
+        return (
+            StatusCode::BAD_REQUEST,
+            "workflow rule exceeds input limits",
+        )
+            .into_response();
+    }
+    let target_category_was_supplied = rule.target_category.is_some();
     rule.name = rule.name.trim().to_owned();
     rule.event = rule.event.trim().to_owned();
     rule.action = rule.action.trim().to_owned();
@@ -1669,6 +1880,14 @@ pub async fn upsert_workflow(
         .category
         .map(|v| v.trim().to_owned())
         .filter(|v| !v.is_empty());
+    rule.target_category = rule
+        .target_category
+        .map(|v| v.trim().to_owned())
+        .filter(|v| !v.is_empty());
+    if rule.action == "set_category" && !target_category_was_supplied {
+        // Keep older clients that submitted the target in `category` working.
+        rule.target_category = rule.category.take();
+    }
     rule.tracker = rule
         .tracker
         .map(|v| v.trim().to_owned())
@@ -1718,15 +1937,46 @@ pub async fn upsert_workflow(
         )
             .into_response();
     }
-    if rule.action == "set_category" && rule.category.is_none() {
+    if rule.action == "set_category" && rule.target_category.is_none() {
         return (
             StatusCode::BAD_REQUEST,
-            "category is required for set_category rules",
+            "target_category is required for set_category rules",
+        )
+            .into_response();
+    }
+    if [rule.category.as_deref(), rule.target_category.as_deref()]
+        .into_iter()
+        .flatten()
+        .any(|category| category.len() > MAX_API_CATEGORY_NAME_BYTES)
+    {
+        return (
+            StatusCode::BAD_REQUEST,
+            "workflow category and target_category are limited to 256 bytes",
         )
             .into_response();
     }
 
     let _write_guard = s.control_plane_write.lock().await;
+    let requested_id = rule.id.clone();
+    let creating = requested_id.trim().is_empty();
+    let existing = match s
+        .db
+        .run_blocking("check_workflow_rule_capacity", |db| {
+            db.list_workflow_rules()
+        })
+        .await
+    {
+        Ok(rules) => rules,
+        Err(error) => {
+            tracing::error!(component = "api", operation = "check_workflow_rule_capacity", result = "error", error = %crate::url_redaction::redact_display(&error), "workflow rule capacity check failed");
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        }
+    };
+    if existing.len() >= MAX_WORKFLOW_RULES
+        && (creating || !existing.iter().any(|entry| entry.id == requested_id))
+    {
+        return StatusCode::TOO_MANY_REQUESTS.into_response();
+    }
     match s
         .db
         .run_blocking("upsert_workflow_rule", move |db| {
@@ -1739,10 +1989,41 @@ pub async fn upsert_workflow(
             Json(rules).into_response()
         }
         Err(e) => {
-            tracing::error!(component = "api", operation = "upsert_workflow_rule", result = "error", error = %e, "workflow rule upsert failed");
-            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+            tracing::error!(component = "api", operation = "upsert_workflow_rule", result = "error", error = %crate::url_redaction::redact_display(&e), "workflow rule upsert failed");
+            automation_state_write_status(&e).into_response()
         }
     }
+}
+
+fn workflow_rule_exceeds_input_limits(rule: &WorkflowRule) -> bool {
+    rule.id.len() > MAX_WORKFLOW_ID_BYTES
+        || rule.name.len() > MAX_WORKFLOW_NAME_BYTES
+        || rule.event.len() > MAX_WORKFLOW_TOKEN_BYTES
+        || rule.action.len() > MAX_WORKFLOW_TOKEN_BYTES
+        || rule
+            .category
+            .as_deref()
+            .is_some_and(|value| value.len() > MAX_API_CATEGORY_NAME_BYTES)
+        || rule
+            .target_category
+            .as_deref()
+            .is_some_and(|value| value.len() > MAX_API_CATEGORY_NAME_BYTES)
+        || rule
+            .tracker
+            .as_deref()
+            .is_some_and(|value| value.len() > MAX_WORKFLOW_TEXT_BYTES)
+        || rule
+            .command
+            .as_deref()
+            .is_some_and(|value| value.len() > MAX_WORKFLOW_TEXT_BYTES)
+        || rule
+            .url
+            .as_deref()
+            .is_some_and(|value| value.len() > MAX_WORKFLOW_TEXT_BYTES)
+        || rule
+            .target_path
+            .as_deref()
+            .is_some_and(|value| value.len() > MAX_WORKFLOW_PATH_BYTES)
 }
 
 pub async fn delete_workflow(
@@ -1763,8 +2044,8 @@ pub async fn delete_workflow(
             Json(rules).into_response()
         }
         Err(e) => {
-            tracing::error!(component = "api", operation = "delete_workflow_rule", result = "error", rule_id = %id, error = %e, "workflow rule delete failed");
-            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+            tracing::error!(component = "api", operation = "delete_workflow_rule", result = "error", rule_id = %crate::url_redaction::redact_display(&id), error = %crate::url_redaction::redact_display(&e), "workflow rule delete failed");
+            automation_state_write_status(&e).into_response()
         }
     }
 }
@@ -1791,7 +2072,7 @@ pub async fn run_workflow(
         Ok(Some(rule)) => rule,
         Ok(None) => return StatusCode::NOT_FOUND.into_response(),
         Err(e) => {
-            tracing::error!(component = "api", operation = "get_workflow_rule", result = "error", rule_id = %id, error = %e, "workflow rule lookup failed");
+            tracing::error!(component = "api", operation = "get_workflow_rule", result = "error", rule_id = %crate::url_redaction::redact_display(&id), error = %crate::url_redaction::redact_display(&e), "workflow rule lookup failed");
             return StatusCode::INTERNAL_SERVER_ERROR.into_response();
         }
     };
@@ -1802,16 +2083,19 @@ pub async fn run_workflow(
     let hashes = match s
         .db
         .run_blocking("workflow_hashes", move |db| {
-            db.workflow_hashes(&rule_for_hashes)
+            db.workflow_hashes(&rule_for_hashes, MAX_BULK_TORRENTS.saturating_add(1))
         })
         .await
     {
         Ok(hashes) => hashes,
         Err(e) => {
-            tracing::error!(component = "api", operation = "workflow_hashes", result = "error", rule_id = %id, error = %e, "workflow hash query failed");
+            tracing::error!(component = "api", operation = "workflow_hashes", result = "error", rule_id = %crate::url_redaction::redact_display(&id), error = %crate::url_redaction::redact_display(&e), "workflow hash query failed");
             return StatusCode::INTERNAL_SERVER_ERROR.into_response();
         }
     };
+    if hashes.len() > MAX_BULK_TORRENTS {
+        return StatusCode::PAYLOAD_TOO_LARGE.into_response();
+    }
     if body.dry_run {
         if let Err(error) =
             record_workflow_run(&s, &rule, true, hashes.clone(), hashes.clone(), Vec::new()).await
@@ -1839,11 +2123,26 @@ pub async fn run_workflow(
     if rule.action == "set_location" && !s.backend.capabilities().supports_location_update {
         return StatusCode::NOT_IMPLEMENTED.into_response();
     }
+    if rule.action == "set_category" {
+        let Some(category) = rule.target_category.as_deref() else {
+            return (StatusCode::BAD_REQUEST, "target_category is not configured").into_response();
+        };
+        let category_name = category.to_owned();
+        if let Err(error) =
+            s.db.run_blocking("preflight_workflow_set_category", move |db| {
+                crate::cache::categories::ensure_category_name_capacity(db, &category_name)
+            })
+            .await
+        {
+            tracing::warn!(component = "cache", operation = "preflight_workflow_set_category", category = %crate::url_redaction::redact_display(&category), result = "error", error = %crate::url_redaction::redact_display(&error), "workflow category update rejected before backend mutation");
+            return metadata_write_status(&error).into_response();
+        }
+    }
     for hash in hashes {
         match rule.action.as_str() {
             "set_category" => {
-                let Some(category) = rule.category.as_deref() else {
-                    errors.push(format!("{hash}: category is not configured"));
+                let Some(category) = rule.target_category.as_deref() else {
+                    errors.push(format!("{hash}: target_category is not configured"));
                     continue;
                 };
                 match s.backend.set_category(&hash, category).await {
@@ -1962,7 +2261,7 @@ async fn execute_workflow_script(
         Ok::<_, String>(canonical)
     })
     .await
-    .map_err(|e| format!("script path validation worker failed: {e}"))??;
+    .map_err(|error| crate::task_join_error_summary("script path validation worker", &error))??;
 
     const MAX_SCRIPT_OUTPUT_BYTES: u64 = 64 * 1024;
 
@@ -1993,36 +2292,20 @@ async fn execute_workflow_script(
         .stderr
         .take()
         .ok_or_else(|| "script stderr pipe was not created".to_owned())?;
-    let output = tokio::time::timeout(
+    let (stdout, stderr, status) = wait_for_script_output(
+        &mut child,
+        stdout,
+        stderr,
+        MAX_SCRIPT_OUTPUT_BYTES,
         Duration::from_secs(s.cfg.workflows.script_timeout_secs.max(1)),
-        async {
-            let (stdout, stderr, status) = tokio::join!(
-                read_script_output(stdout, MAX_SCRIPT_OUTPUT_BYTES),
-                read_script_output(stderr, MAX_SCRIPT_OUTPUT_BYTES),
-                child.wait(),
-            );
-            (stdout, stderr, status)
-        },
     )
-    .await;
-    let output = match output {
-        Ok(output) => output,
-        Err(_) => {
-            let _ = child.kill().await;
-            let _ = child.wait().await;
-            return Err("script timed out".to_owned());
-        }
-    };
-    let (stdout, stderr, status) = output;
-    let stdout = stdout?;
-    let stderr = stderr?;
-    let status = status.map_err(|e| format!("script wait failed: {e}"))?;
+    .await?;
     if !stdout.is_empty() {
         tracing::info!(
             component = "workflow",
             operation = "script",
             stream = "stdout",
-            output = %String::from_utf8_lossy(&stdout),
+            output = %escape_script_log_output(&stdout),
             "workflow script output"
         );
     }
@@ -2031,7 +2314,7 @@ async fn execute_workflow_script(
             component = "workflow",
             operation = "script",
             stream = "stderr",
-            output = %String::from_utf8_lossy(&stderr),
+            output = %escape_script_log_output(&stderr),
             "workflow script error output"
         );
     }
@@ -2040,6 +2323,11 @@ async fn execute_workflow_script(
     } else {
         Err(format!("script exited with {status}"))
     }
+}
+
+fn escape_script_log_output(bytes: &[u8]) -> String {
+    let decoded = String::from_utf8_lossy(bytes);
+    crate::log_sanitization::sanitize_operator_log_text(&decoded)
 }
 
 async fn read_script_output<R: AsyncRead + Unpin>(
@@ -2056,6 +2344,49 @@ async fn read_script_output<R: AsyncRead + Unpin>(
         return Err(format!("script output exceeds {max_bytes} bytes"));
     }
     Ok(output)
+}
+
+async fn wait_for_script_output<Out, ErrOut>(
+    child: &mut tokio::process::Child,
+    stdout: Out,
+    stderr: ErrOut,
+    max_bytes: u64,
+    timeout: Duration,
+) -> Result<(Vec<u8>, Vec<u8>, std::process::ExitStatus), String>
+where
+    Out: AsyncRead + Unpin,
+    ErrOut: AsyncRead + Unpin,
+{
+    let output = tokio::time::timeout(timeout, async {
+        let status = async {
+            child
+                .wait()
+                .await
+                .map_err(|error| format!("script wait failed: {error}"))
+        };
+        tokio::try_join!(
+            read_script_output(stdout, max_bytes),
+            read_script_output(stderr, max_bytes),
+            status,
+        )
+    })
+    .await;
+
+    match output {
+        Ok(Ok(output)) => Ok(output),
+        Ok(Err(error)) => {
+            // A reader stops at max_bytes + 1. If the child is still writing
+            // to that pipe, waiting for it can deadlock once the pipe fills.
+            let _ = child.kill().await;
+            let _ = child.wait().await;
+            Err(error)
+        }
+        Err(_) => {
+            let _ = child.kill().await;
+            let _ = child.wait().await;
+            Err("script timed out".to_owned())
+        }
+    }
 }
 
 async fn execute_workflow_webhook(
@@ -2098,8 +2429,11 @@ async fn record_workflow_run(
         rule_name: rule.name.clone(),
         action: rule.action.clone(),
         dry_run,
+        matched_total: matched.len(),
         matched,
+        applied_total: applied.len(),
         applied,
+        errors_total: errors.len(),
         errors,
         started_at: chrono::Utc::now().timestamp(),
     };
@@ -2108,7 +2442,7 @@ async fn record_workflow_run(
         s.db.run_blocking("record_workflow_run", move |db| db.record_workflow_run(run))
             .await;
     if let Err(e) = result {
-        tracing::error!(component = "api", operation = "record_workflow_run", result = "error", rule_id = %rule.id, error = %e, "workflow run record failed");
+        tracing::error!(component = "api", operation = "record_workflow_run", result = "error", rule_id = %rule.id, error = %crate::url_redaction::redact_display(&e), "workflow run record failed");
         Err(e.to_string())
     } else {
         emit(s, Event::WorkflowRunsUpdated).await;
@@ -2167,7 +2501,7 @@ async fn append_operator_event(
         })
         .await
     {
-        tracing::warn!(component = "app_events", operation = "append", result = "error", error = %e, "failed to append app event");
+        tracing::warn!(component = "app_events", operation = "append", result = "error", error = %crate::url_redaction::redact_display(&e), "failed to append app event");
     }
 }
 
@@ -2276,12 +2610,24 @@ fn statvfs(path: &FsPath) -> Result<FsStat, String> {
         return Err(std::io::Error::last_os_error().to_string());
     }
     let stat = unsafe { stat.assume_init() };
-    let block_size = stat.f_frsize.max(stat.f_bsize);
+    let block_size = statvfs_block_size(stat.f_frsize, stat.f_bsize);
     Ok(FsStat {
         total_bytes: stat.f_blocks.saturating_mul(block_size),
         available_bytes: stat.f_bavail.saturating_mul(block_size),
         readonly: (stat.f_flag & libc::ST_RDONLY) != 0,
     })
+}
+
+#[cfg(any(unix, test))]
+fn statvfs_block_size<T>(fragment_size: T, block_size: T) -> T
+where
+    T: Default + PartialEq,
+{
+    if fragment_size == T::default() {
+        block_size
+    } else {
+        fragment_size
+    }
 }
 
 #[cfg(not(unix))]
@@ -2292,11 +2638,53 @@ fn statvfs(_path: &FsPath) -> Result<FsStat, String> {
 // --- Torrent list ---
 
 const MAX_TORRENT_LIVE_STATS: usize = 128;
+const MAX_TORRENT_LIVE_HASH_QUERY_BYTES: usize = MAX_TORRENT_LIVE_STATS * 65;
 const LIVE_RATE_STALE_AFTER_SECS: i64 = 15;
 
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Deserialize)]
 pub struct TorrentLiveStatsQuery {
-    pub hashes: Option<String>,
+    hashes: Option<BoundedQueryString<MAX_TORRENT_LIVE_HASH_QUERY_BYTES>>,
+}
+
+struct BoundedQueryString<const MAX_BYTES: usize>(String);
+
+impl<'de, const MAX_BYTES: usize> Deserialize<'de> for BoundedQueryString<MAX_BYTES> {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct QueryStringVisitor<const MAX_BYTES: usize>;
+
+        impl<'de, const MAX_BYTES: usize> Visitor<'de> for QueryStringVisitor<MAX_BYTES> {
+            type Value = BoundedQueryString<MAX_BYTES>;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                write!(formatter, "a query string of at most {MAX_BYTES} bytes")
+            }
+
+            fn visit_str<E>(self, value: &str) -> std::result::Result<Self::Value, E>
+            where
+                E: de::Error,
+            {
+                if value.len() > MAX_BYTES {
+                    return Err(E::custom("query value exceeds its byte limit"));
+                }
+                Ok(BoundedQueryString(value.to_owned()))
+            }
+
+            fn visit_string<E>(self, value: String) -> std::result::Result<Self::Value, E>
+            where
+                E: de::Error,
+            {
+                if value.len() > MAX_BYTES {
+                    return Err(E::custom("query value exceeds its byte limit"));
+                }
+                Ok(BoundedQueryString(value))
+            }
+        }
+
+        deserializer.deserialize_str(QueryStringVisitor::<MAX_BYTES>)
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -2316,13 +2704,25 @@ struct TorrentLiveStatsResponse {
 
 fn parse_torrent_live_hashes(raw: Option<&str>) -> Result<Vec<String>, String> {
     let raw = raw.ok_or_else(|| "hashes is required".to_owned())?;
+    if raw.len() > MAX_TORRENT_LIVE_HASH_QUERY_BYTES {
+        return Err(format!(
+            "hashes query must be at most {MAX_TORRENT_LIVE_HASH_QUERY_BYTES} bytes"
+        ));
+    }
     let mut hashes = Vec::new();
     let mut seen = std::collections::HashSet::new();
+    let mut requested = 0;
     for value in raw
         .split(',')
         .map(str::trim)
         .filter(|value| !value.is_empty())
     {
+        requested += 1;
+        if requested > MAX_TORRENT_LIVE_STATS {
+            return Err(format!(
+                "at most {MAX_TORRENT_LIVE_STATS} hashes may be requested"
+            ));
+        }
         if !matches!(value.len(), 40 | 64) || !value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
             return Err(
                 "hashes must contain 40- or 64-character hexadecimal info hashes".to_owned(),
@@ -2335,11 +2735,6 @@ fn parse_torrent_live_hashes(raw: Option<&str>) -> Result<Vec<String>, String> {
     }
     if hashes.is_empty() {
         return Err("hashes must contain at least one info hash".to_owned());
-    }
-    if hashes.len() > MAX_TORRENT_LIVE_STATS {
-        return Err(format!(
-            "at most {MAX_TORRENT_LIVE_STATS} hashes may be requested"
-        ));
     }
     Ok(hashes)
 }
@@ -2360,8 +2755,8 @@ fn live_row_response(row: TorrentLiveRow, sampled_at: u64) -> TorrentLiveStatRes
         .unwrap_or_default()
         .as_secs()
         .min(i64::MAX as u64) as i64;
-    let fresh = row.updated_at > 0
-        && now_secs.saturating_sub(row.updated_at) <= LIVE_RATE_STALE_AFTER_SECS;
+    let fresh =
+        row.updated_at > 0 && now_secs.saturating_sub(row.updated_at) <= LIVE_RATE_STALE_AFTER_SECS;
     TorrentLiveStatResponse {
         hash: row.hash,
         amount_left: size_bytes.saturating_sub(bytes_done),
@@ -2384,10 +2779,11 @@ pub async fn live_torrent_stats(
     Query(query): Query<TorrentLiveStatsQuery>,
 ) -> impl IntoResponse {
     s.metrics.api_requests_total.fetch_add(1, Ordering::Relaxed);
-    let hashes = match parse_torrent_live_hashes(query.hashes.as_deref()) {
-        Ok(hashes) => hashes,
-        Err(error) => return (StatusCode::BAD_REQUEST, error).into_response(),
-    };
+    let hashes =
+        match parse_torrent_live_hashes(query.hashes.as_ref().map(|query| query.0.as_str())) {
+            Ok(hashes) => hashes,
+            Err(error) => return (StatusCode::BAD_REQUEST, error).into_response(),
+        };
     let rows = match s
         .db
         .run_blocking("live_torrent_stats", move |db| db.live_stats(&hashes))
@@ -2399,7 +2795,7 @@ pub async fn live_torrent_stats(
                 component = "api",
                 operation = "live_torrent_stats",
                 result = "error",
-                error = %error,
+                error = %crate::url_redaction::redact_display(&error),
                 "live torrent stats query failed"
             );
             return StatusCode::INTERNAL_SERVER_ERROR.into_response();
@@ -2440,8 +2836,8 @@ pub async fn list_torrents(
             Json(serde_json::json!({ "total": total, "torrents": rows })).into_response()
         }
         Err(e) => {
-            tracing::error!(component = "api", operation = "list_torrents", result = "error", error = %e, "torrent list query failed");
-            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+            tracing::error!(component = "api", operation = "list_torrents", result = "error", error = %crate::url_redaction::redact_display(&e), "torrent list query failed");
+            metadata_read_status(&e).into_response()
         }
     }
 }
@@ -2449,6 +2845,10 @@ pub async fn list_torrents(
 // --- Single torrent ---
 
 pub async fn get_torrent(State(s): State<AppState>, Path(hash): Path<String>) -> impl IntoResponse {
+    let hash = match cached_torrent_hash(&s, &hash).await {
+        Ok(hash) => hash,
+        Err(status) => return status.into_response(),
+    };
     let lookup_hash = hash.clone();
     match s
         .db
@@ -2458,8 +2858,8 @@ pub async fn get_torrent(State(s): State<AppState>, Path(hash): Path<String>) ->
         Ok(Some(row)) => Json(row).into_response(),
         Ok(None) => StatusCode::NOT_FOUND.into_response(),
         Err(e) => {
-            tracing::error!(component = "api", operation = "get_torrent", result = "error", torrent = %hash, error = %e, "torrent lookup failed");
-            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+            tracing::error!(component = "api", operation = "get_torrent", result = "error", torrent = %crate::url_redaction::redact_display(&hash), error = %crate::url_redaction::redact_display(&e), "torrent lookup failed");
+            metadata_read_status(&e).into_response()
         }
     }
 }
@@ -2481,22 +2881,13 @@ pub async fn update_torrent(
         return (StatusCode::BAD_REQUEST, "save_path must not be empty").into_response();
     }
 
-    let lookup_hash = hash.clone();
-    match s
-        .db
-        .run_blocking("update_torrent_exists", move |db| db.exists(&lookup_hash))
-        .await
-    {
-        Ok(true) => {}
-        Ok(false) => return StatusCode::NOT_FOUND.into_response(),
-        Err(e) => {
-            tracing::error!(component = "cache", operation = "exists", result = "error", torrent = %hash, error = %e, "cache torrent existence check failed");
-            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
-        }
-    }
+    let hash = match cached_torrent_hash(&s, &hash).await {
+        Ok(hash) => hash,
+        Err(status) => return status.into_response(),
+    };
 
     if let Err(e) = s.backend.set_location(&hash, save_path).await {
-        tracing::error!(component = "api", operation = "set_location", result = "error", torrent = %hash, error = %e, "backend location update failed");
+        tracing::error!(component = "api", operation = "set_location", result = "error", torrent = %crate::url_redaction::redact_display(&hash), error = %crate::url_redaction::redact_display(&e), "backend location update failed");
         return StatusCode::INTERNAL_SERVER_ERROR.into_response();
     }
     let cache_hash = hash.clone();
@@ -2507,7 +2898,7 @@ pub async fn update_torrent(
         })
         .await
     {
-        tracing::error!(component = "cache", operation = "set_location", result = "error", torrent = %hash, error = %e, "cache location update failed");
+        tracing::error!(component = "cache", operation = "set_location", result = "error", torrent = %crate::url_redaction::redact_display(&hash), error = %crate::url_redaction::redact_display(&e), "cache location update failed");
         return StatusCode::INTERNAL_SERVER_ERROR.into_response();
     }
     emit_torrent_updated(&s, &hash).await;
@@ -2523,6 +2914,8 @@ pub async fn add_torrent(State(s): State<AppState>, mut multipart: Multipart) ->
     let mut start = true;
     let mut magnet: Option<String> = None;
     let mut torrent_data: Option<Vec<u8>> = None;
+    let mut multipart_field_count = 0usize;
+    let mut seen_multipart_fields = HashSet::new();
 
     loop {
         let Some(field) = (match multipart.next_field().await {
@@ -2532,7 +2925,7 @@ pub async fn add_torrent(State(s): State<AppState>, mut multipart: Multipart) ->
                     component = "api",
                     operation = "add_torrent",
                     result = "bad_request",
-                    error = %error,
+                    error = %crate::url_redaction::redact_display(&error),
                     "invalid multipart request"
                 );
                 return (StatusCode::BAD_REQUEST, "invalid multipart request").into_response();
@@ -2540,9 +2933,27 @@ pub async fn add_torrent(State(s): State<AppState>, mut multipart: Multipart) ->
         }) else {
             break;
         };
-        match field.name() {
-            Some("save_path") => {
-                save_path = match field.text().await {
+        multipart_field_count += 1;
+        let Some(field_name) = field.name().map(str::to_owned) else {
+            return (StatusCode::BAD_REQUEST, "multipart field is missing a name").into_response();
+        };
+        if multipart_field_count > MAX_API_TORRENT_ADD_FIELDS
+            || !seen_multipart_fields.insert(field_name.clone())
+        {
+            return (
+                StatusCode::BAD_REQUEST,
+                "multipart fields must be unique and within the field limit",
+            )
+                .into_response();
+        }
+        match field_name.as_str() {
+            "save_path" => {
+                let value = match crate::multipart::read_bounded_multipart_text(
+                    field,
+                    MAX_API_CATEGORY_PATH_BYTES,
+                )
+                .await
+                {
                     Ok(value) => value,
                     Err(error) => {
                         return (
@@ -2552,9 +2963,22 @@ pub async fn add_torrent(State(s): State<AppState>, mut multipart: Multipart) ->
                             .into_response();
                     }
                 };
+                if value.len() > MAX_API_CATEGORY_PATH_BYTES {
+                    return (
+                        StatusCode::BAD_REQUEST,
+                        "save_path exceeds the 4096-byte limit",
+                    )
+                        .into_response();
+                }
+                save_path = value;
             }
-            Some("category") => {
-                category = match field.text().await {
+            "category" => {
+                let value = match crate::multipart::read_bounded_multipart_text(
+                    field,
+                    MAX_API_CATEGORY_NAME_BYTES,
+                )
+                .await
+                {
                     Ok(value) => value,
                     Err(error) => {
                         return (
@@ -2564,9 +2988,17 @@ pub async fn add_torrent(State(s): State<AppState>, mut multipart: Multipart) ->
                             .into_response();
                     }
                 };
+                if value.len() > MAX_API_CATEGORY_NAME_BYTES {
+                    return (
+                        StatusCode::BAD_REQUEST,
+                        "category exceeds the 256-byte limit",
+                    )
+                        .into_response();
+                }
+                category = value;
             }
-            Some("start") => {
-                let value = match field.text().await {
+            "start" => {
+                let value = match crate::multipart::read_bounded_multipart_text(field, 5).await {
                     Ok(value) => value,
                     Err(error) => {
                         return (
@@ -2585,8 +3017,20 @@ pub async fn add_torrent(State(s): State<AppState>, mut multipart: Multipart) ->
                     }
                 };
             }
-            Some("magnet") => {
-                magnet = Some(match field.text().await {
+            "magnet" => {
+                if torrent_data.is_some() {
+                    return (
+                        StatusCode::BAD_REQUEST,
+                        "provide exactly one of magnet or torrent",
+                    )
+                        .into_response();
+                }
+                let value = match crate::multipart::read_bounded_multipart_text(
+                    field,
+                    MAX_API_MAGNET_BYTES,
+                )
+                .await
+                {
                     Ok(value) => value,
                     Err(error) => {
                         return (
@@ -2595,22 +3039,67 @@ pub async fn add_torrent(State(s): State<AppState>, mut multipart: Multipart) ->
                         )
                             .into_response();
                     }
-                });
+                };
+                if value.len() > MAX_API_MAGNET_BYTES {
+                    return (
+                        StatusCode::BAD_REQUEST,
+                        "magnet exceeds the 8192-byte limit",
+                    )
+                        .into_response();
+                }
+                magnet = Some(value);
             }
-            Some("torrent") => {
-                torrent_data = Some(match field.bytes().await {
-                    Ok(value) => value.to_vec(),
-                    Err(error) => {
-                        return (
-                            StatusCode::BAD_REQUEST,
-                            format!("invalid torrent field: {error}"),
-                        )
-                            .into_response();
-                    }
-                });
+            "torrent" => {
+                if magnet.is_some() {
+                    return (
+                        StatusCode::BAD_REQUEST,
+                        "provide exactly one of magnet or torrent",
+                    )
+                        .into_response();
+                }
+                torrent_data = Some(
+                    match crate::multipart::read_bounded_multipart_bytes(
+                        field,
+                        crate::multipart::MAX_MULTIPART_TORRENT_BYTES,
+                    )
+                    .await
+                    {
+                        Ok(value) => value,
+                        Err(error) => {
+                            return (
+                                StatusCode::BAD_REQUEST,
+                                format!("invalid torrent field: {error}"),
+                            )
+                                .into_response();
+                        }
+                    },
+                );
             }
-            _ => {}
+            _ => {
+                return (StatusCode::BAD_REQUEST, "unsupported torrent-add field").into_response();
+            }
         }
+    }
+
+    if magnet.is_some() == torrent_data.is_some() {
+        return (
+            StatusCode::BAD_REQUEST,
+            "provide exactly one of magnet or torrent",
+        )
+            .into_response();
+    }
+    if torrent_data.as_ref().is_some_and(Vec::is_empty) {
+        return (StatusCode::BAD_REQUEST, "torrent file must not be empty").into_response();
+    }
+    let capacity_category = category.clone();
+    if let Err(error) =
+        s.db.run_blocking("preflight_add_torrent_category", move |db| {
+            crate::cache::categories::ensure_category_name_capacity(db, &capacity_category)
+        })
+        .await
+    {
+        tracing::warn!(component = "cache", operation = "preflight_add_torrent_category", result = "error", category = %crate::url_redaction::redact_display(&category), error = %crate::url_redaction::redact_display(&error), "torrent add rejected before backend mutation");
+        return metadata_write_status(&error).into_response();
     }
 
     if let Some(m) = magnet {
@@ -2618,29 +3107,37 @@ pub async fn add_torrent(State(s): State<AppState>, mut multipart: Multipart) ->
         if m.is_empty() {
             return (StatusCode::BAD_REQUEST, "magnet must not be empty").into_response();
         }
-        match s.backend.add_magnet(m, &save_path, &category, start).await {
-            Ok(_) => return StatusCode::ACCEPTED.into_response(),
-            Err(e) => {
-                tracing::error!(component = "api", operation = "add_magnet", result = "error", error = %e, "TorrentNG client magnet add failed");
-                return StatusCode::INTERNAL_SERVER_ERROR.into_response();
-            }
+        if s.backend
+            .add_magnet(m, &save_path, &category, start)
+            .await
+            .is_err()
+        {
+            tracing::error!(
+                component = "api",
+                operation = "add_magnet",
+                source = %redact_log_url(m),
+                result = "error",
+                "TorrentNG client magnet add failed"
+            );
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
         }
+        return StatusCode::ACCEPTED.into_response();
     }
     if let Some(data) = torrent_data {
-        if data.is_empty() {
-            return (StatusCode::BAD_REQUEST, "torrent file must not be empty").into_response();
-        }
-        match s
-            .backend
+        if s.backend
             .add_torrent(&data, &save_path, &category, start)
             .await
+            .is_err()
         {
-            Ok(_) => return StatusCode::ACCEPTED.into_response(),
-            Err(e) => {
-                tracing::error!(component = "api", operation = "add_torrent", result = "error", error = %e, "TorrentNG client torrent add failed");
-                return StatusCode::INTERNAL_SERVER_ERROR.into_response();
-            }
+            tracing::error!(
+                component = "api",
+                operation = "add_torrent",
+                result = "error",
+                "TorrentNG client torrent add failed"
+            );
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
         }
+        return StatusCode::ACCEPTED.into_response();
     }
     (StatusCode::BAD_REQUEST, "missing torrent or magnet").into_response()
 }
@@ -2660,6 +3157,10 @@ pub async fn delete_torrent(
         },
         None => false,
     };
+    let hash = match cached_torrent_hash(&s, &hash).await {
+        Ok(hash) => hash,
+        Err(status) => return status.into_response(),
+    };
     match s.backend.remove(&hash, delete_files).await {
         Ok(_) => {
             let cache_hash = hash.clone();
@@ -2670,9 +3171,9 @@ pub async fn delete_torrent(
                 tracing::warn!(
                     component = "cache",
                     operation = "delete_torrent",
-                    torrent = %hash,
+                    torrent = %crate::url_redaction::redact_display(&hash),
                     result = "error",
-                    error = %e,
+                    error = %crate::url_redaction::redact_display(&e),
                     "cache delete failed after TorrentNG client delete"
                 );
                 // The backend is already mutated, but reporting success here
@@ -2689,9 +3190,9 @@ pub async fn delete_torrent(
             tracing::error!(
                 component = "api",
                 operation = "delete_torrent",
-                torrent = %hash,
+                torrent = %crate::url_redaction::redact_display(&hash),
                 result = "error",
-                error = %e,
+                error = %crate::url_redaction::redact_display(&e),
                 "TorrentNG client delete failed"
             );
             StatusCode::INTERNAL_SERVER_ERROR.into_response()
@@ -2705,16 +3206,20 @@ pub async fn torrent_start(
     State(s): State<AppState>,
     Path(hash): Path<String>,
 ) -> impl IntoResponse {
+    let hash = match cached_torrent_hash(&s, &hash).await {
+        Ok(hash) => hash,
+        Err(status) => return status.into_response(),
+    };
     match s.backend.start(&hash).await {
         Ok(_) => {
             if let Err(error) = update_cached_lifecycle_state(&s, &hash, "start").await {
                 tracing::error!(
                     component = "cache",
                     operation = "set_torrent_runtime_state",
-                    torrent = %hash,
+                    torrent = %crate::url_redaction::redact_display(&hash),
                     action = "start",
                     result = "error",
-                    error = %error,
+                    error = %crate::url_redaction::redact_display(&error),
                     "TorrentNG client start succeeded but cache projection failed"
                 );
                 return StatusCode::INTERNAL_SERVER_ERROR.into_response();
@@ -2723,7 +3228,7 @@ pub async fn torrent_start(
             StatusCode::NO_CONTENT.into_response()
         }
         Err(e) => {
-            tracing::error!(component = "api", operation = "start", result = "error", torrent = %hash, error = %e, "TorrentNG client start failed");
+            tracing::error!(component = "api", operation = "start", result = "error", torrent = %crate::url_redaction::redact_display(&hash), error = %crate::url_redaction::redact_display(&e), "TorrentNG client start failed");
             StatusCode::INTERNAL_SERVER_ERROR.into_response()
         }
     }
@@ -2732,16 +3237,20 @@ pub async fn torrent_stop(
     State(s): State<AppState>,
     Path(hash): Path<String>,
 ) -> impl IntoResponse {
+    let hash = match cached_torrent_hash(&s, &hash).await {
+        Ok(hash) => hash,
+        Err(status) => return status.into_response(),
+    };
     match s.backend.stop(&hash).await {
         Ok(_) => {
             if let Err(error) = update_cached_lifecycle_state(&s, &hash, "stop").await {
                 tracing::error!(
                     component = "cache",
                     operation = "set_torrent_runtime_state",
-                    torrent = %hash,
+                    torrent = %crate::url_redaction::redact_display(&hash),
                     action = "stop",
                     result = "error",
-                    error = %error,
+                    error = %crate::url_redaction::redact_display(&error),
                     "TorrentNG client stop succeeded but cache projection failed"
                 );
                 return StatusCode::INTERNAL_SERVER_ERROR.into_response();
@@ -2750,7 +3259,7 @@ pub async fn torrent_stop(
             StatusCode::NO_CONTENT.into_response()
         }
         Err(e) => {
-            tracing::error!(component = "api", operation = "stop", result = "error", torrent = %hash, error = %e, "TorrentNG client stop failed");
+            tracing::error!(component = "api", operation = "stop", result = "error", torrent = %crate::url_redaction::redact_display(&hash), error = %crate::url_redaction::redact_display(&e), "TorrentNG client stop failed");
             StatusCode::INTERNAL_SERVER_ERROR.into_response()
         }
     }
@@ -2759,10 +3268,14 @@ pub async fn torrent_recheck(
     State(s): State<AppState>,
     Path(hash): Path<String>,
 ) -> impl IntoResponse {
+    let hash = match cached_torrent_hash(&s, &hash).await {
+        Ok(hash) => hash,
+        Err(status) => return status.into_response(),
+    };
     match s.backend.recheck(&hash).await {
         Ok(_) => StatusCode::NO_CONTENT.into_response(),
         Err(e) => {
-            tracing::error!(component = "api", operation = "recheck", result = "error", torrent = %hash, error = %e, "TorrentNG client recheck failed");
+            tracing::error!(component = "api", operation = "recheck", result = "error", torrent = %crate::url_redaction::redact_display(&hash), error = %crate::url_redaction::redact_display(&e), "TorrentNG client recheck failed");
             StatusCode::INTERNAL_SERVER_ERROR.into_response()
         }
     }
@@ -2771,10 +3284,14 @@ pub async fn torrent_reannounce(
     State(s): State<AppState>,
     Path(hash): Path<String>,
 ) -> impl IntoResponse {
+    let hash = match cached_torrent_hash(&s, &hash).await {
+        Ok(hash) => hash,
+        Err(status) => return status.into_response(),
+    };
     match s.backend.reannounce(&hash).await {
         Ok(_) => StatusCode::NO_CONTENT.into_response(),
         Err(e) => {
-            tracing::error!(component = "api", operation = "reannounce", result = "error", torrent = %hash, error = %e, "TorrentNG client reannounce failed");
+            tracing::error!(component = "api", operation = "reannounce", result = "error", torrent = %crate::url_redaction::redact_display(&hash), error = %crate::url_redaction::redact_display(&e), "TorrentNG client reannounce failed");
             StatusCode::INTERNAL_SERVER_ERROR.into_response()
         }
     }
@@ -2786,10 +3303,14 @@ pub async fn torrent_trackers(
     State(s): State<AppState>,
     Path(hash): Path<String>,
 ) -> impl IntoResponse {
+    let hash = match cached_torrent_hash(&s, &hash).await {
+        Ok(hash) => hash,
+        Err(status) => return status.into_response(),
+    };
     match s.backend.list_trackers(&hash).await {
         Ok(trackers) => Json(serde_json::json!({ "trackers": trackers })).into_response(),
         Err(e) => {
-            tracing::error!(component = "api", operation = "list_trackers", result = "error", torrent = %hash, error = %e, "TorrentNG client tracker listing failed");
+            tracing::error!(component = "api", operation = "list_trackers", result = "error", torrent = %crate::url_redaction::redact_display(&hash), error = %crate::url_redaction::redact_display(&e), "TorrentNG client tracker listing failed");
             StatusCode::INTERNAL_SERVER_ERROR.into_response()
         }
     }
@@ -2797,17 +3318,44 @@ pub async fn torrent_trackers(
 
 #[derive(Deserialize)]
 pub struct TrackerEditItem {
+    #[serde(deserialize_with = "deserialize_tracker_url")]
     pub orig_url: String,
+    #[serde(deserialize_with = "deserialize_tracker_url")]
     pub new_url: String,
+}
+
+fn deserialize_tracker_url<'de, D>(deserializer: D) -> std::result::Result<String, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    BoundedJsonString::<MAX_API_TRACKER_URL_BYTES>::deserialize(deserializer).map(|value| value.0)
+}
+
+fn deserialize_tracker_list<'de, D>(deserializer: D) -> std::result::Result<Vec<String>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    deserialize_bounded_strings::<D, MAX_API_TRACKER_MUTATIONS, MAX_API_TRACKER_URL_BYTES>(
+        deserializer,
+    )
+}
+
+fn deserialize_tracker_edits<'de, D>(
+    deserializer: D,
+) -> std::result::Result<Vec<TrackerEditItem>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    deserialize_bounded_vec::<D, TrackerEditItem, MAX_API_TRACKER_MUTATIONS>(deserializer)
 }
 
 #[derive(Deserialize)]
 pub struct PatchTrackersBody {
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_tracker_list")]
     pub add: Vec<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_tracker_list")]
     pub remove: Vec<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_tracker_edits")]
     pub edit: Vec<TrackerEditItem>,
 }
 
@@ -2833,47 +3381,53 @@ pub async fn patch_torrent_trackers(
             .into_response();
     }
 
+    let hash = match cached_torrent_hash(&s, &hash).await {
+        Ok(hash) => hash,
+        Err(status) => return status.into_response(),
+    };
+
     let mut failures = Vec::new();
     for url in add {
-        if let Err(e) = s.backend.add_tracker(&hash, url).await {
+        if s.backend.add_tracker(&hash, url).await.is_err() {
             tracing::warn!(
                 component = "api",
                 operation = "add_tracker",
-                torrent = %hash,
+                torrent = %crate::url_redaction::redact_display(&hash),
                 tracker = %redact_log_url(url),
                 result = "error",
-                error = %e,
                 "add tracker failed"
             );
-            failures.push(format!("add {url}: {e}"));
+            failures.push(tracker_failure_summary("add", url));
         }
     }
     for url in remove {
-        if let Err(e) = s.backend.remove_tracker(&hash, url).await {
+        if s.backend.remove_tracker(&hash, url).await.is_err() {
             tracing::warn!(
                 component = "api",
                 operation = "remove_tracker",
-                torrent = %hash,
+                torrent = %crate::url_redaction::redact_display(&hash),
                 tracker = %redact_log_url(url),
                 result = "error",
-                error = %e,
                 "remove tracker failed"
             );
-            failures.push(format!("remove {url}: {e}"));
+            failures.push(tracker_failure_summary("remove", url));
         }
     }
     for (orig_url, new_url) in edit {
-        if let Err(e) = s.backend.edit_tracker(&hash, orig_url, new_url).await {
+        if s.backend
+            .edit_tracker(&hash, orig_url, new_url)
+            .await
+            .is_err()
+        {
             tracing::warn!(
                 component = "api",
                 operation = "edit_tracker",
-                torrent = %hash,
+                torrent = %crate::url_redaction::redact_display(&hash),
                 tracker = %redact_log_url(orig_url),
                 result = "error",
-                error = %e,
                 "edit tracker failed"
             );
-            failures.push(format!("edit {orig_url}: {e}"));
+            failures.push(tracker_failure_summary("edit", orig_url));
         }
     }
 
@@ -2893,10 +3447,14 @@ pub async fn torrent_files(
     State(s): State<AppState>,
     Path(hash): Path<String>,
 ) -> impl IntoResponse {
+    let hash = match cached_torrent_hash(&s, &hash).await {
+        Ok(hash) => hash,
+        Err(status) => return status.into_response(),
+    };
     match s.backend.list_files(&hash).await {
         Ok(files) => Json(serde_json::json!({ "files": files })).into_response(),
         Err(e) => {
-            tracing::error!(component = "api", operation = "list_files", result = "error", torrent = %hash, error = %e, "TorrentNG client file listing failed");
+            tracing::error!(component = "api", operation = "list_files", result = "error", torrent = %crate::url_redaction::redact_display(&hash), error = %crate::url_redaction::redact_display(&e), "TorrentNG client file listing failed");
             StatusCode::INTERNAL_SERVER_ERROR.into_response()
         }
     }
@@ -2910,7 +3468,17 @@ pub struct FilePriorityItem {
 
 #[derive(Deserialize)]
 pub struct SetFilePrioritiesBody {
+    #[serde(deserialize_with = "deserialize_file_priorities")]
     pub files: Vec<FilePriorityItem>,
+}
+
+fn deserialize_file_priorities<'de, D>(
+    deserializer: D,
+) -> std::result::Result<Vec<FilePriorityItem>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    deserialize_bounded_vec::<D, FilePriorityItem, MAX_API_FILE_PRIORITY_UPDATES>(deserializer)
 }
 
 pub async fn set_file_priorities(
@@ -2922,6 +3490,11 @@ pub async fn set_file_priorities(
         return (StatusCode::BAD_REQUEST, "files must not be empty").into_response();
     }
 
+    let hash = match cached_torrent_hash(&s, &hash).await {
+        Ok(hash) => hash,
+        Err(status) => return status.into_response(),
+    };
+
     let mut failures = Vec::new();
     for item in &body.files {
         if let Err(e) = s
@@ -2932,11 +3505,11 @@ pub async fn set_file_priorities(
             tracing::warn!(
                 component = "api",
                 operation = "set_file_priority",
-                torrent = %hash,
+                torrent = %crate::url_redaction::redact_display(&hash),
                 file_index = item.index,
                 priority = item.priority,
                 result = "error",
-                error = %e,
+                error = %crate::url_redaction::redact_display(&e),
                 "TorrentNG client file priority update failed"
             );
             failures.push(format!("{}: {e}", item.index));
@@ -2962,8 +3535,8 @@ pub async fn list_categories(State(s): State<AppState>) -> impl IntoResponse {
     {
         Ok(cats) => Json(cats).into_response(),
         Err(e) => {
-            tracing::error!(component = "api", operation = "list_categories", result = "error", error = %e, "category listing failed");
-            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+            tracing::error!(component = "api", operation = "list_categories", result = "error", error = %crate::url_redaction::redact_display(&e), "category listing failed");
+            metadata_read_status(&e).into_response()
         }
     }
 }
@@ -2978,6 +3551,18 @@ pub async fn upsert_category(
     State(s): State<AppState>,
     Json(body): Json<CategoryBody>,
 ) -> impl IntoResponse {
+    if body.name.len() > MAX_API_CATEGORY_NAME_BYTES
+        || body
+            .save_path
+            .as_deref()
+            .is_some_and(|path| path.len() > MAX_API_CATEGORY_PATH_BYTES)
+    {
+        return (
+            StatusCode::BAD_REQUEST,
+            "category fields exceed input limits",
+        )
+            .into_response();
+    }
     let name = body.name.trim();
     if name.is_empty() {
         return (StatusCode::BAD_REQUEST, "category name must not be empty").into_response();
@@ -3002,8 +3587,8 @@ pub async fn upsert_category(
             .into_response()
         }
         Err(e) => {
-            tracing::error!(component = "api", operation = "upsert_category", result = "error", category = %name, error = %e, "category upsert failed");
-            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+            tracing::error!(component = "api", operation = "upsert_category", result = "error", category = %crate::url_redaction::redact_display(&name), error = %crate::url_redaction::redact_display(&e), "category upsert failed");
+            metadata_write_status(&e).into_response()
         }
     }
 }
@@ -3012,6 +3597,9 @@ pub async fn delete_category(
     State(s): State<AppState>,
     Path(name): Path<String>,
 ) -> impl IntoResponse {
+    if name.len() > MAX_API_CATEGORY_NAME_BYTES {
+        return StatusCode::BAD_REQUEST.into_response();
+    }
     let delete_name = name.clone();
     match s
         .db
@@ -3026,7 +3614,7 @@ pub async fn delete_category(
             StatusCode::NO_CONTENT.into_response()
         }
         Err(e) => {
-            tracing::error!(component = "api", operation = "delete_category", result = "error", category = %name, error = %e, "category delete failed");
+            tracing::error!(component = "api", operation = "delete_category", result = "error", category = %crate::url_redaction::redact_display(&name), error = %crate::url_redaction::redact_display(&e), "category delete failed");
             StatusCode::INTERNAL_SERVER_ERROR.into_response()
         }
     }
@@ -3038,8 +3626,8 @@ pub async fn list_tags(State(s): State<AppState>) -> impl IntoResponse {
     match s.db.run_blocking("list_tags", |db| db.list_tags()).await {
         Ok(tags) => Json(tags).into_response(),
         Err(e) => {
-            tracing::error!(component = "api", operation = "list_tags", result = "error", error = %e, "tag listing failed");
-            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+            tracing::error!(component = "api", operation = "list_tags", result = "error", error = %crate::url_redaction::redact_display(&e), "tag listing failed");
+            metadata_read_status(&e).into_response()
         }
     }
 }
@@ -3050,6 +3638,9 @@ pub struct TagBody {
 }
 
 pub async fn create_tag(State(s): State<AppState>, Json(body): Json<TagBody>) -> impl IntoResponse {
+    if body.name.len() > MAX_API_TAG_BYTES {
+        return (StatusCode::BAD_REQUEST, "tag name exceeds the input limit").into_response();
+    }
     let name = body.name.trim();
     if name.is_empty() {
         return (StatusCode::BAD_REQUEST, "tag name must not be empty").into_response();
@@ -3065,13 +3656,16 @@ pub async fn create_tag(State(s): State<AppState>, Json(body): Json<TagBody>) ->
             StatusCode::CREATED.into_response()
         }
         Err(e) => {
-            tracing::error!(component = "api", operation = "create_tag", result = "error", tag = %name, error = %e, "tag create failed");
-            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+            tracing::error!(component = "api", operation = "create_tag", result = "error", tag = %crate::url_redaction::redact_display(&name), error = %crate::url_redaction::redact_display(&e), "tag create failed");
+            metadata_write_status(&e).into_response()
         }
     }
 }
 
 pub async fn delete_tag(State(s): State<AppState>, Path(name): Path<String>) -> impl IntoResponse {
+    if name.len() > MAX_API_TAG_BYTES {
+        return StatusCode::BAD_REQUEST.into_response();
+    }
     let delete_name = name.clone();
     match s
         .db
@@ -3084,7 +3678,7 @@ pub async fn delete_tag(State(s): State<AppState>, Path(name): Path<String>) -> 
             StatusCode::NO_CONTENT.into_response()
         }
         Err(e) => {
-            tracing::error!(component = "api", operation = "delete_tag", result = "error", tag = %name, error = %e, "tag delete failed");
+            tracing::error!(component = "api", operation = "delete_tag", result = "error", tag = %crate::url_redaction::redact_display(&name), error = %crate::url_redaction::redact_display(&e), "tag delete failed");
             StatusCode::INTERNAL_SERVER_ERROR.into_response()
         }
     }
@@ -3102,28 +3696,30 @@ pub async fn set_torrent_category(
     Path(hash): Path<String>,
     Json(body): Json<SetCategoryBody>,
 ) -> impl IntoResponse {
-    let lookup_hash = hash.clone();
-    match s
-        .db
-        .run_blocking("set_torrent_category_exists", move |db| {
-            db.exists(&lookup_hash)
-        })
-        .await
-    {
-        Ok(true) => {}
-        Ok(false) => return StatusCode::NOT_FOUND.into_response(),
-        Err(e) => {
-            tracing::error!(component = "cache", operation = "exists", result = "error", torrent = %hash, error = %e, "cache torrent existence check failed");
-            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
-        }
+    if body.category.len() > MAX_API_CATEGORY_NAME_BYTES {
+        return (StatusCode::BAD_REQUEST, "category exceeds the input limit").into_response();
     }
+    let hash = match cached_torrent_hash(&s, &hash).await {
+        Ok(hash) => hash,
+        Err(status) => return status.into_response(),
+    };
     if !s.backend.capabilities().supports_categories {
         return StatusCode::NOT_IMPLEMENTED.into_response();
     }
 
     let category = body.category.trim();
+    let capacity_category = category.to_owned();
+    if let Err(error) =
+        s.db.run_blocking("preflight_set_torrent_category", move |db| {
+            crate::cache::categories::ensure_category_name_capacity(db, &capacity_category)
+        })
+        .await
+    {
+        tracing::warn!(component = "cache", operation = "preflight_set_category", result = "error", torrent = %crate::url_redaction::redact_display(&hash), category = %crate::url_redaction::redact_display(&category), error = %crate::url_redaction::redact_display(&error), "category update rejected before backend mutation");
+        return metadata_write_status(&error).into_response();
+    }
     if let Err(e) = s.backend.set_category(&hash, category).await {
-        tracing::warn!(component = "backend", operation = "set_category", result = "error", torrent = %hash, category = %category, error = %e, "backend category update failed");
+        tracing::warn!(component = "backend", operation = "set_category", result = "error", torrent = %crate::url_redaction::redact_display(&hash), category = %crate::url_redaction::redact_display(&category), error = %crate::url_redaction::redact_display(&e), "backend category update failed");
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     }
     let cache_hash = hash.clone();
@@ -3134,8 +3730,8 @@ pub async fn set_torrent_category(
         })
         .await
     {
-        tracing::error!(component = "cache", operation = "set_category", result = "error", torrent = %hash, category = %category, error = %e, "cache category update failed after backend update");
-        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        tracing::error!(component = "cache", operation = "set_category", result = "error", torrent = %crate::url_redaction::redact_display(&hash), category = %crate::url_redaction::redact_display(&category), error = %crate::url_redaction::redact_display(&e), "cache category update failed after backend update");
+        return metadata_write_status(&e).into_response();
     }
     emit_torrent_updated(&s, &hash).await;
     emit(&s, Event::CategoriesUpdated).await;
@@ -3144,7 +3740,195 @@ pub async fn set_torrent_category(
 
 #[derive(Deserialize)]
 pub struct ModTagsBody {
-    pub tags: Vec<String>,
+    pub tags: BoundedTagList,
+}
+
+pub struct BoundedTagList {
+    values: Vec<String>,
+    valid: bool,
+}
+
+impl BoundedTagList {
+    fn normalized(&self) -> Result<Vec<&str>, ()> {
+        if !self.valid {
+            return Err(());
+        }
+        bounded_normalized_tags(&self.values)
+    }
+}
+
+impl<'de> Deserialize<'de> for BoundedTagList {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct TagListVisitor;
+
+        impl<'de> Visitor<'de> for TagListVisitor {
+            type Value = BoundedTagList;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("an array of bounded tag strings")
+            }
+
+            fn visit_seq<A>(self, mut sequence: A) -> std::result::Result<Self::Value, A::Error>
+            where
+                A: SeqAccess<'de>,
+            {
+                let mut values = Vec::new();
+                let mut valid = true;
+                for _ in 0..MAX_API_TAGS {
+                    let Some(value) = sequence.next_element::<BoundedApiTag>()? else {
+                        return Ok(BoundedTagList { values, valid });
+                    };
+                    match value.0 {
+                        Some(value) => values.push(value),
+                        None => valid = false,
+                    }
+                }
+                if sequence.next_element::<IgnoredAny>()?.is_some() {
+                    valid = false;
+                    while sequence.next_element::<IgnoredAny>()?.is_some() {}
+                }
+                Ok(BoundedTagList { values, valid })
+            }
+        }
+
+        struct BoundedApiTag(Option<String>);
+
+        impl<'de> Deserialize<'de> for BoundedApiTag {
+            fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+            where
+                D: Deserializer<'de>,
+            {
+                struct TagVisitor;
+
+                impl<'de> Visitor<'de> for TagVisitor {
+                    type Value = BoundedApiTag;
+
+                    fn expecting(
+                        &self,
+                        formatter: &mut std::fmt::Formatter<'_>,
+                    ) -> std::fmt::Result {
+                        formatter.write_str("a tag string")
+                    }
+
+                    fn visit_str<E>(self, value: &str) -> std::result::Result<Self::Value, E>
+                    where
+                        E: de::Error,
+                    {
+                        Ok(BoundedApiTag(
+                            (value.len() <= MAX_API_TAG_BYTES).then(|| value.to_owned()),
+                        ))
+                    }
+
+                    fn visit_string<E>(self, value: String) -> std::result::Result<Self::Value, E>
+                    where
+                        E: de::Error,
+                    {
+                        Ok(BoundedApiTag(
+                            (value.len() <= MAX_API_TAG_BYTES).then_some(value),
+                        ))
+                    }
+                }
+
+                deserializer.deserialize_str(TagVisitor)
+            }
+        }
+
+        deserializer.deserialize_seq(TagListVisitor)
+    }
+}
+
+struct BoundedJsonString<const MAX_BYTES: usize>(String);
+
+impl<'de, const MAX_BYTES: usize> Deserialize<'de> for BoundedJsonString<MAX_BYTES> {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct StringVisitor<const MAX_BYTES: usize>;
+
+        impl<'de, const MAX_BYTES: usize> Visitor<'de> for StringVisitor<MAX_BYTES> {
+            type Value = BoundedJsonString<MAX_BYTES>;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                write!(formatter, "a string of at most {MAX_BYTES} UTF-8 bytes")
+            }
+
+            fn visit_str<E>(self, value: &str) -> std::result::Result<Self::Value, E>
+            where
+                E: de::Error,
+            {
+                if value.len() > MAX_BYTES {
+                    return Err(E::custom("string exceeds its byte limit"));
+                }
+                Ok(BoundedJsonString(value.to_owned()))
+            }
+
+            fn visit_string<E>(self, value: String) -> std::result::Result<Self::Value, E>
+            where
+                E: de::Error,
+            {
+                if value.len() > MAX_BYTES {
+                    return Err(E::custom("string exceeds its byte limit"));
+                }
+                Ok(BoundedJsonString(value))
+            }
+        }
+
+        deserializer.deserialize_str(StringVisitor::<MAX_BYTES>)
+    }
+}
+
+fn deserialize_bounded_vec<'de, D, T, const MAX_ITEMS: usize>(
+    deserializer: D,
+) -> std::result::Result<Vec<T>, D::Error>
+where
+    D: Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    struct VecVisitor<T, const MAX_ITEMS: usize>(std::marker::PhantomData<T>);
+
+    impl<'de, T, const MAX_ITEMS: usize> Visitor<'de> for VecVisitor<T, MAX_ITEMS>
+    where
+        T: Deserialize<'de>,
+    {
+        type Value = Vec<T>;
+
+        fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(formatter, "an array with at most {MAX_ITEMS} entries")
+        }
+
+        fn visit_seq<A>(self, mut sequence: A) -> std::result::Result<Self::Value, A::Error>
+        where
+            A: SeqAccess<'de>,
+        {
+            let mut values = Vec::new();
+            for _ in 0..MAX_ITEMS {
+                let Some(value) = sequence.next_element::<T>()? else {
+                    return Ok(values);
+                };
+                values.push(value);
+            }
+            if sequence.next_element::<IgnoredAny>()?.is_some() {
+                return Err(de::Error::custom("array exceeds its item limit"));
+            }
+            Ok(values)
+        }
+    }
+
+    deserializer.deserialize_seq(VecVisitor::<T, MAX_ITEMS>(std::marker::PhantomData))
+}
+
+fn deserialize_bounded_strings<'de, D, const MAX_ITEMS: usize, const MAX_BYTES: usize>(
+    deserializer: D,
+) -> std::result::Result<Vec<String>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    deserialize_bounded_vec::<D, BoundedJsonString<MAX_BYTES>, MAX_ITEMS>(deserializer)
+        .map(|values| values.into_iter().map(|value| value.0).collect())
 }
 
 pub async fn add_torrent_tags(
@@ -3152,29 +3936,47 @@ pub async fn add_torrent_tags(
     Path(hash): Path<String>,
     Json(body): Json<ModTagsBody>,
 ) -> impl IntoResponse {
-    let tags = normalized_tags(&body.tags);
-    if tags.is_empty() {
-        return (StatusCode::BAD_REQUEST, "tags must not be empty").into_response();
-    }
-    let lookup_hash = hash.clone();
-    match s
-        .db
-        .run_blocking("add_torrent_tags_exists", move |db| db.exists(&lookup_hash))
-        .await
-    {
-        Ok(true) => {}
-        Ok(false) => return StatusCode::NOT_FOUND.into_response(),
-        Err(e) => {
-            tracing::error!(component = "cache", operation = "exists", result = "error", torrent = %hash, error = %e, "cache torrent existence check failed");
-            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    let tags = match body.tags.normalized() {
+        Ok(tags) => tags,
+        Err(()) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                "tags must be non-empty and within count/name limits",
+            )
+                .into_response()
         }
-    }
+    };
+    let hash = match cached_torrent_hash(&s, &hash).await {
+        Ok(hash) => hash,
+        Err(status) => return status.into_response(),
+    };
     if !s.backend.capabilities().supports_tags {
         return StatusCode::NOT_IMPLEMENTED.into_response();
     }
 
+    let preflight_hash = hash.clone();
+    let preflight_tags = tags.iter().map(|tag| (*tag).to_owned()).collect::<Vec<_>>();
+    if let Err(error) =
+        s.db.run_blocking("preflight_add_torrent_tags", move |db| {
+            let tag_refs = preflight_tags
+                .iter()
+                .map(String::as_str)
+                .collect::<Vec<_>>();
+            crate::cache::categories::ensure_torrent_tag_capacity(
+                db,
+                &preflight_hash,
+                &tag_refs,
+                true,
+            )
+        })
+        .await
+    {
+        tracing::warn!(component = "cache", operation = "preflight_add_tags", result = "error", torrent = %crate::url_redaction::redact_display(&hash), error = %crate::url_redaction::redact_display(&error), "tag update rejected before backend mutation");
+        return metadata_write_status(&error).into_response();
+    }
+
     if let Err(e) = s.backend.add_tags(&hash, &tags).await {
-        tracing::warn!(component = "api", operation = "add_tags", result = "error", torrent = %hash, error = %e, "backend tag add failed");
+        tracing::warn!(component = "api", operation = "add_tags", result = "error", torrent = %crate::url_redaction::redact_display(&hash), error = %crate::url_redaction::redact_display(&e), "backend tag add failed");
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     }
     let cache_hash = hash.clone();
@@ -3186,8 +3988,8 @@ pub async fn add_torrent_tags(
         })
         .await
     {
-        tracing::error!(component = "cache", operation = "add_tags", result = "error", torrent = %hash, error = %e, "cache tag add failed after backend update");
-        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        tracing::error!(component = "cache", operation = "add_tags", result = "error", torrent = %crate::url_redaction::redact_display(&hash), error = %crate::url_redaction::redact_display(&e), "cache tag add failed after backend update");
+        return metadata_write_status(&e).into_response();
     }
     emit_torrent_updated(&s, &hash).await;
     emit(&s, Event::TagsUpdated).await;
@@ -3199,31 +4001,26 @@ pub async fn remove_torrent_tags(
     Path(hash): Path<String>,
     Json(body): Json<ModTagsBody>,
 ) -> impl IntoResponse {
-    let tags = normalized_tags(&body.tags);
-    if tags.is_empty() {
-        return (StatusCode::BAD_REQUEST, "tags must not be empty").into_response();
-    }
-    let lookup_hash = hash.clone();
-    match s
-        .db
-        .run_blocking("remove_torrent_tags_exists", move |db| {
-            db.exists(&lookup_hash)
-        })
-        .await
-    {
-        Ok(true) => {}
-        Ok(false) => return StatusCode::NOT_FOUND.into_response(),
-        Err(e) => {
-            tracing::error!(component = "cache", operation = "exists", result = "error", torrent = %hash, error = %e, "cache torrent existence check failed");
-            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    let tags = match body.tags.normalized() {
+        Ok(tags) => tags,
+        Err(()) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                "tags must be non-empty and within count/name limits",
+            )
+                .into_response()
         }
-    }
+    };
+    let hash = match cached_torrent_hash(&s, &hash).await {
+        Ok(hash) => hash,
+        Err(status) => return status.into_response(),
+    };
     if !s.backend.capabilities().supports_tags {
         return StatusCode::NOT_IMPLEMENTED.into_response();
     }
 
     if let Err(e) = s.backend.remove_tags(&hash, &tags).await {
-        tracing::warn!(component = "api", operation = "remove_tags", result = "error", torrent = %hash, error = %e, "backend tag removal failed");
+        tracing::warn!(component = "api", operation = "remove_tags", result = "error", torrent = %crate::url_redaction::redact_display(&hash), error = %crate::url_redaction::redact_display(&e), "backend tag removal failed");
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     }
     let cache_hash = hash.clone();
@@ -3235,7 +4032,7 @@ pub async fn remove_torrent_tags(
         })
         .await
     {
-        tracing::error!(component = "cache", operation = "remove_tags", result = "error", torrent = %hash, error = %e, "cache tag removal failed after backend update");
+        tracing::error!(component = "cache", operation = "remove_tags", result = "error", torrent = %crate::url_redaction::redact_display(&hash), error = %crate::url_redaction::redact_display(&e), "cache tag removal failed after backend update");
         return StatusCode::INTERNAL_SERVER_ERROR.into_response();
     }
     emit_torrent_updated(&s, &hash).await;
@@ -3243,8 +4040,16 @@ pub async fn remove_torrent_tags(
     StatusCode::NO_CONTENT.into_response()
 }
 
-fn normalized_tags(tags: &[String]) -> Vec<&str> {
-    normalized_nonempty(tags)
+fn bounded_normalized_tags(tags: &[String]) -> Result<Vec<&str>, ()> {
+    if tags.len() > MAX_API_TAGS || tags.iter().any(|tag| tag.len() > MAX_API_TAG_BYTES) {
+        return Err(());
+    }
+    let normalized = normalized_nonempty(tags);
+    if normalized.is_empty() {
+        Err(())
+    } else {
+        Ok(normalized)
+    }
 }
 
 fn normalized_nonempty(values: &[String]) -> Vec<&str> {
@@ -3259,7 +4064,7 @@ fn normalized_nonempty(values: &[String]) -> Vec<&str> {
 
 #[derive(Deserialize)]
 pub struct BulkBody {
-    pub hashes: Vec<String>,
+    pub hashes: BoundedBulkHashes,
     #[serde(default)]
     pub dry_run: bool,
     pub category: Option<String>,
@@ -3273,12 +4078,284 @@ pub struct BulkResult {
     pub dry_run: bool,
 }
 
+pub const MAX_BULK_TORRENTS: usize = 10_000;
+const MAX_BULK_HASH_CHARS: usize = 256;
+const MAX_BULK_CATEGORY_BYTES: usize = 256;
+const MAX_BULK_SAVE_PATH_BYTES: usize = 4_096;
+
+pub struct BoundedBulkHashes {
+    values: Vec<String>,
+    too_many: bool,
+    invalid_hash: bool,
+}
+
+struct BoundedBulkHash(Option<String>);
+
+impl<'de> Deserialize<'de> for BoundedBulkHash {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct HashVisitor;
+
+        impl<'de> Visitor<'de> for HashVisitor {
+            type Value = BoundedBulkHash;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("a bounded torrent hash string")
+            }
+
+            fn visit_str<E>(self, value: &str) -> std::result::Result<Self::Value, E>
+            where
+                E: de::Error,
+            {
+                Ok(BoundedBulkHash(bounded_bulk_hash(value)))
+            }
+
+            fn visit_string<E>(self, value: String) -> std::result::Result<Self::Value, E>
+            where
+                E: de::Error,
+            {
+                let bounded = if value.len() > MAX_BULK_HASH_CHARS * 4
+                    || value.chars().count() > MAX_BULK_HASH_CHARS
+                {
+                    None
+                } else {
+                    Some(value)
+                };
+                Ok(BoundedBulkHash(bounded))
+            }
+        }
+
+        deserializer.deserialize_str(HashVisitor)
+    }
+}
+
+fn bounded_bulk_hash(value: &str) -> Option<String> {
+    if value.len() > MAX_BULK_HASH_CHARS * 4 || value.chars().count() > MAX_BULK_HASH_CHARS {
+        None
+    } else {
+        Some(value.to_owned())
+    }
+}
+
+impl<'de> Deserialize<'de> for BoundedBulkHashes {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct HashesVisitor;
+
+        impl<'de> Visitor<'de> for HashesVisitor {
+            type Value = BoundedBulkHashes;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                write!(
+                    formatter,
+                    "an array with at most {MAX_BULK_TORRENTS} bounded torrent hashes"
+                )
+            }
+
+            fn visit_seq<A>(self, mut sequence: A) -> std::result::Result<Self::Value, A::Error>
+            where
+                A: SeqAccess<'de>,
+            {
+                let mut values = Vec::new();
+                let mut invalid_hash = false;
+                for _ in 0..MAX_BULK_TORRENTS {
+                    let Some(hash) = sequence.next_element::<BoundedBulkHash>()? else {
+                        return Ok(BoundedBulkHashes {
+                            values,
+                            too_many: false,
+                            invalid_hash,
+                        });
+                    };
+                    if let Some(hash) = hash.0 {
+                        values.push(hash);
+                    } else {
+                        invalid_hash = true;
+                    }
+                }
+                let too_many = sequence.next_element::<IgnoredAny>()?.is_some();
+                if too_many {
+                    while sequence.next_element::<IgnoredAny>()?.is_some() {}
+                }
+                Ok(BoundedBulkHashes {
+                    values,
+                    too_many,
+                    invalid_hash,
+                })
+            }
+        }
+
+        deserializer.deserialize_seq(HashesVisitor)
+    }
+}
+
 fn deduplicate_hashes(hashes: Vec<String>) -> Vec<String> {
     let mut seen = std::collections::HashSet::new();
     hashes
         .into_iter()
-        .filter(|hash| seen.insert(hash.clone()))
+        .filter(|hash| seen.insert(hash.to_ascii_lowercase()))
         .collect()
+}
+
+async fn cached_torrent_hash(s: &AppState, requested: &str) -> Result<String, StatusCode> {
+    let lookup = requested.to_owned();
+    match s
+        .db
+        .run_blocking("canonicalize_torrent_hash", move |db| {
+            db.canonical_hash(&lookup)
+        })
+        .await
+    {
+        Ok(Some(hash)) => Ok(hash),
+        Ok(None) => Err(StatusCode::NOT_FOUND),
+        Err(error) => {
+            tracing::error!(
+                component = "cache",
+                operation = "canonicalize_torrent_hash",
+                torrent = %crate::url_redaction::redact_display(&requested),
+                result = "error",
+                error = %crate::url_redaction::redact_display(&error),
+                "failed to resolve torrent hash against the cache"
+            );
+            Err(StatusCode::INTERNAL_SERVER_ERROR)
+        }
+    }
+}
+
+async fn cached_torrent_hashes(
+    s: &AppState,
+    requested: Vec<String>,
+) -> Result<(Vec<String>, Vec<String>), StatusCode> {
+    let result =
+        s.db.run_blocking("canonicalize_bulk_torrent_hashes", move |db| {
+            let mut found = Vec::with_capacity(requested.len());
+            let mut missing = Vec::new();
+            for hash in requested {
+                match db.canonical_hash(&hash)? {
+                    Some(canonical) => found.push(canonical),
+                    None => missing.push(hash),
+                }
+            }
+            Ok((deduplicate_hashes(found), missing))
+        })
+        .await;
+    match result {
+        Ok(hashes) => Ok(hashes),
+        Err(error) => {
+            tracing::error!(
+                component = "cache",
+                operation = "canonicalize_bulk_torrent_hashes",
+                result = "error",
+                error = %crate::url_redaction::redact_display(&error),
+                "failed to resolve bulk torrent hashes against the cache"
+            );
+            Err(StatusCode::INTERNAL_SERVER_ERROR)
+        }
+    }
+}
+
+fn spawn_bulk_action(
+    set: &mut tokio::task::JoinSet<(String, anyhow::Result<()>)>,
+    s: &AppState,
+    hash: String,
+    action: &str,
+    category: Option<&str>,
+    save_path: Option<&str>,
+) {
+    let state = s.clone();
+    let action = action.to_owned();
+    let category = category.map(str::to_owned);
+    let save_path = save_path.map(str::to_owned);
+    set.spawn(async move {
+        let res: anyhow::Result<()> = match action.as_str() {
+            "start" => state.backend.start(&hash).await,
+            "stop" => state.backend.stop(&hash).await,
+            "recheck" => state.backend.recheck(&hash).await,
+            "reannounce" => state.backend.reannounce(&hash).await,
+            "set-category" => {
+                let category = category.as_deref().expect("category was validated");
+                let lookup_hash = hash.clone();
+                match state
+                    .db
+                    .run_blocking("bulk_set_category_exists", move |db| {
+                        db.exists(&lookup_hash)
+                    })
+                    .await
+                {
+                    Ok(true) => {}
+                    Ok(false) => return (hash, Err(anyhow::anyhow!("not found"))),
+                    Err(e) => return (hash, Err(e)),
+                }
+                match state.backend.set_category(&hash, category).await {
+                    Ok(()) => {
+                        let cache_hash = hash.clone();
+                        let cache_category = category.to_owned();
+                        state
+                            .db
+                            .run_blocking("bulk_set_category_cache", move |db| {
+                                db.set_torrent_category(&cache_hash, &cache_category)
+                            })
+                            .await
+                            .map_err(|error| anyhow::anyhow!(error))
+                    }
+                    Err(e) => Err(e),
+                }
+            }
+            "set-location" => {
+                let save_path = save_path.as_deref().expect("save_path was validated");
+                let lookup_hash = hash.clone();
+                match state
+                    .db
+                    .run_blocking("bulk_set_location_exists", move |db| {
+                        db.exists(&lookup_hash)
+                    })
+                    .await
+                {
+                    Ok(true) => {}
+                    Ok(false) => return (hash, Err(anyhow::anyhow!("not found"))),
+                    Err(e) => return (hash, Err(e)),
+                }
+                match state.backend.set_location(&hash, save_path).await {
+                    Ok(()) => {
+                        let cache_hash = hash.clone();
+                        let cache_path = save_path.to_owned();
+                        if let Err(e) = state
+                            .db
+                            .run_blocking("bulk_set_location_cache", move |db| {
+                                db.set_torrent_location(&cache_hash, &cache_path)
+                            })
+                            .await
+                        {
+                            return (hash, Err(e));
+                        }
+                        Ok(())
+                    }
+                    Err(e) => Err(e),
+                }
+            }
+            _ => unreachable!("bulk action was validated"),
+        };
+        match res {
+            Ok(_) => {
+                if let Err(error) = update_cached_lifecycle_state(&state, &hash, &action).await {
+                    (
+                        hash,
+                        Err(anyhow::anyhow!("cache projection failed: {error}")),
+                    )
+                } else {
+                    emit_torrent_updated(&state, &hash).await;
+                    if action == "set-category" {
+                        emit(&state, Event::CategoriesUpdated).await;
+                    }
+                    (hash, Ok(()))
+                }
+            }
+            Err(e) => (hash, Err(e)),
+        }
+    });
 }
 
 pub async fn bulk_action(
@@ -3305,18 +4382,64 @@ pub async fn bulk_action(
             _ => return (StatusCode::BAD_REQUEST, "save_path must not be empty").into_response(),
         }
     }
+    if category.is_some_and(|value| value.len() > MAX_BULK_CATEGORY_BYTES) {
+        return (
+            StatusCode::BAD_REQUEST,
+            format!("category must be at most {MAX_BULK_CATEGORY_BYTES} UTF-8 bytes"),
+        )
+            .into_response();
+    }
+    if save_path.is_some_and(|value| value.len() > MAX_BULK_SAVE_PATH_BYTES) {
+        return (
+            StatusCode::BAD_REQUEST,
+            format!("save_path must be at most {MAX_BULK_SAVE_PATH_BYTES} UTF-8 bytes"),
+        )
+            .into_response();
+    }
+
+    if body.hashes.too_many {
+        return (
+            StatusCode::PAYLOAD_TOO_LARGE,
+            format!("hashes must contain at most {MAX_BULK_TORRENTS} entries"),
+        )
+            .into_response();
+    }
+    if body.hashes.invalid_hash {
+        return (
+            StatusCode::BAD_REQUEST,
+            format!("each hash must be at most {MAX_BULK_HASH_CHARS} characters"),
+        )
+            .into_response();
+    }
 
     // Treat a repeated hash as one mutation target. The WebUI normally
     // supplies a Set, but qBittorrent/automation clients can submit the same
     // hash repeatedly; forwarding that list would invoke start/reannounce
     // multiple times for the same torrent.
-    let hashes = deduplicate_hashes(body.hashes);
+    let requested_hashes = deduplicate_hashes(body.hashes.values);
+    let (hashes, missing_hashes) = match cached_torrent_hashes(&s, requested_hashes).await {
+        Ok(hashes) => hashes,
+        Err(status) => return status.into_response(),
+    };
+    let missing_errors = missing_hashes
+        .into_iter()
+        .map(|hash| format!("{hash}: not found"))
+        .collect::<Vec<_>>();
 
     if body.dry_run {
         return Json(BulkResult {
-            applied: hashes.clone(),
-            errors: vec![],
+            applied: hashes,
+            errors: missing_errors,
             dry_run: true,
+        })
+        .into_response();
+    }
+
+    if hashes.is_empty() {
+        return Json(BulkResult {
+            applied: Vec::new(),
+            errors: missing_errors,
+            dry_run: false,
         })
         .into_response();
     }
@@ -3326,6 +4449,20 @@ pub async fn bulk_action(
     }
     if action == "set-location" && !s.backend.capabilities().supports_location_update {
         return StatusCode::NOT_IMPLEMENTED.into_response();
+    }
+    if action == "set-category" {
+        let category_name = category
+            .expect("set-category requires a category")
+            .to_owned();
+        if let Err(error) =
+            s.db.run_blocking("preflight_bulk_set_category", move |db| {
+                crate::cache::categories::ensure_category_name_capacity(db, &category_name)
+            })
+            .await
+        {
+            tracing::warn!(component = "cache", operation = "preflight_bulk_set_category", result = "error", error = %crate::url_redaction::redact_display(&error), "bulk category update rejected before backend mutation");
+            return metadata_write_status(&error).into_response();
+        }
     }
 
     // Prefer a backend's bulk-optimized path (e.g. rTorrent's
@@ -3340,7 +4477,7 @@ pub async fn bulk_action(
         };
         if let Some(outcome) = fast {
             let mut applied = Vec::new();
-            let mut errors = Vec::new();
+            let mut errors = missing_errors.clone();
             match outcome {
                 Ok(results) => {
                     // Batch the cache write into one transaction instead of
@@ -3371,7 +4508,7 @@ pub async fn bulk_action(
                             operation = "set_torrent_runtime_state_many",
                             count = state_updates.len(),
                             result = "error",
-                            error = %e,
+                            error = %crate::url_redaction::redact_display(&e),
                             "bulk torrent runtime cache update failed"
                         );
                         for (hash, _, _, _) in &state_updates {
@@ -3396,120 +4533,29 @@ pub async fn bulk_action(
         }
     }
 
-    // Each backend call is one XMLRPC round-trip over a freshly-opened
-    // socket; run them concurrently (bounded) instead of one at a time --
-    // a few thousand torrents took over two minutes sequentially, which
-    // both feels broken and, combined with a status-sorted view reshuffling
-    // mid-operation, looks like the action silently isn't working.
+    // Keep both active backend calls and allocated task state bounded. A
+    // semaphore limits active calls but still leaves one waiting task per
+    // selected torrent, so feed the JoinSet from a fixed-size window.
     const BULK_CONCURRENCY: usize = 32;
-    let semaphore = std::sync::Arc::new(tokio::sync::Semaphore::new(BULK_CONCURRENCY));
-    let category = category.map(str::to_owned);
-    let save_path = save_path.map(str::to_owned);
     let mut set = tokio::task::JoinSet::new();
-    for hash in hashes {
-        let sem = semaphore.clone();
-        let state = s.clone();
-        let action = action.clone();
-        let category = category.clone();
-        let save_path = save_path.clone();
-        set.spawn(async move {
-            let _permit = sem.acquire_owned().await.expect("semaphore never closed");
-            let res: anyhow::Result<()> = match action.as_str() {
-                "start" => state.backend.start(&hash).await,
-                "stop" => state.backend.stop(&hash).await,
-                "recheck" => state.backend.recheck(&hash).await,
-                "reannounce" => state.backend.reannounce(&hash).await,
-                "set-category" => {
-                    let category = category.as_deref().expect("category was validated");
-                    let lookup_hash = hash.clone();
-                    match state
-                        .db
-                        .run_blocking("bulk_set_category_exists", move |db| {
-                            db.exists(&lookup_hash)
-                        })
-                        .await
-                    {
-                        Ok(true) => {}
-                        Ok(false) => return (hash, Err(anyhow::anyhow!("not found"))),
-                        Err(e) => return (hash, Err(e)),
-                    }
-                    match state.backend.set_category(&hash, category).await {
-                        Ok(()) => {
-                            let cache_hash = hash.clone();
-                            let cache_category = category.to_owned();
-                            state
-                                .db
-                                .run_blocking("bulk_set_category_cache", move |db| {
-                                    db.set_torrent_category(&cache_hash, &cache_category)
-                                })
-                                .await
-                                .map_err(|error| anyhow::anyhow!(error))
-                        }
-                        Err(e) => Err(e),
-                    }
-                }
-                "set-location" => {
-                    let save_path = save_path.as_deref().expect("save_path was validated");
-                    let lookup_hash = hash.clone();
-                    match state
-                        .db
-                        .run_blocking("bulk_set_location_exists", move |db| {
-                            db.exists(&lookup_hash)
-                        })
-                        .await
-                    {
-                        Ok(true) => {}
-                        Ok(false) => return (hash, Err(anyhow::anyhow!("not found"))),
-                        Err(e) => return (hash, Err(e)),
-                    }
-                    match state.backend.set_location(&hash, save_path).await {
-                        Ok(()) => {
-                            let cache_hash = hash.clone();
-                            let cache_path = save_path.to_owned();
-                            if let Err(e) = state
-                                .db
-                                .run_blocking("bulk_set_location_cache", move |db| {
-                                    db.set_torrent_location(&cache_hash, &cache_path)
-                                })
-                                .await
-                            {
-                                return (hash, Err(e));
-                            }
-                            Ok(())
-                        }
-                        Err(e) => Err(e),
-                    }
-                }
-                _ => unreachable!("bulk action was validated"),
-            };
-            match res {
-                Ok(_) => {
-                    if let Err(error) = update_cached_lifecycle_state(&state, &hash, &action).await
-                    {
-                        (
-                            hash,
-                            Err(anyhow::anyhow!("cache projection failed: {error}")),
-                        )
-                    } else {
-                        emit_torrent_updated(&state, &hash).await;
-                        if action == "set-category" {
-                            emit(&state, Event::CategoriesUpdated).await;
-                        }
-                        (hash, Ok(()))
-                    }
-                }
-                Err(e) => (hash, Err(e)),
-            }
-        });
+    let mut pending_hashes = hashes.into_iter();
+    for _ in 0..BULK_CONCURRENCY {
+        let Some(hash) = pending_hashes.next() else {
+            break;
+        };
+        spawn_bulk_action(&mut set, &s, hash, &action, category, save_path);
     }
 
     let mut applied = Vec::new();
-    let mut errors = Vec::new();
+    let mut errors = missing_errors;
     while let Some(joined) = set.join_next().await {
         match joined {
             Ok((hash, Ok(()))) => applied.push(hash),
             Ok((hash, Err(e))) => errors.push(format!("{hash}: {e}")),
             Err(join_err) => errors.push(format!("task panicked: {join_err}")),
+        }
+        if let Some(hash) = pending_hashes.next() {
+            spawn_bulk_action(&mut set, &s, hash, &action, category, save_path);
         }
     }
     Json(BulkResult {
@@ -3539,7 +4585,7 @@ pub async fn get_user_agent(State(s): State<AppState>) -> impl IntoResponse {
     match s.backend.get_user_agent().await {
         Ok(ua) => Json(UserAgentResponse { user_agent: ua }).into_response(),
         Err(e) => {
-            tracing::error!(component = "api", operation = "get_user_agent", result = "error", error = %e, "user-agent lookup failed");
+            tracing::error!(component = "api", operation = "get_user_agent", result = "error", error = %crate::url_redaction::redact_display(&e), "user-agent lookup failed");
             StatusCode::INTERNAL_SERVER_ERROR.into_response()
         }
     }
@@ -3580,7 +4626,7 @@ pub async fn set_user_agent(
             Json(UserAgentResponse { user_agent: ua }).into_response()
         }
         Err(e) => {
-            tracing::error!(component = "api", operation = "set_user_agent", result = "error", error = %e, "user-agent update failed");
+            tracing::error!(component = "api", operation = "set_user_agent", result = "error", error = %crate::url_redaction::redact_display(&e), "user-agent update failed");
             record_operator_event(
                 &s,
                 "rtorrent_user_agent_error",
@@ -3600,30 +4646,93 @@ pub async fn set_user_agent(
 }
 
 fn redact_log_url(value: &str) -> String {
-    let lower = value.to_ascii_lowercase();
-    if lower.starts_with("magnet:?") {
-        return "[redacted-magnet]".to_owned();
-    }
-    let without_query = value.split(['?', '#']).next().unwrap_or(value);
-    if without_query.starts_with('/')
-        || without_query.starts_with("~/")
-        || without_query.starts_with("./")
-        || without_query.starts_with("../")
-    {
-        return "[redacted-path]".to_owned();
-    }
-    without_query.to_owned()
+    crate::url_redaction::redact_log_url(value)
+}
+
+fn tracker_failure_summary(action: &str, url: &str) -> String {
+    format!("{action} {}: backend operation failed", redact_log_url(url))
+}
+
+fn rss_magnet_failure_summary(rule_name: &str) -> String {
+    format!("{rule_name}: magnet add failed")
 }
 
 #[cfg(test)]
 mod tests {
+    use axum::http::StatusCode;
+
     use super::{
-        live_row_response, merge_rtorrent_overlay, read_script_output, rtorrent_settings,
-        write_rtorrent_overlay,
+        automation_state_write_status, escape_script_log_output, live_row_response,
+        merge_rtorrent_overlay, metadata_read_status, metadata_write_status,
+        parse_torrent_live_hashes, read_script_output, rss_magnet_failure_summary,
+        rtorrent_overlay_is_writable, rtorrent_settings, statvfs_block_size,
+        tracker_failure_summary, write_rtorrent_overlay, ApplyRssRuleBody, TestRssRuleBody,
+        MAX_RSS_RULE_FIELD_BYTES, MAX_TORRENT_LIVE_HASH_QUERY_BYTES, MAX_TORRENT_LIVE_STATS,
     };
     use crate::cache::TorrentLiveRow;
     use std::collections::BTreeMap;
     use tokio::io::{duplex, AsyncWriteExt};
+
+    #[test]
+    fn tracker_failure_summaries_do_not_echo_tracker_credentials() {
+        let summary = tracker_failure_summary(
+            "remove",
+            "https://user:password@tracker.example/announce/path-secret?passkey=query-secret#fragment-secret",
+        );
+
+        assert_eq!(
+            summary,
+            "remove https://tracker.example/: backend operation failed"
+        );
+        for secret in [
+            "user",
+            "password",
+            "path-secret",
+            "query-secret",
+            "fragment-secret",
+        ] {
+            assert!(!summary.contains(secret), "{summary}");
+        }
+    }
+
+    #[test]
+    fn rss_magnet_failure_summary_does_not_echo_backend_error_or_magnet() {
+        let summary = rss_magnet_failure_summary("Linux ISO");
+        assert_eq!(summary, "Linux ISO: magnet add failed");
+    }
+
+    #[test]
+    fn metadata_capacity_errors_map_to_bounded_service_statuses() {
+        let error = anyhow::Error::new(crate::cache::categories::CategoryTagCapacityError::new(
+            "category",
+        ));
+        assert_eq!(metadata_write_status(&error), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(
+            metadata_read_status(&error),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+    }
+
+    #[test]
+    fn automation_state_capacity_errors_map_to_payload_too_large() {
+        let error = anyhow::Error::new(crate::cache::AutomationStateCapacityError);
+        assert_eq!(
+            automation_state_write_status(&error),
+            StatusCode::PAYLOAD_TOO_LARGE
+        );
+    }
+
+    #[test]
+    fn workflow_script_log_output_escapes_record_and_terminal_controls() {
+        let output = escape_script_log_output(
+            "ok café\nforged\r\n\u{1b}[31m\u{85}\u{2028}\u{2029}\u{202e}\u{2066}".as_bytes(),
+        );
+
+        assert_eq!(
+            output,
+            "ok café\\nforged\\r\\n\\u{1b}[31m\\u{85}\\u{2028}\\u{2029}\\u{202e}\\u{2066}"
+        );
+    }
 
     #[tokio::test]
     async fn workflow_script_output_is_bounded() {
@@ -3644,6 +4753,38 @@ mod tests {
             .unwrap();
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn workflow_script_output_overflow_kills_blocked_child_immediately() {
+        use std::{
+            process::Stdio,
+            time::{Duration, Instant},
+        };
+
+        let mut child = tokio::process::Command::new("sh")
+            .args(["-c", "printf '0123456789'; exec sleep 30"])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .expect("spawn test script");
+        let stdout = child.stdout.take().expect("script stdout");
+        let stderr = child.stderr.take().expect("script stderr");
+        let start = Instant::now();
+
+        let error =
+            super::wait_for_script_output(&mut child, stdout, stderr, 4, Duration::from_secs(10))
+                .await
+                .expect_err("excess output should fail");
+
+        assert!(
+            error.contains("exceeds 4 bytes"),
+            "unexpected error: {error}"
+        );
+        assert!(start.elapsed() < Duration::from_secs(2));
+        assert!(child.try_wait().expect("child status").is_some());
+    }
+
     #[test]
     fn rtorrent_settings_patch_preserves_omitted_values_and_custom_lines() {
         let directory = tempfile::tempdir().unwrap();
@@ -3662,6 +4803,63 @@ mod tests {
     }
 
     #[test]
+    fn rtorrent_overlay_writability_checks_the_actual_directory_and_cleans_probe() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("rtorrent.rc");
+        std::fs::write(&path, "keep this config").unwrap();
+
+        assert!(rtorrent_overlay_is_writable(&path));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "keep this config");
+        assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 1);
+        assert!(!rtorrent_overlay_is_writable(
+            &directory.path().join("missing/rtorrent.rc")
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rtorrent_overlay_writability_rejects_a_read_only_parent() {
+        use std::os::unix::fs::PermissionsExt;
+
+        // Root can create files despite mode bits, so this permission test is
+        // meaningful only when the process is subject to ordinary DAC checks.
+        if unsafe { libc::geteuid() } == 0 {
+            return;
+        }
+
+        let directory = tempfile::tempdir().unwrap();
+        let original = std::fs::metadata(directory.path()).unwrap().permissions();
+        let mut readonly = original.clone();
+        readonly.set_mode(0o500);
+        std::fs::set_permissions(directory.path(), readonly).unwrap();
+        let writable = rtorrent_overlay_is_writable(&directory.path().join("rtorrent.rc"));
+        std::fs::set_permissions(directory.path(), original).unwrap();
+
+        assert!(!writable, "existing read-only parent is not writable");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rtorrent_overlay_replacement_is_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("rtorrent.rc");
+        write_rtorrent_overlay(
+            &path,
+            &rtorrent_settings(),
+            &BTreeMap::new(),
+            "token = secret",
+        )
+        .unwrap();
+
+        assert_eq!(
+            std::fs::metadata(path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+    }
+
+    #[test]
     fn live_stats_zero_expired_rates() {
         let row = TorrentLiveRow {
             hash: "stale".to_owned(),
@@ -3675,5 +4873,75 @@ mod tests {
         assert_eq!(response.download_rate, 0);
         assert_eq!(response.upload_rate, 0);
         assert_eq!(response.amount_left, 75);
+    }
+
+    #[test]
+    fn statvfs_uses_fragment_size_and_only_falls_back_when_zero() {
+        assert_eq!(statvfs_block_size(4_096, 8_192), 4_096);
+        assert_eq!(statvfs_block_size(8_192, 4_096), 8_192);
+        assert_eq!(statvfs_block_size(0, 8_192), 8_192);
+    }
+
+    #[test]
+    fn live_stats_bounds_raw_query_and_counts_duplicates_before_deduplication() {
+        let hash = "a".repeat(40);
+        let within_limit = std::iter::repeat_n(hash.as_str(), MAX_TORRENT_LIVE_STATS)
+            .collect::<Vec<_>>()
+            .join(",");
+        assert_eq!(
+            parse_torrent_live_hashes(Some(&within_limit))
+                .expect("the bounded duplicate list is accepted"),
+            vec![hash.clone()]
+        );
+
+        let too_many = std::iter::repeat_n(hash.as_str(), MAX_TORRENT_LIVE_STATS + 1)
+            .collect::<Vec<_>>()
+            .join(",");
+        assert!(parse_torrent_live_hashes(Some(&too_many))
+            .expect_err("duplicates count toward the request limit")
+            .contains("at most"));
+
+        let oversized_empty_segments = ",".repeat(MAX_TORRENT_LIVE_HASH_QUERY_BYTES + 1);
+        assert!(parse_torrent_live_hashes(Some(&oversized_empty_segments))
+            .expect_err("empty segments must not bypass the raw query cap")
+            .contains("bytes"));
+    }
+
+    #[test]
+    fn rss_sample_fields_are_bounded_during_json_deserialization() {
+        let within_limit = "x".repeat(MAX_RSS_RULE_FIELD_BYTES);
+        let title_only: TestRssRuleBody = serde_json::from_value(serde_json::json!({
+            "title": within_limit,
+        }))
+        .expect("an absent optional link and an exact-limit title are accepted");
+        assert_eq!(title_only.link, None);
+
+        let oversized = "x".repeat(MAX_RSS_RULE_FIELD_BYTES + 1);
+        assert!(
+            serde_json::from_value::<TestRssRuleBody>(serde_json::json!({
+                "title": oversized,
+            }))
+            .is_err()
+        );
+        assert!(
+            serde_json::from_value::<TestRssRuleBody>(serde_json::json!({
+                "title": "valid",
+                "link": oversized,
+            }))
+            .is_err()
+        );
+        assert!(
+            serde_json::from_value::<ApplyRssRuleBody>(serde_json::json!({
+                "title": "valid",
+                "link": oversized,
+            }))
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn live_stats_query_string_deserialization_enforces_its_byte_limit() {
+        assert!(serde_json::from_str::<super::BoundedQueryString<3>>("\"abc\"").is_ok());
+        assert!(serde_json::from_str::<super::BoundedQueryString<3>>("\"abcd\"").is_err());
     }
 }

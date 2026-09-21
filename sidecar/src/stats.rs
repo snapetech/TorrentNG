@@ -1,6 +1,6 @@
 use std::{
-    fs::File,
     io::{BufRead, BufReader, Read},
+    path::Path,
     sync::{
         atomic::{AtomicI64, Ordering},
         Arc,
@@ -16,10 +16,12 @@ use crate::{
     backend::TorrentBackend,
     cache::{AppEventRow, Db},
     rtorrent::TransferRates,
+    safe_file::open_regular_read,
 };
 
 const PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 const LIVE_SPEEDS_MAX_AGE: Duration = Duration::from_secs(60);
+const LIVE_SPEEDS_MAX_FUTURE_SKEW_SECS: i64 = 5;
 const MAX_LIVE_SPEEDS_BYTES: u64 = 64 * 1024;
 const MAX_RTORRENT_CONFIG_PROBE_BYTES: u64 = 256 * 1024;
 const DEFAULT_INCOMING_PORT: u16 = 50000;
@@ -154,7 +156,7 @@ async fn read_live_speeds_async(path: String) -> Option<TransferRates> {
                 component = "stats",
                 operation = "read_live_speeds",
                 result = "error",
-                error = %error,
+                error = %crate::task_join_error_summary("live speed file worker", &error),
                 "live speed file worker failed"
             );
             None
@@ -242,7 +244,7 @@ async fn append_app_event_async(
             operation = "append",
             kind,
             result = "error",
-            error = %e,
+            error = %crate::url_redaction::redact_display(&e),
             "failed to append stats app event"
         );
     }
@@ -280,7 +282,7 @@ fn read_live_speeds(path: &str) -> Option<TransferRates> {
 }
 
 fn read_bounded_text(path: &str, max_bytes: u64) -> std::io::Result<String> {
-    let file = File::open(path)?;
+    let file = open_regular_read(Path::new(path))?;
     let mut bytes = Vec::new();
     file.take(max_bytes.saturating_add(1))
         .read_to_end(&mut bytes)?;
@@ -301,8 +303,9 @@ fn read_bounded_text(path: &str, max_bytes: u64) -> std::io::Result<String> {
 fn is_live_speeds_fresh(updated_at: Option<i64>, legacy_modified_at: Option<SystemTime>) -> bool {
     match updated_at {
         Some(updated_at) => {
-            let age = chrono::Utc::now().timestamp().saturating_sub(updated_at);
-            age <= LIVE_SPEEDS_MAX_AGE.as_secs() as i64
+            let now = chrono::Utc::now().timestamp();
+            updated_at >= now.saturating_sub(LIVE_SPEEDS_MAX_AGE.as_secs() as i64)
+                && updated_at <= now.saturating_add(LIVE_SPEEDS_MAX_FUTURE_SKEW_SECS)
         }
         None => legacy_modified_at
             .and_then(|modified| SystemTime::now().duration_since(modified).ok())
@@ -354,7 +357,7 @@ async fn live_status(backend: &dyn TorrentBackend) -> LiveStatus {
                 component = "stats",
                 operation = "local_status",
                 result = "error",
-                error = %error,
+                error = %crate::task_join_error_summary("local stats probe worker", &error),
                 "local stats probe worker failed"
             );
             LiveStatus {
@@ -391,7 +394,7 @@ fn tcp_socket_counts(port: u16) -> TcpSocketCounts {
 }
 
 fn read_tcp_table(path: &str, port: u16, counts: &mut TcpSocketCounts) {
-    let Ok(file) = File::open(path) else {
+    let Ok(file) = open_regular_read(Path::new(path)) else {
         return;
     };
 
@@ -487,6 +490,13 @@ mod tests {
     fn live_speeds_with_old_timestamp_are_stale() {
         let old = chrono::Utc::now().timestamp() - LIVE_SPEEDS_MAX_AGE.as_secs() as i64 - 1;
         assert!(!is_live_speeds_fresh(Some(old), None));
+    }
+
+    #[test]
+    fn live_speeds_with_far_future_timestamp_are_stale() {
+        let future = chrono::Utc::now().timestamp() + LIVE_SPEEDS_MAX_FUTURE_SKEW_SECS + 1;
+        assert!(!is_live_speeds_fresh(Some(future), None));
+        assert!(!is_live_speeds_fresh(Some(i64::MAX), None));
     }
 
     #[test]

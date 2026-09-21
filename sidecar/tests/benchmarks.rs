@@ -16,6 +16,7 @@ use torrentng::{
 };
 
 const DEFAULT_TORRENTS: usize = 50_000;
+const QBIT_INFO_PAGE_LIMIT: usize = 5_000;
 
 async fn spawn_server_with_db() -> (SocketAddr, Client, Arc<Db>) {
     let cfg = Arc::new(Config::test_default());
@@ -37,14 +38,19 @@ async fn spawn_server_with_db() -> (SocketAddr, Client, Arc<Db>) {
         qbit_search_plugins: Arc::new(tokio::sync::RwLock::new(serde_json::Map::new())),
         qbit_search_jobs: Arc::new(tokio::sync::RwLock::new(serde_json::Map::new())),
         qbit_next_search_id: Arc::new(std::sync::atomic::AtomicU64::new(1)),
-        qbit_rss_items: Arc::new(tokio::sync::RwLock::new(serde_json::Map::new())),
+        login_attempt_limiter: torrentng::auth::LoginAttemptLimiter::default(),
         control_plane_write: Arc::new(tokio::sync::Mutex::new(())),
     };
     let app: Router = torrentng::api::server::build_router(state);
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move {
-        axum::serve(listener, app).await.unwrap();
+        axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<SocketAddr>(),
+        )
+        .await
+        .unwrap();
     });
     let client = Client::builder().cookie_store(true).build().unwrap();
     (addr, client, db)
@@ -101,12 +107,13 @@ async fn bench_qb_torrents_info_50k_under_500ms() {
     let (addr, client, db) = spawn_server_with_db().await;
     let count = torrent_count();
     seed_torrents(&db, count);
+    let requested = count.min(QBIT_INFO_PAGE_LIMIT);
 
     let started = Instant::now();
     let res = client
         .get(url(
             addr,
-            &format!("/api/qb/v2/torrents/info?limit={count}&sort=name"),
+            &format!("/api/qb/v2/torrents/info?limit={requested}&sort=name"),
         ))
         .send()
         .await
@@ -114,8 +121,10 @@ async fn bench_qb_torrents_info_50k_under_500ms() {
     let elapsed = started.elapsed();
     assert_eq!(res.status(), 200);
     let body: Vec<serde_json::Value> = res.json().await.unwrap();
-    assert_eq!(body.len(), count);
-    println!("qBit torrents/info {count} rows: {elapsed:?}");
+    assert_eq!(body.len(), requested);
+    println!(
+        "qBit torrents/info corpus={count}, page={requested} rows: {elapsed:?}"
+    );
     assert!(
         elapsed.as_millis() < 500,
         "qBit torrents/info exceeded 500ms target: {elapsed:?}"
@@ -128,12 +137,14 @@ async fn bench_qb_sync_maindata_delta_under_50ms() {
     let (addr, client, db) = spawn_server_with_db().await;
     let count = torrent_count();
     seed_torrents(&db, count);
+    let revision = db.current_revision().unwrap();
+    let rid = revision.saturating_sub(100);
 
     let started = Instant::now();
     let res = client
         .get(url(
             addr,
-            &format!("/api/qb/v2/sync/maindata?rid={}", count.saturating_sub(100)),
+            &format!("/api/qb/v2/sync/maindata?rid={rid}"),
         ))
         .send()
         .await
@@ -142,7 +153,7 @@ async fn bench_qb_sync_maindata_delta_under_50ms() {
     assert_eq!(res.status(), 200);
     let body: serde_json::Value = res.json().await.unwrap();
     assert_eq!(body["full_update"], false);
-    println!("qBit sync/maindata delta at {count} rows: {elapsed:?}");
+    println!("qBit sync/maindata corpus={count}, rid={rid}: {elapsed:?}");
     assert!(
         elapsed.as_millis() < 50,
         "qBit sync/maindata delta exceeded 50ms target: {elapsed:?}"
