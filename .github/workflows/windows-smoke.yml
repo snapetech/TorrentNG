@@ -17,15 +17,18 @@ permissions:
 jobs:
   smoke:
     timeout-minutes: 45
-    runs-on: [self-hosted, Windows, X64, packer-windows]
+    runs-on: windows-latest
     defaults:
       run:
         shell: powershell
     steps:
       - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.pull_request.merge_commit_sha || github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
 
       - name: Select Rust toolchain
-        run: rustup default stable
+        uses: dtolnay/rust-toolchain@stable
 
       - uses: actions/setup-node@v7
         with:

@@ -18,10 +18,13 @@ jobs:
   native-quality:
     name: TorrentNG client quality
     timeout-minutes: 60
-    runs-on: [self-hosted, Linux, X64]
+    runs-on: ${{ github.event_name == 'push' && fromJSON('["self-hosted","Linux","X64"]') || fromJSON('["ubuntu-latest"]') }}
     steps:
       - name: Checkout
         uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.pull_request.merge_commit_sha || github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -31,6 +34,9 @@ jobs:
 
       - name: Validate TorrentNG API contract
         run: python3 scripts/validate_openapi.py
+
+      - name: Test protected API target and load-runner boundaries
+        run: python3 -m unittest scripts.test_protected_target scripts.test_backend_burndown_api_load scripts.test_workflow_security
 
       - name: Test TorrentNG client workspace
         run: cargo test --workspace --all-targets --locked
@@ -52,6 +58,9 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.pull_request.merge_commit_sha || github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -80,6 +89,9 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.pull_request.merge_commit_sha || github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -93,7 +105,7 @@ jobs:
           set -euo pipefail
           TORRENTNGD_CONFIG=certification/fixtures/backend-burndown-native-release-smoke.toml \
           TNG_STATIC_DIR=sidecar/static \
-            target/release/torrentngd > /tmp/torrentng-api-load-${GITHUB_RUN_ID}.log 2>&1 &
+            target/release/torrentngd > "/tmp/torrentng-api-load-${GITHUB_RUN_ID}.log" 2>&1 &
           pid=$!
           cleanup() {
             kill -TERM "$pid" 2>/dev/null || true
@@ -130,20 +142,17 @@ jobs:
             /tmp/torrentng-api-load-${{ github.run_id }}.log
           if-no-files-found: warn
 
-  # TNG-025: the empirically-verified MSRV floor for this workspace's
-  # locked dependency graph (see docs/BACKEND_AUDIT_BURN_DOWN.md) is
-  # 1.88, declared in Cargo.toml's `rust-version` -- but `native-quality`
-  # above tracks `@stable` (whatever's current), so nothing in CI actually
-  # builds against the floor itself. Without this, MSRV drift (a
-  # transitive dependency bump that needs a newer compiler than declared)
-  # is only caught if someone happens to run it locally, which is exactly
-  # how this session found .clippy.toml's own MSRV had drifted stale.
+  # TNG-025: native-quality tracks stable; this separate gate builds and
+  # tests the locked workspace at the declared Rust 1.88 MSRV.
   msrv-check:
     timeout-minutes: 60
-    runs-on: [self-hosted, Linux, X64]
+    runs-on: ${{ github.event_name == 'push' && fromJSON('["self-hosted","Linux","X64"]') || fromJSON('["ubuntu-latest"]') }}
     steps:
       - name: Checkout
         uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.pull_request.merge_commit_sha || github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
 
       - name: Install Rust 1.88.0 (declared MSRV)
         uses: dtolnay/rust-toolchain@1.88.0
@@ -160,10 +169,13 @@ jobs:
   msrv-check-sidecar:
     name: Compatible-client service MSRV gate
     timeout-minutes: 30
-    runs-on: [self-hosted, Linux, X64]
+    runs-on: ${{ github.event_name == 'push' && fromJSON('["self-hosted","Linux","X64"]') || fromJSON('["ubuntu-latest"]') }}
     steps:
       - name: Checkout
         uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.pull_request.merge_commit_sha || github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
 
       - name: Install Rust 1.97.0 (compatible-client service declared MSRV)
         uses: dtolnay/rust-toolchain@1.97.0
@@ -176,10 +188,13 @@ jobs:
 
   fuzz-smoke:
     timeout-minutes: 30
-    runs-on: [self-hosted, Linux, X64]
+    runs-on: ${{ github.event_name == 'push' && fromJSON('["self-hosted","Linux","X64"]') || fromJSON('["ubuntu-latest"]') }}
     steps:
       - name: Checkout
         uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.pull_request.merge_commit_sha || github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
 
       - name: Install Rust nightly
         uses: dtolnay/rust-toolchain@nightly
@@ -253,10 +268,13 @@ jobs:
   sidecar:
     name: Compatible-client service quality
     timeout-minutes: 30
-    runs-on: [self-hosted, Linux, X64]
+    runs-on: ${{ github.event_name == 'push' && fromJSON('["self-hosted","Linux","X64"]') || fromJSON('["ubuntu-latest"]') }}
     steps:
       - name: Checkout
         uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.pull_request.merge_commit_sha || github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -269,10 +287,13 @@ jobs:
 
   webui:
     timeout-minutes: 20
-    runs-on: [self-hosted, Linux, X64]
+    runs-on: ${{ github.event_name == 'push' && fromJSON('["self-hosted","Linux","X64"]') || fromJSON('["ubuntu-latest"]') }}
     steps:
       - name: Checkout
         uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.pull_request.merge_commit_sha || github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
 
       - name: Setup Node
         uses: actions/setup-node@v7
@@ -307,6 +328,9 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.pull_request.merge_commit_sha || github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -334,6 +358,9 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.pull_request.merge_commit_sha || github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -342,7 +369,10 @@ jobs:
         run: cargo install cargo-audit --locked
 
       - name: Audit Rust dependencies
-        run: cargo audit
+        run: |
+          cargo audit --file Cargo.lock
+          cargo audit --file sidecar/Cargo.lock
+          cargo audit --file fuzz/Cargo.lock
 
       - name: Setup Node
         uses: actions/setup-node@v7
