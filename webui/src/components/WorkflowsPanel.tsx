@@ -1,7 +1,7 @@
 import { useState } from 'react'
 import { useQuery, useQueryClient } from '@tanstack/react-query'
 import { api } from '../api/client'
-import { maskAnnounceUrl } from '../lib/maskUrl'
+import { maskAnnounceUrl, redactUrlForDisplay } from '../lib/maskUrl'
 import type { WorkflowRule, WorkflowRun } from '../api/client'
 
 const EMPTY: WorkflowRule = {
@@ -11,6 +11,7 @@ const EMPTY: WorkflowRule = {
   event: 'completed',
   action: 'webhook',
   category: null,
+  target_category: null,
   tracker: null,
   command: null,
   url: null,
@@ -44,6 +45,7 @@ export function WorkflowsPanel() {
         ...draft,
         name: draft.name.trim(),
         category: draft.category?.trim() || null,
+        target_category: draft.target_category?.trim() || null,
         tracker: draft.tracker?.trim() || null,
         command: draft.command?.trim() || null,
         url: draft.url?.trim() || null,
@@ -77,10 +79,12 @@ export function WorkflowsPanel() {
     setPreview(null)
     try {
       const result = await api.workflows.run(rule.id, dryRun)
+      const appliedCount = result.applied_total ?? result.applied.length
+      const errorCount = result.errors_total ?? result.errors.length
       if (dryRun) {
-        setPreview({ name: rule.name, count: result.applied.length })
-      } else if (result.errors.length > 0) {
-        setError(`${result.errors.length} error(s) running ${rule.name}`)
+        setPreview({ name: rule.name, count: appliedCount })
+      } else if (errorCount > 0) {
+        setError(`${errorCount} error(s) running ${rule.name}`)
       }
       qc.invalidateQueries({ queryKey: ['workflow-runs'] })
     } catch (e) {
@@ -108,13 +112,18 @@ export function WorkflowsPanel() {
             <Field label="Name"><Input value={draft.name} placeholder="notify complete" onChange={name => setDraft({ ...draft, name })} /></Field>
             <Field label="Event"><Select value={draft.event} onChange={event => setDraft({ ...draft, event: event as WorkflowRule['event'] })} options={['completed', 'added', 'category_changed']} /></Field>
             <Field label="Action"><Select value={draft.action} onChange={action => setDraft({ ...draft, action: action as WorkflowRule['action'] })} options={['webhook', 'script', 'set_category', 'set_location']} /></Field>
-            <Field label="Filter"><Input value={draft.category ?? ''} placeholder="category" onChange={category => setDraft({ ...draft, category })} /></Field>
-            <Field label="Target"><Input value={draft.url ?? draft.command ?? draft.target_path ?? ''} placeholder="URL, command, or path" onChange={value => setDraft({
+            <Field label="Category filter"><Input value={draft.category ?? ''} placeholder="any category" onChange={category => setDraft({ ...draft, category })} /></Field>
+            <Field label={draft.action === 'set_category' ? 'Target category' : 'Target'}><Input value={
+              draft.action === 'webhook' ? draft.url ?? '' :
+              draft.action === 'script' ? draft.command ?? '' :
+              draft.action === 'set_category' ? draft.target_category ?? '' :
+              draft.target_path ?? ''
+            } placeholder={draft.action === 'set_category' ? 'category name' : 'URL, command, or path'} onChange={value => setDraft({
               ...draft,
               url: draft.action === 'webhook' ? value : null,
               command: draft.action === 'script' ? value : null,
               target_path: draft.action === 'set_location' ? value : null,
-              category: draft.action === 'set_category' ? value : draft.category,
+              target_category: draft.action === 'set_category' ? value : null,
             })} /></Field>
             <button type="button" onClick={save} disabled={!draft.name.trim() || Boolean(pending)} style={primaryButton(!draft.name.trim() || Boolean(pending))}>{pending === '__save__' ? 'Saving…' : 'Save'}</button>
           </div>
@@ -149,7 +158,7 @@ export function WorkflowsPanel() {
             <Pill tone={rule.enabled ? 'ok' : 'idle'}>{rule.action}</Pill>
             <span style={{ color: 'var(--faint)' }}>{rule.category || 'any category'}</span>
             <span style={{ color: 'var(--faint)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-              {rule.url || rule.command || rule.target_path || (rule.tracker ? maskAnnounceUrl(rule.tracker) : null) || 'configured'}
+              {rule.url ? redactUrlForDisplay(rule.url) : rule.command || rule.target_path || rule.target_category || (rule.tracker ? maskAnnounceUrl(rule.tracker) : null) || 'configured'}
             </span>
             <button type="button" onClick={() => run(rule, true)} disabled={Boolean(pending)} style={{
               background: 'none', border: '1px solid var(--border-strong)', borderRadius: 4,
@@ -207,10 +216,13 @@ const scrollX: React.CSSProperties = {
 }
 
 function WorkflowRunRow({ run }: { run: WorkflowRun }) {
-  const status = run.errors.length > 0 ? `${run.errors.length} error(s)` : run.dry_run ? 'previewed' : 'completed'
-  const tone = run.errors.length > 0 ? 'error' : run.dry_run ? 'info' : 'ok'
+  const matchedCount = run.matched_total ?? run.matched.length
+  const appliedCount = run.applied_total ?? run.applied.length
+  const errorCount = run.errors_total ?? run.errors.length
+  const status = errorCount > 0 ? `${errorCount} error(s)` : run.dry_run ? 'previewed' : 'completed'
+  const tone = errorCount > 0 ? 'error' : run.dry_run ? 'info' : 'ok'
   return (
-    <div className="tng-automation-row" data-enabled={run.errors.length === 0 ? 'true' : 'false'} style={{
+    <div className="tng-automation-row" data-enabled={errorCount === 0 ? 'true' : 'false'} style={{
       display: 'grid', gridTemplateColumns: '150px 120px 90px 90px 90px 1fr',
       minWidth: 760,
       gap: 8, alignItems: 'center', border: '1px solid var(--border)',
@@ -220,8 +232,8 @@ function WorkflowRunRow({ run }: { run: WorkflowRun }) {
         {run.rule_name}
       </strong>
       <span style={{ color: 'var(--muted)' }}>{run.action}</span>
-      <span style={{ color: 'var(--faint)' }}>{run.matched.length.toLocaleString()} matched</span>
-      <span style={{ color: 'var(--faint)' }}>{run.applied.length.toLocaleString()} applied</span>
+      <span style={{ color: 'var(--faint)' }}>{matchedCount.toLocaleString()} matched</span>
+      <span style={{ color: 'var(--faint)' }}>{appliedCount.toLocaleString()} applied</span>
       <Pill tone={tone}>{status}</Pill>
       <span style={{ color: 'var(--faint)', textAlign: 'right' }}>
         {new Date(run.started_at * 1000).toLocaleString()}

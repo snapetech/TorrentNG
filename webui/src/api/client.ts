@@ -297,6 +297,13 @@ async function login(username: string, password: string): Promise<void> {
     credentials: 'same-origin',
   })
   const text = await res.text()
+  if (res.status === 429) {
+    const retryAfter = Number(res.headers.get('Retry-After'))
+    const message = Number.isSafeInteger(retryAfter) && retryAfter > 0
+      ? `Too many login attempts. Try again in ${retryAfter} seconds.`
+      : 'Too many login attempts. Please try again later.'
+    throw new AuthError(message)
+  }
   if (!res.ok || text.trim() !== 'Ok.') {
     throw new AuthError('Invalid username or password')
   }
@@ -319,6 +326,10 @@ export interface BulkResult {
   applied: string[]
   errors: string[]
   dry_run: boolean
+  matched?: string[]
+  matched_total?: number
+  applied_total?: number
+  errors_total?: number
 }
 
 export interface BulkOptions {
@@ -651,6 +662,7 @@ export interface WorkflowRule {
   event: 'completed' | 'added' | 'category_changed'
   action: 'webhook' | 'script' | 'set_category' | 'set_location'
   category: string | null
+  target_category: string | null
   tracker: string | null
   command: string | null
   url: string | null
@@ -661,11 +673,14 @@ export interface WorkflowRun {
   id: string
   rule_id: string
   rule_name: string
-  action: WorkflowRule['action']
+  action: string
   dry_run: boolean
   matched: string[]
+  matched_total?: number
   applied: string[]
+  applied_total?: number
   errors: string[]
+  errors_total?: number
   started_at: number
 }
 
