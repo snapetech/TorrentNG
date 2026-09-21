@@ -51,9 +51,10 @@ use crate::torrent_task::{
     TorrentCmd, UtpPeerIo,
 };
 use crate::tracker_runtime::{
-    announce_tracker, protocol_numwant, TrackerAnnounceContext, TrackerAnnounceResult,
-    TrackerAnnounceSpec, TrackerWorkers, MAX_TRACKER_ANNOUNCES_IN_FLIGHT,
-    STOPPED_TRACKER_ANNOUNCE_DEADLINE,
+    announce_tracker, first_tracker_key, next_tracker_key, protocol_numwant,
+    tracker_keys_for_announce, tracker_keys_for_stopped_announce, url_log_target,
+    TrackerAnnounceContext, TrackerAnnounceResult, TrackerAnnounceSpec, TrackerKey, TrackerWorkers,
+    MAX_TRACKER_ANNOUNCES_IN_FLIGHT, STOPPED_TRACKER_ANNOUNCE_DEADLINE,
 };
 use crate::{EnginePeerSnapshot, EngineTorrentLimits, EngineWebseedSnapshot, TorrentRuntimeStats};
 
@@ -360,6 +361,14 @@ struct V2PeerHandle {
     _bitmap_memory_lease: MemoryLease,
 }
 
+async fn join_aborted_v2_peer_task(task: tokio::task::JoinHandle<()>, operation: &'static str) {
+    if let Err(error) = task.await {
+        if error.is_panic() {
+            crate::log_task_join_error("torrent_v2", operation, "peer task", &error);
+        }
+    }
+}
+
 #[derive(Debug)]
 enum V2PeerEvent {
     Downloaded { peer: SocketAddr, bytes: u64 },
@@ -541,6 +550,7 @@ pub struct V2TorrentTask {
     file_policy: Arc<HashMap<u32, (bool, i64)>>,
     tracker_tiers: Vec<Vec<TrackerState>>,
     active_tracker_tier: usize,
+    private_tracker_key: Option<TrackerKey>,
     tracker_event: TrackerEvent,
     tracker_workers: TrackerWorkers,
     listen_port: u16,
@@ -642,6 +652,11 @@ impl V2TorrentTask {
             );
             tracker_tiers.clear();
         }
+        let private_tracker_key = if meta.private {
+            first_tracker_key(&tracker_tiers)
+        } else {
+            None
+        };
         let meta = Arc::new(meta);
         let spans = meta
             .files
@@ -697,6 +712,7 @@ impl V2TorrentTask {
             file_policy: Arc::new(HashMap::new()),
             tracker_tiers,
             active_tracker_tier: 0,
+            private_tracker_key,
             tracker_event: TrackerEvent::Started,
             tracker_workers: TrackerWorkers::new(),
             listen_port,
@@ -1194,9 +1210,24 @@ impl V2TorrentTask {
     }
 
     fn schedule_trackers_now(&mut self) {
-        for tier in &mut self.tracker_tiers {
-            for tracker in tier {
-                tracker.schedule_immediate();
+        if self.meta.private {
+            if let Some(key) = self
+                .private_tracker_key
+                .or_else(|| first_tracker_key(&self.tracker_tiers))
+            {
+                if let Some(tracker) = self
+                    .tracker_tiers
+                    .get_mut(key.0)
+                    .and_then(|tier| tier.get_mut(key.1))
+                {
+                    tracker.schedule_immediate();
+                }
+            }
+        } else {
+            for tier in &mut self.tracker_tiers {
+                for tracker in tier {
+                    tracker.schedule_immediate();
+                }
             }
         }
     }
@@ -1208,11 +1239,19 @@ impl V2TorrentTask {
         let tier_index = self
             .active_tracker_tier
             .min(self.tracker_tiers.len().saturating_sub(1));
-        let Some(tier) = self.tracker_tiers.get_mut(tier_index) else {
-            return;
-        };
-        for tracker in tier {
-            tracker.schedule_immediate();
+        for (selected_tier, tracker_index) in tracker_keys_for_announce(
+            &self.tracker_tiers,
+            tier_index,
+            self.meta.private,
+            self.private_tracker_key,
+        ) {
+            if let Some(tracker) = self
+                .tracker_tiers
+                .get_mut(selected_tier)
+                .and_then(|tier| tier.get_mut(tracker_index))
+            {
+                tracker.schedule_immediate();
+            }
         }
     }
 
@@ -1224,9 +1263,17 @@ impl V2TorrentTask {
             return Err("pure-v2 tracker state allocation denied".to_owned());
         }
         self.tracker_workers.cancel();
+        if self.meta.private {
+            self.disconnect_private_tracker_peers().await;
+        }
         self.known_tracker_peers.clear();
         self.tracker_tiers = tracker_tiers;
-        self.active_tracker_tier = 0;
+        self.private_tracker_key = if self.meta.private {
+            first_tracker_key(&self.tracker_tiers)
+        } else {
+            None
+        };
+        self.active_tracker_tier = self.private_tracker_key.map_or(0, |(tier, _)| tier);
         self.tracker_event = TrackerEvent::Empty;
         self._tracker_state_memory_lease = tracker_state_memory_lease;
         self.schedule_trackers_now();
@@ -1250,20 +1297,24 @@ impl V2TorrentTask {
         if available == 0 {
             return;
         }
-        let specs = self.tracker_tiers[tier_idx]
-            .iter()
-            .enumerate()
-            .filter(|(index, tracker)| {
-                tracker.is_due() && !self.tracker_workers.contains((tier_idx, *index))
-            })
-            .take(available)
-            .map(|(index, tracker)| TrackerAnnounceSpec {
-                key: (tier_idx, index),
+        let specs = tracker_keys_for_announce(
+            &self.tracker_tiers,
+            tier_idx,
+            self.meta.private,
+            self.private_tracker_key,
+        )
+        .into_iter()
+        .filter_map(|key @ (selected_tier, tracker_index)| {
+            let tracker = self.tracker_tiers.get(selected_tier)?.get(tracker_index)?;
+            (tracker.is_due() && !self.tracker_workers.contains(key)).then(|| TrackerAnnounceSpec {
+                key,
                 url: tracker.url.clone(),
                 tracker_id: tracker.tracker_id.clone(),
                 event: self.tracker_event,
             })
-            .collect::<Vec<_>>();
+        })
+        .take(available)
+        .collect::<Vec<_>>();
         if specs.is_empty() {
             return;
         }
@@ -1309,6 +1360,7 @@ impl V2TorrentTask {
         else {
             return;
         };
+        let failed = result.response.is_err();
         match result.response {
             Ok(response) => {
                 let peers = response
@@ -1328,18 +1380,69 @@ impl V2TorrentTask {
             Err(error) => {
                 tracker.on_failure(error);
                 let _ = self.persist_tracker_state().await;
-                if self.tracker_tiers.get(tier_idx).is_some_and(|tier| {
-                    !tier.is_empty()
-                        && tier
-                            .iter()
-                            .all(|tracker| matches!(tracker.status, TrackerStatus::Error(_)))
-                }) {
-                    self.active_tracker_tier = self
-                        .active_tracker_tier
-                        .saturating_add(1)
-                        .min(self.tracker_tiers.len().saturating_sub(1));
-                }
             }
+        }
+        if self.meta.private {
+            if failed {
+                self.advance_private_tracker_after_failure((tier_idx, tracker_idx))
+                    .await;
+            }
+        } else if failed
+            && self.tracker_tiers.get(tier_idx).is_some_and(|tier| {
+                !tier.is_empty()
+                    && tier
+                        .iter()
+                        .all(|tracker| matches!(tracker.status, TrackerStatus::Error(_)))
+            })
+        {
+            self.active_tracker_tier = self
+                .active_tracker_tier
+                .saturating_add(1)
+                .min(self.tracker_tiers.len().saturating_sub(1));
+        }
+    }
+
+    async fn advance_private_tracker_after_failure(&mut self, failed: TrackerKey) {
+        if self.private_tracker_key != Some(failed) {
+            return;
+        }
+        let Some(next) = next_tracker_key(&self.tracker_tiers, failed) else {
+            return;
+        };
+        if next == failed {
+            return;
+        }
+
+        self.tracker_workers.cancel();
+        self.disconnect_private_tracker_peers().await;
+        self.private_tracker_key = Some(next);
+        self.active_tracker_tier = next.0;
+        if let Some(tracker) = self
+            .tracker_tiers
+            .get_mut(next.0)
+            .and_then(|tier| tier.get_mut(next.1))
+        {
+            tracker.schedule_immediate();
+        }
+        debug!(
+            component = "tracker",
+            operation = "private_failover",
+            torrent = %self.info_hash_hex,
+            from_tier = failed.0,
+            to_tier = next.0,
+            result = "switched",
+            "private torrent advanced to the next tracker after failure"
+        );
+    }
+
+    async fn disconnect_private_tracker_peers(&mut self) {
+        self.known_tracker_peers.clear();
+        let peers = std::mem::take(&mut self.peers);
+        for peer in peers.values() {
+            peer.abort.abort();
+        }
+        for (_, peer) in peers {
+            join_aborted_v2_peer_task(peer.task, "disconnect_private_tracker_peers").await;
         }
     }
 
@@ -1347,23 +1450,22 @@ impl V2TorrentTask {
         if !consume_v2_stopped_announce(&mut self.stopped_announced) {
             return;
         }
-        let candidates = self
-            .tracker_tiers
-            .iter()
-            .enumerate()
-            .flat_map(|(tier_index, tier)| {
-                tier.iter()
-                    .enumerate()
-                    .map(move |(tracker_index, tracker)| {
-                        (
-                            tier_index,
-                            tracker_index,
-                            tracker.url.clone(),
-                            tracker.tracker_id.clone(),
-                        )
-                    })
-            })
-            .collect::<Vec<_>>();
+        let candidates = tracker_keys_for_stopped_announce(
+            &self.tracker_tiers,
+            self.meta.private,
+            self.private_tracker_key,
+        )
+        .into_iter()
+        .filter_map(|(tier_index, tracker_index)| {
+            let tracker = self.tracker_tiers.get(tier_index)?.get(tracker_index)?;
+            Some((
+                tier_index,
+                tracker_index,
+                tracker.url.clone(),
+                tracker.tracker_id.clone(),
+            ))
+        })
+        .collect::<Vec<_>>();
         if candidates.is_empty() {
             return;
         }
@@ -1428,7 +1530,7 @@ impl V2TorrentTask {
                         component = "tracker",
                         operation = "announce_stopped",
                         torrent = %self.info_hash_hex,
-                        tracker = %url,
+                        tracker = %url_log_target(&url),
                         result = "error",
                         error = %error,
                         "pure-v2 stopped tracker announce failed"
@@ -1778,6 +1880,18 @@ impl V2TorrentTask {
             if self.peers.len() >= self.peer_capacity() {
                 break;
             }
+            if let Err(error) = self.egress_policy.validate_peer_addr(peer) {
+                debug!(
+                    component = "torrent_v2",
+                    operation = "connect_peer",
+                    peer = %peer,
+                    result = "rejected",
+                    reason = "egress_address_policy",
+                    error = %error,
+                    "skipping outgoing peer denied by address policy"
+                );
+                continue;
+            }
             if self.peers.contains_key(&peer)
                 || self.registry.read().await.is_peer_banned(peer)
                 || !private_peer_source_allowed(self.meta.private, &self.known_tracker_peers, peer)
@@ -1839,11 +1953,27 @@ impl V2TorrentTask {
     }
 
     async fn connect_priority_peers(&mut self, peers: Vec<SocketAddr>) {
-        let preferred = peers
+        let mut allowed_peers = Vec::with_capacity(peers.len());
+        for peer in peers {
+            if let Err(error) = self.egress_policy.validate_peer_addr(peer) {
+                debug!(
+                    component = "torrent_v2",
+                    operation = "connect_priority",
+                    peer = %peer,
+                    result = "rejected",
+                    reason = "egress_address_policy",
+                    error = %error,
+                    "skipping priority peer denied by address policy"
+                );
+                continue;
+            }
+            allowed_peers.push(peer);
+        }
+        let preferred = allowed_peers
             .iter()
             .copied()
             .collect::<std::collections::HashSet<_>>();
-        for peer in peers {
+        for peer in allowed_peers {
             if self.peers.len() >= self.peer_capacity() {
                 let victim = self
                     .peers
@@ -2014,7 +2144,7 @@ impl V2TorrentTask {
             return;
         };
         handle.abort.abort();
-        let _ = handle.task.await;
+        join_aborted_v2_peer_task(handle.task, "remove_peer").await;
     }
 
     async fn shutdown_peers(&mut self) {
@@ -2023,7 +2153,7 @@ impl V2TorrentTask {
             handle.abort.abort();
         }
         for (_, handle) in peers {
-            let _ = handle.task.await;
+            join_aborted_v2_peer_task(handle.task, "shutdown_peers").await;
         }
     }
 
@@ -3418,6 +3548,77 @@ mod tests {
                 vec!["https://backup-b.example/announce"],
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn private_tracker_failover_disconnects_v2_peers_and_clears_allowlist() {
+        let temp = tempfile::tempdir().unwrap();
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        rt_db::migrate(&conn).unwrap();
+        let db = DbExecutor::direct(Arc::new(Mutex::new(conn)));
+        let resources = ResourceGovernor::new(Default::default());
+        let meta = TorrentMetaV2 {
+            info_hash_v2: [27; 32],
+            announce: Some("https://tracker-a.example/announce".to_owned()),
+            announce_list: vec![vec![
+                "https://tracker-a.example/announce".to_owned(),
+                "https://tracker-b.example/announce".to_owned(),
+            ]],
+            webseeds: Vec::new(),
+            comment: None,
+            created_by: None,
+            creation_date: None,
+            name: "private-v2-failover.bin".to_owned(),
+            piece_length: 16 * 1024,
+            files: Vec::new(),
+            piece_layers: HashMap::new(),
+            private: true,
+            raw: Vec::new(),
+        };
+        let (_cmd_tx, cmd_rx) = mpsc::channel(1);
+        let mut task = V2TorrentTask::new(
+            meta,
+            temp.path().to_path_buf(),
+            false,
+            TorrentState::Downloading,
+            Arc::new(RwLock::new(SessionRegistry::new())),
+            db,
+            resources.clone(),
+            cmd_rx,
+            8,
+            1024 * 1024,
+            StorageIoConfig::default(),
+            OutboundEgressPolicy::default(),
+            6881,
+            10,
+            10,
+            60,
+            GlobalNetworkBudget::unlimited(),
+            None,
+            None,
+        )
+        .await;
+
+        let peer: SocketAddr = "127.0.0.1:6881".parse().unwrap();
+        let peer_task = tokio::spawn(std::future::pending::<()>());
+        let abort = peer_task.abort_handle();
+        task.peers.insert(
+            peer,
+            V2PeerHandle {
+                state: Arc::new(Mutex::new(V2PeerState::new(0))),
+                task: peer_task,
+                abort,
+                _bitmap_memory_lease: resources.try_acquire(MemoryClass::PeerBuffer, 1).unwrap(),
+            },
+        );
+        task.known_tracker_peers.insert(peer);
+
+        task.advance_private_tracker_after_failure((0, 0)).await;
+
+        assert_eq!(task.private_tracker_key, Some((0, 1)));
+        assert!(task.peers.is_empty());
+        assert!(task.known_tracker_peers.is_empty());
+        assert!(task.tracker_tiers[0][1].is_due());
     }
 
     #[test]

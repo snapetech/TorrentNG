@@ -12,7 +12,7 @@ use axum::{
 
 use crate::{handlers::*, state::AppState};
 use rt_api_model::{
-    api_token_allowed, csrf_request_allowed, has_session_cookie, request_fingerprint,
+    api_token_allowed, bearer_token, csrf_request_allowed, has_session_cookie, request_fingerprint,
     valid_idempotency_key, CachedResponse, IdempotencyClaim, MAX_IDEMPOTENCY_BODY_BYTES,
 };
 use tower::limit::GlobalConcurrencyLimitLayer;
@@ -176,8 +176,7 @@ async fn qbit_auth_guard(
         return next.run(req).await;
     }
 
-    if qbit_bearer_token(req.headers())
-        .is_some_and(|token| api_token_allowed(&state.api_tokens, &token))
+    if bearer_token(req.headers()).is_some_and(|token| api_token_allowed(&state.api_tokens, &token))
     {
         return next.run(req).await;
     }
@@ -212,24 +211,27 @@ fn is_mutating_request(req: &Request<Body>) -> bool {
 }
 
 fn qbit_public_path(path: &str) -> bool {
-    path.ends_with("/auth/login") || path.ends_with("/auth/logout")
+    matches!(
+        path,
+        // `route_layer` runs inside the nested router and normally sees the
+        // route-relative path. Keep the outer forms exact as well for direct
+        // middleware composition and tests.
+        "/auth/login"
+            | "/auth/logout"
+            | "/api/qb/v2/auth/login"
+            | "/api/qb/v2/auth/logout"
+            | "/api/v2/auth/login"
+            | "/api/v2/auth/logout"
+    )
 }
 
 fn qbit_presented_token(headers: &HeaderMap) -> Option<String> {
-    qbit_bearer_token(headers).or_else(|| {
+    bearer_token(headers).or_else(|| {
         headers
             .get(header::COOKIE)
             .and_then(|value| value.to_str().ok())
             .and_then(qbit_sid_cookie)
     })
-}
-
-fn qbit_bearer_token(headers: &HeaderMap) -> Option<String> {
-    headers
-        .get(header::AUTHORIZATION)
-        .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.strip_prefix("Bearer "))
-        .map(str::to_owned)
 }
 
 fn qbit_sid_cookie(cookie: &str) -> Option<String> {
@@ -409,4 +411,30 @@ fn qbit_routes(large_body_limit: GlobalConcurrencyLimitLayer) -> Router<AppState
         .route("/rss/setRule", post(rss_set_rule))
         .route("/rss/renameRule", post(rss_rename_rule))
         .route("/rss/removeRule", post(rss_remove_rule))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::qbit_public_path;
+
+    #[test]
+    fn qbit_public_auth_paths_are_exact() {
+        for path in [
+            "/auth/login",
+            "/auth/logout",
+            "/api/qb/v2/auth/login",
+            "/api/qb/v2/auth/logout",
+            "/api/v2/auth/login",
+            "/api/v2/auth/logout",
+        ] {
+            assert!(qbit_public_path(path), "{path} should be public");
+        }
+        for path in [
+            "/api/qb/v2/nested/auth/login",
+            "/api/v2/auth/logout/extra",
+            "/api/v2/not-auth/login",
+        ] {
+            assert!(!qbit_public_path(path), "{path} should remain protected");
+        }
+    }
 }

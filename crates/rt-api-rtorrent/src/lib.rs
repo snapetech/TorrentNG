@@ -9,7 +9,7 @@ use rt_engine::{
     EngineGlobalLimits, EngineHandle, EnginePeerSnapshot, EngineTorrentFile, EngineTorrentLimits,
     EngineTorrentMetadata, EngineTrackerSnapshot,
 };
-use rt_metainfo::{parse_magnet, parse_torrent};
+use rt_metainfo::{parse_magnet, parse_torrent, MAX_TORRENT_BYTES};
 use rt_metrics::{MemoryClass, MemoryLease};
 use rt_session::{SessionRegistry, TorrentEntry};
 use serde_json::Value;
@@ -411,8 +411,9 @@ async fn load_rtorrent_limit_projections(
             });
         }
         while let Some(result) = tasks.join_next().await {
-            let (hash, projection) = result
-                .map_err(|error| format!("rTorrent runtime projection task failed: {error}"))??;
+            let (hash, projection) = result.map_err(|error| {
+                rt_engine::task_join_error_summary("rTorrent runtime projection task", &error)
+            })??;
             limits.insert(hash, projection);
         }
     }
@@ -993,9 +994,29 @@ fn load_torrent_bytes(method: &str, payload: &str) -> Result<Vec<u8>, String> {
             "path-based rTorrent loads are unsupported at this library boundary; use load.raw or load.raw_start with embedded metainfo".to_owned(),
         );
     }
-    general_purpose::STANDARD
+    decode_base64_torrent_payload(payload, MAX_TORRENT_BYTES)
+}
+
+fn decode_base64_torrent_payload(payload: &str, max_raw_bytes: usize) -> Result<Vec<u8>, String> {
+    let max_encoded_bytes = max_raw_bytes
+        .checked_add(2)
+        .and_then(|bytes| bytes.checked_div(3))
+        .and_then(|chunks| chunks.checked_mul(4))
+        .ok_or_else(|| "torrent payload size limit overflow".to_owned())?;
+    if payload.len() > max_encoded_bytes {
+        return Err(format!(
+            "base64 torrent payload exceeds the {max_raw_bytes} byte decoded limit"
+        ));
+    }
+    let decoded = general_purpose::STANDARD
         .decode(payload)
-        .map_err(|err| format!("invalid base64 torrent payload: {err}"))
+        .map_err(|err| format!("invalid base64 torrent payload: {err}"))?;
+    if decoded.len() > max_raw_bytes {
+        return Err(format!(
+            "torrent payload exceeds the {max_raw_bytes} byte decoded limit"
+        ));
+    }
+    Ok(decoded)
 }
 
 enum Lifecycle {
@@ -1328,6 +1349,20 @@ mod tests {
 
     use rt_engine::{EnginePieceState, EngineTorrentFile, EngineTorrentMetadata};
     use rt_session::{TorrentEntry, TorrentState};
+
+    #[test]
+    fn base64_torrent_payload_is_bounded_before_decoding() {
+        assert_eq!(decode_base64_torrent_payload("YQ==", 1).unwrap(), b"a");
+        assert!(decode_base64_torrent_payload("YWFhYQ==", 3)
+            .unwrap_err()
+            .contains("decoded limit"));
+        assert!(decode_base64_torrent_payload("YWJj", 2)
+            .unwrap_err()
+            .contains("decoded limit"));
+        assert!(decode_base64_torrent_payload("", usize::MAX)
+            .unwrap_err()
+            .contains("size limit overflow"));
+    }
 
     async fn state_with_torrent() -> AppState {
         let registry = Arc::new(RwLock::new(SessionRegistry::new()));

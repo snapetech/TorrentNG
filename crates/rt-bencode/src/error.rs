@@ -14,6 +14,10 @@ pub enum BencodeError {
     DepthExceeded(usize),
     #[error("node limit exceeded: {nodes} > max {max}")]
     NodeLimitExceeded { nodes: usize, max: usize },
+    #[error("bencode allocation budget denied for {bytes} bytes")]
+    AllocationBudgetExceeded { bytes: usize },
+    #[error("bencode allocation failed")]
+    AllocationFailed,
     #[error("unsorted dictionary keys")]
     UnsortedDictKeys,
     #[error("unexpected byte {0:#04x} at offset {1}")]

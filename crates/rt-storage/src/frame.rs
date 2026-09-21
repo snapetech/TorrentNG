@@ -9,7 +9,7 @@
 
 use std::sync::{
     atomic::{AtomicU64, Ordering},
-    Arc, Mutex,
+    Arc, Mutex, MutexGuard,
 };
 
 use once_cell::sync::OnceCell;
@@ -29,7 +29,7 @@ const MAX_RETAINED_PER_CLASS: usize = 256;
 
 static GLOBAL_FRAME_POOL: OnceCell<FramePool> = OnceCell::new();
 
-#[derive(Debug)]
+#[derive(Debug, Default)]
 struct PoolInner {
     /// Free lists, one per size class, parallel to `SIZE_CLASSES`.
     free: [Vec<Vec<u8>>; SIZE_CLASSES.len()],
@@ -54,6 +54,20 @@ impl FramePool {
             in_use: Arc::new(AtomicU64::new(0)),
             denied: Arc::new(AtomicU64::new(0)),
             cap_bytes,
+        }
+    }
+
+    fn lock_inner(&self) -> MutexGuard<'_, PoolInner> {
+        match self.inner.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => {
+                // Free buffers are disposable; live frames own their buffers
+                // and accounting independently of this reuse cache.
+                let mut guard = poisoned.into_inner();
+                *guard = PoolInner::default();
+                self.inner.clear_poison();
+                guard
+            }
         }
     }
 
@@ -105,7 +119,7 @@ impl FramePool {
         let class = Self::class_for(len);
         let mut buf = match class {
             Some(ci) => {
-                let mut guard = self.inner.lock().expect("frame pool poisoned");
+                let mut guard = self.lock_inner();
                 guard.free[ci]
                     .pop()
                     .unwrap_or_else(|| vec![0u8; SIZE_CLASSES[ci]])
@@ -131,7 +145,7 @@ impl FramePool {
             // Restore full class capacity and retain for reuse, bounded.
             buf.clear();
             buf.resize(SIZE_CLASSES[ci], 0);
-            let mut guard = self.inner.lock().expect("frame pool poisoned");
+            let mut guard = self.lock_inner();
             if guard.free[ci].len() < MAX_RETAINED_PER_CLASS {
                 guard.free[ci].push(buf);
             }
@@ -342,6 +356,23 @@ impl RegisteredFrameSlots {
         })
     }
 
+    fn lock_free_slots(&self) -> MutexGuard<'_, Vec<u16>> {
+        match self.free.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => {
+                // A duplicate free index would hand the same registered
+                // buffer to two callers. Sanitize the reusable-slot list;
+                // never invent missing slots because they may be in flight.
+                let mut guard = poisoned.into_inner();
+                guard.retain(|slot| usize::from(*slot) < self.buffers.len());
+                guard.sort_unstable();
+                guard.dedup();
+                self.free.clear_poison();
+                guard
+            }
+        }
+    }
+
     #[cfg(target_os = "linux")]
     pub fn iovecs(&self) -> Vec<libc::iovec> {
         self.buffers
@@ -355,7 +386,7 @@ impl RegisteredFrameSlots {
 
     pub fn acquire(self: &Arc<Self>, len: usize) -> Option<RegisteredFrameSlot> {
         let slot = {
-            let mut free = self.free.lock().expect("registered frame slots poisoned");
+            let mut free = self.lock_free_slots();
             let slot = *free.last()?;
             if len > self.buffers[slot as usize].len {
                 return None;
@@ -369,7 +400,7 @@ impl RegisteredFrameSlots {
     }
 
     fn release(&self, slot: u16) {
-        let mut free = self.free.lock().expect("registered frame slots poisoned");
+        let mut free = self.lock_free_slots();
         free.push(slot);
     }
 }
@@ -499,6 +530,49 @@ mod tests {
         drop(frame);
 
         assert_eq!(pool.in_use_bytes(), 0);
+        assert!(slots.acquire(1).is_some());
+    }
+
+    #[test]
+    fn poisoned_frame_cache_drops_idle_buffers_and_recovers() {
+        let pool = FramePool::new(1024 * 1024);
+        drop(pool.try_acquire(4096).unwrap());
+        assert_eq!(pool.inner.lock().unwrap().free[0].len(), 1);
+
+        let inner = Arc::clone(&pool.inner);
+        assert!(std::thread::spawn(move || {
+            let _guard = inner.lock().unwrap();
+            panic!("poison the derived frame cache");
+        })
+        .join()
+        .is_err());
+        assert!(pool.inner.is_poisoned());
+
+        let frame = pool.try_acquire(4096).unwrap();
+        assert!(!pool.inner.is_poisoned());
+        assert!(pool.inner.lock().unwrap().free[0].is_empty());
+        assert_eq!(frame.len(), 4096);
+    }
+
+    #[test]
+    fn poisoned_registered_slot_list_drops_invalid_and_duplicate_indices() {
+        let slots = RegisteredFrameSlots::new(1, 64);
+        let poisoner = Arc::clone(&slots);
+        assert!(std::thread::spawn(move || {
+            let mut free = poisoner.free.lock().unwrap();
+            free.push(0);
+            free.push(u16::MAX);
+            panic!("poison the registered-slot free list");
+        })
+        .join()
+        .is_err());
+        assert!(slots.free.is_poisoned());
+
+        let slot = slots.acquire(64).unwrap();
+        assert_eq!(slot.index(), 0);
+        assert!(slots.acquire(1).is_none());
+        assert!(!slots.free.is_poisoned());
+        drop(slot);
         assert!(slots.acquire(1).is_some());
     }
 }

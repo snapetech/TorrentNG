@@ -15,7 +15,6 @@ bytes.workspace = true
 sha1.workspace = true
 once_cell.workspace = true
 futures.workspace = true
-libc = "0.2"
 rt-hash = { path = "../rt-hash" }
 rt-metrics = { path = "../rt-metrics" }
 rt-path = { path = "../rt-path" }
@@ -23,6 +22,12 @@ rt-piece-map = { path = "../rt-piece-map" }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 io-uring = "0.7"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Storage_FileSystem"] }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["full", "test-util"] }

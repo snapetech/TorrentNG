@@ -1,5 +1,5 @@
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
 use tokio::sync::{Notify, Semaphore};
@@ -133,12 +133,28 @@ impl SharedRateLimiter {
         }
     }
 
+    fn lock_state(&self) -> MutexGuard<'_, RateState> {
+        match self.state.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => {
+                // Keep the existing token balance and rate limit. Resetting
+                // this state would grant an attacker a fresh burst.
+                let guard = poisoned.into_inner();
+                self.state.clear_poison();
+                guard
+            }
+        }
+    }
+
     fn set_limit(&self, limit: Option<u64>) {
         let limit = limit.filter(|limit| *limit > 0);
+        let mut state = self.lock_state();
+        if state.limit_bytes_per_sec == limit {
+            return;
+        }
         let capacity = limit
             .map(|limit| limit.max(MAX_INITIAL_BURST_BYTES))
             .unwrap_or(u64::MAX);
-        let mut state = self.state.lock().expect("network budget mutex poisoned");
         state.limit_bytes_per_sec = limit;
         state.tokens = capacity;
         state.updated_at = Instant::now();
@@ -154,7 +170,7 @@ impl SharedRateLimiter {
         let mut limit_generation = self.limit_changed.generation();
         loop {
             let wait = {
-                let mut state = self.state.lock().expect("network budget mutex poisoned");
+                let mut state = self.lock_state();
                 let Some(limit) = state.limit_bytes_per_sec else {
                     return;
                 };
@@ -224,7 +240,7 @@ impl SharedRateLimiter {
                 return false;
             }
             let wait = {
-                let mut state = self.state.lock().expect("network budget mutex poisoned");
+                let mut state = self.lock_state();
                 let Some(limit) = state.limit_bytes_per_sec else {
                     return true;
                 };
@@ -346,6 +362,44 @@ mod tests {
         assert!(!waiter.is_finished());
         limiter.set_limit(None);
         waiter.await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn reapplying_same_limit_does_not_restore_spent_burst_tokens() {
+        let limiter = Arc::new(SharedRateLimiter::new(Some(1)));
+        limiter.acquire(MAX_INITIAL_BURST_BYTES).await;
+
+        // Runtime API updates may persist and reapply an unchanged effective
+        // limit. That is not a grant of a new token-bucket burst.
+        limiter.set_limit(Some(1));
+        let waiter_limiter = Arc::clone(&limiter);
+        let waiter = tokio::spawn(async move { waiter_limiter.acquire(1).await });
+        tokio::task::yield_now().await;
+        assert!(!waiter.is_finished());
+
+        tokio::time::advance(Duration::from_secs(1)).await;
+        waiter.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn poisoned_rate_limiter_preserves_tokens_and_recovers() {
+        let limiter = Arc::new(SharedRateLimiter::new(Some(1_000_000)));
+        limiter.acquire(1_000).await;
+        let tokens_before_poison = limiter.lock_state().tokens;
+
+        let poisoner = Arc::clone(&limiter);
+        assert!(std::thread::spawn(move || {
+            let _guard = poisoner.state.lock().unwrap();
+            panic!("poison the shared network token bucket");
+        })
+        .join()
+        .is_err());
+        assert!(limiter.state.is_poisoned());
+
+        limiter.set_limit(Some(1_000_000));
+        assert_eq!(limiter.lock_state().tokens, tokens_before_poison);
+        assert!(!limiter.state.is_poisoned());
+        limiter.acquire(1).await;
     }
 
     #[test]

@@ -21,15 +21,33 @@ use std::ffi::OsString;
 use std::os::fd::{AsRawFd, FromRawFd};
 #[cfg(unix)]
 use std::os::unix::ffi::OsStrExt;
-#[cfg(unix)]
+#[cfg(windows)]
+use std::os::windows::ffi::OsStrExt;
+#[cfg(windows)]
+use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
+#[cfg(windows)]
+use std::os::windows::io::AsRawHandle;
+#[cfg(any(unix, windows))]
 use std::path::{Component, PathBuf};
+#[cfg(windows)]
+use windows_sys::Win32::Foundation::HANDLE;
+#[cfg(windows)]
+use windows_sys::Win32::Storage::FileSystem::{
+    GetFileInformationByHandle, MoveFileW, BY_HANDLE_FILE_INFORMATION,
+    FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
+    FILE_SHARE_READ, FILE_SHARE_WRITE,
+};
 
 pub(crate) fn open_path_no_follow(path: &Path, write: bool, create: bool) -> io::Result<File> {
     #[cfg(unix)]
     {
         open_path_no_follow_unix(path, write, create)
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    {
+        open_path_no_follow_windows(path, write, create)
+    }
+    #[cfg(not(any(unix, windows)))]
     {
         let mut options = OpenOptions::new();
         options
@@ -42,8 +60,64 @@ pub(crate) fn open_path_no_follow(path: &Path, write: bool, create: bool) -> io:
     }
 }
 
+/// Create a new runtime file without following the final component or an
+/// ancestor reparse point/symlink. Existing destinations are never opened or
+/// truncated.
+#[cfg(any(not(unix), test))]
+pub(crate) fn create_new_file_no_follow(path: &Path) -> io::Result<File> {
+    #[cfg(unix)]
+    {
+        let (parent, name) = open_parent_no_follow_unix(path)?;
+        let name = CString::new(name.as_os_str().as_bytes()).map_err(|_| {
+            io::Error::new(io::ErrorKind::InvalidInput, "runtime path contains NUL")
+        })?;
+        let fd = unsafe {
+            libc::openat(
+                parent.as_raw_fd(),
+                name.as_ptr(),
+                libc::O_WRONLY
+                    | libc::O_CREAT
+                    | libc::O_EXCL
+                    | libc::O_CLOEXEC
+                    | libc::O_NOFOLLOW
+                    | libc::O_NONBLOCK,
+                0o644,
+            )
+        };
+        if fd < 0 {
+            Err(io::Error::last_os_error())
+        } else {
+            ensure_regular_file(unsafe { File::from_raw_fd(fd) })
+        }
+    }
+    #[cfg(windows)]
+    {
+        let _parents = open_windows_parent_dirs(path)?;
+        let mut options = OpenOptions::new();
+        options
+            .write(true)
+            .create_new(true)
+            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+        ensure_regular_file(options.open(path)?)
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true);
+        ensure_regular_file(options.open(path)?)
+    }
+}
+
 fn ensure_regular_file(file: File) -> io::Result<File> {
-    if file.metadata()?.is_file() {
+    let metadata = file.metadata()?;
+    #[cfg(windows)]
+    if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "runtime storage path is a reparse point",
+        ));
+    }
+    if metadata.is_file() {
         Ok(file)
     } else {
         Err(io::Error::new(
@@ -62,13 +136,12 @@ fn ensure_regular_file(file: File) -> io::Result<File> {
 /// symlinks are inspected without following them so replacing a regular file
 /// with a symlink cannot make a cached entry look valid.
 pub(crate) fn file_matches_path(file: &File, path: &Path) -> io::Result<bool> {
-    let file_metadata = file.metadata()?;
-    let path_metadata = std::fs::symlink_metadata(path)?;
-
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;
 
+        let file_metadata = file.metadata()?;
+        let path_metadata = std::fs::symlink_metadata(path)?;
         Ok(
             file_metadata.dev() == path_metadata.dev()
                 && file_metadata.ino() == path_metadata.ino(),
@@ -77,19 +150,61 @@ pub(crate) fn file_matches_path(file: &File, path: &Path) -> io::Result<bool> {
 
     #[cfg(windows)]
     {
-        use std::os::windows::fs::MetadataExt;
-
-        return Ok(
-            file_metadata.volume_serial_number() == path_metadata.volume_serial_number()
-                && file_metadata.file_index() == path_metadata.file_index(),
-        );
+        let current = open_path_no_follow_windows(path, false, false)?;
+        return Ok(windows_file_identity(file)? == windows_file_identity(&current)?);
     }
 
     #[cfg(not(any(unix, windows)))]
     {
-        let _ = (file_metadata, path_metadata);
-        Ok(true)
+        let _ = (file, path);
+        Ok(false)
     }
+}
+
+#[cfg(windows)]
+pub(crate) fn windows_file_identity(file: &File) -> io::Result<(u32, u64)> {
+    let mut information = BY_HANDLE_FILE_INFORMATION::default();
+    let result =
+        unsafe { GetFileInformationByHandle(file.as_raw_handle() as HANDLE, &mut information) };
+    if result == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let file_index =
+        (u64::from(information.nFileIndexHigh) << 32) | u64::from(information.nFileIndexLow);
+    Ok((information.dwVolumeSerialNumber, file_index))
+}
+
+#[cfg(windows)]
+pub(crate) fn windows_path_volume_serial(path: &Path) -> io::Result<u32> {
+    let metadata = std::fs::symlink_metadata(path)?;
+    if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "runtime storage path is a reparse point",
+        ));
+    }
+
+    let volume_serial = if metadata.is_dir() {
+        let probe = path.join(".tng-volume-probe");
+        let parents = open_windows_parent_dirs(&probe)?;
+        let directory = parents.last().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "runtime storage directory has no opened path components",
+            )
+        })?;
+        windows_file_identity(directory)?.0
+    } else if metadata.is_file() {
+        let file = open_path_no_follow_windows(path, false, false)?;
+        windows_file_identity(&file)?.0
+    } else {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "runtime storage path is not a regular file or directory",
+        ));
+    };
+
+    Ok(volume_serial)
 }
 
 /// Create a directory tree without following an ancestor symlink.
@@ -100,12 +215,21 @@ pub(crate) fn file_matches_path(file: &File, path: &Path) -> io::Result<bool> {
 /// the directory equivalent of [`open_path_no_follow`] and closes the small
 /// but real window where `create_dir_all` could create a configured download
 /// path outside its authorized root.
+///
+/// On Windows, each path prefix is opened with `FILE_FLAG_OPEN_REPARSE_POINT`
+/// and retained without delete-sharing while the next component is accessed,
+/// preventing a reparse-point ancestor from being substituted during the
+/// walk.
 pub fn create_dir_all_no_follow(path: &Path) -> io::Result<()> {
     #[cfg(unix)]
     {
         create_dir_all_no_follow_unix(path)
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    {
+        create_dir_all_no_follow_windows(path)
+    }
+    #[cfg(not(any(unix, windows)))]
     {
         std::fs::create_dir_all(path)
     }
@@ -209,7 +333,12 @@ pub fn remove_file_no_follow(path: &Path) -> io::Result<()> {
             Ok(())
         }
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    {
+        let _parents = open_windows_parent_dirs(path)?;
+        std::fs::remove_file(path)
+    }
+    #[cfg(not(any(unix, windows)))]
     {
         std::fs::remove_file(path)
     }
@@ -245,10 +374,291 @@ pub fn rename_no_follow(source: &Path, destination: &Path) -> io::Result<()> {
             Ok(())
         }
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    {
+        let _source_parents = open_windows_parent_dirs(source)?;
+        let _destination_parents = open_windows_parent_dirs(destination)?;
+        std::fs::rename(source, destination)
+    }
+    #[cfg(not(any(unix, windows)))]
     {
         std::fs::rename(source, destination)
     }
+}
+
+/// Rename a file without replacing an existing destination.
+///
+/// The Windows storage-plan executor uses this after checking that the
+/// destination is absent. `MoveFileW` makes that condition atomic with the
+/// rename: if another process creates the destination after the check, the
+/// move fails and leaves both files intact. The held parent handles also
+/// prevent an ancestor directory from being replaced during path resolution.
+#[cfg(windows)]
+pub(crate) fn rename_no_replace(source: &Path, destination: &Path) -> io::Result<()> {
+    let _source_parents = open_windows_parent_dirs(source)?;
+    let _destination_parents = open_windows_parent_dirs(destination)?;
+    let source = windows_move_path(source)?;
+    let destination = windows_move_path(destination)?;
+    let result = unsafe { MoveFileW(source.as_ptr(), destination.as_ptr()) };
+    if result == 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(windows)]
+fn windows_move_path(path: &Path) -> io::Result<Vec<u16>> {
+    let file_name = path.file_name().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "runtime move path must identify a file",
+        )
+    })?;
+    let parent = path.parent().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "runtime move path must have a parent directory",
+        )
+    })?;
+    // Canonicalize only the parent: the final destination may not exist.
+    // Parent directories are already held open without delete-sharing by the
+    // caller, so this cannot be redirected through an ancestor replacement.
+    let mut absolute = std::fs::canonicalize(parent)?;
+    absolute.push(file_name);
+    let mut wide: Vec<u16> = absolute
+        .as_os_str()
+        .encode_wide()
+        .map(|unit| {
+            if unit == b'/' as u16 {
+                b'\\' as u16
+            } else {
+                unit
+            }
+        })
+        .collect();
+    if wide.contains(&0) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "runtime move path contains NUL",
+        ));
+    }
+
+    let verbatim_prefix = [b'\\' as u16, b'\\' as u16, b'?' as u16, b'\\' as u16];
+    let unc_prefix = [b'\\' as u16, b'\\' as u16];
+    if wide.starts_with(&verbatim_prefix) {
+        // Already in the extended-length namespace.
+    } else if wide.starts_with(&unc_prefix) {
+        let mut extended = r"\\?\UNC\".encode_utf16().collect::<Vec<_>>();
+        extended.extend_from_slice(&wide[2..]);
+        wide = extended;
+    } else if wide.len() >= 3
+        && matches!(wide[0], 0x41..=0x5a | 0x61..=0x7a)
+        && wide[1] == b':' as u16
+        && wide[2] == b'\\' as u16
+    {
+        let mut extended = r"\\?\".encode_utf16().collect::<Vec<_>>();
+        extended.append(&mut wide);
+        wide = extended;
+    } else {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "runtime move path is not an absolute drive or UNC path",
+        ));
+    }
+    if wide.len() >= 32_767 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "runtime move path exceeds the Windows path limit",
+        ));
+    }
+    wide.push(0);
+    Ok(wide)
+}
+
+#[cfg(windows)]
+fn open_path_no_follow_windows(path: &Path, write: bool, create: bool) -> io::Result<File> {
+    let _parents = open_windows_parent_dirs(path)?;
+    let mut options = OpenOptions::new();
+    options
+        .read(true)
+        .write(write)
+        .create(write && create)
+        .truncate(false)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+    ensure_regular_file(options.open(path)?)
+}
+
+#[cfg(windows)]
+fn open_windows_parent_dirs(path: &Path) -> io::Result<Vec<File>> {
+    if !path.is_absolute() || path.file_name().is_none() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "runtime storage path must be an absolute file path",
+        ));
+    }
+    let parent = path.parent().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "runtime storage path must identify a file",
+        )
+    })?;
+    open_windows_directory_chain(parent)
+}
+
+#[cfg(windows)]
+fn open_windows_directory_chain(path: &Path) -> io::Result<Vec<File>> {
+    if !path.is_absolute() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "runtime storage directory must be absolute",
+        ));
+    }
+    let mut current = PathBuf::new();
+    let mut opened = Vec::new();
+    for component in path.components() {
+        match component {
+            Component::Prefix(prefix) => current.push(prefix.as_os_str()),
+            Component::RootDir => {
+                current.push(component.as_os_str());
+                opened.push(open_windows_directory(&current)?);
+            }
+            Component::Normal(name) => {
+                current.push(name);
+                opened.push(open_windows_directory(&current)?);
+            }
+            Component::CurDir | Component::ParentDir => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "runtime storage path contains an unsafe component",
+                ));
+            }
+        }
+    }
+    if opened.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "runtime storage directory has no rooted components",
+        ));
+    }
+    Ok(opened)
+}
+
+pub(crate) struct ParentDirsGuard {
+    #[cfg(windows)]
+    _handles: Vec<File>,
+}
+
+pub(crate) fn hold_parent_dirs_no_follow(path: &Path) -> io::Result<ParentDirsGuard> {
+    #[cfg(windows)]
+    {
+        Ok(ParentDirsGuard {
+            _handles: open_windows_parent_dirs(path)?,
+        })
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = path;
+        Ok(ParentDirsGuard {})
+    }
+}
+
+pub(crate) struct DirectoryGuard {
+    #[cfg(windows)]
+    _handle: File,
+}
+
+pub(crate) fn hold_directory_no_follow(path: &Path) -> io::Result<DirectoryGuard> {
+    #[cfg(windows)]
+    {
+        Ok(DirectoryGuard {
+            _handle: open_windows_directory(path)?,
+        })
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = path;
+        Ok(DirectoryGuard {})
+    }
+}
+
+#[cfg(windows)]
+fn open_windows_directory(path: &Path) -> io::Result<File> {
+    let mut options = OpenOptions::new();
+    options
+        .read(true)
+        // Holding each traversed directory without FILE_SHARE_DELETE prevents
+        // it from being renamed or replaced while a later full-path open is
+        // resolved. FILE_FLAG_OPEN_REPARSE_POINT lets us reject junctions and
+        // other reparse tags on the opened handle itself.
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS);
+    let directory = options.open(path)?;
+    let metadata = directory.metadata()?;
+    if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "runtime storage ancestor is a reparse point",
+        ));
+    }
+    if !metadata.is_dir() {
+        return Err(io::Error::new(
+            io::ErrorKind::NotADirectory,
+            "runtime storage ancestor is not a directory",
+        ));
+    }
+    Ok(directory)
+}
+
+#[cfg(windows)]
+fn create_dir_all_no_follow_windows(path: &Path) -> io::Result<()> {
+    if !path.is_absolute() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "runtime storage path must be absolute",
+        ));
+    }
+
+    let mut current = PathBuf::new();
+    let mut opened = Vec::new();
+    for component in path.components() {
+        match component {
+            Component::Prefix(prefix) => current.push(prefix.as_os_str()),
+            Component::RootDir => {
+                current.push(component.as_os_str());
+                opened.push(open_windows_directory(&current)?);
+            }
+            Component::Normal(name) => {
+                current.push(name);
+                match open_windows_directory(&current) {
+                    Ok(directory) => opened.push(directory),
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                        match std::fs::create_dir(&current) {
+                            Ok(()) => {}
+                            Err(create_error)
+                                if create_error.kind() == io::ErrorKind::AlreadyExists => {}
+                            Err(create_error) => return Err(create_error),
+                        }
+                        opened.push(open_windows_directory(&current)?);
+                    }
+                    Err(error) => return Err(error),
+                }
+            }
+            Component::CurDir | Component::ParentDir => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "runtime storage path contains an unsafe component",
+                ));
+            }
+        }
+    }
+    if opened.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "runtime storage path must be absolute",
+        ));
+    }
+    Ok(())
 }
 
 #[cfg(unix)]
@@ -476,6 +886,99 @@ mod tests {
         let error = read_file_no_follow_limited(&path, 3).unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
         assert_eq!(read_file_no_follow_limited(&path, 4).unwrap(), b"1234");
+    }
+
+    #[test]
+    fn create_new_no_follow_refuses_to_replace_an_existing_file() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("existing.bin");
+        std::fs::write(&path, b"existing").unwrap();
+
+        let error = create_new_file_no_follow(&path).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
+        assert_eq!(std::fs::read(path).unwrap(), b"existing");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn runtime_open_rejects_a_final_file_reparse_point() {
+        let temp = tempfile::tempdir().unwrap();
+        let target = temp.path().join("target.bin");
+        let link = temp.path().join("link.bin");
+        std::fs::write(&target, b"target").unwrap();
+        if let Err(error) = std::os::windows::fs::symlink_file(&target, &link) {
+            if error.kind() == io::ErrorKind::PermissionDenied {
+                return;
+            }
+            panic!("failed to create file symlink for regression test: {error}");
+        }
+
+        let error = open_path_no_follow(&link, false, false).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn runtime_open_rejects_a_reparse_point_ancestor() {
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let alias = root.path().join("alias");
+        if let Err(error) = std::os::windows::fs::symlink_dir(outside.path(), &alias) {
+            if error.kind() == io::ErrorKind::PermissionDenied {
+                return;
+            }
+            panic!("failed to create directory symlink for regression test: {error}");
+        }
+
+        let error = open_path_no_follow(&alias.join("payload.bin"), false, false).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn no_replace_rename_preserves_an_existing_destination() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("source.bin");
+        let destination = temp.path().join("destination.bin");
+        std::fs::write(&source, b"source").unwrap();
+        std::fs::write(&destination, b"destination").unwrap();
+
+        let error = rename_no_replace(&source, &destination).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
+        assert_eq!(std::fs::read(source).unwrap(), b"source");
+        assert_eq!(std::fs::read(destination).unwrap(), b"destination");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn held_directory_handle_prevents_path_replacement() {
+        let temp = tempfile::tempdir().unwrap();
+        let directory = temp.path().join("protected");
+        let replacement = temp.path().join("replacement");
+        std::fs::create_dir(&directory).unwrap();
+
+        let guard = hold_directory_no_follow(&directory).unwrap();
+        assert!(std::fs::rename(&directory, &replacement).is_err());
+        drop(guard);
+        std::fs::rename(&directory, &replacement).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn directory_creation_does_not_traverse_a_reparse_point_ancestor() {
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let alias = root.path().join("alias");
+        if let Err(error) = std::os::windows::fs::symlink_dir(outside.path(), &alias) {
+            if error.kind() == io::ErrorKind::PermissionDenied {
+                return;
+            }
+            panic!("failed to create directory symlink for regression test: {error}");
+        }
+
+        let error = create_dir_all_no_follow(&alias.join("created")).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        assert!(!outside.path().join("created").exists());
     }
 
     #[cfg(unix)]

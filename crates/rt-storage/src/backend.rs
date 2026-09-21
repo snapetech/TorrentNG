@@ -26,16 +26,30 @@ use std::os::unix::io::AsRawFd;
 use std::os::windows::fs::FileExt;
 #[cfg(target_os = "linux")]
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{mpsc, Arc, Mutex};
+use std::sync::{mpsc, Arc, Mutex, MutexGuard};
 use std::thread;
 
 #[cfg(target_os = "linux")]
 use io_uring::{opcode, types, IoUring};
 use tokio::sync::oneshot;
 
+use crate::file_handle::LeasedFileHandle;
 use crate::frame::Frame;
 #[cfg(target_os = "linux")]
 use crate::frame::{RegisteredFrameSlot, RegisteredFrameSlots};
+
+fn lock_job_receiver<T>(receiver: &Mutex<T>) -> MutexGuard<'_, T> {
+    match receiver.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => {
+            // The receiver is the authoritative bounded work queue. Keep its
+            // pending jobs and let another worker continue after a panic.
+            let guard = poisoned.into_inner();
+            receiver.clear_poison();
+            guard
+        }
+    }
+}
 
 const DEFAULT_BACKEND_QUEUE_DEPTH: usize = 1024;
 #[cfg(target_os = "linux")]
@@ -210,6 +224,43 @@ impl SelectedDiskBackend {
 
     pub fn selection(&self) -> &BackendSelection {
         &self.selection
+    }
+
+    pub(crate) fn pread_leased(
+        &self,
+        file: Arc<LeasedFileHandle>,
+        frame: Frame,
+        offset: u64,
+    ) -> oneshot::Receiver<io::Result<Frame>> {
+        match &self.inner {
+            SelectedDiskBackendInner::Pread(backend) => backend.pread_leased(file, frame, offset),
+            #[cfg(target_os = "linux")]
+            SelectedDiskBackendInner::Uring(backend) => backend.pread_leased(file, frame, offset),
+        }
+    }
+
+    pub(crate) fn pwrite_leased(
+        &self,
+        file: Arc<LeasedFileHandle>,
+        data: bytes::Bytes,
+        offset: u64,
+    ) -> oneshot::Receiver<io::Result<()>> {
+        match &self.inner {
+            SelectedDiskBackendInner::Pread(backend) => backend.pwrite_leased(file, data, offset),
+            #[cfg(target_os = "linux")]
+            SelectedDiskBackendInner::Uring(backend) => backend.pwrite_leased(file, data, offset),
+        }
+    }
+
+    pub(crate) fn fdatasync_leased(
+        &self,
+        file: Arc<LeasedFileHandle>,
+    ) -> oneshot::Receiver<io::Result<()>> {
+        match &self.inner {
+            SelectedDiskBackendInner::Pread(backend) => backend.fdatasync_leased(file),
+            #[cfg(target_os = "linux")]
+            SelectedDiskBackendInner::Uring(backend) => backend.fdatasync_leased(file),
+        }
     }
 
     pub fn kind(&self) -> BackendKind {
@@ -453,6 +504,47 @@ impl UringBackend {
         })
     }
 
+    fn pread_leased(
+        &self,
+        file: Arc<LeasedFileHandle>,
+        frame: Frame,
+        offset: u64,
+    ) -> oneshot::Receiver<io::Result<Frame>> {
+        let (reply, rx) = oneshot::channel();
+        fail_job_on_full(self.tx.try_send(Job::Read {
+            file: BackendFile::Leased(file),
+            frame,
+            offset,
+            reply,
+        }));
+        rx
+    }
+
+    fn pwrite_leased(
+        &self,
+        file: Arc<LeasedFileHandle>,
+        data: bytes::Bytes,
+        offset: u64,
+    ) -> oneshot::Receiver<io::Result<()>> {
+        let (reply, rx) = oneshot::channel();
+        fail_job_on_full(self.tx.try_send(Job::Write {
+            file: BackendFile::Leased(file),
+            data,
+            offset,
+            reply,
+        }));
+        rx
+    }
+
+    fn fdatasync_leased(&self, file: Arc<LeasedFileHandle>) -> oneshot::Receiver<io::Result<()>> {
+        let (reply, rx) = oneshot::channel();
+        fail_job_on_full(self.tx.try_send(Job::Sync {
+            file: BackendFile::Leased(file),
+            reply,
+        }));
+        rx
+    }
+
     pub fn probe() -> Result<UringProbe, String> {
         #[cfg(target_os = "linux")]
         {
@@ -550,7 +642,7 @@ impl DiskBackend for UringBackend {
     ) -> oneshot::Receiver<io::Result<Frame>> {
         let (reply, rx) = oneshot::channel();
         fail_job_on_full(self.tx.try_send(Job::Read {
-            file,
+            file: BackendFile::Unleased(file),
             frame,
             offset,
             reply,
@@ -566,7 +658,7 @@ impl DiskBackend for UringBackend {
     ) -> oneshot::Receiver<io::Result<()>> {
         let (reply, rx) = oneshot::channel();
         fail_job_on_full(self.tx.try_send(Job::Write {
-            file,
+            file: BackendFile::Unleased(file),
             data,
             offset,
             reply,
@@ -576,7 +668,10 @@ impl DiskBackend for UringBackend {
 
     fn fdatasync(&self, file: Arc<File>) -> oneshot::Receiver<io::Result<()>> {
         let (reply, rx) = oneshot::channel();
-        fail_job_on_full(self.tx.try_send(Job::Sync { file, reply }));
+        fail_job_on_full(self.tx.try_send(Job::Sync {
+            file: BackendFile::Unleased(file),
+            reply,
+        }));
         rx
     }
 
@@ -651,7 +746,7 @@ fn file_identity(file: &File) -> FileIdentity {
 #[cfg(target_os = "linux")]
 enum PendingUring {
     Read {
-        file: Arc<File>,
+        file: BackendFile,
         frame: Frame,
         expected: usize,
         fixed_slot: Option<RegisteredFrameSlot>,
@@ -659,14 +754,14 @@ enum PendingUring {
         reply: Option<oneshot::Sender<io::Result<Frame>>>,
     },
     Write {
-        file: Arc<File>,
+        file: BackendFile,
         data: bytes::Bytes,
         expected: usize,
         file_slot: Option<RegisteredFileSlot>,
         reply: Option<oneshot::Sender<io::Result<()>>>,
     },
     Sync {
-        file: Arc<File>,
+        file: BackendFile,
         file_slot: Option<RegisteredFileSlot>,
         reply: Option<oneshot::Sender<io::Result<()>>>,
     },
@@ -762,7 +857,7 @@ impl UringWorker {
     }
 
     fn recv_batch(&self) -> Option<Vec<Job>> {
-        let guard = self.rx.lock().expect("uring job queue poisoned");
+        let guard = lock_job_receiver(&self.rx);
         let mut jobs = Vec::with_capacity(URING_BATCH_LIMIT);
         jobs.push(guard.recv().ok()?);
         while jobs.len() < URING_BATCH_LIMIT {
@@ -785,7 +880,7 @@ impl UringWorker {
                 reply,
             } => {
                 let len = frame.len();
-                let file_slot = self.register_file_slot(&file);
+                let file_slot = self.register_file_slot(file.as_file());
                 let fixed_slot = self.fixed.as_ref().and_then(|fixed| fixed.acquire(len));
                 let entry = if let Some(buf_slot) = fixed_slot.as_ref() {
                     let ptr = buf_slot.ptr_mut();
@@ -797,7 +892,7 @@ impl UringWorker {
                             buf_slot.index(),
                         ),
                         None => opcode::ReadFixed::new(
-                            types::Fd(file.as_raw_fd()),
+                            types::Fd(file.as_file().as_raw_fd()),
                             ptr,
                             len as _,
                             buf_slot.index(),
@@ -810,7 +905,9 @@ impl UringWorker {
                     let ptr = frame.as_mut_slice().as_mut_ptr();
                     match file_slot.as_ref().map(|slot| slot.index) {
                         Some(slot) => opcode::Read::new(types::Fixed(slot), ptr, len as _),
-                        None => opcode::Read::new(types::Fd(file.as_raw_fd()), ptr, len as _),
+                        None => {
+                            opcode::Read::new(types::Fd(file.as_file().as_raw_fd()), ptr, len as _)
+                        }
                     }
                     .offset(offset)
                     .build()
@@ -840,11 +937,13 @@ impl UringWorker {
                 reply,
             } => {
                 let len = data.len();
-                let file_slot = self.register_file_slot(&file);
+                let file_slot = self.register_file_slot(file.as_file());
                 let ptr = data.as_ptr();
                 let entry = match file_slot.as_ref().map(|slot| slot.index) {
                     Some(slot) => opcode::Write::new(types::Fixed(slot), ptr, len as _),
-                    None => opcode::Write::new(types::Fd(file.as_raw_fd()), ptr, len as _),
+                    None => {
+                        opcode::Write::new(types::Fd(file.as_file().as_raw_fd()), ptr, len as _)
+                    }
                 }
                 .offset(offset)
                 .build()
@@ -866,10 +965,10 @@ impl UringWorker {
                 );
             }
             Job::Sync { file, reply } => {
-                let file_slot = self.register_file_slot(&file);
+                let file_slot = self.register_file_slot(file.as_file());
                 let entry = match file_slot.as_ref().map(|slot| slot.index) {
                     Some(slot) => opcode::Fsync::new(types::Fixed(slot)),
-                    None => opcode::Fsync::new(types::Fd(file.as_raw_fd())),
+                    None => opcode::Fsync::new(types::Fd(file.as_file().as_raw_fd())),
                 }
                 .flags(types::FsyncFlags::DATASYNC)
                 .build()
@@ -1150,21 +1249,35 @@ pub trait DiskBackend: Send + Sync {
     }
 }
 
+enum BackendFile {
+    Unleased(Arc<File>),
+    Leased(Arc<LeasedFileHandle>),
+}
+
+impl BackendFile {
+    fn as_file(&self) -> &File {
+        match self {
+            Self::Unleased(file) => file.as_ref(),
+            Self::Leased(file) => file.as_file(),
+        }
+    }
+}
+
 enum Job {
     Read {
-        file: Arc<File>,
+        file: BackendFile,
         frame: Frame,
         offset: u64,
         reply: oneshot::Sender<io::Result<Frame>>,
     },
     Write {
-        file: Arc<File>,
+        file: BackendFile,
         data: bytes::Bytes,
         offset: u64,
         reply: oneshot::Sender<io::Result<()>>,
     },
     Sync {
-        file: Arc<File>,
+        file: BackendFile,
         reply: oneshot::Sender<io::Result<()>>,
     },
 }
@@ -1308,12 +1421,53 @@ impl PreadBackend {
         Self::new(default_worker_threads())
     }
 
+    fn pread_leased(
+        &self,
+        file: Arc<LeasedFileHandle>,
+        frame: Frame,
+        offset: u64,
+    ) -> oneshot::Receiver<io::Result<Frame>> {
+        let (reply, rx) = oneshot::channel();
+        fail_job_on_full(self.tx.try_send(Job::Read {
+            file: BackendFile::Leased(file),
+            frame,
+            offset,
+            reply,
+        }));
+        rx
+    }
+
+    fn pwrite_leased(
+        &self,
+        file: Arc<LeasedFileHandle>,
+        data: bytes::Bytes,
+        offset: u64,
+    ) -> oneshot::Receiver<io::Result<()>> {
+        let (reply, rx) = oneshot::channel();
+        fail_job_on_full(self.tx.try_send(Job::Write {
+            file: BackendFile::Leased(file),
+            data,
+            offset,
+            reply,
+        }));
+        rx
+    }
+
+    fn fdatasync_leased(&self, file: Arc<LeasedFileHandle>) -> oneshot::Receiver<io::Result<()>> {
+        let (reply, rx) = oneshot::channel();
+        fail_job_on_full(self.tx.try_send(Job::Sync {
+            file: BackendFile::Leased(file),
+            reply,
+        }));
+        rx
+    }
+
     fn worker(rx: Arc<Mutex<mpsc::Receiver<Job>>>) {
         loop {
             // Lock only to dequeue; the actual syscall runs unlocked so
             // workers process jobs in parallel.
             let job = {
-                let guard = rx.lock().expect("disk job queue poisoned");
+                let guard = lock_job_receiver(&rx);
                 guard.recv()
             };
             let Ok(job) = job else {
@@ -1326,7 +1480,8 @@ impl PreadBackend {
                     offset,
                     reply,
                 } => {
-                    let res = read_exact_at(&file, frame.as_mut_slice(), offset).map(|()| frame);
+                    let res =
+                        read_exact_at(file.as_file(), frame.as_mut_slice(), offset).map(|()| frame);
                     let _ = reply.send(res);
                 }
                 Job::Write {
@@ -1335,10 +1490,12 @@ impl PreadBackend {
                     offset,
                     reply,
                 } => {
-                    let _ = reply.send(write_all_at(&file, &data, offset));
+                    let res = write_all_at(file.as_file(), &data, offset);
+                    let _ = reply.send(res);
                 }
                 Job::Sync { file, reply } => {
-                    let _ = reply.send(file.sync_data());
+                    let res = file.as_file().sync_data();
+                    let _ = reply.send(res);
                 }
             }
         }
@@ -1361,7 +1518,7 @@ impl DiskBackend for PreadBackend {
     ) -> oneshot::Receiver<io::Result<Frame>> {
         let (reply, rx) = oneshot::channel();
         fail_job_on_full(self.tx.try_send(Job::Read {
-            file,
+            file: BackendFile::Unleased(file),
             frame,
             offset,
             reply,
@@ -1377,7 +1534,7 @@ impl DiskBackend for PreadBackend {
     ) -> oneshot::Receiver<io::Result<()>> {
         let (reply, rx) = oneshot::channel();
         fail_job_on_full(self.tx.try_send(Job::Write {
-            file,
+            file: BackendFile::Unleased(file),
             data,
             offset,
             reply,
@@ -1387,7 +1544,10 @@ impl DiskBackend for PreadBackend {
 
     fn fdatasync(&self, file: Arc<File>) -> oneshot::Receiver<io::Result<()>> {
         let (reply, rx) = oneshot::channel();
-        fail_job_on_full(self.tx.try_send(Job::Sync { file, reply }));
+        fail_job_on_full(self.tx.try_send(Job::Sync {
+            file: BackendFile::Unleased(file),
+            reply,
+        }));
         rx
     }
 }
@@ -1422,6 +1582,75 @@ fn fail_job(job: Job, kind: io::ErrorKind, message: &'static str) {
 mod tests {
     use super::*;
     use crate::frame::FramePool;
+    use crate::handle_cache::HandleCache;
+    use std::time::Duration;
+
+    #[test]
+    fn queued_job_retains_descriptor_lease_after_caller_cancellation() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("queued-lease.bin");
+        std::fs::write(&path, b"payload").unwrap();
+        let cache = HandleCache::new(0, Duration::from_secs(30));
+        let operation = cache.get_or_open(&path, false, false).unwrap();
+        let handle = operation.leased_handle();
+        let (tx, queued) = mpsc::sync_channel(1);
+        let backend = PreadBackend {
+            tx,
+            _workers: Vec::new(),
+        };
+
+        let completion = backend.fdatasync_leased(Arc::clone(&handle));
+        drop(completion); // Simulate a caller cancelling after queue admission.
+        drop(handle);
+        drop(operation);
+        assert_eq!(cache.active_descriptors(), 1);
+
+        let job = queued.try_recv().unwrap();
+        assert_eq!(cache.active_descriptors(), 1);
+        drop(job); // Backend completion releases the final descriptor owner.
+        assert_eq!(cache.active_descriptors(), 0);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn pending_uring_job_retains_descriptor_lease_until_completion() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("uring-lease.bin");
+        std::fs::write(&path, b"payload").unwrap();
+        let cache = HandleCache::new(0, Duration::from_secs(30));
+        let operation = cache.get_or_open(&path, false, false).unwrap();
+        let handle = operation.leased_handle();
+        let pending = PendingUring::Sync {
+            file: BackendFile::Leased(Arc::clone(&handle)),
+            file_slot: None,
+            reply: None,
+        };
+
+        drop(handle);
+        drop(operation);
+        assert_eq!(cache.active_descriptors(), 1);
+        drop(pending);
+        assert_eq!(cache.active_descriptors(), 0);
+    }
+
+    #[test]
+    fn poisoned_backend_receiver_preserves_queued_work() {
+        let (sender, receiver) = mpsc::channel();
+        sender.send(41_u8).unwrap();
+        let receiver = Arc::new(Mutex::new(receiver));
+
+        let poisoner = Arc::clone(&receiver);
+        assert!(std::thread::spawn(move || {
+            let _guard = poisoner.lock().unwrap();
+            panic!("poison the bounded disk-job receiver");
+        })
+        .join()
+        .is_err());
+        assert!(receiver.is_poisoned());
+
+        assert_eq!(lock_job_receiver(&receiver).recv().unwrap(), 41);
+        assert!(!receiver.is_poisoned());
+    }
 
     #[test]
     fn backend_request_parses_user_values() {
@@ -1726,7 +1955,10 @@ mod tests {
         assert!(pushed > 0);
 
         let (reply, response) = oneshot::channel();
-        let result = worker.submit_job(Job::Sync { file, reply });
+        let result = worker.submit_job(Job::Sync {
+            file: BackendFile::Unleased(file),
+            reply,
+        });
         assert_eq!(
             result.unwrap_err().kind(),
             io::ErrorKind::WouldBlock,
@@ -1771,13 +2003,13 @@ mod tests {
 
         worker
             .submit_job(Job::Sync {
-                file: file.clone(),
+                file: BackendFile::Unleased(file.clone()),
                 reply: reply_a,
             })
             .unwrap();
         worker
             .submit_job(Job::Sync {
-                file,
+                file: BackendFile::Unleased(file),
                 reply: reply_b,
             })
             .unwrap();
@@ -1820,7 +2052,7 @@ mod tests {
 
         worker
             .submit_job(Job::Read {
-                file,
+                file: BackendFile::Unleased(file),
                 frame,
                 offset: 0,
                 reply,

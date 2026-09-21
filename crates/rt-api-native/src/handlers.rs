@@ -10,7 +10,7 @@ use std::{
 };
 
 use axum::{
-    extract::{Path, Query, State},
+    extract::{multipart::Field, FromRequest, Multipart, Path, Query, Request, State},
     http::{header, HeaderMap, HeaderValue, StatusCode},
     response::{
         sse::{Event, KeepAlive, Sse},
@@ -20,13 +20,13 @@ use axum::{
 };
 use base64::Engine as _;
 use rt_api_model::{
-    api_token_allowed, AddTorrentRequest, AddTorrentResponse, ApiError, ApiRuntimeMetricsSnapshot,
-    ApiSseClientGuard, FileInfo, TorrentDetail, TorrentSummary,
+    api_token_allowed, bearer_token, AddTorrentRequest, AddTorrentResponse, ApiError,
+    ApiRuntimeMetricsSnapshot, ApiSseClientGuard, FileInfo, TorrentDetail, TorrentSummary,
 };
 use rt_engine::{
-    EngineGlobalLimits, EngineHandle, EngineJob, EngineNetworkFeatures, EngineStorageRoot,
-    EngineSubsystemHealth, EngineTorrentLimits, QueueMove, TorrentLiveStats,
-    MAX_MANUAL_PEER_ADDRESSES,
+    EngineDatabaseWorkerStats, EngineGlobalLimits, EngineHandle, EngineJob, EngineNetworkFeatures,
+    EngineStorageRoot, EngineSubsystemHealth, EngineTorrentLimits, PeerIngressStats, QueueMove,
+    TorrentLiveStats, MAX_MANUAL_PEER_ADDRESSES,
 };
 use rt_metainfo::parse_magnet;
 use rt_metrics::{MemoryClass, MemoryLease};
@@ -61,7 +61,17 @@ const SETTING_NATIVE_WORKFLOW_RUNS: &str = "native.workflow_runs";
 const MAX_NATIVE_JSON_BYTES: usize = 1024 * 1024;
 const MAX_NATIVE_JSON_ENTRIES: usize = 4096;
 const MAX_NATIVE_WORKFLOW_RUNS: usize = 200;
+const MAX_NATIVE_WORKFLOW_MATCHES: usize = 10_000;
+const MAX_NATIVE_WORKFLOW_RUN_SAMPLE_ITEMS: usize = 32;
+const MAX_NATIVE_WORKFLOW_RUN_ERROR_BYTES: usize = 512;
+const MAX_NATIVE_JSON_RULE_TEXT_BYTES: usize = 8_192;
+const MAX_NATIVE_JSON_RULE_TOKEN_BYTES: usize = 64;
 const MAX_NATIVE_MUTATION_ITEMS: usize = 16_384;
+const MAX_NATIVE_API_TAG_ITEMS: usize = 1_024;
+const MAX_NATIVE_API_LABEL_BYTES: usize = 256;
+const MAX_NATIVE_CATEGORY_PATH_BYTES: usize = 4_096;
+const MAX_NATIVE_MULTIPART_TORRENT_BYTES: usize = 64 * 1024 * 1024;
+const MAX_NATIVE_MULTIPART_FIELDS: usize = 5;
 const MAX_NATIVE_LABEL_ITEMS: usize = 16_384;
 const MAX_NATIVE_LABEL_BYTES: usize = 4 * 1024 * 1024;
 
@@ -69,6 +79,8 @@ const MAX_NATIVE_LABEL_BYTES: usize = 4 * 1024 * 1024;
 struct MetricsHealth {
     engine_alive: bool,
     peer_listener_healthy: bool,
+    peer_ingress: PeerIngressStats,
+    database_worker: EngineDatabaseWorkerStats,
     subsystem: Option<EngineSubsystemHealth>,
 }
 
@@ -632,15 +644,290 @@ fn api_snapshot_budget_exhausted() -> axum::response::Response {
         .into_response()
 }
 
-/// `POST /api/v1/torrents` — add a v1/hybrid `.torrent` from base64 JSON.
+fn api_bad_request(message: impl Into<String>) -> Response {
+    (
+        StatusCode::BAD_REQUEST,
+        Json(serde_json::to_value(ApiError::bad_request(message.into())).unwrap()),
+    )
+        .into_response()
+}
+
+fn api_payload_too_large(message: impl Into<String>) -> Response {
+    (
+        StatusCode::PAYLOAD_TOO_LARGE,
+        Json(serde_json::to_value(ApiError::new("PAYLOAD_TOO_LARGE", message.into())).unwrap()),
+    )
+        .into_response()
+}
+
+enum NativeTorrentAddSource {
+    Magnet(String),
+    Torrent(Vec<u8>),
+}
+
+struct NativeTorrentAddInput {
+    source: NativeTorrentAddSource,
+    save_path: Option<PathBuf>,
+    paused: bool,
+    category: Option<String>,
+    tags: Vec<String>,
+}
+
+type NativeTorrentAddError = Box<Response>;
+
+fn native_torrent_add_bad_request(message: impl Into<String>) -> NativeTorrentAddError {
+    Box::new(api_bad_request(message))
+}
+
+fn native_torrent_add_payload_too_large() -> NativeTorrentAddError {
+    Box::new(StatusCode::PAYLOAD_TOO_LARGE.into_response())
+}
+
+async fn read_native_multipart_bytes(
+    mut field: Field<'_>,
+    max_bytes: usize,
+) -> Result<Vec<u8>, NativeTorrentAddError> {
+    let mut bytes = Vec::with_capacity(max_bytes.min(4 * 1024));
+    while let Some(chunk) = field.chunk().await.map_err(|error| {
+        native_torrent_add_bad_request(format!("invalid multipart field: {error}"))
+    })? {
+        if chunk.len() > max_bytes.saturating_sub(bytes.len()) {
+            return Err(native_torrent_add_payload_too_large());
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    Ok(bytes)
+}
+
+async fn read_native_multipart_text(
+    field: Field<'_>,
+    max_bytes: usize,
+) -> Result<String, NativeTorrentAddError> {
+    String::from_utf8(read_native_multipart_bytes(field, max_bytes).await?).map_err(|error| {
+        native_torrent_add_bad_request(format!("multipart text is not valid UTF-8: {error}"))
+    })
+}
+
+fn decode_native_torrent_base64(
+    encoded: &str,
+    max_raw_bytes: usize,
+) -> Result<Vec<u8>, NativeTorrentAddError> {
+    let max_encoded_bytes = max_raw_bytes
+        .checked_add(2)
+        .and_then(|bytes| bytes.checked_div(3))
+        .and_then(|chunks| chunks.checked_mul(4))
+        .ok_or_else(native_torrent_add_payload_too_large)?;
+    if encoded.len() > max_encoded_bytes {
+        return Err(native_torrent_add_payload_too_large());
+    }
+
+    let raw = base64::engine::general_purpose::STANDARD
+        .decode(encoded)
+        .map_err(|error| native_torrent_add_bad_request(format!("invalid torrent_b64: {error}")))?;
+    if raw.len() > max_raw_bytes {
+        return Err(native_torrent_add_payload_too_large());
+    }
+    Ok(raw)
+}
+
+fn native_torrent_add_input_from_json(
+    request: AddTorrentRequest,
+) -> Result<NativeTorrentAddInput, NativeTorrentAddError> {
+    if request.magnet.is_some() && request.torrent_b64.is_some() {
+        return Err(native_torrent_add_bad_request(
+            "provide exactly one of magnet or torrent_b64",
+        ));
+    }
+    if request.save_path.len() > MAX_NATIVE_CATEGORY_PATH_BYTES {
+        return Err(native_torrent_add_bad_request(
+            "save_path exceeds the 4096-byte limit",
+        ));
+    }
+
+    let source = if let Some(magnet) = request.magnet {
+        if magnet.len() > 8_192 {
+            return Err(native_torrent_add_bad_request(
+                "magnet exceeds the 8192-byte limit",
+            ));
+        }
+        if magnet.trim().is_empty() {
+            return Err(native_torrent_add_bad_request("magnet must not be empty"));
+        }
+        NativeTorrentAddSource::Magnet(magnet.trim().to_owned())
+    } else if let Some(torrent_b64) = request.torrent_b64 {
+        let raw = decode_native_torrent_base64(&torrent_b64, MAX_NATIVE_MULTIPART_TORRENT_BYTES)?;
+        if raw.is_empty() {
+            return Err(native_torrent_add_bad_request(
+                "torrent file must not be empty",
+            ));
+        }
+        NativeTorrentAddSource::Torrent(raw)
+    } else {
+        return Err(native_torrent_add_bad_request(
+            "exactly one of magnet or torrent_b64 is required",
+        ));
+    };
+
+    Ok(NativeTorrentAddInput {
+        source,
+        save_path: normalize_optional_text(Some(request.save_path)).map(PathBuf::from),
+        paused: !request.start.unwrap_or(true),
+        category: normalize_optional_text(request.category),
+        tags: request.tags.unwrap_or_default(),
+    })
+}
+
+async fn native_torrent_add_input_from_multipart(
+    request: Request,
+    state: &AppState,
+) -> Result<NativeTorrentAddInput, NativeTorrentAddError> {
+    let mut multipart = Multipart::from_request(request, state)
+        .await
+        .map_err(|error| Box::new(error.into_response()))?;
+    let mut field_count = 0usize;
+    let mut seen_fields = HashSet::new();
+    let mut save_path = None;
+    let mut category = None;
+    let mut start = true;
+    let mut source = None;
+
+    loop {
+        let field = match multipart.next_field().await {
+            Ok(Some(field)) => field,
+            Ok(None) => break,
+            Err(error) => {
+                return Err(native_torrent_add_bad_request(format!(
+                    "invalid multipart request: {error}"
+                )))
+            }
+        };
+        field_count += 1;
+        let Some(name) = field.name().map(str::to_owned) else {
+            return Err(native_torrent_add_bad_request(
+                "multipart field is missing a name",
+            ));
+        };
+        if field_count > MAX_NATIVE_MULTIPART_FIELDS || !seen_fields.insert(name.clone()) {
+            return Err(native_torrent_add_bad_request(
+                "multipart fields must be unique and within the field limit",
+            ));
+        }
+
+        match name.as_str() {
+            "save_path" => {
+                let value =
+                    read_native_multipart_text(field, MAX_NATIVE_CATEGORY_PATH_BYTES).await?;
+                save_path = Some(value);
+            }
+            "category" => {
+                let value = read_native_multipart_text(field, MAX_NATIVE_API_LABEL_BYTES).await?;
+                category = Some(value);
+            }
+            "start" => {
+                let value = read_native_multipart_text(field, 5).await?;
+                start = match value.as_str() {
+                    "true" => true,
+                    "false" => false,
+                    _ => {
+                        return Err(native_torrent_add_bad_request(
+                            "start must be true or false",
+                        ))
+                    }
+                };
+            }
+            "magnet" => {
+                if source.is_some() {
+                    return Err(native_torrent_add_bad_request(
+                        "provide exactly one of magnet or torrent",
+                    ));
+                }
+                let value = read_native_multipart_text(field, 8_192).await?;
+                if value.trim().is_empty() {
+                    return Err(native_torrent_add_bad_request("magnet must not be empty"));
+                }
+                source = Some(NativeTorrentAddSource::Magnet(value.trim().to_owned()));
+            }
+            "torrent" => {
+                if source.is_some() {
+                    return Err(native_torrent_add_bad_request(
+                        "provide exactly one of magnet or torrent",
+                    ));
+                }
+                let value =
+                    read_native_multipart_bytes(field, MAX_NATIVE_MULTIPART_TORRENT_BYTES).await?;
+                if value.is_empty() {
+                    return Err(native_torrent_add_bad_request(
+                        "torrent file must not be empty",
+                    ));
+                }
+                source = Some(NativeTorrentAddSource::Torrent(value));
+            }
+            _ => {
+                return Err(native_torrent_add_bad_request(
+                    "unsupported torrent-add field",
+                ))
+            }
+        }
+    }
+
+    let Some(source) = source else {
+        return Err(native_torrent_add_bad_request(
+            "exactly one of magnet or torrent is required",
+        ));
+    };
+    if save_path
+        .as_deref()
+        .is_some_and(|value| value.len() > MAX_NATIVE_CATEGORY_PATH_BYTES)
+    {
+        return Err(native_torrent_add_bad_request(
+            "save_path exceeds the 4096-byte limit",
+        ));
+    }
+
+    Ok(NativeTorrentAddInput {
+        source,
+        save_path: normalize_optional_text(save_path).map(PathBuf::from),
+        paused: !start,
+        category: normalize_optional_text(category),
+        tags: Vec::new(),
+    })
+}
+
+async fn parse_native_torrent_add_input(
+    request: Request,
+    state: &AppState,
+) -> Result<NativeTorrentAddInput, NativeTorrentAddError> {
+    let content_type = request
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("");
+    let media_type = content_type.split(';').next().unwrap_or("").trim();
+    if media_type.eq_ignore_ascii_case("application/json") {
+        let Json(request) = Json::<AddTorrentRequest>::from_request(request, state)
+            .await
+            .map_err(|error| Box::new(error.into_response()))?;
+        native_torrent_add_input_from_json(request)
+    } else if media_type.eq_ignore_ascii_case("multipart/form-data") {
+        native_torrent_add_input_from_multipart(request, state).await
+    } else {
+        Err(Box::new(StatusCode::UNSUPPORTED_MEDIA_TYPE.into_response()))
+    }
+}
+
+/// `POST /api/v1/torrents` — add a torrent from JSON or bounded multipart form data.
 pub async fn add_torrent(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Json(req): Json<AddTorrentRequest>,
+    request: Request,
 ) -> impl IntoResponse {
     if let Some(response) = require_mutation_auth(&state, &headers) {
         return response;
     }
+    let request = match parse_native_torrent_add_input(request, &state).await {
+        Ok(request) => request,
+        Err(response) => return *response,
+    };
     let Some(engine) = &state.engine else {
         return (
             StatusCode::SERVICE_UNAVAILABLE,
@@ -654,93 +941,35 @@ pub async fn add_torrent(
             .into_response();
     };
 
-    if let Some(magnet) = req
-        .magnet
-        .as_deref()
-        .filter(|magnet| !magnet.trim().is_empty())
-    {
-        let magnet = match parse_magnet(magnet) {
-            Ok(magnet) => magnet,
-            Err(e) => {
-                return (
-                    StatusCode::BAD_REQUEST,
-                    Json(serde_json::to_value(ApiError::bad_request(e.to_string())).unwrap()),
+    let result = match request.source {
+        NativeTorrentAddSource::Magnet(magnet) => {
+            let magnet = match parse_magnet(&magnet) {
+                Ok(magnet) => magnet,
+                Err(error) => return api_bad_request(error.to_string()),
+            };
+            engine
+                .add_magnet_with_labels(
+                    magnet,
+                    request.save_path,
+                    request.paused,
+                    request.category,
+                    request.tags,
                 )
-                    .into_response();
-            }
-        };
-        let save_path = if req.save_path.trim().is_empty() {
-            None
-        } else {
-            Some(std::path::PathBuf::from(req.save_path))
-        };
-        let paused = !req.start.unwrap_or(true);
-        return match engine
-            .add_magnet_with_labels(
-                magnet,
-                save_path,
-                paused,
-                req.category,
-                req.tags.unwrap_or_default(),
-            )
-            .await
-        {
-            Ok(info_hash) => (
-                StatusCode::CREATED,
-                Json(serde_json::to_value(AddTorrentResponse { info_hash }).unwrap()),
-            )
-                .into_response(),
-            Err(e) => (
-                StatusCode::BAD_REQUEST,
-                Json(serde_json::to_value(ApiError::bad_request(e)).unwrap()),
-            )
-                .into_response(),
-        };
-    }
-
-    let Some(torrent_b64) = req.torrent_b64.as_deref() else {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(
-                serde_json::to_value(ApiError::bad_request("torrent_b64 is required".to_owned()))
-                    .unwrap(),
-            ),
-        )
-            .into_response();
-    };
-
-    let raw = match base64::engine::general_purpose::STANDARD.decode(torrent_b64) {
-        Ok(raw) => raw,
-        Err(e) => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(
-                    serde_json::to_value(ApiError::bad_request(format!(
-                        "invalid torrent_b64: {e}"
-                    )))
-                    .unwrap(),
-                ),
-            )
-                .into_response();
+                .await
+        }
+        NativeTorrentAddSource::Torrent(raw) => {
+            engine
+                .add_torrent_raw_with_labels(
+                    raw,
+                    request.save_path,
+                    request.paused,
+                    request.category,
+                    request.tags,
+                )
+                .await
         }
     };
-    let save_path = if req.save_path.trim().is_empty() {
-        None
-    } else {
-        Some(std::path::PathBuf::from(req.save_path))
-    };
-    let paused = !req.start.unwrap_or(true);
-
-    match engine
-        .add_torrent_raw_with_labels(
-            raw,
-            save_path,
-            paused,
-            req.category,
-            req.tags.unwrap_or_default(),
-        )
-        .await
-    {
+    match result {
         Ok(info_hash) => (
             StatusCode::CREATED,
             Json(serde_json::to_value(AddTorrentResponse { info_hash }).unwrap()),
@@ -976,6 +1205,15 @@ pub async fn set_torrent_category(
     if let Some(response) = require_mutation_auth(&state, &headers) {
         return response;
     }
+    if req
+        .category
+        .as_deref()
+        .is_some_and(|category| category.len() > MAX_NATIVE_API_LABEL_BYTES)
+    {
+        return api_bad_request(format!(
+            "category exceeds the {MAX_NATIVE_API_LABEL_BYTES}-byte limit"
+        ));
+    }
     if !torrent_exists(&state, &info_hash).await {
         return not_found(info_hash);
     }
@@ -1165,6 +1403,122 @@ where
     }
 
     deserializer.deserialize_seq(BoundedVecVisitor(PhantomData))
+}
+
+struct BoundedNativeTag(String);
+
+impl<'de> Deserialize<'de> for BoundedNativeTag {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct TagVisitor;
+
+        impl de::Visitor<'_> for TagVisitor {
+            type Value = BoundedNativeTag;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("a tag with at most 256 UTF-8 bytes")
+            }
+
+            fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
+            where
+                E: de::Error,
+            {
+                if value.len() > MAX_NATIVE_API_LABEL_BYTES {
+                    return Err(E::custom(format!(
+                        "tag exceeds the {MAX_NATIVE_API_LABEL_BYTES}-byte limit"
+                    )));
+                }
+                Ok(BoundedNativeTag(value.to_owned()))
+            }
+
+            fn visit_string<E>(self, value: String) -> Result<Self::Value, E>
+            where
+                E: de::Error,
+            {
+                if value.len() > MAX_NATIVE_API_LABEL_BYTES {
+                    return Err(E::custom(format!(
+                        "tag exceeds the {MAX_NATIVE_API_LABEL_BYTES}-byte limit"
+                    )));
+                }
+                Ok(BoundedNativeTag(value))
+            }
+        }
+
+        deserializer.deserialize_string(TagVisitor)
+    }
+}
+
+fn deserialize_bounded_native_tags<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    struct TagsVisitor;
+
+    impl<'de> Visitor<'de> for TagsVisitor {
+        type Value = Vec<String>;
+
+        fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter.write_str("an array of at most 1024 bounded tags")
+        }
+
+        fn visit_seq<A>(self, mut sequence: A) -> Result<Self::Value, A::Error>
+        where
+            A: SeqAccess<'de>,
+        {
+            let mut tags = Vec::with_capacity(
+                sequence
+                    .size_hint()
+                    .unwrap_or_default()
+                    .min(MAX_NATIVE_API_TAG_ITEMS),
+            );
+            while let Some(tag) = sequence.next_element::<BoundedNativeTag>()? {
+                if tags.len() >= MAX_NATIVE_API_TAG_ITEMS {
+                    return Err(de::Error::custom(format!(
+                        "tag array exceeds the {MAX_NATIVE_API_TAG_ITEMS}-item limit"
+                    )));
+                }
+                tags.push(tag.0);
+            }
+            Ok(tags)
+        }
+    }
+
+    deserializer.deserialize_seq(TagsVisitor)
+}
+
+fn deserialize_optional_bounded_native_tags<'de, D>(
+    deserializer: D,
+) -> Result<Option<Vec<String>>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    struct OptionalTagsVisitor;
+
+    impl<'de> Visitor<'de> for OptionalTagsVisitor {
+        type Value = Option<Vec<String>>;
+
+        fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter.write_str("null or a bounded tag array")
+        }
+
+        fn visit_none<E>(self) -> Result<Self::Value, E>
+        where
+            E: de::Error,
+        {
+            Ok(None)
+        }
+
+        fn visit_some<D2>(self, deserializer: D2) -> Result<Self::Value, D2::Error>
+        where
+            D2: Deserializer<'de>,
+        {
+            deserialize_bounded_native_tags(deserializer).map(Some)
+        }
+    }
+
+    deserializer.deserialize_option(OptionalTagsVisitor)
 }
 
 #[derive(Debug, Serialize)]
@@ -1736,9 +2090,9 @@ fn nullable_f64(value: serde_json::Value, field: &str) -> Result<Option<f64>, St
 
 #[derive(Debug, Deserialize)]
 pub struct PatchTagsRequest {
-    #[serde(default, deserialize_with = "deserialize_bounded_vec")]
+    #[serde(default, deserialize_with = "deserialize_bounded_native_tags")]
     pub add: Vec<String>,
-    #[serde(default, deserialize_with = "deserialize_bounded_vec")]
+    #[serde(default, deserialize_with = "deserialize_bounded_native_tags")]
     pub remove: Vec<String>,
 }
 
@@ -1751,6 +2105,11 @@ pub async fn patch_torrent_tags(
 ) -> impl IntoResponse {
     if let Some(response) = require_mutation_auth(&state, &headers) {
         return response;
+    }
+    if req.add.len().saturating_add(req.remove.len()) > MAX_NATIVE_API_TAG_ITEMS {
+        return api_bad_request(format!(
+            "combined tag mutation exceeds the {MAX_NATIVE_API_TAG_ITEMS}-item limit"
+        ));
     }
     if !torrent_exists(&state, &info_hash).await {
         return not_found(info_hash);
@@ -2292,7 +2651,7 @@ pub struct BulkRequest {
     dry_run: Option<bool>,
     category: Option<String>,
     save_path: Option<PathBuf>,
-    #[serde(default, deserialize_with = "deserialize_bounded_optional_vec")]
+    #[serde(default, deserialize_with = "deserialize_optional_bounded_native_tags")]
     tags: Option<Vec<String>>,
 }
 
@@ -2301,6 +2660,71 @@ pub struct BulkResponse {
     applied: Vec<String>,
     errors: Vec<String>,
     dry_run: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct WorkflowRunResponse {
+    matched: Vec<String>,
+    matched_total: usize,
+    applied: Vec<String>,
+    applied_total: usize,
+    errors: Vec<String>,
+    errors_total: usize,
+    dry_run: bool,
+}
+
+impl WorkflowRunResponse {
+    fn record_error_parts(&mut self, parts: &[&str]) {
+        self.errors_total = self.errors_total.saturating_add(1);
+        if self.errors.len() >= MAX_NATIVE_WORKFLOW_RUN_SAMPLE_ITEMS {
+            return;
+        }
+        let mut sample = String::with_capacity(MAX_NATIVE_WORKFLOW_RUN_ERROR_BYTES);
+        for part in parts {
+            append_bounded_utf8(&mut sample, part, MAX_NATIVE_WORKFLOW_RUN_ERROR_BYTES);
+        }
+        self.errors.push(sample);
+    }
+}
+
+#[derive(Default)]
+struct NativeWorkflowActionResult {
+    applied: Vec<String>,
+    applied_total: usize,
+    errors: Vec<String>,
+    errors_total: usize,
+}
+
+impl NativeWorkflowActionResult {
+    fn record_applied(&mut self, hash: &str) {
+        self.applied_total = self.applied_total.saturating_add(1);
+        if self.applied.len() < MAX_NATIVE_WORKFLOW_RUN_SAMPLE_ITEMS
+            && hash.len() <= MAX_NATIVE_API_LABEL_BYTES
+        {
+            self.applied.push(hash.to_owned());
+        }
+    }
+
+    fn record_error(&mut self, hash: Option<&str>, error: &str) {
+        self.record_error_parts(hash, &[error]);
+    }
+
+    fn record_error_parts(&mut self, hash: Option<&str>, parts: &[&str]) {
+        self.errors_total = self.errors_total.saturating_add(1);
+        if self.errors.len() >= MAX_NATIVE_WORKFLOW_RUN_SAMPLE_ITEMS {
+            return;
+        }
+
+        let mut sample = String::with_capacity(MAX_NATIVE_WORKFLOW_RUN_ERROR_BYTES);
+        if let Some(hash) = hash {
+            append_bounded_utf8(&mut sample, hash, MAX_NATIVE_WORKFLOW_RUN_ERROR_BYTES);
+            append_bounded_utf8(&mut sample, ": ", MAX_NATIVE_WORKFLOW_RUN_ERROR_BYTES);
+        }
+        for part in parts {
+            append_bounded_utf8(&mut sample, part, MAX_NATIVE_WORKFLOW_RUN_ERROR_BYTES);
+        }
+        self.errors.push(sample);
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -2320,7 +2744,7 @@ pub struct UserAgentRequest {
 
 #[derive(Debug, Deserialize)]
 pub struct TagsRequest {
-    #[serde(deserialize_with = "deserialize_bounded_vec")]
+    #[serde(deserialize_with = "deserialize_bounded_native_tags")]
     tags: Vec<String>,
 }
 
@@ -2378,9 +2802,46 @@ pub struct DryRunRequest {
 
 #[derive(Debug, Deserialize)]
 pub struct RssSampleRequest {
+    #[serde(deserialize_with = "deserialize_bounded_native_rss_text")]
     title: String,
+    #[serde(
+        default,
+        deserialize_with = "deserialize_bounded_optional_native_rss_text"
+    )]
     link: Option<String>,
     dry_run: Option<bool>,
+}
+
+fn deserialize_bounded_native_rss_text<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = String::deserialize(deserializer)?;
+    if value.len() > MAX_NATIVE_JSON_RULE_TEXT_BYTES {
+        return Err(de::Error::custom(format!(
+            "RSS sample text exceeds the {MAX_NATIVE_JSON_RULE_TEXT_BYTES}-byte limit"
+        )));
+    }
+    Ok(value)
+}
+
+fn deserialize_bounded_optional_native_rss_text<'de, D>(
+    deserializer: D,
+) -> Result<Option<String>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    Option::<String>::deserialize(deserializer)?
+        .map(|value| {
+            if value.len() > MAX_NATIVE_JSON_RULE_TEXT_BYTES {
+                Err(de::Error::custom(format!(
+                    "RSS sample text exceeds the {MAX_NATIVE_JSON_RULE_TEXT_BYTES}-byte limit"
+                )))
+            } else {
+                Ok(value)
+            }
+        })
+        .transpose()
 }
 
 pub trait JsonStore: Send + Sync + 'static {
@@ -2435,6 +2896,7 @@ fn validate_json_item(value: &serde_json::Value, key: &str, kind: &str) -> Resul
     }
     for field in [
         "category",
+        "target_category",
         "tracker",
         "save_path",
         "target_path",
@@ -2446,6 +2908,9 @@ fn validate_json_item(value: &serde_json::Value, key: &str, kind: &str) -> Resul
         "mustContain",
         "mustNotContain",
         "action",
+        "event",
+        "command",
+        "url",
     ] {
         if let Some(value) = object.get(field) {
             if !(value.is_null() || value.is_string()) {
@@ -2475,6 +2940,123 @@ fn validate_json_item(value: &serde_json::Value, key: &str, kind: &str) -> Resul
     if kind == "ratio_group" {
         ratio_group_limit(value).map_err(|error| format!("{kind} {key:?}: {error}"))?;
         seeding_time_group_limit(value).map_err(|error| format!("{kind} {key:?}: {error}"))?;
+    }
+    Ok(())
+}
+
+fn validate_json_item_limits(
+    value: &serde_json::Value,
+    key: &str,
+    kind: &str,
+) -> Result<(), String> {
+    let Some(object) = value.as_object() else {
+        return Err(format!("{kind} {key:?} must be a JSON object"));
+    };
+    for (field, max_bytes) in [
+        ("id", MAX_NATIVE_API_LABEL_BYTES),
+        ("name", MAX_NATIVE_API_LABEL_BYTES),
+        ("category", MAX_NATIVE_API_LABEL_BYTES),
+        ("target_category", MAX_NATIVE_API_LABEL_BYTES),
+        ("event", MAX_NATIVE_JSON_RULE_TOKEN_BYTES),
+        ("action", MAX_NATIVE_JSON_RULE_TOKEN_BYTES),
+        ("tracker", MAX_NATIVE_JSON_RULE_TEXT_BYTES),
+        ("feed_url", MAX_NATIVE_JSON_RULE_TEXT_BYTES),
+        ("include", MAX_NATIVE_JSON_RULE_TEXT_BYTES),
+        ("exclude", MAX_NATIVE_JSON_RULE_TEXT_BYTES),
+        ("contains", MAX_NATIVE_JSON_RULE_TEXT_BYTES),
+        ("pattern", MAX_NATIVE_JSON_RULE_TEXT_BYTES),
+        ("mustContain", MAX_NATIVE_JSON_RULE_TEXT_BYTES),
+        ("mustNotContain", MAX_NATIVE_JSON_RULE_TEXT_BYTES),
+        ("command", MAX_NATIVE_JSON_RULE_TEXT_BYTES),
+        ("url", MAX_NATIVE_JSON_RULE_TEXT_BYTES),
+        ("save_path", MAX_NATIVE_CATEGORY_PATH_BYTES),
+        ("target_path", MAX_NATIVE_CATEGORY_PATH_BYTES),
+    ] {
+        if object
+            .get(field)
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|text| text.len() > max_bytes)
+        {
+            return Err(format!(
+                "{kind} {key:?} field {field:?} exceeds the {max_bytes}-byte limit"
+            ));
+        }
+    }
+    if let Some(tags) = object.get("tags").and_then(serde_json::Value::as_array) {
+        if tags.len() > MAX_NATIVE_API_TAG_ITEMS {
+            return Err(format!(
+                "{kind} {key:?} tags exceed the {MAX_NATIVE_API_TAG_ITEMS}-item limit"
+            ));
+        }
+        if tags.iter().any(|tag| {
+            tag.as_str()
+                .is_some_and(|value| value.len() > MAX_NATIVE_API_LABEL_BYTES)
+        }) {
+            return Err(format!(
+                "{kind} {key:?} tag values exceed the {MAX_NATIVE_API_LABEL_BYTES}-byte limit"
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn normalize_native_workflow_category_target(rule: &mut serde_json::Value) {
+    let is_set_category = rule
+        .get("action")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("set_category")
+        == "set_category";
+    let target_missing = rule
+        .get("target_category")
+        .is_none_or(serde_json::Value::is_null);
+    if !is_set_category || !target_missing {
+        return;
+    }
+
+    let Some(category) = rule
+        .get("category")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_owned)
+    else {
+        return;
+    };
+    let Some(object) = rule.as_object_mut() else {
+        return;
+    };
+    object.insert("category".to_owned(), serde_json::Value::Null);
+    object.insert(
+        "target_category".to_owned(),
+        serde_json::Value::String(category),
+    );
+}
+
+fn native_workflow_target_category(rule: &serde_json::Value) -> Option<String> {
+    rule.get("target_category")
+        .or_else(|| rule.get("category"))
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_owned)
+}
+
+fn normalize_native_workflow_categories(map: &mut JsonMap) {
+    for rule in map.values_mut() {
+        normalize_native_workflow_category_target(rule);
+    }
+}
+
+fn validate_native_workflow_rule(rule: &serde_json::Value, key: &str) -> Result<(), String> {
+    let action = rule
+        .get("action")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("set_category");
+    if action == "set_category"
+        && rule
+            .get("target_category")
+            .and_then(serde_json::Value::as_str)
+            .is_none_or(|target| target.trim().is_empty())
+    {
+        return Err(format!(
+            "workflow {key:?} requires a non-empty target_category for set_category"
+        ));
     }
     Ok(())
 }
@@ -2525,7 +3107,7 @@ json_store!(
 );
 
 async fn load_json_map<S: JsonStore>(state: &AppState) -> Result<JsonMap, String> {
-    let map = if let Some(engine) = &state.engine {
+    let mut map = if let Some(engine) = &state.engine {
         match engine.get_setting(S::setting_key().to_owned()).await? {
             Some(value) => {
                 if value.len() > MAX_NATIVE_JSON_BYTES {
@@ -2545,6 +3127,9 @@ async fn load_json_map<S: JsonStore>(state: &AppState) -> Result<JsonMap, String
         S::store(state).read().await.clone()
     };
     validate_json_map(&map, S::setting_key(), S::kind())?;
+    if S::kind() == "workflow" {
+        normalize_native_workflow_categories(&mut map);
+    }
     *S::store(state).write().await = map.clone();
     Ok(map)
 }
@@ -2562,7 +3147,7 @@ async fn save_json_map<S: JsonStore>(state: &AppState, map: &JsonMap) -> Result<
 }
 
 async fn load_workflow_runs(state: &AppState) -> Result<Vec<serde_json::Value>, String> {
-    let runs = if let Some(engine) = &state.engine {
+    let mut runs = if let Some(engine) = &state.engine {
         match engine
             .get_setting(SETTING_NATIVE_WORKFLOW_RUNS.to_owned())
             .await?
@@ -2586,6 +3171,9 @@ async fn load_workflow_runs(state: &AppState) -> Result<Vec<serde_json::Value>, 
             "persisted workflow runs contain more than {MAX_NATIVE_WORKFLOW_RUNS} entries"
         ));
     }
+    for run in &mut runs {
+        bound_native_workflow_run(run);
+    }
     *state.workflow_runs.write().await = runs.clone();
     Ok(runs)
 }
@@ -2594,16 +3182,28 @@ async fn save_workflow_runs(
     state: &AppState,
     mut runs: Vec<serde_json::Value>,
 ) -> Result<(), String> {
-    if runs.len() > MAX_NATIVE_WORKFLOW_RUNS {
-        let drop_count = runs.len() - MAX_NATIVE_WORKFLOW_RUNS;
-        runs.drain(..drop_count);
+    for run in &mut runs {
+        bound_native_workflow_run(run);
     }
-    let encoded = serde_json::to_string(&runs).map_err(|error| error.to_string())?;
-    if encoded.len() > MAX_NATIVE_JSON_BYTES {
-        return Err(format!(
-            "workflow runs exceed the {MAX_NATIVE_JSON_BYTES} byte compatibility limit"
-        ));
+
+    let mut encoded_runs = Vec::with_capacity(runs.len());
+    let mut encoded_len = 2usize.saturating_add(runs.len().saturating_sub(1));
+    for run in &runs {
+        let encoded = serde_json::to_string(run).map_err(|error| error.to_string())?;
+        encoded_len = encoded_len.saturating_add(encoded.len());
+        encoded_runs.push(encoded);
     }
+    while runs.len() > MAX_NATIVE_WORKFLOW_RUNS || encoded_len > MAX_NATIVE_JSON_BYTES {
+        if runs.len() <= 1 {
+            return Err(format!(
+                "one workflow run exceeds the {MAX_NATIVE_JSON_BYTES} byte history limit"
+            ));
+        }
+        let oldest = encoded_runs.remove(0);
+        encoded_len = encoded_len.saturating_sub(oldest.len().saturating_add(1));
+        runs.remove(0);
+    }
+    let encoded = format!("[{}]", encoded_runs.join(","));
     if let Some(engine) = &state.engine {
         engine
             .set_setting(SETTING_NATIVE_WORKFLOW_RUNS.to_owned(), encoded)
@@ -2611,6 +3211,114 @@ async fn save_workflow_runs(
     }
     *state.workflow_runs.write().await = runs;
     Ok(())
+}
+
+fn append_bounded_utf8(output: &mut String, value: &str, max_bytes: usize) {
+    let remaining = max_bytes.saturating_sub(output.len());
+    if remaining == 0 {
+        return;
+    }
+    let mut end = value.len().min(remaining);
+    while !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    output.push_str(&value[..end]);
+}
+
+fn truncate_utf8(value: &mut String, max_bytes: usize) {
+    if value.len() <= max_bytes {
+        return;
+    }
+    let mut boundary = max_bytes;
+    while !value.is_char_boundary(boundary) {
+        boundary -= 1;
+    }
+    value.truncate(boundary);
+}
+
+fn bound_native_workflow_run_array(
+    run: &mut serde_json::Value,
+    field: &str,
+    total_field: &str,
+    max_items: usize,
+    max_item_bytes: usize,
+    truncate_items: bool,
+) {
+    let original_len = run
+        .get(field)
+        .and_then(serde_json::Value::as_array)
+        .map_or(0, Vec::len);
+    let existing_total = run
+        .get(total_field)
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0);
+    let total = existing_total.max(original_len as u64);
+    let Some(object) = run.as_object_mut() else {
+        return;
+    };
+    object.insert(total_field.to_owned(), serde_json::Value::from(total));
+    let Some(items) = object
+        .get_mut(field)
+        .and_then(serde_json::Value::as_array_mut)
+    else {
+        return;
+    };
+    if truncate_items {
+        items.retain(serde_json::Value::is_string);
+        for item in items.iter_mut() {
+            if let Some(value) = item.as_str() {
+                let mut value = value.to_owned();
+                truncate_utf8(&mut value, max_item_bytes);
+                *item = serde_json::Value::String(value);
+            }
+        }
+    } else {
+        items.retain(|item| {
+            item.as_str()
+                .is_some_and(|value| value.len() <= max_item_bytes)
+        });
+    }
+    items.truncate(max_items);
+}
+
+fn bound_native_workflow_run(run: &mut serde_json::Value) {
+    if let Some(object) = run.as_object_mut() {
+        for (field, max_bytes) in [
+            ("id", MAX_NATIVE_API_LABEL_BYTES),
+            ("rule_id", MAX_NATIVE_API_LABEL_BYTES),
+            ("rule_name", MAX_NATIVE_API_LABEL_BYTES),
+            ("action", MAX_NATIVE_API_LABEL_BYTES),
+            ("kind", MAX_NATIVE_API_LABEL_BYTES),
+        ] {
+            if let Some(serde_json::Value::String(value)) = object.get_mut(field) {
+                truncate_utf8(value, max_bytes);
+            }
+        }
+    }
+    bound_native_workflow_run_array(
+        run,
+        "matched",
+        "matched_total",
+        MAX_NATIVE_WORKFLOW_RUN_SAMPLE_ITEMS,
+        MAX_NATIVE_API_LABEL_BYTES,
+        false,
+    );
+    bound_native_workflow_run_array(
+        run,
+        "applied",
+        "applied_total",
+        MAX_NATIVE_WORKFLOW_RUN_SAMPLE_ITEMS,
+        MAX_NATIVE_API_LABEL_BYTES,
+        false,
+    );
+    bound_native_workflow_run_array(
+        run,
+        "errors",
+        "errors_total",
+        MAX_NATIVE_WORKFLOW_RUN_SAMPLE_ITEMS,
+        MAX_NATIVE_WORKFLOW_RUN_ERROR_BYTES,
+        true,
+    );
 }
 
 fn json_item_id(value: &serde_json::Value) -> Option<String> {
@@ -2674,6 +3382,23 @@ pub async fn upsert_json_map<S: JsonStore>(
         .and_then(serde_json::Value::as_str)
         .map(str::to_owned)
         .unwrap_or(id);
+    if id.len() > 256 {
+        return api_bad_request("item id exceeds the 256-byte limit");
+    }
+    if S::kind() == "workflow" {
+        normalize_native_workflow_category_target(&mut value);
+    }
+    if let Err(error) = validate_json_item(&value, &id, S::kind()) {
+        return api_bad_request(error);
+    }
+    if let Err(error) = validate_json_item_limits(&value, &id, S::kind()) {
+        return api_bad_request(error);
+    }
+    if S::kind() == "workflow" {
+        if let Err(error) = validate_native_workflow_rule(&value, &id) {
+            return api_bad_request(error);
+        }
+    }
     let mut items = match load_json_map::<S>(&state).await {
         Ok(items) => items,
         Err(error) => {
@@ -2684,7 +3409,39 @@ pub async fn upsert_json_map<S: JsonStore>(
                 .into_response()
         }
     };
+    if !items.contains_key(&id) && items.len() >= MAX_NATIVE_JSON_ENTRIES {
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
+            Json(
+                serde_json::to_value(ApiError::new(
+                    "CAPACITY_REACHED",
+                    format!(
+                        "{} already contains the maximum number of entries",
+                        S::setting_key()
+                    ),
+                ))
+                .unwrap(),
+            ),
+        )
+            .into_response();
+    }
     items.insert(id, value);
+    let encoded_len = match serde_json::to_vec(&items) {
+        Ok(encoded) => encoded.len(),
+        Err(error) => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::to_value(ApiError::internal(error.to_string())).unwrap()),
+            )
+                .into_response()
+        }
+    };
+    if encoded_len > MAX_NATIVE_JSON_BYTES {
+        return api_payload_too_large(format!(
+            "{} would exceed the {MAX_NATIVE_JSON_BYTES}-byte persisted-state limit",
+            S::setting_key()
+        ));
+    }
     if let Err(error) = save_json_map::<S>(&state, &items).await {
         return (
             StatusCode::SERVICE_UNAVAILABLE,
@@ -2754,6 +3511,18 @@ pub async fn run_json_workflow<S: JsonStore>(
         )
             .into_response();
     };
+    if let Err(error) = validate_json_item_limits(&value, &id, S::kind()) {
+        return api_bad_request(format!(
+            "stored rule must be updated before execution: {error}"
+        ));
+    }
+    if S::kind() == "workflow" {
+        if let Err(error) = validate_native_workflow_rule(&value, &id) {
+            return api_bad_request(format!(
+                "stored rule must be updated before execution: {error}"
+            ));
+        }
+    }
     if !value
         .get("enabled")
         .and_then(serde_json::Value::as_bool)
@@ -2767,7 +3536,12 @@ pub async fn run_json_workflow<S: JsonStore>(
     }
     let matched = match matching_hashes_for_json_rule(&state, &value).await {
         Ok(matched) => matched,
-        Err(error) => {
+        Err(WorkflowMatchError::TooMany) => {
+            return api_payload_too_large(format!(
+                "workflow selection exceeds the {MAX_NATIVE_WORKFLOW_MATCHES} torrent limit"
+            ));
+        }
+        Err(WorkflowMatchError::Internal(error)) => {
             return (
                 StatusCode::SERVICE_UNAVAILABLE,
                 Json(serde_json::to_value(ApiError::internal(error)).unwrap()),
@@ -2775,8 +3549,19 @@ pub async fn run_json_workflow<S: JsonStore>(
                 .into_response()
         }
     };
-    let (applied, errors) = if dry_run {
-        (matched.clone(), Vec::new())
+    let matched_total = matched.len();
+    let matched_sample = matched
+        .iter()
+        .take(MAX_NATIVE_WORKFLOW_RUN_SAMPLE_ITEMS)
+        .filter(|hash| hash.len() <= MAX_NATIVE_API_LABEL_BYTES)
+        .cloned()
+        .collect::<Vec<_>>();
+    let outcome = if dry_run {
+        NativeWorkflowActionResult {
+            applied: matched_sample.clone(),
+            applied_total: matched_total,
+            ..NativeWorkflowActionResult::default()
+        }
     } else if S::kind() == "ratio_group" {
         apply_ratio_group_action(&state, &value, &matched).await
     } else {
@@ -2795,44 +3580,52 @@ pub async fn run_json_workflow<S: JsonStore>(
     } else {
         "native_json_workflow"
     };
+    let mut rule_name = value
+        .get("name")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("")
+        .to_owned();
+    truncate_utf8(&mut rule_name, MAX_NATIVE_API_LABEL_BYTES);
+    let mut action_name = action.to_owned();
+    truncate_utf8(&mut action_name, MAX_NATIVE_API_LABEL_BYTES);
+    let started_at = unix_now();
+    let mut response = WorkflowRunResponse {
+        matched: matched_sample,
+        matched_total,
+        applied: outcome.applied,
+        applied_total: outcome.applied_total,
+        errors: outcome.errors,
+        errors_total: outcome.errors_total,
+        dry_run,
+    };
     let run = serde_json::json!({
-        "id": format!("run-{}", unix_now()),
+        "id": workflow_run_id("run", started_at),
         "rule_id": id,
-        "rule_name": value.get("name").and_then(serde_json::Value::as_str).unwrap_or(""),
-        "action": action,
+        "rule_name": rule_name,
+        "action": action_name,
         "kind": kind,
         "dry_run": dry_run,
-        "matched": matched,
-        "applied": applied,
-        "errors": errors.clone(),
-        "started_at": unix_now(),
+        "matched": response.matched.clone(),
+        "matched_total": response.matched_total,
+        "applied": response.applied.clone(),
+        "applied_total": response.applied_total,
+        "errors": response.errors.clone(),
+        "errors_total": response.errors_total,
+        "started_at": started_at,
     });
-    let mut response_errors = errors;
     let _write = state.json_store_write.lock().await;
     match load_workflow_runs(&state).await {
         Ok(mut runs) => {
             runs.push(run.clone());
             if let Err(error) = save_workflow_runs(&state, runs).await {
-                response_errors.push(format!("workflow audit persistence failed: {error}"));
+                response.record_error_parts(&["workflow audit persistence failed: ", &error]);
             }
         }
-        Err(error) => response_errors.push(format!("workflow audit persistence failed: {error}")),
+        Err(error) => {
+            response.record_error_parts(&["workflow audit persistence failed: ", &error]);
+        }
     }
-    Json(BulkResponse {
-        applied: run["applied"]
-            .as_array()
-            .map(|items| {
-                items
-                    .iter()
-                    .filter_map(serde_json::Value::as_str)
-                    .map(str::to_owned)
-                    .collect()
-            })
-            .unwrap_or_default(),
-        errors: response_errors,
-        dry_run,
-    })
-    .into_response()
+    Json(response).into_response()
 }
 
 pub async fn list_workflow_runs(State(state): State<AppState>) -> impl IntoResponse {
@@ -2880,6 +3673,9 @@ pub async fn apply_rss_rules(
     if let Some(response) = require_mutation_auth(&state, &headers) {
         return response;
     }
+    if req.title.trim().is_empty() {
+        return api_bad_request("title must not be empty");
+    }
     let dry_run = req.dry_run.unwrap_or(true);
     let matches = match rss_rule_matches(&state, &req).await {
         Ok(matches) => matches,
@@ -2891,51 +3687,66 @@ pub async fn apply_rss_rules(
                 .into_response()
         }
     };
-    let (applied, errors) = if dry_run {
-        (
-            matches
-                .iter()
-                .filter_map(|rule| {
-                    rule.get("rule_name")
-                        .and_then(serde_json::Value::as_str)
-                        .map(str::to_owned)
-                })
-                .collect::<Vec<_>>(),
-            Vec::new(),
-        )
+    let matched_total = matches.len();
+    let matched_sample = matches
+        .iter()
+        .take(MAX_NATIVE_WORKFLOW_RUN_SAMPLE_ITEMS)
+        .filter_map(|rule| {
+            rule.get("rule_name")
+                .and_then(serde_json::Value::as_str)
+                .filter(|name| name.len() <= MAX_NATIVE_API_LABEL_BYTES)
+                .map(str::to_owned)
+        })
+        .collect::<Vec<_>>();
+    let outcome = if dry_run {
+        NativeWorkflowActionResult {
+            applied: matched_sample.clone(),
+            applied_total: matched_total,
+            ..NativeWorkflowActionResult::default()
+        }
     } else {
         apply_rss_rule_matches(&state, &req, &matches).await
     };
-    let mut response_errors = errors;
+    let started_at = unix_now();
+    let mut response = WorkflowRunResponse {
+        matched: matched_sample,
+        matched_total,
+        applied: outcome.applied,
+        applied_total: outcome.applied_total,
+        errors: outcome.errors,
+        errors_total: outcome.errors_total,
+        dry_run,
+    };
     let _write = state.json_store_write.lock().await;
     if !dry_run {
         let run = serde_json::json!({
-            "id": format!("rss-{}", unix_now()),
-            "kind": "rss_rules",
-            "dry_run": false,
-            "matched": matches,
-            "applied": applied.clone(),
-            "errors": response_errors.clone(),
-            "started_at": unix_now(),
+            "id": workflow_run_id("rss", started_at),
+            "rule_id": "rss_rules",
+            "rule_name": "RSS rules",
+            "action": "add_magnet",
+            "kind": "native_rss_rules",
+            "dry_run": dry_run,
+            "matched": response.matched.clone(),
+            "matched_total": response.matched_total,
+            "applied": response.applied.clone(),
+            "applied_total": response.applied_total,
+            "errors": response.errors.clone(),
+            "errors_total": response.errors_total,
+            "started_at": started_at,
         });
         match load_workflow_runs(&state).await {
             Ok(mut runs) => {
                 runs.push(run);
                 if let Err(error) = save_workflow_runs(&state, runs).await {
-                    response_errors.push(format!("workflow audit persistence failed: {error}"));
+                    response.record_error_parts(&["workflow audit persistence failed: ", &error]);
                 }
             }
             Err(error) => {
-                response_errors.push(format!("workflow audit persistence failed: {error}"));
+                response.record_error_parts(&["workflow audit persistence failed: ", &error]);
             }
         }
     }
-    Json(BulkResponse {
-        applied,
-        errors: response_errors,
-        dry_run,
-    })
-    .into_response()
+    Json(response).into_response()
 }
 
 impl From<EngineStorageRoot> for StorageRootView {
@@ -3070,6 +3881,14 @@ pub async fn upsert_category(
     if let Some(response) = require_mutation_auth(&state, &headers) {
         return response;
     }
+    if req.name.len() > MAX_NATIVE_API_LABEL_BYTES
+        || req
+            .save_path
+            .as_deref()
+            .is_some_and(|path| path.len() > MAX_NATIVE_CATEGORY_PATH_BYTES)
+    {
+        return api_bad_request("category name or save path exceeds the input limit");
+    }
     let name = req.name.trim();
     if name.is_empty() {
         return (
@@ -3111,6 +3930,11 @@ pub async fn delete_category(
 ) -> impl IntoResponse {
     if let Some(response) = require_mutation_auth(&state, &headers) {
         return response;
+    }
+    if name.len() > MAX_NATIVE_API_LABEL_BYTES {
+        return api_bad_request(format!(
+            "category name exceeds the {MAX_NATIVE_API_LABEL_BYTES}-byte limit"
+        ));
     }
     if let Some(engine) = &state.engine {
         if let Err(error) = engine.remove_categories(vec![name.clone()]).await {
@@ -3200,6 +4024,11 @@ pub async fn create_tag(
     if let Some(response) = require_mutation_auth(&state, &headers) {
         return response;
     }
+    if req.name.len() > MAX_NATIVE_API_LABEL_BYTES {
+        return api_bad_request(format!(
+            "tag name exceeds the {MAX_NATIVE_API_LABEL_BYTES}-byte limit"
+        ));
+    }
     let name = req.name.trim();
     if name.is_empty() {
         return (
@@ -3234,6 +4063,11 @@ pub async fn delete_tag(
 ) -> impl IntoResponse {
     if let Some(response) = require_mutation_auth(&state, &headers) {
         return response;
+    }
+    if name.len() > MAX_NATIVE_API_LABEL_BYTES {
+        return api_bad_request(format!(
+            "tag name exceeds the {MAX_NATIVE_API_LABEL_BYTES}-byte limit"
+        ));
     }
     if let Some(engine) = &state.engine {
         if let Err(error) = engine.remove_tags(vec![name.clone()]).await {
@@ -3271,6 +4105,15 @@ pub async fn bulk_action(
 ) -> impl IntoResponse {
     if let Some(response) = require_mutation_auth(&state, &headers) {
         return response;
+    }
+    if req
+        .category
+        .as_deref()
+        .is_some_and(|category| category.len() > MAX_NATIVE_API_LABEL_BYTES)
+    {
+        return api_bad_request(format!(
+            "category exceeds the {MAX_NATIVE_API_LABEL_BYTES}-byte limit"
+        ));
     }
     let dry_run = req.dry_run.unwrap_or(false);
     if !matches!(
@@ -4489,6 +5332,9 @@ fn storage_plan_issue_label(issue: &PlanIssue) -> String {
         PlanIssue::InsufficientCapacity { needed, available } => {
             format!("insufficient capacity: needed {needed}, available {available}")
         }
+        PlanIssue::AtomicNoReplaceRenameUnavailable => {
+            "atomic no-replace rename unavailable on this platform".to_owned()
+        }
         PlanIssue::DeleteRequiresDryRunApproval => {
             "delete requires execute confirmation".to_owned()
         }
@@ -4876,6 +5722,8 @@ pub async fn metrics(State(state): State<AppState>) -> impl IntoResponse {
             let health = MetricsHealth {
                 engine_alive: engine.is_alive(),
                 peer_listener_healthy: engine.peer_listener_healthy(),
+                peer_ingress: engine.peer_ingress_stats(),
+                database_worker: engine.database_worker_stats(),
                 subsystem: match engine.subsystem_health().await {
                     Ok(health) => Some(health),
                     Err(error) => {
@@ -5377,6 +6225,55 @@ fn render_metrics_with_health(
     );
     metric(
         &mut out,
+        "torrentng_peer_handshakes_admitted_total",
+        "counter",
+        "Inbound handshake-admission permits granted before peer-wire validation",
+        health.peer_ingress.accepted,
+    );
+    metric(
+        &mut out,
+        "torrentng_peer_handshakes_rejected_global_budget_total",
+        "counter",
+        "Inbound handshakes rejected by the global handshake budget",
+        health.peer_ingress.rejected_global_budget,
+    );
+    metric(
+        &mut out,
+        "torrentng_peer_handshakes_rejected_per_ip_budget_total",
+        "counter",
+        "Inbound handshakes rejected by the per-IP rate budget",
+        health.peer_ingress.rejected_ip_budget,
+    );
+    metric(
+        &mut out,
+        "torrentng_peer_connections_rejected_budget_total",
+        "counter",
+        "Inbound handshakes rejected by the global peer-connection budget",
+        health.peer_ingress.rejected_peer_connection_budget,
+    );
+    metric(
+        &mut out,
+        "torrentng_peer_handshake_read_errors_total",
+        "counter",
+        "Inbound peer handshakes with a failed or truncated read",
+        health.peer_ingress.handshake_read_errors,
+    );
+    metric(
+        &mut out,
+        "torrentng_peer_handshake_timeouts_total",
+        "counter",
+        "Inbound peer handshakes that exceeded the handshake deadline",
+        health.peer_ingress.handshake_timeouts,
+    );
+    metric(
+        &mut out,
+        "torrentng_peer_handshakes_malformed_total",
+        "counter",
+        "Inbound peer handshakes rejected by wire-protocol parsing",
+        health.peer_ingress.malformed_handshakes,
+    );
+    metric(
+        &mut out,
         "torrentng_database_worker_healthy",
         "gauge",
         "Dedicated database worker health (1=healthy, 0=unhealthy)",
@@ -5385,6 +6282,90 @@ fn render_metrics_with_health(
                 .subsystem
                 .is_some_and(|subsystem| subsystem.db_worker_healthy),
         ),
+    );
+    metric(
+        &mut out,
+        "torrentng_database_worker_queue_depth",
+        "gauge",
+        "Commands waiting in the bounded native database-worker queue",
+        health.database_worker.queue_depth,
+    );
+    metric(
+        &mut out,
+        "torrentng_database_worker_queue_capacity",
+        "gauge",
+        "Configured capacity of the native database-worker command queue",
+        health.database_worker.queue_capacity,
+    );
+    metric(
+        &mut out,
+        "torrentng_database_worker_commands_enqueued_total",
+        "counter",
+        "Database-worker commands successfully admitted to the bounded queue",
+        health.database_worker.commands_enqueued_total,
+    );
+    metric(
+        &mut out,
+        "torrentng_database_worker_commands_completed_total",
+        "counter",
+        "Database-worker commands completed with either success or failure",
+        health.database_worker.commands_completed_total,
+    );
+    metric(
+        &mut out,
+        "torrentng_database_worker_command_failures_total",
+        "counter",
+        "Database-worker commands completed with an error",
+        health.database_worker.command_failures_total,
+    );
+    metric(
+        &mut out,
+        "torrentng_database_worker_commands_cancelled_total",
+        "counter",
+        "Queued database-worker commands cancelled before execution",
+        health.database_worker.commands_cancelled_total,
+    );
+    metric(
+        &mut out,
+        "torrentng_database_worker_enqueue_timeouts_total",
+        "counter",
+        "Database-worker queue admissions that timed out under backpressure",
+        health.database_worker.enqueue_timeouts_total,
+    );
+    metric_seconds(
+        &mut out,
+        "torrentng_database_worker_queue_wait_seconds_total",
+        "counter",
+        "Cumulative time database-worker commands waited in the queue",
+        health.database_worker.queue_wait_nanoseconds_total,
+    );
+    metric_seconds(
+        &mut out,
+        "torrentng_database_worker_command_latency_seconds_total",
+        "counter",
+        "Cumulative enqueue-to-result latency for completed database-worker commands",
+        health.database_worker.command_latency_nanoseconds_total,
+    );
+    metric(
+        &mut out,
+        "torrentng_database_worker_batch_transactions_total",
+        "counter",
+        "Shared database transactions attempted for batched worker commands",
+        health.database_worker.batch_transactions_total,
+    );
+    metric(
+        &mut out,
+        "torrentng_database_worker_batch_transaction_failures_total",
+        "counter",
+        "Shared batched database transactions that failed to commit or roll back",
+        health.database_worker.batch_transaction_failures_total,
+    );
+    metric_seconds(
+        &mut out,
+        "torrentng_database_worker_batch_transaction_duration_seconds_total",
+        "counter",
+        "Cumulative duration of shared batched database transactions",
+        health.database_worker.batch_transaction_nanoseconds_total,
     );
     metric(
         &mut out,
@@ -5721,21 +6702,28 @@ fn render_metrics_with_health(
         &mut out,
         "torrentng_storage_file_pool_capacity",
         "gauge",
-        "Configured open-file cache capacity across running torrent schedulers",
+        "Configured open-file cache capacity across unique shared scheduler pools",
         stats.storage_file_pool_capacity,
     );
     metric(
         &mut out,
         "torrentng_storage_file_pool_open_files",
         "gauge",
-        "Open files across running torrent scheduler caches",
+        "Cached file entries across unique shared scheduler pools",
         stats.storage_file_pool_open_files,
+    );
+    metric(
+        &mut out,
+        "torrentng_storage_file_pool_active_descriptors",
+        "gauge",
+        "Leased descriptor slots for cached files, open attempts, or I/O across unique shared scheduler pools",
+        stats.storage_file_pool_active_descriptors,
     );
     metric(
         &mut out,
         "torrentng_storage_file_pool_memory_bytes",
         "gauge",
-        "Approximate memory used by open-file cache metadata across running torrent schedulers",
+        "Approximate open-file cache metadata across unique shared scheduler pools",
         stats.storage_file_pool_memory_bytes,
     );
     metric(
@@ -5770,14 +6758,14 @@ fn render_metrics_with_health(
         &mut out,
         "torrentng_storage_io_queue_depth",
         "gauge",
-        "Queued disk I/O jobs across running torrent schedulers",
+        "Queued disk I/O jobs across unique shared worker pools",
         stats.storage_io_queue_depth,
     );
     metric(
         &mut out,
         "torrentng_storage_hash_queue_depth",
         "gauge",
-        "Queued hashing jobs across running torrent schedulers",
+        "Queued hashing jobs across unique shared worker pools",
         stats.storage_hash_queue_depth,
     );
     metric(
@@ -6374,13 +7362,14 @@ fn render_metrics_with_health(
             &mut out,
             "torrentng_hot_torrent_storage_cache_bytes",
             "gauge",
-            "Per-torrent storage cache bytes attributed to top active torrents",
+            "Torrent-local storage cache metadata attributed to top active torrents; shared cache memory is reported in aggregate storage pool metrics",
             ("rank", &(rank + 1).to_string()),
             ("info_hash", metric_info_hash.as_ref()),
             torrent.storage_cache_bytes,
         );
     }
     let storage = StorageRuntime::global();
+    let descriptor_budget = rt_storage::fd_limit::process_descriptor_budget_stats();
     metric_with_label(
         &mut out,
         "torrentng_storage_backend_selected",
@@ -6446,8 +7435,36 @@ fn render_metrics_with_health(
         &mut out,
         "torrentng_storage_handles_open",
         "gauge",
-        "Open file handles in the global storage runtime cache",
+        "Cached file entries in the global storage runtime cache",
         storage.handles_open() as u64,
+    );
+    metric(
+        &mut out,
+        "torrentng_storage_handles_active",
+        "gauge",
+        "Leased descriptor slots for cached files, open attempts, or I/O in the global storage runtime cache",
+        storage.handles_active() as u64,
+    );
+    metric(
+        &mut out,
+        "torrentng_storage_descriptor_leases_active",
+        "gauge",
+        "Active managed-storage descriptor leases across all storage caches, including cached files, open attempts, and in-flight I/O",
+        descriptor_budget.active_leases as u64,
+    );
+    metric(
+        &mut out,
+        "torrentng_storage_descriptor_leases_capacity",
+        "gauge",
+        "Shared process-level descriptor lease capacity reserved for managed storage caches",
+        descriptor_budget.capacity as u64,
+    );
+    metric(
+        &mut out,
+        "torrentng_storage_descriptor_budget_waits_total",
+        "counter",
+        "Storage descriptor admission attempts delayed by the shared process-level managed-storage quota",
+        descriptor_budget.admission_waits_total,
     );
     metric(
         &mut out,
@@ -6696,6 +7713,15 @@ fn hash_metric_id(info_hash: &str) -> String {
 }
 
 fn metric(out: &mut String, name: &str, kind: &str, help: &str, value: u64) {
+    metric_value(out, name, kind, help, &value.to_string());
+}
+
+fn metric_seconds(out: &mut String, name: &str, kind: &str, help: &str, nanoseconds: u64) {
+    let seconds = nanoseconds as f64 / 1_000_000_000.0;
+    metric_value(out, name, kind, help, &format!("{seconds:.9}"));
+}
+
+fn metric_value(out: &mut String, name: &str, kind: &str, help: &str, value: &str) {
     out.push_str("# HELP ");
     out.push_str(name);
     out.push(' ');
@@ -6708,7 +7734,7 @@ fn metric(out: &mut String, name: &str, kind: &str, help: &str, value: u64) {
     out.push('\n');
     out.push_str(name);
     out.push(' ');
-    out.push_str(&value.to_string());
+    out.push_str(value);
     out.push('\n');
 }
 
@@ -6989,10 +8015,16 @@ async fn preview_hashes(state: &AppState, hashes: &[String]) -> Result<Vec<Strin
         .collect())
 }
 
+#[derive(Debug)]
+enum WorkflowMatchError {
+    TooMany,
+    Internal(String),
+}
+
 async fn matching_hashes_for_json_rule(
     state: &AppState,
     rule: &serde_json::Value,
-) -> Result<Vec<String>, String> {
+) -> Result<Vec<String>, WorkflowMatchError> {
     let category = rule
         .get("category")
         .and_then(serde_json::Value::as_str)
@@ -7003,9 +8035,11 @@ async fn matching_hashes_for_json_rule(
         .and_then(serde_json::Value::as_str)
         .map(str::trim)
         .filter(|value| !value.is_empty());
-    let tracker_hashes = tracker_filter_hashes(state, tracker).await?;
+    let tracker_hashes = tracker_filter_hashes(state, tracker)
+        .await
+        .map_err(WorkflowMatchError::Internal)?;
     let reg = state.registry.read().await;
-    Ok(reg
+    let matched = reg
         .iter()
         .filter(|entry| {
             category
@@ -7019,7 +8053,12 @@ async fn matching_hashes_for_json_rule(
                 .unwrap_or(true)
         })
         .map(|entry| entry.info_hash.clone())
-        .collect())
+        .take(MAX_NATIVE_WORKFLOW_MATCHES.saturating_add(1))
+        .collect::<Vec<_>>();
+    if matched.len() > MAX_NATIVE_WORKFLOW_MATCHES {
+        return Err(WorkflowMatchError::TooMany);
+    }
+    Ok(matched)
 }
 
 fn ratio_group_limit(rule: &serde_json::Value) -> Result<Option<f64>, String> {
@@ -7061,23 +8100,26 @@ async fn apply_ratio_group_action(
     state: &AppState,
     rule: &serde_json::Value,
     hashes: &[String],
-) -> (Vec<String>, Vec<String>) {
+) -> NativeWorkflowActionResult {
+    let mut outcome = NativeWorkflowActionResult::default();
     let Some(engine) = &state.engine else {
-        return (
-            Vec::new(),
-            vec!["TorrentNG client is required to apply ratio groups".to_owned()],
-        );
+        outcome.record_error(None, "TorrentNG client is required to apply ratio groups");
+        return outcome;
     };
     let ratio_limit = match ratio_group_limit(rule) {
         Ok(limit) => limit,
-        Err(error) => return (Vec::new(), vec![error]),
+        Err(error) => {
+            outcome.record_error(None, &error);
+            return outcome;
+        }
     };
     let seed_idle_limit = match seeding_time_group_limit(rule) {
         Ok(limit) => limit,
-        Err(error) => return (Vec::new(), vec![error]),
+        Err(error) => {
+            outcome.record_error(None, &error);
+            return outcome;
+        }
     };
-    let mut applied = Vec::new();
-    let mut errors = Vec::new();
     for hash in hashes {
         let result = async {
             let mut limits = engine.torrent_limits(hash.clone()).await?;
@@ -7087,124 +8129,130 @@ async fn apply_ratio_group_action(
         }
         .await;
         match result {
-            Ok(()) => applied.push(hash.clone()),
-            Err(error) => errors.push(format!("{hash}: {error}")),
+            Ok(()) => outcome.record_applied(hash),
+            Err(error) => outcome.record_error(Some(hash), &error),
         }
     }
-    (applied, errors)
+    outcome
 }
 
 async fn apply_json_rule_action(
     state: &AppState,
     rule: &serde_json::Value,
     hashes: &[String],
-) -> (Vec<String>, Vec<String>) {
+) -> NativeWorkflowActionResult {
+    let mut outcome = NativeWorkflowActionResult::default();
+    if hashes.is_empty() {
+        return outcome;
+    }
     let action = rule
         .get("action")
         .and_then(serde_json::Value::as_str)
         .unwrap_or("set_category");
-    let mut applied = Vec::new();
-    let mut errors = Vec::new();
+    if action == "webhook" {
+        outcome.record_error(
+            None,
+            "TorrentNG-client workflows do not execute webhooks; use the compatible-client service workflow route",
+        );
+        return outcome;
+    }
+    if action == "script" {
+        outcome.record_error(
+            None,
+            "TorrentNG-client workflows do not execute scripts; use the compatible-client service workflow route",
+        );
+        return outcome;
+    }
+    if !matches!(action, "set_category" | "set_location") {
+        outcome.record_error_parts(None, &["unsupported workflow action: ", action]);
+        return outcome;
+    }
+    let Some(engine) = &state.engine else {
+        outcome.record_error(None, "TorrentNG client is not available");
+        return outcome;
+    };
+    let category = native_workflow_target_category(rule);
+    let save_path = rule
+        .get("target_path")
+        .or_else(|| rule.get("save_path"))
+        .and_then(serde_json::Value::as_str)
+        .map(PathBuf::from);
+    if action == "set_location" && save_path.is_none() {
+        outcome.record_error(None, "target_path is required");
+        return outcome;
+    }
     for hash in hashes {
         let result = match action {
             "set_category" => {
-                let category = rule
-                    .get("category")
-                    .and_then(serde_json::Value::as_str)
-                    .map(str::to_owned);
-                let Some(engine) = &state.engine else {
-                    return (
-                        Vec::new(),
-                        vec!["TorrentNG client is not available".to_owned()],
-                    );
-                };
                 engine
-                    .update_torrent_labels(hash.clone(), Some(category), Vec::new(), Vec::new())
+                    .update_torrent_labels(
+                        hash.clone(),
+                        Some(category.clone()),
+                        Vec::new(),
+                        Vec::new(),
+                    )
                     .await
             }
             "set_location" => {
-                let save_path = rule
-                    .get("target_path")
-                    .or_else(|| rule.get("save_path"))
-                    .and_then(serde_json::Value::as_str)
-                    .map(PathBuf::from);
-                if let Some(engine) = &state.engine {
-                    match save_path {
-                        Some(path) => {
-                            engine
-                                .update_torrent_fields(hash.clone(), None, Some(path))
-                                .await
-                        }
-                        None => Err("target_path is required".to_owned()),
-                    }
-                } else {
-                    Err("TorrentNG client is not available".to_owned())
-                }
+                engine
+                    .update_torrent_fields(hash.clone(), None, save_path.clone())
+                    .await
             }
-            "webhook" => Err(
-                "TorrentNG-client workflows do not execute webhooks; use the compatible-client service workflow route"
-                    .to_owned(),
-            ),
-            "script" => Err(
-                "TorrentNG-client workflows do not execute scripts; use the compatible-client service workflow route"
-                    .to_owned(),
-            ),
-            _ => Err(format!("unsupported workflow action: {action}")),
+            _ => unreachable!("workflow action was checked above"),
         };
         match result {
-            Ok(()) => applied.push(hash.clone()),
-            Err(error) => errors.push(format!("{hash}: {error}")),
+            Ok(()) => outcome.record_applied(hash),
+            Err(error) => outcome.record_error(Some(hash), &error),
         }
     }
-    (applied, errors)
+    outcome
 }
 
 async fn apply_rss_rule_matches(
     state: &AppState,
     req: &RssSampleRequest,
     matches: &[serde_json::Value],
-) -> (Vec<String>, Vec<String>) {
+) -> NativeWorkflowActionResult {
+    let mut outcome = NativeWorkflowActionResult::default();
+    if matches.is_empty() {
+        return outcome;
+    }
     let Some(link) = req
         .link
         .as_deref()
         .map(str::trim)
         .filter(|value| !value.is_empty())
     else {
-        return (
-            Vec::new(),
-            vec!["link is required for RSS apply".to_owned()],
-        );
+        outcome.record_error(None, "link is required for RSS apply");
+        return outcome;
     };
     let Some(engine) = &state.engine else {
-        return (
-            Vec::new(),
-            vec!["TorrentNG client is not available".to_owned()],
-        );
+        outcome.record_error(None, "TorrentNG client is not available");
+        return outcome;
     };
     if !link
         .get(.."magnet:".len())
         .is_some_and(|prefix| prefix.eq_ignore_ascii_case("magnet:"))
     {
-        return (
-            Vec::new(),
-            vec![
-                "TorrentNG-client RSS apply supports magnet links only; HTTP torrent downloads are a compatible-client service capability"
-                    .to_owned(),
-            ],
+        outcome.record_error(
+            None,
+            "TorrentNG-client RSS apply supports magnet links only; HTTP torrent downloads are a compatible-client service capability",
         );
+        return outcome;
     }
     let magnet = match parse_magnet(link) {
         Ok(magnet) => magnet,
-        Err(error) => return (Vec::new(), vec![format!("invalid magnet link: {error}")]),
+        Err(error) => {
+            let error = error.to_string();
+            outcome.record_error_parts(None, &["invalid magnet link: ", &error]);
+            return outcome;
+        }
     };
-    let mut applied = Vec::new();
-    let mut errors = Vec::new();
     for rule in matches {
         let rule_name = rule
             .get("rule_name")
             .and_then(serde_json::Value::as_str)
-            .unwrap_or("rss rule")
-            .to_owned();
+            .unwrap_or("rss rule");
         let category = rule
             .get("category")
             .and_then(serde_json::Value::as_str)
@@ -7234,11 +8282,11 @@ async fn apply_rss_rule_matches(
             .add_magnet_with_labels(magnet.clone(), save_path, paused, category, tags)
             .await
         {
-            Ok(_) => applied.push(rule_name),
-            Err(error) => errors.push(format!("{rule_name}: {error}")),
+            Ok(_) => outcome.record_applied(rule_name),
+            Err(error) => outcome.record_error(Some(rule_name), &error),
         }
     }
-    (applied, errors)
+    outcome
 }
 
 async fn run_bulk_action(
@@ -7374,6 +8422,10 @@ fn unix_now() -> u64 {
         .as_secs()
 }
 
+fn workflow_run_id(kind: &str, started_at: u64) -> String {
+    format!("{kind}-{started_at}-{}", uuid::Uuid::new_v4())
+}
+
 async fn rss_rule_matches(
     state: &AppState,
     req: &RssSampleRequest,
@@ -7381,66 +8433,66 @@ async fn rss_rule_matches(
     let rules = load_json_map::<RssRulesStore>(state).await?;
     let haystack =
         format!("{} {}", req.title, req.link.as_deref().unwrap_or_default()).to_ascii_lowercase();
-    Ok(rules
-        .values()
-        .filter_map(|rule| {
-            if !rule
-                .get("enabled")
-                .and_then(serde_json::Value::as_bool)
-                .unwrap_or(true)
-            {
-                return None;
-            }
-            let include_matches = rule
-                .get("contains")
-                .or_else(|| rule.get("pattern"))
-                .or_else(|| rule.get("include"))
-                .or_else(|| rule.get("mustContain"))
-                .and_then(serde_json::Value::as_str)
-                .map(|needle| {
-                    needle
-                        .split(',')
-                        .map(str::trim)
-                        .filter(|part| !part.is_empty())
-                        .any(|part| haystack.contains(&part.to_ascii_lowercase()))
-                })
-                .unwrap_or(true);
-            let exclude_matches = rule
-                .get("exclude")
-                .or_else(|| rule.get("mustNotContain"))
-                .and_then(serde_json::Value::as_str)
-                .map(|needle| {
-                    needle
-                        .split(',')
-                        .map(str::trim)
-                        .filter(|part| !part.is_empty())
-                        .any(|part| haystack.contains(&part.to_ascii_lowercase()))
-                })
-                .unwrap_or(false);
-            if !include_matches || exclude_matches {
-                return None;
-            }
-            let rule_id = rule
-                .get("id")
-                .and_then(serde_json::Value::as_str)
-                .or_else(|| rule.get("name").and_then(serde_json::Value::as_str))
-                .unwrap_or_default();
-            let rule_name = rule
-                .get("name")
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or(rule_id);
-            Some(serde_json::json!({
-                "rule_id": rule_id,
-                "rule_name": rule_name,
-                "matched": true,
-                "reason": "include matched",
-                "category": rule.get("category").cloned().unwrap_or(serde_json::Value::Null),
-                "save_path": rule.get("save_path").cloned().unwrap_or(serde_json::Value::Null),
-                "tags": rule.get("tags").cloned().unwrap_or_else(|| serde_json::json!([])),
-                "start": rule.get("start").and_then(serde_json::Value::as_bool).unwrap_or(true),
-            }))
-        })
-        .collect())
+    let mut matches = Vec::new();
+    for (key, rule) in &rules {
+        validate_json_item_limits(rule, key, "rss_rule")?;
+        if !rule
+            .get("enabled")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(true)
+        {
+            continue;
+        }
+        let include_matches = rule
+            .get("contains")
+            .or_else(|| rule.get("pattern"))
+            .or_else(|| rule.get("include"))
+            .or_else(|| rule.get("mustContain"))
+            .and_then(serde_json::Value::as_str)
+            .map(|needle| {
+                needle
+                    .split(',')
+                    .map(str::trim)
+                    .filter(|part| !part.is_empty())
+                    .any(|part| haystack.contains(&part.to_ascii_lowercase()))
+            })
+            .unwrap_or(true);
+        let exclude_matches = rule
+            .get("exclude")
+            .or_else(|| rule.get("mustNotContain"))
+            .and_then(serde_json::Value::as_str)
+            .map(|needle| {
+                needle
+                    .split(',')
+                    .map(str::trim)
+                    .filter(|part| !part.is_empty())
+                    .any(|part| haystack.contains(&part.to_ascii_lowercase()))
+            })
+            .unwrap_or(false);
+        if !include_matches || exclude_matches {
+            continue;
+        }
+        let rule_id = rule
+            .get("id")
+            .and_then(serde_json::Value::as_str)
+            .or_else(|| rule.get("name").and_then(serde_json::Value::as_str))
+            .unwrap_or_default();
+        let rule_name = rule
+            .get("name")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or(rule_id);
+        matches.push(serde_json::json!({
+            "rule_id": rule_id,
+            "rule_name": rule_name,
+            "matched": true,
+            "reason": "include matched",
+            "category": rule.get("category").cloned().unwrap_or(serde_json::Value::Null),
+            "save_path": rule.get("save_path").cloned().unwrap_or(serde_json::Value::Null),
+            "tags": rule.get("tags").cloned().unwrap_or_else(|| serde_json::json!([])),
+            "start": rule.get("start").and_then(serde_json::Value::as_bool).unwrap_or(true),
+        }));
+    }
+    Ok(matches)
 }
 
 fn slug_id(value: &str) -> String {
@@ -7662,17 +8714,12 @@ fn hex_value(byte: u8) -> Option<u8> {
 }
 
 fn presented_token(headers: &HeaderMap) -> Option<String> {
-    headers
-        .get(header::AUTHORIZATION)
-        .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.strip_prefix("Bearer "))
-        .map(ToOwned::to_owned)
-        .or_else(|| {
-            headers
-                .get(header::COOKIE)
-                .and_then(|value| value.to_str().ok())
-                .and_then(extract_session_cookie)
-        })
+    bearer_token(headers).or_else(|| {
+        headers
+            .get(header::COOKIE)
+            .and_then(|value| value.to_str().ok())
+            .and_then(extract_session_cookie)
+    })
 }
 
 fn extract_session_cookie(cookie: &str) -> Option<String> {
@@ -7872,10 +8919,31 @@ mod tests {
         let response = storage_plan_response(&req.operation, &plan, None);
 
         assert_eq!(response.operation, "move");
-        assert!(response.plan.can_apply);
+        let atomic_rename_supported = cfg!(any(
+            target_os = "linux",
+            target_os = "android",
+            target_os = "macos",
+            windows
+        ));
+        assert_eq!(response.plan.can_apply, atomic_rename_supported);
+        assert_eq!(
+            response
+                .plan
+                .issues
+                .contains(&"atomic no-replace rename unavailable on this platform".to_owned()),
+            !atomic_rename_supported
+        );
         assert!(response.plan.dry_run);
         assert!(!response.plan.steps.is_empty());
         assert_eq!(response.plan.steps[0].action, "rename");
+    }
+
+    #[test]
+    fn storage_plan_labels_missing_atomic_rename_support() {
+        assert_eq!(
+            storage_plan_issue_label(&PlanIssue::AtomicNoReplaceRenameUnavailable),
+            "atomic no-replace rename unavailable on this platform"
+        );
     }
 
     #[test]
@@ -7903,7 +8971,20 @@ mod tests {
         let response = storage_plan_response(&req.operation, &plan, None);
 
         assert_eq!(response.operation, "import");
-        assert!(response.plan.can_apply);
+        let atomic_rename_supported = cfg!(any(
+            target_os = "linux",
+            target_os = "android",
+            target_os = "macos",
+            windows
+        ));
+        assert_eq!(response.plan.can_apply, atomic_rename_supported);
+        assert_eq!(
+            response
+                .plan
+                .issues
+                .contains(&"atomic no-replace rename unavailable on this platform".to_owned()),
+            !atomic_rename_supported
+        );
         assert_eq!(response.plan.steps.len(), 2);
         assert_eq!(response.plan.steps[0].action, "copy_verify_rename");
         let destination = destination.display().to_string();
@@ -8275,6 +9356,9 @@ mod tests {
             dht_tracked_torrents_rejected: 60,
             dht_outstanding_requests: 49,
             dht_queried_nodes: 50,
+            storage_file_pool_capacity: 64,
+            storage_file_pool_open_files: 65,
+            storage_file_pool_active_descriptors: 66,
             storage_file_pool_memory_bytes: 57,
             storage_file_pool_hits: 5,
             storage_read_ops: 6,
@@ -8536,7 +9620,13 @@ mod tests {
         assert!(rendered.contains("torrentng_storage_backend_fixed_buffer_strategy{strategy=\""));
         assert!(rendered.contains("torrentng_storage_backend_fixed_buffer_worker_copy "));
         assert!(rendered.contains("torrentng_storage_backend_frame_pool_slots_supported "));
+        assert!(rendered.contains("torrentng_storage_file_pool_open_files 65"));
+        assert!(rendered.contains("torrentng_storage_file_pool_active_descriptors 66"));
         assert!(rendered.contains("torrentng_storage_handles_open "));
+        assert!(rendered.contains("torrentng_storage_handles_active "));
+        assert!(rendered.contains("torrentng_storage_descriptor_leases_active "));
+        assert!(rendered.contains("torrentng_storage_descriptor_leases_capacity "));
+        assert!(rendered.contains("torrentng_storage_descriptor_budget_waits_total "));
         assert!(rendered.contains("torrentng_storage_frame_bytes_cap "));
         assert!(rendered.contains("torrentng_utp_connects_total "));
         assert!(rendered.contains("torrentng_utp_accepts_total "));
@@ -8593,6 +9683,29 @@ mod tests {
             MetricsHealth {
                 engine_alive: true,
                 peer_listener_healthy: true,
+                peer_ingress: PeerIngressStats {
+                    accepted: 2,
+                    rejected_global_budget: 3,
+                    rejected_ip_budget: 4,
+                    rejected_peer_connection_budget: 5,
+                    handshake_read_errors: 6,
+                    handshake_timeouts: 7,
+                    malformed_handshakes: 8,
+                },
+                database_worker: EngineDatabaseWorkerStats {
+                    queue_depth: 3,
+                    queue_capacity: 128,
+                    commands_enqueued_total: 11,
+                    commands_completed_total: 9,
+                    command_failures_total: 2,
+                    commands_cancelled_total: 1,
+                    enqueue_timeouts_total: 4,
+                    queue_wait_nanoseconds_total: 1_500_000_000,
+                    command_latency_nanoseconds_total: 2_250_000_000,
+                    batch_transactions_total: 5,
+                    batch_transaction_failures_total: 1,
+                    batch_transaction_nanoseconds_total: 750_000_000,
+                },
                 subsystem: Some(EngineSubsystemHealth {
                     db_worker_healthy: true,
                     storage_workers_healthy: true,
@@ -8603,7 +9716,29 @@ mod tests {
         );
         assert!(rendered.contains("torrentng_engine_alive 1"));
         assert!(rendered.contains("torrentng_peer_listener_healthy 1"));
+        assert!(rendered.contains("torrentng_peer_handshakes_admitted_total 2"));
+        assert!(rendered.contains("torrentng_peer_handshakes_rejected_global_budget_total 3"));
+        assert!(rendered.contains("torrentng_peer_handshakes_rejected_per_ip_budget_total 4"));
+        assert!(rendered.contains("torrentng_peer_connections_rejected_budget_total 5"));
+        assert!(rendered.contains("torrentng_peer_handshake_read_errors_total 6"));
+        assert!(rendered.contains("torrentng_peer_handshake_timeouts_total 7"));
+        assert!(rendered.contains("torrentng_peer_handshakes_malformed_total 8"));
         assert!(rendered.contains("torrentng_database_worker_healthy 1"));
+        assert!(rendered.contains("torrentng_database_worker_queue_depth 3"));
+        assert!(rendered.contains("torrentng_database_worker_queue_capacity 128"));
+        assert!(rendered.contains("torrentng_database_worker_commands_enqueued_total 11"));
+        assert!(rendered.contains("torrentng_database_worker_commands_completed_total 9"));
+        assert!(rendered.contains("torrentng_database_worker_command_failures_total 2"));
+        assert!(rendered.contains("torrentng_database_worker_commands_cancelled_total 1"));
+        assert!(rendered.contains("torrentng_database_worker_enqueue_timeouts_total 4"));
+        assert!(rendered.contains("torrentng_database_worker_queue_wait_seconds_total 1.500000000"));
+        assert!(rendered
+            .contains("torrentng_database_worker_command_latency_seconds_total 2.250000000"));
+        assert!(rendered.contains("torrentng_database_worker_batch_transactions_total 5"));
+        assert!(rendered.contains("torrentng_database_worker_batch_transaction_failures_total 1"));
+        assert!(rendered.contains(
+            "torrentng_database_worker_batch_transaction_duration_seconds_total 0.750000000"
+        ));
         assert!(rendered.contains("torrentng_storage_supervisor_healthy 1"));
         assert!(rendered.contains("torrentng_dht_enabled 1"));
         assert!(rendered.contains("torrentng_dht_healthy 0"));
@@ -8633,6 +9768,25 @@ mod tests {
         );
     }
 
+    #[test]
+    fn native_torrent_base64_is_bounded_before_decoding() {
+        let exact = base64::engine::general_purpose::STANDARD.encode(b"ab");
+        assert_eq!(decode_native_torrent_base64(&exact, 2).unwrap(), b"ab");
+
+        // The encoded length is over the derived ceiling, so malformed input
+        // is rejected by size before the base64 decoder is called.
+        let over_encoded_limit = decode_native_torrent_base64("!!!!!!!!!", 2).unwrap_err();
+        assert_eq!(over_encoded_limit.status(), StatusCode::PAYLOAD_TOO_LARGE);
+
+        // A valid, maximum-envelope value can still decode one byte over a
+        // non-multiple-of-three raw limit; the post-decode check closes it.
+        let decoded_over_limit = decode_native_torrent_base64("YWJj", 2).unwrap_err();
+        assert_eq!(decoded_over_limit.status(), StatusCode::PAYLOAD_TOO_LARGE);
+
+        let invalid_within_limit = decode_native_torrent_base64("!!!!", 2).unwrap_err();
+        assert_eq!(invalid_within_limit.status(), StatusCode::BAD_REQUEST);
+    }
+
     #[tokio::test]
     async fn add_torrent_without_engine_returns_unavailable() {
         let state = AppState::new();
@@ -8653,6 +9807,132 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[tokio::test]
+    async fn add_torrent_accepts_the_webui_multipart_form() {
+        let state = AppState::new();
+        let app = build_router(state);
+        let boundary = "tng-test-boundary";
+        let body = format!(
+            "--{boundary}\r\nContent-Disposition: form-data; name=\"magnet\"\r\n\r\nmagnet:?xt=urn:btih:0123456789012345678901234567890123456789\r\n--{boundary}\r\nContent-Disposition: form-data; name=\"save_path\"\r\n\r\n/data\r\n--{boundary}\r\nContent-Disposition: form-data; name=\"start\"\r\n\r\nfalse\r\n--{boundary}--\r\n"
+        );
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/torrents")
+                    .header(
+                        "content-type",
+                        format!("multipart/form-data; boundary={boundary}"),
+                    )
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[tokio::test]
+    async fn add_torrent_accepts_a_multipart_torrent_file() {
+        let state = AppState::new();
+        let app = build_router(state);
+        let boundary = "tng-file-boundary";
+        let body = format!(
+            "--{boundary}\r\nContent-Disposition: form-data; name=\"torrent\"; filename=\"sample.torrent\"\r\nContent-Type: application/octet-stream\r\n\r\nnot a torrent\r\n--{boundary}--\r\n"
+        );
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/torrents")
+                    .header(
+                        "content-type",
+                        format!("multipart/form-data; boundary={boundary}"),
+                    )
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[tokio::test]
+    async fn multipart_torrent_field_limit_returns_payload_too_large() {
+        let boundary = "tng-limit-boundary";
+        let body = format!(
+            "--{boundary}\r\nContent-Disposition: form-data; name=\"torrent\"; filename=\"sample.torrent\"\r\nContent-Type: application/octet-stream\r\n\r\nabc\r\n--{boundary}--\r\n"
+        );
+        let request = Request::builder()
+            .method("POST")
+            .uri("/api/v1/torrents")
+            .header(
+                "content-type",
+                format!("multipart/form-data; boundary={boundary}"),
+            )
+            .body(Body::from(body))
+            .unwrap();
+        let mut multipart = Multipart::from_request(request, &AppState::new())
+            .await
+            .unwrap();
+        let field = multipart.next_field().await.unwrap().unwrap();
+
+        let error = read_native_multipart_bytes(field, 2).await.unwrap_err();
+        assert_eq!(error.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
+    #[tokio::test]
+    async fn add_torrent_rejects_ambiguous_json_sources() {
+        let state = AppState::new();
+        let app = build_router(state);
+        let body = serde_json::json!({
+            "save_path": "/data",
+            "magnet": "magnet:?xt=urn:btih:0123456789012345678901234567890123456789",
+            "torrent_b64": base64::engine::general_purpose::STANDARD.encode(b"not a torrent"),
+        });
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/torrents")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn add_torrent_rejects_ambiguous_multipart_sources() {
+        let state = AppState::new();
+        let app = build_router(state);
+        let boundary = "tng-test-boundary";
+        let body = format!(
+            "--{boundary}\r\nContent-Disposition: form-data; name=\"magnet\"\r\n\r\nmagnet:?xt=urn:btih:0123456789012345678901234567890123456789\r\n--{boundary}\r\nContent-Disposition: form-data; name=\"torrent\"; filename=\"sample.torrent\"\r\nContent-Type: application/octet-stream\r\n\r\nfile bytes\r\n--{boundary}--\r\n"
+        );
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/torrents")
+                    .header(
+                        "content-type",
+                        format!("multipart/form-data; boundary={boundary}"),
+                    )
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     }
 
     #[tokio::test]
@@ -9616,6 +10896,197 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn native_category_and_tag_mutations_bound_names_and_paths() {
+        let app = build_router(AppState::new());
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/categories")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({ "name": "x".repeat(MAX_NATIVE_API_LABEL_BYTES + 1) })
+                            .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/categories")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "name": "Movies",
+                            "save_path": "x".repeat(MAX_NATIVE_CATEGORY_PATH_BYTES + 1),
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri(format!(
+                        "/api/v1/categories/{}",
+                        "x".repeat(MAX_NATIVE_API_LABEL_BYTES + 1)
+                    ))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/tags")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({ "name": "x".repeat(MAX_NATIVE_API_LABEL_BYTES + 1) })
+                            .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri(format!(
+                        "/api/v1/tags/{}",
+                        "x".repeat(MAX_NATIVE_API_LABEL_BYTES + 1)
+                    ))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/api/v1/torrents/missing/category")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "category": "x".repeat(MAX_NATIVE_API_LABEL_BYTES + 1),
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn native_torrent_tag_mutations_bound_count_and_label_bytes() {
+        let app = build_router(AppState::new());
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/torrents/missing/tags")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "tags": vec!["tag"; MAX_NATIVE_API_TAG_ITEMS + 1],
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/bulk/set-tags")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "hashes": ["missing"],
+                            "tags": vec!["tag"; MAX_NATIVE_API_TAG_ITEMS + 1],
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri("/api/v1/torrents/missing/tags")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "tags": ["x".repeat(MAX_NATIVE_API_LABEL_BYTES + 1)],
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("PATCH")
+                    .uri("/api/v1/torrents/missing/tags")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "add": vec!["a"; MAX_NATIVE_API_TAG_ITEMS / 2 + 1],
+                            "remove": vec!["b"; MAX_NATIVE_API_TAG_ITEMS / 2],
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
     async fn patch_files_rejects_empty_body() {
         let (app, hash) = setup_app_with_torrent().await;
         let resp = app
@@ -9950,6 +11421,692 @@ mod tests {
             serde_json::json!({ "id": "view", "name": "Active", "params": {} }),
         );
         assert!(validate_json_map(&view, "native.saved_views", "saved_view").is_ok());
+    }
+
+    #[tokio::test]
+    async fn json_store_upsert_returns_bad_request_for_invalid_rule_without_saving() {
+        let state = AppState::new();
+        let groups = state.ratio_groups.clone();
+        let app = build_router(state);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/ratio-groups")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "id": "invalid",
+                            "name": "Invalid",
+                            "ratio_limit": "not-a-number"
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert!(groups.read().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn json_store_upsert_returns_payload_too_large_without_replacing_state() {
+        let state = AppState::new();
+        let empty_record = serde_json::json!({ "id": "old", "name": "" });
+        let mut baseline = JsonMap::new();
+        baseline.insert("old".to_owned(), empty_record.clone());
+        let baseline_len = serde_json::to_vec(&baseline).unwrap().len();
+        let mut record = empty_record;
+        record["name"] =
+            serde_json::Value::String("x".repeat(MAX_NATIVE_JSON_BYTES - baseline_len));
+        let mut persisted = JsonMap::new();
+        persisted.insert("old".to_owned(), record);
+        assert_eq!(
+            serde_json::to_vec(&persisted).unwrap().len(),
+            MAX_NATIVE_JSON_BYTES
+        );
+        *state.saved_views.write().await = persisted.clone();
+        let saved_views = state.saved_views.clone();
+        let app = build_router(state);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/saved-views")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"id":"new","name":"New"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        assert_eq!(*saved_views.read().await, persisted);
+    }
+
+    #[tokio::test]
+    async fn json_store_upsert_returns_too_many_requests_at_entry_capacity() {
+        let state = AppState::new();
+        {
+            let mut saved_views = state.saved_views.write().await;
+            for index in 0..MAX_NATIVE_JSON_ENTRIES {
+                let id = format!("view-{index}");
+                saved_views.insert(
+                    id.clone(),
+                    serde_json::json!({ "id": id, "name": "Saved view" }),
+                );
+            }
+        }
+        let app = build_router(state);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/saved-views")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"id":"new","name":"New"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+    }
+
+    #[tokio::test]
+    async fn workflow_match_limit_returns_payload_too_large_before_recording_a_run() {
+        let state = AppState::new();
+        state.workflows.write().await.insert(
+            "rule".to_owned(),
+            serde_json::json!({
+                "id": "rule",
+                "name": "Rule",
+                "enabled": true,
+                "action": "set_category",
+                "target_category": "new-category"
+            }),
+        );
+        {
+            let mut registry = state.registry.write().await;
+            for index in 0..=MAX_NATIVE_WORKFLOW_MATCHES {
+                registry
+                    .add(TorrentEntry::new(
+                        format!("{index:040x}"),
+                        "bounded selection".to_owned(),
+                        "/data".to_owned(),
+                    ))
+                    .unwrap();
+            }
+        }
+        let workflow_runs = state.workflow_runs.clone();
+        let app = build_router(state);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/workflows/rule")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"dry_run":false}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        assert!(workflow_runs.read().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn workflow_response_and_history_keep_samples_with_full_totals() {
+        let state = AppState::new();
+        state.workflows.write().await.insert(
+            "rule".to_owned(),
+            serde_json::json!({
+                "id": "rule",
+                "name": "Rule",
+                "enabled": true,
+                "action": "set_category",
+                "target_category": "new-category"
+            }),
+        );
+        {
+            let mut registry = state.registry.write().await;
+            for index in 0..100 {
+                registry
+                    .add(TorrentEntry::new(
+                        format!("{index:040x}"),
+                        "sample selection".to_owned(),
+                        "/data".to_owned(),
+                    ))
+                    .unwrap();
+            }
+        }
+        let workflow_runs = state.workflow_runs.clone();
+        let app = build_router(state);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/workflows/rule")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"dry_run":true}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let result: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(result["matched_total"], 100);
+        assert_eq!(result["matched"].as_array().unwrap().len(), 32);
+        assert_eq!(result["applied_total"], 100);
+        assert_eq!(result["applied"].as_array().unwrap().len(), 32);
+        assert_eq!(result["errors_total"], 0);
+
+        let runs = workflow_runs.read().await;
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0]["matched_total"], 100);
+        assert_eq!(runs[0]["matched"].as_array().unwrap().len(), 32);
+        assert_eq!(runs[0]["applied_total"], 100);
+        assert_eq!(runs[0]["applied"].as_array().unwrap().len(), 32);
+    }
+
+    #[tokio::test]
+    async fn workflow_history_drops_oldest_rows_to_stay_within_byte_limit() {
+        let state = AppState::new();
+        let runs = (0..100)
+            .map(|index| {
+                serde_json::json!({
+                    "id": format!("run-{index}"),
+                    "rule_id": "rule",
+                    "rule_name": "Rule",
+                    "action": "set_category",
+                    "kind": "native_json_workflow",
+                    "dry_run": false,
+                    "matched": vec!["a".repeat(40); 32],
+                    "applied": vec!["b".repeat(40); 32],
+                    "errors": vec!["é".repeat(300); 32],
+                    "started_at": index
+                })
+            })
+            .collect();
+
+        save_workflow_runs(&state, runs).await.unwrap();
+        let stored = state.workflow_runs.read().await;
+        assert!(stored.len() < 100);
+        assert!(!stored.is_empty());
+        assert_eq!(stored.last().unwrap()["id"], "run-99");
+        for run in stored.iter() {
+            assert_eq!(run["matched"].as_array().unwrap().len(), 32);
+            assert_eq!(run["matched_total"], 32);
+            assert_eq!(run["errors"].as_array().unwrap().len(), 32);
+            assert!(run["errors"].as_array().unwrap().iter().all(|error| error
+                .as_str()
+                .unwrap()
+                .len()
+                <= MAX_NATIVE_WORKFLOW_RUN_ERROR_BYTES));
+        }
+        assert!(serde_json::to_vec(&*stored).unwrap().len() <= MAX_NATIVE_JSON_BYTES);
+    }
+
+    #[test]
+    fn native_workflow_action_errors_keep_bounded_utf8_samples_and_full_count() {
+        let mut result = NativeWorkflowActionResult::default();
+        let hash = "a".repeat(40);
+        let error = "é".repeat(400);
+        for _ in 0..100 {
+            result.record_error(Some(&hash), &error);
+        }
+
+        assert_eq!(result.errors_total, 100);
+        assert_eq!(result.errors.len(), MAX_NATIVE_WORKFLOW_RUN_SAMPLE_ITEMS);
+        assert!(result
+            .errors
+            .iter()
+            .all(|sample| sample.len() == MAX_NATIVE_WORKFLOW_RUN_ERROR_BYTES));
+    }
+
+    #[test]
+    fn native_json_automation_field_limits_cover_utf8_strings_and_tag_vectors() {
+        let invalid_cases = [
+            (
+                serde_json::json!({"id": "r", "name": "Rule", "category": "é".repeat(129)}),
+                "workflow",
+            ),
+            (
+                serde_json::json!({"id": "r", "name": "Rule", "include": "x".repeat(MAX_NATIVE_JSON_RULE_TEXT_BYTES + 1)}),
+                "rss_rule",
+            ),
+            (
+                serde_json::json!({"id": "r", "name": "Rule", "target_path": "x".repeat(MAX_NATIVE_CATEGORY_PATH_BYTES + 1)}),
+                "workflow",
+            ),
+            (
+                serde_json::json!({"id": "r", "name": "Rule", "tags": vec!["tag"; MAX_NATIVE_API_TAG_ITEMS + 1]}),
+                "rss_rule",
+            ),
+            (
+                serde_json::json!({"id": "r", "name": "Rule", "tags": ["é".repeat(129)]}),
+                "rss_rule",
+            ),
+        ];
+
+        for (rule, kind) in invalid_cases {
+            assert!(validate_json_item_limits(&rule, "r", kind).is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn native_workflow_target_category_is_distinct_from_match_filter() {
+        let state = AppState::new();
+        let source_hash = "a".repeat(40);
+        let other_hash = "b".repeat(40);
+        {
+            let mut registry = state.registry.write().await;
+            let mut source =
+                TorrentEntry::new(source_hash.clone(), "source".into(), "/data".into());
+            source.category = Some("source-category".to_owned());
+            registry.add(source).unwrap();
+            let mut other = TorrentEntry::new(other_hash, "other".into(), "/data".into());
+            other.category = Some("other-category".to_owned());
+            registry.add(other).unwrap();
+        }
+
+        let rule = serde_json::json!({
+            "action": "set_category",
+            "category": "source-category",
+            "target_category": "destination-category"
+        });
+        assert_eq!(
+            native_workflow_target_category(&rule).as_deref(),
+            Some("destination-category")
+        );
+        assert_eq!(
+            matching_hashes_for_json_rule(&state, &rule).await.unwrap(),
+            vec![source_hash]
+        );
+
+        let mut legacy = serde_json::json!({
+            "action": "set_category",
+            "category": "legacy-destination"
+        });
+        normalize_native_workflow_category_target(&mut legacy);
+        assert!(legacy["category"].is_null());
+        assert_eq!(
+            native_workflow_target_category(&legacy).as_deref(),
+            Some("legacy-destination")
+        );
+
+        state.workflows.write().await.insert(
+            "stored-legacy".to_owned(),
+            serde_json::json!({
+                "id": "stored-legacy",
+                "name": "Stored legacy",
+                "action": "set_category",
+                "category": "stored-destination",
+            }),
+        );
+        let loaded = load_json_map::<WorkflowsStore>(&state).await.unwrap();
+        assert!(loaded["stored-legacy"]["category"].is_null());
+        assert_eq!(
+            loaded["stored-legacy"]["target_category"],
+            "stored-destination"
+        );
+    }
+
+    #[tokio::test]
+    async fn native_automation_upserts_bound_fields_and_migrate_legacy_category_targets() {
+        let state = AppState::new();
+        let workflows = state.workflows.clone();
+        let rss_rules = state.rss_rules.clone();
+        let app = build_router(state);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/workflows")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "id": "oversized",
+                            "name": "Oversized",
+                            "action": "set_category",
+                            "target_category": "x".repeat(MAX_NATIVE_API_LABEL_BYTES + 1),
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert!(workflows.read().await.is_empty());
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/rss-rules")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "id": "oversized",
+                            "name": "Oversized",
+                            "feed_url": "https://example.test/feed",
+                            "include": "ubuntu",
+                            "tags": vec!["tag"; MAX_NATIVE_API_TAG_ITEMS + 1],
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert!(rss_rules.read().await.is_empty());
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/workflows")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "id": "legacy",
+                            "name": "Legacy",
+                            "action": "set_category",
+                            "category": "Movies",
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let listed: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(listed[0]["category"].is_null());
+        assert_eq!(listed[0]["target_category"], "Movies");
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/workflows")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "id": "missing-target",
+                            "name": "Missing target",
+                            "action": "set_category",
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn legacy_workflow_with_oversized_category_fails_closed_before_history() {
+        let state = AppState::new();
+        state.workflows.write().await.insert(
+            "legacy".to_owned(),
+            serde_json::json!({
+                "id": "legacy",
+                "name": "Legacy",
+                "action": "set_category",
+                "category": "x".repeat(MAX_NATIVE_API_LABEL_BYTES + 1),
+            }),
+        );
+        let workflow_runs = state.workflow_runs.clone();
+        let app = build_router(state);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/workflows/legacy")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"dry_run":false}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert!(workflow_runs.read().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn rss_matching_rejects_oversized_legacy_tag_vectors() {
+        let state = AppState::new();
+        state.rss_rules.write().await.insert(
+            "legacy".to_owned(),
+            serde_json::json!({
+                "id": "legacy",
+                "name": "Legacy",
+                "enabled": true,
+                "contains": "ubuntu",
+                "tags": vec!["tag"; MAX_NATIVE_API_TAG_ITEMS + 1],
+            }),
+        );
+        let app = build_router(state);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/rss-rules/test")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"title":"Ubuntu"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[tokio::test]
+    async fn rss_apply_returns_bounded_name_samples_with_full_history_totals() {
+        let state = AppState::new();
+        {
+            let mut rules = state.rss_rules.write().await;
+            for index in 0..40 {
+                let id = format!("rule-{index}");
+                rules.insert(
+                    id.clone(),
+                    serde_json::json!({
+                        "id": id,
+                        "name": format!("Rule {index}"),
+                        "enabled": true,
+                        "contains": "ubuntu",
+                        "tags": [],
+                    }),
+                );
+            }
+        }
+        let workflow_runs = state.workflow_runs.clone();
+        let app = build_router(state);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/rss-rules/apply")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "title": "Ubuntu release",
+                            "link": "magnet:?xt=urn:btih:0123456789012345678901234567890123456789",
+                            "dry_run": false,
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let result: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(result["matched_total"], 40);
+        assert_eq!(result["matched"].as_array().unwrap().len(), 32);
+        assert!(result["matched"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(serde_json::Value::is_string));
+        assert_eq!(result["applied_total"], 0);
+        assert_eq!(result["errors_total"], 1);
+
+        let runs = workflow_runs.read().await;
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0]["matched_total"], 40);
+        assert_eq!(runs[0]["matched"].as_array().unwrap().len(), 32);
+        assert!(runs[0]["matched"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(serde_json::Value::is_string));
+        assert_eq!(runs[0]["applied_total"], 0);
+        assert_eq!(runs[0]["errors_total"], 1);
+    }
+
+    #[tokio::test]
+    async fn rss_apply_with_no_matches_does_not_require_client_or_link() {
+        let state = AppState::new();
+        state.rss_rules.write().await.insert(
+            "ubuntu".to_owned(),
+            serde_json::json!({
+                "id": "ubuntu",
+                "name": "Ubuntu",
+                "enabled": true,
+                "contains": "ubuntu",
+                "tags": [],
+            }),
+        );
+        let workflow_runs = state.workflow_runs.clone();
+        let app = build_router(state);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/rss-rules/apply")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "title": "Unrelated release",
+                            "dry_run": false,
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let result: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(result["matched_total"], 0);
+        assert_eq!(result["applied_total"], 0);
+        assert_eq!(result["errors_total"], 0);
+        assert_eq!(workflow_runs.read().await.len(), 1);
+    }
+
+    #[test]
+    fn workflow_run_ids_are_unique_for_identical_timestamps() {
+        let ids = (0..100)
+            .map(|_| workflow_run_id("run", 1_789_000_000))
+            .collect::<HashSet<_>>();
+        assert_eq!(ids.len(), 100);
+    }
+
+    #[tokio::test]
+    async fn rss_sample_routes_bound_text_and_reject_empty_apply_titles() {
+        let state = AppState::new();
+        let workflow_runs = state.workflow_runs.clone();
+        let app = build_router(state);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/rss-rules/test")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "title": "x".repeat(MAX_NATIVE_JSON_RULE_TEXT_BYTES + 1),
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/rss-rules/apply")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "title": "Ubuntu",
+                            "link": "x".repeat(MAX_NATIVE_JSON_RULE_TEXT_BYTES + 1),
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/rss-rules/apply")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "title": "   ",
+                            "link": "magnet:?xt=urn:btih:0123456789012345678901234567890123456789",
+                            "dry_run": false,
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert!(workflow_runs.read().await.is_empty());
     }
 
     #[tokio::test]

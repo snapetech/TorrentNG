@@ -5,7 +5,8 @@ use crate::error::PathError;
 // Windows reserved names (case-insensitive, with or without extension)
 const WINDOWS_RESERVED: &[&str] = &[
     "CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8",
-    "COM9", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
+    "COM9", "COM¹", "COM²", "COM³", "CONIN$", "CONOUT$", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5",
+    "LPT6", "LPT7", "LPT8", "LPT9", "LPT¹", "LPT²", "LPT³",
 ];
 const MAX_COMPONENT_BYTES: usize = 4096;
 pub const MAX_COMPONENTS: usize = 256;
@@ -18,7 +19,8 @@ pub const MAX_PATH_BYTES: usize = MAX_COMPONENT_BYTES * MAX_COMPONENTS + MAX_COM
 /// - No `..` components
 /// - No empty components
 /// - No NUL bytes
-/// - No Windows-reserved names (when check_windows_reserved is true)
+/// - No Win32-invalid, reserved, or normalization-ambiguous names (when
+///   `check_windows_reserved` is true)
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct SafeRelPath(Vec<String>);
 
@@ -108,6 +110,121 @@ impl SafeRelPath {
     }
 }
 
+/// Reject duplicate file paths and paths that would require one file to also
+/// be another file's parent directory. Windows comparisons use the operating
+/// system's ordinal, case-insensitive table so validation matches ordinary
+/// Win32 path lookup for Unicode as well as ASCII names.
+pub fn validate_unique_file_paths<'a>(
+    paths: impl IntoIterator<Item = &'a SafeRelPath>,
+) -> Result<(), PathError> {
+    let mut comparable = paths
+        .into_iter()
+        .map(ComparablePath::new)
+        .collect::<Vec<_>>();
+    comparable.sort_unstable_by(ComparablePath::compare);
+
+    for pair in comparable.windows(2) {
+        let previous = &pair[0];
+        let current = &pair[1];
+        if previous.compare(current).is_eq() || previous.is_directory_prefix_of(current) {
+            return Err(PathError::ConflictingPaths(current.path.as_display()));
+        }
+    }
+    Ok(())
+}
+
+struct ComparablePath<'a> {
+    path: &'a SafeRelPath,
+    #[cfg(windows)]
+    components: Vec<Vec<u16>>,
+}
+
+impl<'a> ComparablePath<'a> {
+    fn new(path: &'a SafeRelPath) -> Self {
+        Self {
+            path,
+            #[cfg(windows)]
+            components: path
+                .components()
+                .iter()
+                .map(|component| component.encode_utf16().collect())
+                .collect(),
+        }
+    }
+
+    fn compare(&self, other: &Self) -> std::cmp::Ordering {
+        #[cfg(windows)]
+        {
+            for (left, right) in self.components.iter().zip(&other.components) {
+                let ordering = compare_windows_ordinal_ignore_case(left, right);
+                if !ordering.is_eq() {
+                    return ordering;
+                }
+            }
+            self.components.len().cmp(&other.components.len())
+        }
+        #[cfg(not(windows))]
+        {
+            for (left, right) in self.path.components().iter().zip(other.path.components()) {
+                let ordering = left.cmp(right);
+                if !ordering.is_eq() {
+                    return ordering;
+                }
+            }
+            self.path
+                .components()
+                .len()
+                .cmp(&other.path.components().len())
+        }
+    }
+
+    fn is_directory_prefix_of(&self, other: &Self) -> bool {
+        let self_len = self.path.components().len();
+        let other_len = other.path.components().len();
+        self_len < other_len
+            && (0..self_len).all(|index| {
+                #[cfg(windows)]
+                {
+                    compare_windows_ordinal_ignore_case(
+                        &self.components[index],
+                        &other.components[index],
+                    )
+                    .is_eq()
+                }
+                #[cfg(not(windows))]
+                {
+                    self.path.components()[index] == other.path.components()[index]
+                }
+            })
+    }
+}
+
+#[cfg(windows)]
+fn compare_windows_ordinal_ignore_case(left: &[u16], right: &[u16]) -> std::cmp::Ordering {
+    use windows_sys::Win32::Globalization::{
+        CompareStringOrdinal, CSTR_EQUAL, CSTR_GREATER_THAN, CSTR_LESS_THAN,
+    };
+
+    // Every component is bounded by MAX_COMPONENT_BYTES before it reaches
+    // this function, so the UTF-16 lengths fit in i32.
+    let result = unsafe {
+        CompareStringOrdinal(
+            left.as_ptr(),
+            left.len() as i32,
+            right.as_ptr(),
+            right.len() as i32,
+            1,
+        )
+    };
+    match result {
+        CSTR_LESS_THAN => std::cmp::Ordering::Less,
+        CSTR_EQUAL => std::cmp::Ordering::Equal,
+        CSTR_GREATER_THAN => std::cmp::Ordering::Greater,
+        // Failure must not let two paths be accepted as distinct.
+        _ => std::cmp::Ordering::Equal,
+    }
+}
+
 fn validate_component(s: &str, check_windows_reserved: bool) -> Result<(), PathError> {
     if s.is_empty() {
         return Err(PathError::EmptyComponent);
@@ -138,7 +255,25 @@ fn validate_component(s: &str, check_windows_reserved: bool) -> Result<(), PathE
         return Err(PathError::AbsolutePath(s.to_owned()));
     }
     if check_windows_reserved {
-        let stem = s.split('.').next().unwrap_or(s);
+        if s.starts_with(' ') || s.ends_with([' ', '.']) {
+            let character = if s.starts_with(' ') {
+                ' '
+            } else {
+                s.chars().next_back().unwrap_or(' ')
+            };
+            return Err(PathError::IllegalCharacter(character));
+        }
+        if let Some(character) = s.chars().find(|character| {
+            matches!(character, '<' | '>' | ':' | '"' | '|' | '?' | '*')
+                || ('\u{1}'..='\u{1f}').contains(character)
+        }) {
+            return Err(PathError::IllegalCharacter(character));
+        }
+        let stem = s
+            .split('.')
+            .next()
+            .unwrap_or(s)
+            .trim_end_matches([' ', '.']);
         if WINDOWS_RESERVED
             .iter()
             .any(|&r| r.eq_ignore_ascii_case(stem))
@@ -251,6 +386,65 @@ mod tests {
     #[test]
     fn windows_reserved_allowed_when_disabled() {
         assert!(SafeRelPath::from_components(&["NUL"], false).is_ok());
+    }
+
+    #[test]
+    fn windows_mode_rejects_streams_invalid_characters_and_normalized_names() {
+        for component in [
+            "payload:stream",
+            "bad<name",
+            "bad\u{1f}name",
+            "name.",
+            "name ",
+            " leading-space",
+            "CON .txt",
+            "COM¹.log",
+            "LPT³",
+            "CONIN$",
+            "CONOUT$.txt",
+        ] {
+            assert!(
+                SafeRelPath::from_name(component, true).is_err(),
+                "Windows-compatible paths must reject {component:?}"
+            );
+        }
+        for component in [".hidden", "name with spaces", "COM0", "payload"] {
+            assert!(
+                SafeRelPath::from_name(component, true).is_ok(),
+                "Windows-compatible paths should retain {component:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn file_path_set_rejects_duplicate_and_file_directory_conflicts() {
+        let duplicate_a = SafeRelPath::from_name("payload.bin", false).unwrap();
+        let duplicate_b = SafeRelPath::from_name("payload.bin", false).unwrap();
+        let parent = SafeRelPath::from_name("payload", false).unwrap();
+        let child = SafeRelPath::from_components(&["payload", "data.bin"], false).unwrap();
+        let sibling_a = SafeRelPath::from_components(&["payload", "a.bin"], false).unwrap();
+        let sibling_b = SafeRelPath::from_components(&["payload", "b.bin"], false).unwrap();
+
+        assert!(matches!(
+            validate_unique_file_paths([&duplicate_a, &duplicate_b]),
+            Err(PathError::ConflictingPaths(_))
+        ));
+        assert!(matches!(
+            validate_unique_file_paths([&parent, &child]),
+            Err(PathError::ConflictingPaths(_))
+        ));
+        assert!(validate_unique_file_paths([&sibling_a, &sibling_b]).is_ok());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_path_set_rejects_ascii_case_aliases() {
+        let uppercase = SafeRelPath::from_name("Payload.bin", true).unwrap();
+        let lowercase = SafeRelPath::from_name("payload.BIN", true).unwrap();
+        assert!(matches!(
+            validate_unique_file_paths([&uppercase, &lowercase]),
+            Err(PathError::ConflictingPaths(_))
+        ));
     }
 
     #[test]

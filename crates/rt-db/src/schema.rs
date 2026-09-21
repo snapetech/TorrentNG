@@ -7,7 +7,7 @@ use rusqlite::Connection;
 use crate::error::DbError;
 
 /// Current TorrentNG client database schema version.
-pub const CURRENT_SCHEMA_VERSION: u32 = 10;
+pub const CURRENT_SCHEMA_VERSION: u32 = 11;
 
 /// Apply all pending migrations to bring the database up to the current schema version.
 ///
@@ -68,7 +68,7 @@ const MIGRATIONS: &[(u32, &str)] = &[
         PRAGMA foreign_keys = ON;
 
         CREATE TABLE IF NOT EXISTS torrents (
-            info_hash       TEXT    NOT NULL PRIMARY KEY, -- hex-encoded SHA-1
+            info_hash       TEXT    NOT NULL PRIMARY KEY, -- hex-encoded v1 SHA-1 or full v2 SHA-256 identity
             name            TEXT    NOT NULL,
             total_length    INTEGER NOT NULL,
             piece_length    INTEGER NOT NULL,
@@ -347,6 +347,20 @@ const MIGRATIONS: &[(u32, &str)] = &[
                      AND state IN ('paused', 'stopped', 'queued', 'error')) THEN 0
             ELSE MAX(total_length, 0)
         END;
+        ",
+    ),
+    (
+        11,
+        "
+        PRAGMA foreign_keys = ON;
+
+        -- A hybrid magnet is keyed by its v1 hash, but its supplied v2 hash
+        -- must remain available until metadata is fetched and verified.
+        CREATE TABLE IF NOT EXISTS torrent_metadata_v2_hashes (
+            info_hash       TEXT NOT NULL PRIMARY KEY REFERENCES torrents(info_hash) ON DELETE CASCADE,
+            expected_v2_hash BLOB NOT NULL
+                CHECK (typeof(expected_v2_hash) = 'blob' AND length(expected_v2_hash) = 32)
+        );
         ",
     ),
 ];

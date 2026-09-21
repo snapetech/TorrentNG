@@ -17,9 +17,9 @@ use axum::{
 };
 use base64::{engine::general_purpose, Engine as _};
 use rt_api_model::{
-    api_token_allowed, csrf_request_allowed, request_fingerprint, session_cookie_value,
-    valid_idempotency_key, CachedResponse, IdempotencyClaim, IdempotencyStore,
-    MAX_IDEMPOTENCY_BODY_BYTES,
+    api_token_allowed, bearer_token, csrf_request_allowed, request_fingerprint,
+    session_cookie_value, valid_idempotency_key, CachedResponse, IdempotencyClaim,
+    IdempotencyStore, MAX_IDEMPOTENCY_BODY_BYTES,
 };
 use rt_engine::{
     EngineGlobalLimits, EngineHandle, EngineJob, EngineNetworkFeatures, EnginePeerSnapshot,
@@ -407,8 +407,9 @@ async fn load_transmission_runtime_projections(
             });
         }
         while let Some(result) = tasks.join_next().await {
-            let projection = result
-                .map_err(|error| format!("Transmission projection task failed: {error}"))??;
+            let projection = result.map_err(|error| {
+                rt_engine::task_join_error_summary("Transmission projection task", &error)
+            })??;
             projections.push(projection);
         }
     }
@@ -429,8 +430,9 @@ async fn load_transmission_tracker_snapshot_size(
             tasks.spawn(async move { engine.torrent_tracker_snapshot_size(info_hash).await });
         }
         while let Some(result) = tasks.join_next().await {
-            let (count, bytes) = result
-                .map_err(|error| format!("Transmission tracker size task failed: {error}"))??;
+            let (count, bytes) = result.map_err(|error| {
+                rt_engine::task_join_error_summary("Transmission tracker size task", &error)
+            })??;
             total_count = total_count.saturating_add(count);
             total_bytes = total_bytes.saturating_add(bytes);
         }
@@ -623,11 +625,7 @@ async fn transmission_auth_guard(
 }
 
 fn transmission_bearer_token(headers: &HeaderMap) -> Option<String> {
-    headers
-        .get(header::AUTHORIZATION)
-        .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.strip_prefix("Bearer "))
-        .map(str::to_owned)
+    bearer_token(headers)
 }
 
 fn transmission_is_mutating(req: &Request<Body>) -> bool {

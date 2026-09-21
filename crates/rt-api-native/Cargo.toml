@@ -25,6 +25,7 @@ rt-storage = { path = "../rt-storage" }
 rt-utp = { path = "../rt-utp" }
 sha2.workspace = true
 tower.workspace = true
+uuid.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

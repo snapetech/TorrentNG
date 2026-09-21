@@ -13,7 +13,7 @@ use rt_tracker::{
     to_http_scrape_url,
     udp::{UdpAnnounceRequest, UdpAnnounceResponse, UdpConnectRequest, UdpConnectResponse},
     AnnounceRequest, AnnounceResponse, InfoHash, ScrapeStats, TrackerError, TrackerEvent,
-    MAX_TRACKER_PEERS, MAX_TRACKER_STATE_ID_BYTES, MAX_TRACKER_STATE_TEXT_BYTES,
+    TrackerState, MAX_TRACKER_PEERS, MAX_TRACKER_STATE_ID_BYTES, MAX_TRACKER_STATE_TEXT_BYTES,
 };
 use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
@@ -33,6 +33,97 @@ pub(crate) const STOPPED_TRACKER_ANNOUNCE_DEADLINE: Duration = Duration::from_se
 const TRACKER_RESPONSE_PEER_VECTOR_CAPACITY_MULTIPLIER: usize = 2;
 
 pub(crate) type TrackerKey = (usize, usize);
+
+/// Return a URL log label without userinfo, path, query, or fragment. These
+/// fields may contain tracker passkeys, webseed credentials, or access tokens.
+pub(crate) fn url_log_target(value: &str) -> String {
+    let Ok(mut url) = Url::parse(value) else {
+        return "invalid URL".to_owned();
+    };
+    let _ = url.set_username("");
+    let _ = url.set_password(None);
+    url.set_path("/");
+    url.set_query(None);
+    url.set_fragment(None);
+    let mut label = url.to_string();
+    if label.ends_with('/') {
+        label.pop();
+    }
+    label
+}
+
+pub(crate) fn first_tracker_key(tiers: &[Vec<TrackerState>]) -> Option<TrackerKey> {
+    tiers
+        .iter()
+        .enumerate()
+        .find_map(|(tier_index, tier)| (!tier.is_empty()).then_some((tier_index, 0)))
+}
+
+pub(crate) fn next_tracker_key(
+    tiers: &[Vec<TrackerState>],
+    current: TrackerKey,
+) -> Option<TrackerKey> {
+    let first = first_tracker_key(tiers)?;
+    let mut found_current = false;
+    for (tier_index, tier) in tiers.iter().enumerate() {
+        for tracker_index in 0..tier.len() {
+            if found_current {
+                return Some((tier_index, tracker_index));
+            }
+            if (tier_index, tracker_index) == current {
+                found_current = true;
+            }
+        }
+    }
+    Some(first)
+}
+
+pub(crate) fn tracker_keys_for_announce(
+    tiers: &[Vec<TrackerState>],
+    active_tier: usize,
+    is_private: bool,
+    private_tracker: Option<TrackerKey>,
+) -> Vec<TrackerKey> {
+    if is_private {
+        let key = private_tracker
+            .filter(|(tier, tracker)| {
+                tiers
+                    .get(*tier)
+                    .is_some_and(|values| *tracker < values.len())
+            })
+            .or_else(|| first_tracker_key(tiers));
+        return key.into_iter().collect();
+    }
+    tiers
+        .get(active_tier)
+        .into_iter()
+        .flat_map(|tier| (0..tier.len()).map(move |tracker_index| (active_tier, tracker_index)))
+        .collect()
+}
+
+pub(crate) fn tracker_keys_for_stopped_announce(
+    tiers: &[Vec<TrackerState>],
+    is_private: bool,
+    private_tracker: Option<TrackerKey>,
+) -> Vec<TrackerKey> {
+    if is_private {
+        let key = private_tracker
+            .filter(|(tier, tracker)| {
+                tiers
+                    .get(*tier)
+                    .is_some_and(|values| *tracker < values.len())
+            })
+            .or_else(|| first_tracker_key(tiers));
+        return key.into_iter().collect();
+    }
+    tiers
+        .iter()
+        .enumerate()
+        .flat_map(|(tier_index, tier)| {
+            (0..tier.len()).map(move |tracker_index| (tier_index, tracker_index))
+        })
+        .collect()
+}
 
 /// URI schemes are case-insensitive. Dispatch must inspect the scheme with
 /// the same rule; routing `UDP://...` through the HTTP client makes a valid
@@ -268,7 +359,7 @@ async fn announce_http(
         if e.is_timeout() {
             TrackerError::Timeout
         } else {
-            TrackerError::Network(e.to_string())
+            TrackerError::Network(e.without_url().to_string())
         }
     })?;
     if !response.status().is_success() {
@@ -420,7 +511,7 @@ async fn scrape_tracker(
         .get(url)
         .send()
         .await
-        .map_err(|e| TrackerError::Network(e.to_string()))?;
+        .map_err(|e| TrackerError::Network(e.without_url().to_string()))?;
     let status = resp.status();
     if !status.is_success() {
         return Err(TrackerError::Http {
@@ -508,7 +599,7 @@ pub(crate) async fn bounded_response_body(
     while let Some(chunk) = response
         .chunk()
         .await
-        .map_err(|error| TrackerError::Network(error.to_string()))?
+        .map_err(|error| TrackerError::Network(error.without_url().to_string()))?
     {
         if body.len().saturating_add(chunk.len()) > max_bytes {
             return Err(TrackerError::ParseError(format!(
@@ -523,11 +614,71 @@ pub(crate) async fn bounded_response_body(
 #[cfg(test)]
 mod tests {
     use super::{
-        is_udp_tracker_url, protocol_numwant, reserve_tracker_response_bytes, TrackerWorkers,
+        first_tracker_key, is_udp_tracker_url, next_tracker_key, protocol_numwant,
+        reserve_tracker_response_bytes, tracker_keys_for_announce,
+        tracker_keys_for_stopped_announce, url_log_target, TrackerWorkers,
         MAX_TRACKER_ANNOUNCES_IN_FLIGHT,
     };
     use rt_metrics::{MemoryClass, ResourceGovernor, ResourceGovernorConfig, MEMORY_CLASS_COUNT};
-    use rt_tracker::MAX_TRACKER_PEERS;
+    use rt_tracker::{TrackerState, MAX_TRACKER_PEERS};
+
+    #[test]
+    fn url_log_target_redacts_credentials_paths_queries_and_fragments() {
+        let http = url_log_target(
+            "https://user:secret@tracker.example:8443/announce/passkey?token=hidden#fragment",
+        );
+        assert_eq!(http, "https://tracker.example:8443");
+        assert!(!http.contains("secret"));
+        assert!(!http.contains("passkey"));
+        assert!(!http.contains("hidden"));
+
+        let udp = url_log_target("udp://tracker.example:6969/announce?passkey=hidden");
+        assert_eq!(udp, "udp://tracker.example:6969");
+        assert_eq!(url_log_target("not a URL?secret=hidden"), "invalid URL");
+
+        let webseed = url_log_target(
+            "https://seed-user:seed-secret@cdn.example:8443/private/torrent?token=hidden#fragment",
+        );
+        assert_eq!(webseed, "https://cdn.example:8443");
+        for secret in [
+            "seed-user",
+            "seed-secret",
+            "private",
+            "token",
+            "hidden",
+            "fragment",
+        ] {
+            assert!(!webseed.contains(secret), "{webseed}");
+        }
+    }
+
+    #[test]
+    fn private_tracker_selection_uses_one_tracker_and_fails_over_in_order() {
+        let tiers = vec![
+            vec![
+                TrackerState::new("https://a.example/announce"),
+                TrackerState::new("https://b.example/announce"),
+            ],
+            vec![TrackerState::new("https://c.example/announce")],
+        ];
+
+        assert_eq!(first_tracker_key(&tiers), Some((0, 0)));
+        assert_eq!(next_tracker_key(&tiers, (0, 0)), Some((0, 1)));
+        assert_eq!(next_tracker_key(&tiers, (0, 1)), Some((1, 0)));
+        assert_eq!(next_tracker_key(&tiers, (1, 0)), Some((0, 0)));
+        assert_eq!(
+            tracker_keys_for_announce(&tiers, 0, true, Some((0, 1))),
+            vec![(0, 1)]
+        );
+        assert_eq!(
+            tracker_keys_for_stopped_announce(&tiers, true, Some((1, 0))),
+            vec![(1, 0)]
+        );
+        assert_eq!(
+            tracker_keys_for_stopped_announce(&tiers, false, None),
+            vec![(0, 0), (0, 1), (1, 0)]
+        );
+    }
 
     #[test]
     fn tracker_scheme_dispatch_is_case_insensitive() {

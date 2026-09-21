@@ -32,6 +32,10 @@ pub enum MetainfoError {
     PieceLayerRootMismatch,
     #[error("invalid file path: {0}")]
     InvalidPath(#[from] PathError),
+    #[error("torrent file paths collide on this platform: {0}")]
+    ConflictingFilePaths(String),
+    #[error("inconsistent hybrid torrent layout: {0}")]
+    InconsistentHybridLayout(&'static str),
     #[error("invalid UTF-8 in field: {0}")]
     InvalidUtf8(&'static str),
     #[error("zero-length name")]

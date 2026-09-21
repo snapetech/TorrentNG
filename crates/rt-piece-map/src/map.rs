@@ -16,6 +16,8 @@ pub struct FileRegion {
     pub piece_offset: u64,
     /// Length of this region.
     pub length: u64,
+    /// BEP 47 padding is synthetic zero content and has no on-disk path.
+    pub pad: bool,
 }
 
 /// File spans in the order they appear in the torrent.
@@ -37,6 +39,8 @@ pub struct PieceRegion {
     pub file_offset: u64,
     /// How many bytes to read.
     pub length: u32,
+    /// BEP 47 padding is synthetic zero content and has no on-disk path.
+    pub pad: bool,
 }
 
 /// Maps pieces to file regions and validates peer block requests.
@@ -46,11 +50,22 @@ pub struct PieceMap {
     pub total_length: u64,
     pub piece_count: u32,
     files: Vec<FileSpan>,
+    padding_file_indices: Vec<u32>,
 }
 
 impl PieceMap {
     /// Build a PieceMap from a list of files in content-stream order.
     pub fn new(piece_length: u64, files: Vec<FileSpan>) -> Result<Self, PieceMapError> {
+        Self::new_with_padding(piece_length, files, std::iter::empty())
+    }
+
+    /// Build a PieceMap that treats the selected file indexes as BEP 47
+    /// synthetic zero spans rather than files that must exist on disk.
+    pub fn new_with_padding(
+        piece_length: u64,
+        files: Vec<FileSpan>,
+        padding_file_indices: impl IntoIterator<Item = u32>,
+    ) -> Result<Self, PieceMapError> {
         if piece_length == 0 {
             return Err(PieceMapError::ZeroPieceLength);
         }
@@ -74,17 +89,39 @@ impl PieceMap {
         if total_length == 0 {
             return Err(PieceMapError::ZeroTotalLength);
         }
+        let mut file_indices = files.iter().map(|file| file.file_index).collect::<Vec<_>>();
+        file_indices.sort_unstable();
+        if let Some(duplicate) = file_indices
+            .windows(2)
+            .find_map(|pair| (pair[0] == pair[1]).then_some(pair[0]))
+        {
+            return Err(PieceMapError::DuplicateFileIndex(duplicate));
+        }
         let piece_count_u64 = (total_length / piece_length)
             .checked_add(u64::from(!total_length.is_multiple_of(piece_length)))
             .ok_or(PieceMapError::IntegerOverflow("piece count"))?;
         let piece_count = u32::try_from(piece_count_u64)
             .map_err(|_| PieceMapError::PieceCountTooLarge(piece_count_u64))?;
+        let mut padding_file_indices = padding_file_indices.into_iter().collect::<Vec<_>>();
+        padding_file_indices.sort_unstable();
+        padding_file_indices.dedup();
+        if let Some(unknown) = padding_file_indices
+            .iter()
+            .find(|file_index| file_indices.binary_search(*file_index).is_err())
+        {
+            return Err(PieceMapError::UnknownPaddingFileIndex(*unknown));
+        }
         Ok(PieceMap {
             piece_length,
             total_length,
             piece_count,
             files,
+            padding_file_indices,
         })
+    }
+
+    fn file_is_padding(&self, file_index: u32) -> bool {
+        self.padding_file_indices.binary_search(&file_index).is_ok()
     }
 
     /// Byte length of a specific piece (last piece may be shorter).
@@ -153,6 +190,7 @@ impl PieceMap {
                 file_offset: overlap_start - file.content_offset,
                 piece_offset: overlap_start - piece_start,
                 length: overlap_end - overlap_start,
+                pad: self.file_is_padding(file.file_index),
             });
         }
         Ok(regions)
@@ -169,7 +207,10 @@ impl PieceMap {
     ) -> Result<Vec<(u32, u32)>, PieceMapError> {
         let mut ranges = Vec::new();
         for file in &self.files {
-            if file_indices.binary_search(&file.file_index).is_err() || file.length == 0 {
+            if file_indices.binary_search(&file.file_index).is_err()
+                || file.length == 0
+                || self.file_is_padding(file.file_index)
+            {
                 continue;
             }
             let file_end = file
@@ -248,6 +289,7 @@ impl PieceMap {
                 path: file.path.clone(),
                 file_offset: overlap_start - file.content_offset,
                 length: (overlap_end - overlap_start) as u32,
+                pad: self.file_is_padding(file.file_index),
             });
         }
         Ok(regions)
@@ -431,6 +473,60 @@ mod tests {
         assert_eq!(
             regions.iter().map(|region| region.length).sum::<u32>(),
             16 * 1024
+        );
+    }
+
+    #[test]
+    fn padding_regions_are_synthetic_and_do_not_invalidate_file_pieces() {
+        let files = vec![
+            FileSpan {
+                file_index: 0,
+                path: SafeRelPath::from_components(&["bundle", "a.bin"], false).unwrap(),
+                content_offset: 0,
+                length: 3,
+            },
+            FileSpan {
+                file_index: 1,
+                path: SafeRelPath::from_components(&["bundle", ".pad", "13"], false).unwrap(),
+                content_offset: 3,
+                length: 13,
+            },
+            FileSpan {
+                file_index: 2,
+                path: SafeRelPath::from_components(&["bundle", "b.bin"], false).unwrap(),
+                content_offset: 16,
+                length: 4,
+            },
+        ];
+        let map = PieceMap::new_with_padding(16, files, [1]).unwrap();
+
+        let regions = map.piece_to_file_regions(0).unwrap();
+        assert_eq!(regions.len(), 2);
+        assert!(!regions[0].pad);
+        assert!(regions[1].pad);
+        assert!(map.piece_ranges_for_file_indices(&[1]).unwrap().is_empty());
+
+        let request = map.validate_request(0, 3, 13).unwrap();
+        assert_eq!(request.len(), 1);
+        assert!(request[0].pad);
+    }
+
+    #[test]
+    fn rejects_duplicate_file_indexes() {
+        let mut files = make_files(&[(&["a.bin"], 8), (&["b.bin"], 8)]);
+        files[1].file_index = files[0].file_index;
+
+        assert_eq!(
+            PieceMap::new(16, files).unwrap_err(),
+            PieceMapError::DuplicateFileIndex(0)
+        );
+    }
+
+    #[test]
+    fn rejects_padding_indexes_without_a_file_span() {
+        assert_eq!(
+            PieceMap::new_with_padding(16, make_files(&[(&["a.bin"], 16)]), [7]).unwrap_err(),
+            PieceMapError::UnknownPaddingFileIndex(7)
         );
     }
 

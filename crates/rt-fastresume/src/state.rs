@@ -654,6 +654,38 @@ mod tests {
     }
 
     #[test]
+    fn missing_synthetic_padding_hint_does_not_invalidate_verified_pieces() {
+        let files = vec![
+            FileSpan {
+                file_index: 0,
+                path: SafeRelPath::from_name("payload.bin", false).unwrap(),
+                content_offset: 0,
+                length: 3,
+            },
+            FileSpan {
+                file_index: 1,
+                path: SafeRelPath::from_components(&[".pad", "13"], false).unwrap(),
+                content_offset: 3,
+                length: 13,
+            },
+        ];
+        let piece_map = PieceMap::new_with_padding(16, files, [1]).unwrap();
+        let mut state = FastresumeState::new_empty(&test_hash(), 1, ImportPolicy::TrustHints);
+        state.pieces[0] = PieceState::Valid;
+        state.file_hints = vec![FileHint {
+            file_index: 1,
+            size: 13,
+            mtime_secs: 1,
+            inode: 1,
+        }];
+
+        let invalidated = state.apply_file_hints(Vec::new(), &piece_map);
+
+        assert_eq!(invalidated, 0);
+        assert!(state.is_complete());
+    }
+
+    #[test]
     fn is_complete_only_when_all_valid() {
         let mut state =
             FastresumeState::new_empty(&test_hash(), 3, ImportPolicy::RequireVerification);

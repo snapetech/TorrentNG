@@ -1,9 +1,9 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, AtomicU8, AtomicUsize, Ordering};
-use std::sync::{mpsc, Arc, Mutex, Weak};
+use std::sync::{mpsc, Arc, Mutex, MutexGuard, Weak};
 use std::time::{Duration, Instant};
 
 use once_cell::sync::Lazy;
@@ -19,9 +19,11 @@ use rt_path::{StorageProfile, StorageRootId};
 use sha1::{Digest, Sha1};
 
 use crate::{
-    backend::{BackendRequest, DiskBackend, SelectedDiskBackend},
+    backend::{BackendRequest, SelectedDiskBackend},
     device::{detect_storage_topology, StorageTopology},
     error::StorageError,
+    fd_limit::process_handle_cache_capacity,
+    file_handle::{DescriptorLimiter, DescriptorPermit, LeasedFile, LeasedFileHandle},
     frame::{global_frame_pool, Frame},
     io_class::IoClass,
     open::{create_dir_all_no_follow, open_path_no_follow},
@@ -41,6 +43,33 @@ pub const STORAGE_LATENCY_BUCKET_COUNT: usize = STORAGE_LATENCY_BUCKETS_NS.len()
 
 const QUEUED_DISK_JOB_OVERHEAD_BYTES: u64 = 1024;
 const MAX_HASH_QUEUE_RETRIES: usize = 10_000;
+
+fn lock_recover<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    match mutex.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => {
+            // Preserve authoritative state such as dirty-write generations,
+            // shared device semaphores, and queued I/O receiver state.
+            let guard = poisoned.into_inner();
+            mutex.clear_poison();
+            guard
+        }
+    }
+}
+
+fn lock_reset_derived_cache<T: Default>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    match mutex.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => {
+            // Only use this for reconstructible caches whose backing state is
+            // authoritative elsewhere.
+            let mut guard = poisoned.into_inner();
+            *guard = T::default();
+            mutex.clear_poison();
+            guard
+        }
+    }
+}
 
 /// A pending read or write operation against a storage root.
 #[derive(Debug)]
@@ -150,7 +179,10 @@ pub fn preallocation_mode_for_topology(topology: Option<&StorageTopology>) -> Pr
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct FilePoolStats {
     pub capacity: usize,
+    /// File descriptors retained by cache entries.
     pub open_files: usize,
+    /// Descriptor leases held by cached files, open attempts, or active operations.
+    pub active_descriptors: usize,
     pub memory_bytes: u64,
     pub hits: u64,
     pub misses: u64,
@@ -160,6 +192,10 @@ pub struct FilePoolStats {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StorageIoStats {
+    /// Identity for deduplicating snapshots of shared scheduler resources.
+    /// Zero means the identity is unavailable and must not be deduplicated.
+    #[doc(hidden)]
+    pub shared_resource_id: u64,
     pub device_id: Option<String>,
     pub profile: StorageProfile,
     pub file_pool: FilePoolStats,
@@ -250,6 +286,7 @@ impl StorageRead {
 impl Default for StorageIoStats {
     fn default() -> Self {
         Self {
+            shared_resource_id: 0,
             device_id: None,
             profile: StorageProfile::Unknown,
             file_pool: FilePoolStats::default(),
@@ -339,15 +376,37 @@ struct FileIdentity {
 }
 
 fn file_identity(file: &File) -> io::Result<FileIdentity> {
-    metadata_identity(&file.metadata()?)
+    #[cfg(windows)]
+    {
+        let (volume_serial, file_index) = crate::open::windows_file_identity(file)?;
+        return Ok(FileIdentity {
+            volume_serial,
+            file_index,
+        });
+    }
+
+    #[cfg(not(windows))]
+    {
+        metadata_identity(&file.metadata()?)
+    }
 }
 
 fn path_identity(path: &Path) -> io::Result<FileIdentity> {
     // Do not follow a final symlink here. Runtime opens reject symlinks, and a
     // symlink replacing a cached regular file must force a fresh safe open.
-    metadata_identity(&std::fs::symlink_metadata(path)?)
+    #[cfg(windows)]
+    {
+        let file = crate::open::open_path_no_follow(path, false, false)?;
+        return file_identity(&file);
+    }
+
+    #[cfg(not(windows))]
+    {
+        metadata_identity(&std::fs::symlink_metadata(path)?)
+    }
 }
 
+#[cfg(not(windows))]
 fn metadata_identity(metadata: &std::fs::Metadata) -> io::Result<FileIdentity> {
     #[cfg(unix)]
     {
@@ -359,16 +418,6 @@ fn metadata_identity(metadata: &std::fs::Metadata) -> io::Result<FileIdentity> {
         })
     }
 
-    #[cfg(windows)]
-    {
-        use std::os::windows::fs::MetadataExt;
-
-        return Ok(FileIdentity {
-            volume_serial: metadata.volume_serial_number().unwrap_or_default(),
-            file_index: metadata.file_index().unwrap_or_default(),
-        });
-    }
-
     #[cfg(not(any(unix, windows)))]
     {
         let _ = metadata;
@@ -378,7 +427,7 @@ fn metadata_identity(metadata: &std::fs::Metadata) -> io::Result<FileIdentity> {
 
 #[derive(Debug)]
 struct CachedFile {
-    file: Arc<File>,
+    file: Arc<LeasedFile>,
     mode: OpenMode,
     identity: FileIdentity,
     last_used: Instant,
@@ -390,6 +439,7 @@ struct FilePool {
     capacity: usize,
     idle_ttl: Duration,
     entries: Mutex<HashMap<PathBuf, CachedFile>>,
+    descriptors: Arc<DescriptorLimiter>,
     counters: FilePoolCounters,
     sequence: AtomicU64,
 }
@@ -397,9 +447,10 @@ struct FilePool {
 impl FilePool {
     fn new(capacity: usize, idle_ttl: Duration) -> Self {
         Self {
-            capacity: capacity.max(1),
+            capacity,
             idle_ttl,
             entries: Mutex::new(HashMap::new()),
+            descriptors: DescriptorLimiter::new(capacity),
             counters: FilePoolCounters::default(),
             sequence: AtomicU64::new(1),
         }
@@ -410,31 +461,46 @@ impl FilePool {
         path: &Path,
         mode: OpenMode,
         create: bool,
-    ) -> Result<Arc<File>, StorageError> {
+    ) -> Result<Arc<LeasedFileHandle>, StorageError> {
         let key = normalized_key(path);
         let path_str = key.display().to_string();
-        let now = Instant::now();
-        let seq = self.sequence.fetch_add(1, Ordering::Relaxed);
+        {
+            let now = Instant::now();
+            let mut entries = lock_reset_derived_cache(&self.entries);
+            self.sweep_idle_locked(&mut entries, now);
+            if let Some(entry) = entries.get_mut(&key) {
+                if entry.mode == mode && path_identity(&key).ok() == Some(entry.identity) {
+                    entry.last_used = now;
+                    entry.sequence = self.sequence.fetch_add(1, Ordering::Relaxed);
+                    self.counters.hits.fetch_add(1, Ordering::Relaxed);
+                    return Ok(Arc::new(LeasedFileHandle::new(Arc::clone(&entry.file))));
+                }
+                entries.remove(&key);
+                self.counters.evictions.fetch_add(1, Ordering::Relaxed);
+            }
+        }
 
-        let mut entries = self.entries.lock().expect("file pool mutex poisoned");
+        self.counters.misses.fetch_add(1, Ordering::Relaxed);
+        let permit = self.acquire_descriptor();
+        let mut entries = lock_reset_derived_cache(&self.entries);
+        let now = Instant::now();
         self.sweep_idle_locked(&mut entries, now);
         if let Some(entry) = entries.get_mut(&key) {
             if entry.mode == mode && path_identity(&key).ok() == Some(entry.identity) {
                 entry.last_used = now;
-                entry.sequence = seq;
+                entry.sequence = self.sequence.fetch_add(1, Ordering::Relaxed);
                 self.counters.hits.fetch_add(1, Ordering::Relaxed);
-                return Ok(entry.file.clone());
+                return Ok(Arc::new(LeasedFileHandle::new(Arc::clone(&entry.file))));
             }
             entries.remove(&key);
             self.counters.evictions.fetch_add(1, Ordering::Relaxed);
         }
 
-        self.counters.misses.fetch_add(1, Ordering::Relaxed);
-        let file = Arc::new(
-            open_path_no_follow(&key, mode == OpenMode::Write, create)
-                .map_err(|e| StorageError::io(&path_str, e))?,
-        );
+        let file = open_path_no_follow(&key, mode == OpenMode::Write, create)
+            .map_err(|e| StorageError::io(&path_str, e))?;
+        let file = Arc::new(LeasedFile::new(file, permit));
         let identity = file_identity(&file).map_err(|e| StorageError::io(&path_str, e))?;
+        let seq = self.sequence.fetch_add(1, Ordering::Relaxed);
         entries.insert(
             key,
             CachedFile {
@@ -446,37 +512,48 @@ impl FilePool {
             },
         );
         self.enforce_capacity_locked(&mut entries);
-        Ok(file)
+        Ok(Arc::new(LeasedFileHandle::new(file)))
     }
 
-    fn open_for_sync(&self, path: &Path) -> Result<Arc<File>, StorageError> {
+    fn open_for_sync(&self, path: &Path) -> Result<Arc<LeasedFileHandle>, StorageError> {
         let key = normalized_key(path);
         let path_str = key.display().to_string();
-        let file = {
-            let mut entries = self.entries.lock().expect("file pool mutex poisoned");
-            let file = entries
-                .get(&key)
-                .filter(|entry| {
-                    entry.mode == OpenMode::Write
-                        && path_identity(&key).ok() == Some(entry.identity)
-                })
-                .map(|entry| entry.file.clone());
-            if file.is_none() && entries.remove(&key).is_some() {
+        {
+            let mut entries = lock_reset_derived_cache(&self.entries);
+            if let Some(entry) = entries.get_mut(&key) {
+                if entry.mode == OpenMode::Write && path_identity(&key).ok() == Some(entry.identity)
+                {
+                    entry.last_used = Instant::now();
+                    entry.sequence = self.sequence.fetch_add(1, Ordering::Relaxed);
+                    return Ok(Arc::new(LeasedFileHandle::new(Arc::clone(&entry.file))));
+                }
+            }
+            if entries.remove(&key).is_some() {
                 self.counters.evictions.fetch_add(1, Ordering::Relaxed);
             }
-            file
-        };
-        match file {
-            Some(file) => Ok(file),
-            None => Ok(Arc::new(
-                open_path_no_follow(&key, true, false)
-                    .map_err(|e| StorageError::io(&path_str, e))?,
-            )),
         }
+
+        let permit = self.acquire_descriptor();
+        let mut entries = lock_reset_derived_cache(&self.entries);
+        if let Some(entry) = entries.get_mut(&key) {
+            if entry.mode == OpenMode::Write && path_identity(&key).ok() == Some(entry.identity) {
+                entry.last_used = Instant::now();
+                entry.sequence = self.sequence.fetch_add(1, Ordering::Relaxed);
+                return Ok(Arc::new(LeasedFileHandle::new(Arc::clone(&entry.file))));
+            }
+        }
+        if entries.remove(&key).is_some() {
+            self.counters.evictions.fetch_add(1, Ordering::Relaxed);
+        }
+        let file =
+            open_path_no_follow(&key, true, false).map_err(|e| StorageError::io(&path_str, e))?;
+        Ok(Arc::new(LeasedFileHandle::new(Arc::new(LeasedFile::new(
+            file, permit,
+        )))))
     }
 
-    fn write_handles(&self) -> Vec<(PathBuf, Arc<File>)> {
-        let mut entries = self.entries.lock().expect("file pool mutex poisoned");
+    fn write_paths(&self) -> Vec<PathBuf> {
+        let mut entries = lock_reset_derived_cache(&self.entries);
         let stale: Vec<PathBuf> = entries
             .iter()
             .filter(|(path, entry)| {
@@ -492,15 +569,16 @@ impl FilePool {
         entries
             .iter()
             .filter(|(_, entry)| entry.mode == OpenMode::Write)
-            .map(|(path, entry)| (path.clone(), entry.file.clone()))
+            .map(|(path, _)| path.clone())
             .collect()
     }
 
     fn stats(&self) -> FilePoolStats {
-        let entries = self.entries.lock().expect("file pool mutex poisoned");
+        let entries = lock_reset_derived_cache(&self.entries);
         FilePoolStats {
             capacity: self.capacity,
             open_files: entries.len(),
+            active_descriptors: self.descriptors.active(),
             memory_bytes: entries
                 .keys()
                 .map(|path| {
@@ -532,16 +610,47 @@ impl FilePool {
 
     fn enforce_capacity_locked(&self, entries: &mut HashMap<PathBuf, CachedFile>) {
         while entries.len() > self.capacity {
-            let Some(path) = entries
-                .iter()
-                .min_by_key(|(_, entry)| entry.sequence)
-                .map(|(path, _)| path.clone())
-            else {
+            if !self.evict_oldest_locked(entries) {
                 break;
-            };
-            entries.remove(&path);
-            self.counters.evictions.fetch_add(1, Ordering::Relaxed);
+            }
         }
+    }
+
+    fn acquire_descriptor(&self) -> DescriptorPermit {
+        loop {
+            if let Some(permit) = self.descriptors.try_acquire() {
+                return permit;
+            }
+
+            let generation = self.descriptors.generation();
+            {
+                let now = Instant::now();
+                let mut entries = lock_reset_derived_cache(&self.entries);
+                self.sweep_idle_locked(&mut entries, now);
+                if let Some(permit) = self.descriptors.try_acquire() {
+                    return permit;
+                }
+                // Cached descriptors and queued I/O share the same ceiling.
+                // Evict one entry; if it is still in-flight, wait for its
+                // operation reference to drop, then retry so newly-idle cache
+                // entries can be evicted instead of leaving waiters asleep.
+                self.evict_oldest_locked(&mut entries);
+            }
+            self.descriptors.wait_for_change(generation);
+        }
+    }
+
+    fn evict_oldest_locked(&self, entries: &mut HashMap<PathBuf, CachedFile>) -> bool {
+        let Some(path) = entries
+            .iter()
+            .min_by_key(|(_, entry)| entry.sequence)
+            .map(|(path, _)| path.clone())
+        else {
+            return false;
+        };
+        entries.remove(&path);
+        self.counters.evictions.fetch_add(1, Ordering::Relaxed);
+        true
     }
 }
 
@@ -585,7 +694,7 @@ impl BlockingPool {
             let name = format!("{name_prefix}-{index}");
             match std::thread::Builder::new().name(name).spawn(move || loop {
                 let job = {
-                    let rx = receiver.lock().expect("I/O pool mutex poisoned");
+                    let rx = lock_recover(&receiver);
                     rx.recv()
                 };
                 match job {
@@ -673,6 +782,7 @@ impl BlockingPool {
 /// queue identity.
 #[derive(Debug)]
 struct SharedSchedulerResources {
+    id: u64,
     file_pool: Arc<FilePool>,
     io_pool: Arc<BlockingPool>,
     disk_backend: Arc<SelectedDiskBackend>,
@@ -693,6 +803,22 @@ struct SharedSchedulerKey {
 static SHARED_SCHEDULER_RESOURCES: Lazy<
     Mutex<HashMap<SharedSchedulerKey, Weak<SharedSchedulerResources>>>,
 > = Lazy::new(|| Mutex::new(HashMap::new()));
+static NEXT_SHARED_SCHEDULER_RESOURCE_ID: AtomicU64 = AtomicU64::new(1);
+
+fn next_shared_scheduler_resource_id() -> u64 {
+    loop {
+        let id = NEXT_SHARED_SCHEDULER_RESOURCE_ID.load(Ordering::Relaxed);
+        let next = id
+            .checked_add(1)
+            .expect("shared scheduler resource identity exhausted");
+        if NEXT_SHARED_SCHEDULER_RESOURCE_ID
+            .compare_exchange_weak(id, next, Ordering::Relaxed, Ordering::Relaxed)
+            .is_ok()
+        {
+            return id;
+        }
+    }
+}
 
 fn backend_request_from_env() -> BackendRequest {
     std::env::var("TNG_STORAGE_BACKEND")
@@ -703,7 +829,10 @@ fn backend_request_from_env() -> BackendRequest {
 
 fn shared_scheduler_key(io_config: &StorageIoConfig) -> SharedSchedulerKey {
     SharedSchedulerKey {
-        file_pool_size: clamp_file_pool_size(io_config.file_pool_size),
+        file_pool_size: effective_file_pool_size(
+            io_config.file_pool_size,
+            process_handle_cache_capacity(),
+        ),
         idle_file_ttl_secs: io_config.idle_file_ttl_secs,
         io_worker_threads: io_config.io_worker_threads.max(1),
         io_queue_depth: io_config.io_queue_depth.max(1),
@@ -715,6 +844,7 @@ fn shared_scheduler_key(io_config: &StorageIoConfig) -> SharedSchedulerKey {
 
 fn create_scheduler_resources(key: SharedSchedulerKey) -> Arc<SharedSchedulerResources> {
     Arc::new(SharedSchedulerResources {
+        id: next_shared_scheduler_resource_id(),
         file_pool: Arc::new(FilePool::new(
             key.file_pool_size,
             Duration::from_secs(key.idle_file_ttl_secs),
@@ -739,9 +869,7 @@ fn create_scheduler_resources(key: SharedSchedulerKey) -> Arc<SharedSchedulerRes
 
 fn shared_scheduler_resources(io_config: &StorageIoConfig) -> Arc<SharedSchedulerResources> {
     let key = shared_scheduler_key(io_config);
-    let mut resources = SHARED_SCHEDULER_RESOURCES
-        .lock()
-        .expect("shared scheduler resources mutex poisoned");
+    let mut resources = lock_recover(&SHARED_SCHEDULER_RESOURCES);
     if let Some(existing) = resources.get(&key).and_then(Weak::upgrade) {
         return existing;
     }
@@ -763,7 +891,7 @@ fn mark_dirty_path(
     dirty_path_generation: &AtomicU64,
     path: PathBuf,
 ) {
-    let mut dirty = dirty_paths.lock().expect("dirty path mutex poisoned");
+    let mut dirty = lock_recover(dirty_paths);
     let generation = dirty_path_generation.fetch_add(1, Ordering::Relaxed);
     dirty.insert(path, generation);
 }
@@ -773,7 +901,7 @@ fn clear_dirty_path_if_generation(
     path: &Path,
     expected_generation: u64,
 ) {
-    let mut dirty = dirty_paths.lock().expect("dirty path mutex poisoned");
+    let mut dirty = lock_recover(dirty_paths);
     if dirty.get(path).copied() == Some(expected_generation) {
         dirty.remove(path);
     }
@@ -947,7 +1075,7 @@ enum ReadPreparation {
     CacheHit(bytes::Bytes),
     BackendRead {
         key: PathBuf,
-        file: Arc<File>,
+        file: Arc<LeasedFileHandle>,
         read_len: usize,
     },
 }
@@ -1077,9 +1205,7 @@ fn device_queue_for(
     capacity: usize,
 ) -> Arc<Semaphore> {
     let key = device_queue_key(storage_root, device_id, profile);
-    let mut queues = DEVICE_QUEUES
-        .lock()
-        .expect("device queue registry mutex poisoned");
+    let mut queues = lock_recover(&DEVICE_QUEUES);
     if let Some(queue) = queues.get(&key).and_then(Weak::upgrade) {
         return queue;
     }
@@ -1381,7 +1507,7 @@ async fn dispatch_peer_read_batch(
             };
             match await_backend_io_with_expected(
                 &key,
-                disk_backend.pread(file.clone(), frame, offset),
+                disk_backend.pread_leased(file.clone(), frame, offset),
                 Some(len),
             )
             .await
@@ -1639,24 +1765,14 @@ impl MountScheduler {
     }
 
     pub fn stats(&self) -> StorageIoStats {
-        let dirty_files = self
-            .dirty_paths
-            .lock()
-            .expect("dirty path mutex poisoned")
-            .len();
-        let peer_read_cache_entries = self
-            .peer_read_cache
-            .lock()
-            .expect("peer read cache mutex poisoned")
-            .len();
-        let peer_read_elevator_queued = self
-            .peer_read_elevator
-            .lock()
-            .expect("peer read elevator mutex poisoned")
+        let dirty_files = lock_recover(&self.dirty_paths).len();
+        let peer_read_cache_entries = lock_reset_derived_cache(&self.peer_read_cache).len();
+        let peer_read_elevator_queued = lock_recover(&self.peer_read_elevator)
             .as_ref()
             .map(PeerReadElevator::queued_len)
             .unwrap_or(0);
         StorageIoStats {
+            shared_resource_id: self._shared_resources.id,
             device_id: self.device_id.clone(),
             profile: self.profile.clone(),
             file_pool: self.file_pool.stats(),
@@ -1859,10 +1975,7 @@ impl MountScheduler {
         if !self.peer_read_elevator_enabled {
             return None;
         }
-        let mut elevator = self
-            .peer_read_elevator
-            .lock()
-            .expect("peer read elevator mutex poisoned");
+        let mut elevator = lock_recover(&self.peer_read_elevator);
         if elevator.is_none() && tokio::runtime::Handle::try_current().is_ok() {
             *elevator = Some(PeerReadElevator::spawn(
                 self.storage_root,
@@ -2021,7 +2134,7 @@ impl MountScheduler {
                 })?;
                 let frame = match await_backend_io_with_expected(
                     &key,
-                    disk_backend.pread(file.clone(), frame, offset),
+                    disk_backend.pread_leased(file.clone(), frame, offset),
                     Some(read_len),
                 )
                 .await
@@ -2090,10 +2203,7 @@ impl MountScheduler {
         } else {
             None
         };
-        let mut cache = self
-            .peer_read_cache
-            .lock()
-            .expect("peer read cache mutex poisoned");
+        let mut cache = lock_reset_derived_cache(&self.peer_read_cache);
         if self.peer_read_cache_epoch.load(Ordering::Acquire) != generation {
             // A write completed while this read was in flight. Do not
             // publish the stale backend bytes into the cache.
@@ -2170,7 +2280,7 @@ impl MountScheduler {
         let result = await_backend_io_with_expected(
             &key,
             backend_write_completion_with_cache_invalidation(
-                disk_backend.pwrite(file.clone(), data, offset),
+                disk_backend.pwrite_leased(file.clone(), data, offset),
                 peer_read_cache.clone(),
                 peer_read_cache_epoch.clone(),
                 key.clone(),
@@ -2187,7 +2297,7 @@ impl MountScheduler {
         peer_read_cache_invalidate(&peer_read_cache, &peer_read_cache_epoch, &key);
         if strict {
             let sync_started = Instant::now();
-            let result = await_backend_io(&key, disk_backend.fdatasync(file)).await;
+            let result = await_backend_io(&key, disk_backend.fdatasync_leased(file)).await;
             if let Err(error) = result {
                 if matches!(error, StorageError::QueueFull { .. }) {
                     counters.queue_full.fetch_add(1, Ordering::Relaxed);
@@ -2301,11 +2411,7 @@ impl MountScheduler {
         let started = Instant::now();
         let submission = self.reserve_submission(0)?;
         let key = normalized_key(&path);
-        let expected_generation = dirty_paths
-            .lock()
-            .expect("dirty path mutex poisoned")
-            .get(&key)
-            .copied();
+        let expected_generation = lock_recover(&dirty_paths).get(&key).copied();
         let file = match self
             .io_pool
             .run({
@@ -2323,7 +2429,7 @@ impl MountScheduler {
                 return Err(error);
             }
         };
-        let result = await_backend_io(&key, disk_backend.fdatasync(file)).await;
+        let result = await_backend_io(&key, disk_backend.fdatasync_leased(file)).await;
         if let Err(error) = result {
             if matches!(error, StorageError::QueueFull { .. }) {
                 counters.queue_full.fetch_add(1, Ordering::Relaxed);
@@ -2345,37 +2451,22 @@ impl MountScheduler {
         let counters = self.counters.clone();
         let started = Instant::now();
         let submission = self.reserve_submission(0)?;
-        let paths: Vec<(PathBuf, u64)> = {
-            let dirty = dirty_paths.lock().expect("dirty path mutex poisoned");
+        let dirty_snapshot: Vec<(PathBuf, u64)> = {
+            let dirty = lock_recover(&dirty_paths);
             dirty
                 .iter()
                 .map(|(path, generation)| (path.clone(), *generation))
                 .collect()
         };
-        let paths_for_open = paths
-            .iter()
-            .map(|(path, _)| path.clone())
-            .collect::<Vec<_>>();
-        let files = match self
+        let cached_write_paths = match self
             .io_pool
             .run({
                 let pool = pool.clone();
-                let paths = paths_for_open;
-                move || {
-                    let mut files = pool.write_handles();
-                    for path in paths {
-                        let key = normalized_key(&path);
-                        let file = pool.open_for_sync(&key)?;
-                        if !files.iter().any(|(existing, _)| existing == &key) {
-                            files.push((key, file));
-                        }
-                    }
-                    Ok(files)
-                }
+                move || Ok(pool.write_paths())
             })
             .await
         {
-            Ok(files) => files,
+            Ok(paths) => paths,
             Err(error) => {
                 if matches!(error, StorageError::QueueFull { .. }) {
                     counters.queue_full.fetch_add(1, Ordering::Relaxed);
@@ -2383,8 +2474,42 @@ impl MountScheduler {
                 return Err(error);
             }
         };
-        for (path, file) in files {
-            let result = await_backend_io(&path, disk_backend.fdatasync(file)).await;
+        let mut seen = HashSet::with_capacity(
+            cached_write_paths
+                .len()
+                .saturating_add(dirty_snapshot.len()),
+        );
+        seen.extend(cached_write_paths.iter().cloned());
+        let mut paths_to_sync = cached_write_paths;
+        for (path, _) in &dirty_snapshot {
+            if seen.insert(path.clone()) {
+                paths_to_sync.push(path.clone());
+            }
+        }
+
+        // Do not open all dirty files at once. The dirty set can be much
+        // larger than the descriptor-cache capacity; syncing each path
+        // sequentially keeps evicted handles from accumulating in a vector.
+        for path in paths_to_sync {
+            let key = normalized_key(&path);
+            let file = match self
+                .io_pool
+                .run({
+                    let pool = pool.clone();
+                    let key = key.clone();
+                    move || pool.open_for_sync(&key)
+                })
+                .await
+            {
+                Ok(file) => file,
+                Err(error) => {
+                    if matches!(error, StorageError::QueueFull { .. }) {
+                        counters.queue_full.fetch_add(1, Ordering::Relaxed);
+                    }
+                    return Err(error);
+                }
+            };
+            let result = await_backend_io(&key, disk_backend.fdatasync_leased(file)).await;
             if let Err(error) = result {
                 if matches!(error, StorageError::QueueFull { .. }) {
                     counters.queue_full.fetch_add(1, Ordering::Relaxed);
@@ -2392,8 +2517,8 @@ impl MountScheduler {
                 return Err(error);
             }
         }
-        let mut dirty = dirty_paths.lock().expect("dirty path mutex poisoned");
-        for (path, expected_generation) in paths {
+        let mut dirty = lock_recover(&dirty_paths);
+        for (path, expected_generation) in dirty_snapshot {
             if dirty.get(&path).copied() == Some(expected_generation) {
                 dirty.remove(&path);
             }
@@ -2688,7 +2813,7 @@ fn peer_read_cache_hit(
     len: usize,
 ) -> Option<bytes::Bytes> {
     let identity = file_identity(file).ok()?;
-    let mut cache = cache.lock().expect("peer read cache mutex poisoned");
+    let mut cache = lock_reset_derived_cache(cache);
     if cache
         .get(key)
         .is_some_and(|entry| entry.identity != identity)
@@ -2713,10 +2838,7 @@ fn peer_read_cache_invalidate(
     key: &Path,
 ) {
     epoch.fetch_add(1, Ordering::AcqRel);
-    cache
-        .lock()
-        .expect("peer read cache mutex poisoned")
-        .remove(key);
+    lock_reset_derived_cache(cache).remove(key);
 }
 
 fn advise_for_read_class(
@@ -2885,22 +3007,8 @@ fn seek_data_extents(
     }
 }
 
-fn clamp_file_pool_size(configured: usize) -> usize {
-    let configured = configured.max(1);
-    #[cfg(unix)]
-    {
-        let mut limits = libc::rlimit {
-            rlim_cur: 0,
-            rlim_max: 0,
-        };
-        let rc = unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limits) };
-        if rc == 0 && limits.rlim_cur != libc::RLIM_INFINITY {
-            let soft = limits.rlim_cur as usize;
-            let budget = soft.saturating_mul(3) / 4;
-            return configured.min(budget.max(1));
-        }
-    }
-    configured
+fn effective_file_pool_size(configured: usize, process_budget: usize) -> usize {
+    configured.min(process_budget)
 }
 
 fn full_preallocate(file: &File, len: u64) -> Result<(), StorageError> {
@@ -3306,6 +3414,17 @@ mod tests {
         assert!(Arc::ptr_eq(&first.io_pool, &second.io_pool));
         assert!(Arc::ptr_eq(&first.disk_backend, &second.disk_backend));
         assert!(Arc::ptr_eq(&first.hash_pool, &second.hash_pool));
+        let first_stats = first.stats();
+        let second_stats = second.stats();
+        assert_ne!(first_stats.shared_resource_id, 0);
+        assert_eq!(
+            first_stats.shared_resource_id,
+            second_stats.shared_resource_id
+        );
+        assert_eq!(
+            first.file_pool_stats().capacity,
+            effective_file_pool_size(3, process_handle_cache_capacity())
+        );
     }
 
     #[test]
@@ -3464,6 +3583,72 @@ mod tests {
         assert!(stats.misses >= 3);
         assert!(stats.evictions >= 1);
         assert_eq!(stats.open_files, 2);
+    }
+
+    #[test]
+    fn configured_file_pool_is_clamped_to_the_process_fd_budget() {
+        assert_eq!(effective_file_pool_size(512, 6), 6);
+        assert_eq!(effective_file_pool_size(3, 6), 3);
+        assert_eq!(effective_file_pool_size(512, 0), 0);
+    }
+
+    #[test]
+    fn zero_capacity_file_pool_opens_without_retaining_the_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("uncached.bin");
+        std::fs::write(&path, b"data").unwrap();
+        let pool = FilePool::new(0, Duration::from_secs(30));
+
+        let file = pool.get_or_open(&path, OpenMode::Read, false).unwrap();
+
+        assert_eq!(file.metadata().unwrap().len(), 4);
+        assert_eq!(pool.descriptors.active(), 1);
+        let stats = pool.stats();
+        assert_eq!(stats.capacity, 0);
+        assert_eq!(stats.open_files, 0);
+        drop(file);
+        assert_eq!(pool.descriptors.active(), 0);
+    }
+
+    #[test]
+    fn file_pool_waits_for_an_evicted_in_flight_descriptor_lease() {
+        let dir = tempfile::tempdir().unwrap();
+        let first_path = dir.path().join("first.bin");
+        let second_path = dir.path().join("second.bin");
+        std::fs::write(&first_path, b"first").unwrap();
+        std::fs::write(&second_path, b"second").unwrap();
+        let pool = Arc::new(FilePool::new(1, Duration::from_secs(30)));
+        let first = pool
+            .get_or_open(&first_path, OpenMode::Read, false)
+            .unwrap();
+        assert_eq!(pool.descriptors.active(), 1);
+
+        let (opened_tx, opened_rx) = mpsc::channel();
+        let opener = {
+            let pool = Arc::clone(&pool);
+            std::thread::spawn(move || {
+                let second = pool
+                    .get_or_open(&second_path, OpenMode::Read, false)
+                    .unwrap();
+                opened_tx.send(second).unwrap();
+            })
+        };
+
+        assert!(matches!(
+            opened_rx.recv_timeout(Duration::from_millis(50)),
+            Err(mpsc::RecvTimeoutError::Timeout)
+        ));
+        assert_eq!(pool.descriptors.active(), 1);
+
+        drop(first);
+        let second = opened_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("descriptor waiter did not resume after the in-flight handle dropped");
+        opener.join().unwrap();
+        assert_eq!(second.metadata().unwrap().len(), 6);
+        assert_eq!(pool.descriptors.active(), 1);
+        drop(second);
+        assert_eq!(pool.descriptors.active(), 1, "the cache retains one handle");
     }
 
     #[tokio::test]
@@ -3886,6 +4071,196 @@ mod tests {
         assert_eq!(after_sync.sync_ops, 1);
     }
 
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn sync_all_open_files_stays_within_low_descriptor_limit() {
+        const CHILD_ENV: &str = "TNG_TEST_SYNC_ALL_OPEN_FILES_LOW_FD_CHILD";
+
+        if std::env::var_os(CHILD_ENV).is_some() {
+            let mut current = libc::rlimit {
+                rlim_cur: 0,
+                rlim_max: 0,
+            };
+            // SAFETY: `current` is a valid writable `rlimit` for getrlimit.
+            assert_eq!(
+                unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut current) },
+                0
+            );
+            let limit = current.rlim_max.clamp(1, 64);
+            let constrained = libc::rlimit {
+                rlim_cur: limit,
+                rlim_max: limit,
+            };
+            // SAFETY: lowering this child process's soft and hard descriptor
+            // limits is local to the subprocess; it cannot affect the parent.
+            assert_eq!(
+                unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &constrained) },
+                0
+            );
+            let dir = tempfile::tempdir().unwrap();
+            let sched = MountScheduler::new(
+                StorageRootId::new(),
+                &SchedulerConfig {
+                    profile: StorageProfile::Ssd,
+                    storage_io: StorageIoConfig {
+                        file_pool_size: 1,
+                        io_worker_threads: 1,
+                        io_queue_depth: 8,
+                        hash_worker_threads: 1,
+                        hash_queue_depth: 8,
+                        durability_mode: DurabilityMode::Checkpoint,
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+            );
+            for index in 0..96 {
+                let path = dir.path().join(format!("dirty-{index}.bin"));
+                scheduled_write(
+                    &sched,
+                    IoClass::PeerWrite,
+                    &path,
+                    0,
+                    bytes::Bytes::from_static(b"payload"),
+                    true,
+                )
+                .await
+                .unwrap_or_else(|error| panic!("write {path:?} failed: {error}"));
+            }
+            assert_eq!(sched.stats().dirty_files, 96);
+            sched.sync_all_open_files().await.unwrap();
+            assert_eq!(sched.stats().dirty_files, 0);
+            return;
+        }
+
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "scheduler::tests::sync_all_open_files_stays_within_low_descriptor_limit",
+                "--nocapture",
+            ])
+            .env(CHILD_ENV, "1")
+            .env("TNG_STORAGE_BACKEND", "pread")
+            .output()
+            .unwrap();
+        let transcript = format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            output.status.success() && transcript.contains("1 passed"),
+            "low-fd child failed or did not run the test:\n{transcript}"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn concurrent_file_pool_opens_stay_within_low_descriptor_limit() {
+        const CHILD_ENV: &str = "TNG_TEST_FILE_POOL_CONCURRENT_LOW_FD_CHILD";
+
+        if std::env::var_os(CHILD_ENV).is_some() {
+            let mut current = libc::rlimit {
+                rlim_cur: 0,
+                rlim_max: 0,
+            };
+            // SAFETY: `current` is a valid writable `rlimit` for getrlimit.
+            assert_eq!(
+                unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut current) },
+                0
+            );
+            let limit = current.rlim_max.clamp(1, 64);
+            let constrained = libc::rlimit {
+                rlim_cur: limit,
+                rlim_max: limit,
+            };
+            // SAFETY: lowering this child process's limits cannot affect the
+            // parent test process.
+            assert_eq!(
+                unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &constrained) },
+                0
+            );
+
+            const OPERATIONS: usize = 72;
+            const ACTIVE_LIMIT: usize = 8;
+            let dir = tempfile::tempdir().unwrap();
+            let paths = (0..OPERATIONS)
+                .map(|index| {
+                    let path = dir.path().join(format!("concurrent-{index}.bin"));
+                    std::fs::write(&path, b"payload").unwrap();
+                    path
+                })
+                .collect::<Vec<_>>();
+            let pool = Arc::new(FilePool::new(ACTIVE_LIMIT, Duration::from_secs(30)));
+            let start = Arc::new(std::sync::Barrier::new(OPERATIONS));
+            let max_active = Arc::new(AtomicUsize::new(0));
+            let workers = paths
+                .into_iter()
+                .map(|path| {
+                    let pool = Arc::clone(&pool);
+                    let start = Arc::clone(&start);
+                    let max_active = Arc::clone(&max_active);
+                    std::thread::spawn(move || {
+                        start.wait();
+                        let file = pool
+                            .get_or_open(&path, OpenMode::Read, false)
+                            .unwrap_or_else(|error| panic!("open {path:?} failed: {error}"));
+                        max_active.fetch_max(pool.descriptors.active(), Ordering::Relaxed);
+                        std::thread::sleep(Duration::from_millis(30));
+                        assert_eq!(file.metadata().unwrap().len(), 7);
+                    })
+                })
+                .collect::<Vec<_>>();
+
+            for worker in workers {
+                worker.join().expect("file-pool worker panicked");
+            }
+            assert!(max_active.load(Ordering::Relaxed) <= ACTIVE_LIMIT);
+            assert!(pool.descriptors.active() <= ACTIVE_LIMIT);
+            assert!(pool.stats().open_files <= ACTIVE_LIMIT);
+            return;
+        }
+
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "scheduler::tests::concurrent_file_pool_opens_stay_within_low_descriptor_limit",
+                "--nocapture",
+            ])
+            .env(CHILD_ENV, "1")
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(20);
+        loop {
+            if child.try_wait().unwrap().is_some() {
+                break;
+            }
+            if Instant::now() >= deadline {
+                let _ = child.kill();
+                let output = child.wait_with_output().unwrap();
+                let transcript = format!(
+                    "{}{}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                );
+                panic!("concurrent low-fd child timed out:\n{transcript}");
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        let output = child.wait_with_output().unwrap();
+        let transcript = format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            output.status.success() && transcript.contains("1 passed"),
+            "concurrent low-fd child failed or did not run the test:\n{transcript}"
+        );
+    }
+
     #[test]
     fn write_handle_snapshot_drops_replaced_paths() {
         let dir = tempfile::tempdir().unwrap();
@@ -3897,13 +4272,65 @@ mod tests {
         std::fs::remove_file(&path).unwrap();
         std::fs::write(&path, b"new-content").unwrap();
 
-        assert!(pool.write_handles().is_empty());
+        assert!(pool.write_paths().is_empty());
         let current = pool.open_for_sync(&path).unwrap();
         assert_ne!(
             file_identity(&old).unwrap(),
             file_identity(&current).unwrap()
         );
         assert_eq!(current.metadata().unwrap().len(), 11);
+    }
+
+    #[test]
+    fn poisoned_file_pool_discards_cached_handles_and_reopens() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("poisoned-pool.bin");
+        std::fs::write(&path, b"payload").unwrap();
+        let pool = Arc::new(FilePool::new(16, Duration::from_secs(30)));
+        let old = pool.get_or_open(&path, OpenMode::Read, false).unwrap();
+
+        let poisoner = Arc::clone(&pool);
+        assert!(std::thread::spawn(move || {
+            let _guard = poisoner.entries.lock().unwrap();
+            panic!("poison the derived file pool");
+        })
+        .join()
+        .is_err());
+        assert!(pool.entries.is_poisoned());
+
+        let reopened = pool.get_or_open(&path, OpenMode::Read, false).unwrap();
+        assert!(!Arc::ptr_eq(&old, &reopened));
+        assert!(!pool.entries.is_poisoned());
+    }
+
+    #[test]
+    fn poisoned_peer_read_cache_is_discarded_as_a_miss() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("poisoned-peer-cache.bin");
+        std::fs::write(&path, b"fresh").unwrap();
+        let file = File::open(&path).unwrap();
+        let cache = Arc::new(Mutex::new(HashMap::from([(
+            path.clone(),
+            PeerReadCacheEntry {
+                identity: file_identity(&file).unwrap(),
+                offset: 0,
+                data: bytes::Bytes::from_static(b"stale"),
+                last_used: Instant::now(),
+                _lease: None,
+            },
+        )])));
+
+        let poisoner = Arc::clone(&cache);
+        assert!(std::thread::spawn(move || {
+            let _guard = poisoner.lock().unwrap();
+            panic!("poison the derived peer read cache");
+        })
+        .join()
+        .is_err());
+
+        assert!(peer_read_cache_hit(&cache, &path, &file, 0, 5).is_none());
+        assert!(!cache.is_poisoned());
+        assert!(lock_reset_derived_cache(&cache).is_empty());
     }
 
     #[test]
@@ -3922,6 +4349,27 @@ mod tests {
         let second_generation = dirty_paths.lock().unwrap().get(&path).copied().unwrap();
         clear_dirty_path_if_generation(&dirty_paths, &path, second_generation);
         assert!(dirty_paths.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn poisoned_dirty_path_state_is_preserved_and_unpoisoned() {
+        let original_path = PathBuf::from("already-dirty.bin");
+        let new_path = PathBuf::from("new-dirty.bin");
+        let dirty_paths = Arc::new(Mutex::new(HashMap::from([(original_path.clone(), 7)])));
+
+        let poisoner = Arc::clone(&dirty_paths);
+        assert!(std::thread::spawn(move || {
+            let _guard = poisoner.lock().unwrap();
+            panic!("poison authoritative dirty-path state");
+        })
+        .join()
+        .is_err());
+
+        mark_dirty_path(&dirty_paths, &AtomicU64::new(8), new_path.clone());
+        let dirty = lock_recover(&dirty_paths);
+        assert_eq!(dirty.get(&original_path), Some(&7));
+        assert!(dirty.contains_key(&new_path));
+        assert!(!dirty_paths.is_poisoned());
     }
 
     #[tokio::test]

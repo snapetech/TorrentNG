@@ -198,7 +198,11 @@ pub struct V2PieceLayerRequirements {
 
 impl TorrentMetaV2 {
     pub fn total_length(&self) -> u64 {
-        self.files.iter().map(|f| f.length).sum()
+        self.files
+            .iter()
+            .filter(|file| !file.pad)
+            .map(|file| file.length)
+            .sum()
     }
 
     /// Logical BEP 52 address-space length, including alignment gaps between

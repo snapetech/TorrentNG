@@ -19,6 +19,7 @@ use tokio::time::{interval, timeout};
 use tracing::{debug, info, warn};
 
 use crate::command::EngineCmd;
+use crate::egress_policy::OutboundEgressPolicy;
 use crate::torrent_task::TorrentCmd;
 
 const DHT_ANNOUNCED_PEERS_PER_INFO_HASH_CAP: usize = 512;
@@ -28,10 +29,10 @@ const DHT_ANNOUNCED_PEERS_GLOBAL_CAP: usize = 16_384;
 // (16,384), which silently dropped DHT peer discovery for any torrent beyond
 // that count with no operator-visible signal beyond a single debug-level
 // scan of the logs. It is now `DhtTask::tracked_torrents_cap`, sourced from
-// `rt_config::DhtConfig::tracked_torrents_cap` (see `run_dht`'s
-// `tracked_torrents_cap` parameter), and every rejection increments
-// `DhtRuntimeStats::tracked_torrents_rejected` in addition to the existing
-// `warn!` log line so the cap being hit is observable without grepping logs.
+// `rt_config::DhtConfig::tracked_torrents_cap` (see `DhtRuntimeConfig`), and
+// every rejection increments `DhtRuntimeStats::tracked_torrents_rejected` in
+// addition to the existing `warn!` log line so the cap being hit is
+// observable without grepping logs.
 const DHT_QUERIED_NODES_PER_INFO_HASH_CAP: usize = 256;
 // Keep the aggregate queried-node history bounded across all tracked
 // torrents. The old per-info-hash limit alone allowed 16,384 torrents to
@@ -64,6 +65,28 @@ const DHT_ENGINE_READY_SEND_TIMEOUT: Duration = Duration::from_millis(500);
 const DHT_IPV6_COMMAND_SEND_TIMEOUT: Duration = Duration::from_millis(500);
 const DHT_IPV6_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
 const DHT_IPV6_ABORT_GRACE: Duration = Duration::from_millis(100);
+
+fn dht_egress_allowed(
+    policy: &OutboundEgressPolicy,
+    addr: SocketAddr,
+    operation: &'static str,
+) -> bool {
+    match policy.validate_socket_addr(addr) {
+        Ok(()) => true,
+        Err(error) => {
+            debug!(
+                component = "dht",
+                operation,
+                peer = %addr,
+                result = "rejected",
+                reason = "egress_address_policy",
+                error = %error,
+                "DHT address rejected by outbound address policy"
+            );
+            false
+        }
+    }
+}
 
 // The node ID is sent in ordinary DHT responses and therefore cannot be used
 // as an announce-token secret. Keep rotating unpredictable secrets for the
@@ -269,15 +292,25 @@ enum DhtV6Command {
     Shutdown,
 }
 
-pub async fn run_dht(
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct DhtRuntimeConfig {
+    pub(crate) tracked_torrents_cap: usize,
+    pub(crate) egress_policy: OutboundEgressPolicy,
+}
+
+pub(crate) async fn run_dht(
     port: u16,
     listen_port: u16,
     bootstrap_nodes: Vec<String>,
-    tracked_torrents_cap: usize,
+    runtime_config: DhtRuntimeConfig,
     cmd_rx: &mut mpsc::Receiver<DhtCommand>,
     mut pending_commands: VecDeque<DhtCommand>,
     engine_tx: &mpsc::Sender<EngineCmd>,
 ) -> anyhow::Result<()> {
+    let DhtRuntimeConfig {
+        tracked_torrents_cap,
+        egress_policy,
+    } = runtime_config;
     let local_id = NodeId::random();
     let socket = UdpSocket::bind(("0.0.0.0", port))
         .await
@@ -360,6 +393,7 @@ pub async fn run_dht(
         listen_port,
         bootstrap_nodes,
         tracked_torrents_cap,
+        egress_policy,
         tracked_torrents_rejected: 0,
         next_tx: random_tx_seed,
         outstanding: HashMap::new(),
@@ -386,7 +420,7 @@ pub async fn run_dht(
             local_id,
             listen_port,
             bootstrap_nodes_for_task,
-            tracked_torrents_cap,
+            runtime_config,
             cmd_rx,
             stats_for_task,
         ));
@@ -537,16 +571,25 @@ pub async fn run_dht(
         }
     }
     if let Some(mut join) = ipv6_join {
-        if timeout(DHT_IPV6_SHUTDOWN_TIMEOUT, &mut join).await.is_err() {
-            warn!(
-                component = "dht",
-                operation = "shutdown_ipv6",
-                result = "timeout",
-                timeout_ms = DHT_IPV6_SHUTDOWN_TIMEOUT.as_millis() as u64,
-                "IPv6 DHT task did not stop before the shutdown deadline; aborting it"
-            );
-            join.abort();
-            let _ = timeout(DHT_IPV6_ABORT_GRACE, &mut join).await;
+        if let Some(result) = crate::shutdown_join_task(
+            &mut join,
+            DHT_IPV6_SHUTDOWN_TIMEOUT,
+            DHT_IPV6_ABORT_GRACE,
+            "dht",
+            "shutdown_ipv6",
+            "IPv6 DHT task",
+            || {},
+        )
+        .await
+        {
+            if result.is_err() {
+                warn!(
+                    component = "dht",
+                    operation = "shutdown_ipv6",
+                    result = "task_error",
+                    "IPv6 DHT task returned an error during shutdown"
+                );
+            }
         }
     }
     // Drop the socket-owning task before acknowledging shutdown. Callers can
@@ -569,6 +612,7 @@ struct DhtTask {
     /// see the comment above `DHT_QUERIED_NODES_PER_INFO_HASH_CAP` for why
     /// this moved from a hardcoded constant to a runtime config value.
     tracked_torrents_cap: usize,
+    egress_policy: OutboundEgressPolicy,
     /// Cumulative `AddTorrent` rejections caused by `tracked_torrents_cap`.
     /// Surfaced via `runtime_stats()` -> `DhtRuntimeStats::tracked_torrents_rejected`.
     tracked_torrents_rejected: u64,
@@ -826,7 +870,9 @@ impl DhtTask {
                 if deadline.checked_duration_since(Instant::now()).is_none() {
                     break;
                 }
-                if !addr.is_ipv4() {
+                if !addr.is_ipv4()
+                    || !dht_egress_allowed(&self.egress_policy, addr, "bootstrap_query")
+                {
                     continue;
                 }
                 let tx = self.transaction_id();
@@ -876,6 +922,9 @@ impl DhtTask {
     }
 
     async fn handle_packet(&mut self, packet: &[u8], addr: SocketAddr) {
+        if !dht_egress_allowed(&self.egress_policy, addr, "receive_packet") {
+            return;
+        }
         let msg = match KrpcMessage::parse(packet) {
             Ok(msg) => msg,
             Err(e) => {
@@ -935,7 +984,13 @@ impl DhtTask {
                 self.outstanding.remove(&transaction_id);
                 self.remember_node(response.id, addr);
                 for node in response.nodes {
-                    self.table.insert(node);
+                    if dht_egress_allowed(
+                        &self.egress_policy,
+                        SocketAddr::V4(node.addr),
+                        "learn_node",
+                    ) {
+                        self.table.insert(node);
+                    }
                 }
                 if let DhtRequest::GetPeers(info_hash) = outstanding.request {
                     if let Some(token) = response.token {
@@ -994,6 +1049,9 @@ impl DhtTask {
     }
 
     async fn handle_query(&mut self, transaction_id: Vec<u8>, query: DhtQuery, addr: SocketAddr) {
+        if !dht_egress_allowed(&self.egress_policy, addr, "send_response") {
+            return;
+        }
         let response = match query {
             DhtQuery::Ping { .. } => KrpcMessage::Response {
                 transaction_id,
@@ -1250,6 +1308,9 @@ impl DhtTask {
         addr: SocketAddr,
         query_budget: usize,
     ) -> bool {
+        if !dht_egress_allowed(&self.egress_policy, addr, "send_get_peers") {
+            return false;
+        }
         let SocketAddr::V4(v4) = addr else {
             return false;
         };
@@ -1325,6 +1386,9 @@ impl DhtTask {
         token: Vec<u8>,
         addr: SocketAddr,
     ) {
+        if !dht_egress_allowed(&self.egress_policy, addr, "send_announce_peer") {
+            return;
+        }
         let (tx, msg) = self.announce_peer_query(info_hash, token);
         if !self.insert_outstanding(
             tx.clone(),
@@ -1369,6 +1433,10 @@ impl DhtTask {
     }
 
     async fn forward_peers(&mut self, info_hash: [u8; 20], peers: Vec<SocketAddr>) {
+        let peers = peers
+            .into_iter()
+            .filter(|peer| dht_egress_allowed(&self.egress_policy, *peer, "forward_peer"))
+            .collect::<Vec<_>>();
         if peers.is_empty() {
             return;
         }
@@ -1686,10 +1754,14 @@ async fn run_ipv6_dht(
     local_id: NodeId,
     listen_port: u16,
     bootstrap_nodes: Vec<String>,
-    tracked_torrents_cap: usize,
+    runtime_config: DhtRuntimeConfig,
     cmd_rx: mpsc::Receiver<DhtV6Command>,
     stats: DhtV6StatsHandle,
 ) -> anyhow::Result<()> {
+    let DhtRuntimeConfig {
+        tracked_torrents_cap,
+        egress_policy,
+    } = runtime_config;
     let mut task = DhtV6Task {
         local_id,
         table: RoutingTable6::new(local_id),
@@ -1697,6 +1769,7 @@ async fn run_ipv6_dht(
         listen_port,
         bootstrap_nodes,
         tracked_torrents_cap,
+        egress_policy,
         tracked_torrents_rejected: 0,
         next_tx: {
             let seed = *NodeId::random().as_bytes();
@@ -1780,6 +1853,7 @@ struct DhtV6Task {
     listen_port: u16,
     bootstrap_nodes: Vec<String>,
     tracked_torrents_cap: usize,
+    egress_policy: OutboundEgressPolicy,
     tracked_torrents_rejected: u64,
     next_tx: u16,
     outstanding: HashMap<Vec<u8>, OutstandingQuery>,
@@ -1918,6 +1992,9 @@ impl DhtV6Task {
                 _ => continue,
             };
             for addr in addrs.into_iter().take(MAX_DHT_BOOTSTRAP_ADDRESSES) {
+                if !dht_egress_allowed(&self.egress_policy, addr, "bootstrap_query_ipv6") {
+                    continue;
+                }
                 let tx = self.transaction_id();
                 let message = KrpcMessage::Query {
                     transaction_id: tx.clone(),
@@ -1954,6 +2031,9 @@ impl DhtV6Task {
     }
 
     async fn handle_packet(&mut self, packet: &[u8], addr: SocketAddr) {
+        if !dht_egress_allowed(&self.egress_policy, addr, "receive_packet_ipv6") {
+            return;
+        }
         let Ok(message) = KrpcMessage::parse(packet) else {
             return;
         };
@@ -1978,7 +2058,13 @@ impl DhtV6Task {
                 self.outstanding.remove(&transaction_id);
                 self.remember_node(response.id, addr);
                 for node in response.nodes6 {
-                    self.table.insert(node);
+                    if dht_egress_allowed(
+                        &self.egress_policy,
+                        SocketAddr::V6(node.addr),
+                        "learn_node_ipv6",
+                    ) {
+                        self.table.insert(node);
+                    }
                 }
                 if let DhtRequest::GetPeers(info_hash) = outstanding.request {
                     if let Some(token) = response.token {
@@ -2012,6 +2098,9 @@ impl DhtV6Task {
     }
 
     async fn handle_query(&mut self, transaction_id: Vec<u8>, query: DhtQuery, addr: SocketAddr) {
+        if !dht_egress_allowed(&self.egress_policy, addr, "send_response_ipv6") {
+            return;
+        }
         let response = match query {
             DhtQuery::Ping { .. } => KrpcMessage::Response {
                 transaction_id,
@@ -2228,6 +2317,13 @@ impl DhtV6Task {
     }
 
     async fn send_get_peers(&mut self, info_hash: [u8; 20], addr: SocketAddrV6) -> bool {
+        if !dht_egress_allowed(
+            &self.egress_policy,
+            SocketAddr::V6(addr),
+            "send_get_peers_ipv6",
+        ) {
+            return false;
+        }
         if self.outstanding.len() >= DHT_OUTSTANDING_QUERY_CAP
             || self
                 .queried_nodes
@@ -2290,6 +2386,9 @@ impl DhtV6Task {
         token: Vec<u8>,
         addr: SocketAddr,
     ) {
+        if !dht_egress_allowed(&self.egress_policy, addr, "send_announce_peer_ipv6") {
+            return;
+        }
         let tx = self.transaction_id();
         let message = KrpcMessage::Query {
             transaction_id: tx.clone(),
@@ -2320,6 +2419,7 @@ impl DhtV6Task {
         let peers = peers
             .into_iter()
             .filter(SocketAddr::is_ipv6)
+            .filter(|peer| dht_egress_allowed(&self.egress_policy, *peer, "forward_peer_ipv6"))
             .collect::<Vec<_>>();
         if peers.is_empty() {
             return;
@@ -2348,6 +2448,30 @@ impl DhtV6Task {
         cmd_tx: mpsc::Sender<TorrentCmd>,
         peers: Vec<SocketAddr>,
     ) {
+        if !self.pending_peer_forwards.contains_key(&info_hash)
+            && self.pending_peer_count >= DHT_PENDING_FORWARD_PEERS_GLOBAL_CAP
+        {
+            debug!(
+                component = "dht",
+                operation = "forward_peers_ipv6",
+                result = "pending_peer_global_cap_exceeded",
+                cap = DHT_PENDING_FORWARD_PEERS_GLOBAL_CAP,
+                "dropping IPv6 DHT peers because the global pending-forward peer cap is full"
+            );
+            return;
+        }
+        if !self.pending_peer_forwards.contains_key(&info_hash)
+            && self.pending_peer_forwards.len() >= DHT_PENDING_FORWARD_TORRENT_CAP
+        {
+            debug!(
+                component = "dht",
+                operation = "forward_peers_ipv6",
+                result = "pending_cap_exceeded",
+                cap = DHT_PENDING_FORWARD_TORRENT_CAP,
+                "dropping IPv6 DHT peers because the pending-forward cap is full"
+            );
+            return;
+        }
         let pending = self
             .pending_peer_forwards
             .entry(info_hash)
@@ -2569,6 +2693,15 @@ fn socket_addr_with_port(addr: SocketAddr, port: u16) -> SocketAddr {
 mod tests {
     use super::*;
 
+    fn test_egress_policy() -> OutboundEgressPolicy {
+        OutboundEgressPolicy {
+            allow_loopback: true,
+            allow_private: true,
+            allow_link_local: true,
+            ..OutboundEgressPolicy::default()
+        }
+    }
+
     #[tokio::test]
     async fn run_dht_notifies_engine_after_binding() {
         let (dht_tx, mut dht_rx) = mpsc::channel(4);
@@ -2578,7 +2711,10 @@ mod tests {
                 0,
                 6881,
                 Vec::new(),
-                16_384,
+                DhtRuntimeConfig {
+                    tracked_torrents_cap: 16_384,
+                    egress_policy: test_egress_policy(),
+                },
                 &mut dht_rx,
                 VecDeque::new(),
                 &engine_tx,
@@ -2603,6 +2739,167 @@ mod tests {
             .expect("DHT shutdown acknowledgement timed out")
             .expect("DHT shutdown acknowledgement sender dropped");
         assert!(task.await.expect("DHT task panicked").is_ok());
+    }
+
+    #[tokio::test]
+    async fn dht_loopback_addresses_require_explicit_egress_opt_in() {
+        let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let peer_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let peer_addr = peer_socket.local_addr().unwrap();
+        let local_id = NodeId::from_bytes([1; 20]);
+        let mut task = DhtTask {
+            local_id,
+            table: RoutingTable::new(local_id),
+            socket,
+            listen_port: 6881,
+            bootstrap_nodes: Vec::new(),
+            tracked_torrents_cap: 16,
+            egress_policy: OutboundEgressPolicy::default(),
+            tracked_torrents_rejected: 0,
+            next_tx: 1,
+            outstanding: HashMap::new(),
+            queried_nodes: HashMap::new(),
+            queried_node_count: 0,
+            torrents: HashMap::new(),
+            generations: HashMap::new(),
+            announced_peers: HashMap::new(),
+            announced_peer_count: 0,
+            last_full_lookup: HashMap::new(),
+            pending_peer_forwards: HashMap::new(),
+            pending_peer_count: 0,
+            last_bootstrap_at: None,
+        };
+        let info_hash = [9; 20];
+
+        assert!(
+            !task
+                .send_get_peers(info_hash, peer_addr, DHT_QUERIED_NODES_GLOBAL_CAP)
+                .await
+        );
+        assert!(task.outstanding.is_empty());
+
+        let ping = KrpcMessage::Query {
+            transaction_id: b"ping".to_vec(),
+            query: DhtQuery::Ping {
+                id: NodeId::from_bytes([2; 20]),
+            },
+        }
+        .encode();
+        task.handle_packet(&ping, peer_addr).await;
+        assert_eq!(task.table.total_nodes(), 0);
+        let mut packet = [0_u8; DHT_MAX_DATAGRAM_LEN];
+        assert!(timeout(
+            Duration::from_millis(20),
+            peer_socket.recv_from(&mut packet)
+        )
+        .await
+        .is_err());
+
+        task.egress_policy.allow_loopback = true;
+        assert!(
+            task.send_get_peers(info_hash, peer_addr, DHT_QUERIED_NODES_GLOBAL_CAP)
+                .await
+        );
+        let (length, _) = timeout(Duration::from_secs(1), peer_socket.recv_from(&mut packet))
+            .await
+            .expect("opted-in DHT query should reach the local peer")
+            .unwrap();
+        assert!(matches!(
+            KrpcMessage::parse(&packet[..length]),
+            Ok(KrpcMessage::Query { .. })
+        ));
+
+        task.handle_packet(&ping, peer_addr).await;
+        assert_eq!(task.table.total_nodes(), 1);
+        let (length, _) = timeout(Duration::from_secs(1), peer_socket.recv_from(&mut packet))
+            .await
+            .expect("opted-in DHT request should receive a response")
+            .unwrap();
+        assert!(matches!(
+            KrpcMessage::parse(&packet[..length]),
+            Ok(KrpcMessage::Response { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn dht_ipv6_loopback_addresses_require_explicit_egress_opt_in() {
+        let socket = match UdpSocket::bind("[::1]:0").await {
+            Ok(socket) => socket,
+            Err(_) => return,
+        };
+        let peer_socket = match UdpSocket::bind("[::1]:0").await {
+            Ok(socket) => socket,
+            Err(_) => return,
+        };
+        let SocketAddr::V6(peer_addr) = peer_socket.local_addr().unwrap() else {
+            unreachable!("IPv6 loopback socket must have an IPv6 address")
+        };
+        let local_id = NodeId::from_bytes([1; 20]);
+        let mut task = DhtV6Task {
+            local_id,
+            table: RoutingTable6::new(local_id),
+            socket,
+            listen_port: 6881,
+            bootstrap_nodes: Vec::new(),
+            tracked_torrents_cap: 16,
+            egress_policy: OutboundEgressPolicy::default(),
+            tracked_torrents_rejected: 0,
+            next_tx: 1,
+            outstanding: HashMap::new(),
+            queried_nodes: HashMap::new(),
+            queried_node_count: 0,
+            torrents: HashMap::new(),
+            generations: HashMap::new(),
+            announced_peers: HashMap::new(),
+            announced_peer_count: 0,
+            last_full_lookup: HashMap::new(),
+            pending_peer_forwards: HashMap::new(),
+            pending_peer_count: 0,
+            last_bootstrap_at: None,
+            stats: Arc::new(Mutex::new(DhtV6Stats::default())),
+        };
+        let info_hash = [9; 20];
+        let ping = KrpcMessage::Query {
+            transaction_id: b"ping6".to_vec(),
+            query: DhtQuery::Ping {
+                id: NodeId::from_bytes([2; 20]),
+            },
+        }
+        .encode();
+
+        assert!(!task.send_get_peers(info_hash, peer_addr).await);
+        assert!(task.outstanding.is_empty());
+        task.handle_packet(&ping, SocketAddr::V6(peer_addr)).await;
+        assert_eq!(task.table.total_nodes(), 0);
+        let mut packet = [0_u8; DHT_MAX_DATAGRAM_LEN];
+        assert!(timeout(
+            Duration::from_millis(20),
+            peer_socket.recv_from(&mut packet)
+        )
+        .await
+        .is_err());
+
+        task.egress_policy.allow_loopback = true;
+        assert!(task.send_get_peers(info_hash, peer_addr).await);
+        let (length, _) = timeout(Duration::from_secs(1), peer_socket.recv_from(&mut packet))
+            .await
+            .expect("opted-in IPv6 DHT query should reach the local peer")
+            .unwrap();
+        assert!(matches!(
+            KrpcMessage::parse(&packet[..length]),
+            Ok(KrpcMessage::Query { .. })
+        ));
+
+        task.handle_packet(&ping, SocketAddr::V6(peer_addr)).await;
+        assert_eq!(task.table.total_nodes(), 1);
+        let (length, _) = timeout(Duration::from_secs(1), peer_socket.recv_from(&mut packet))
+            .await
+            .expect("opted-in IPv6 DHT query should receive a response")
+            .unwrap();
+        assert!(matches!(
+            KrpcMessage::parse(&packet[..length]),
+            Ok(KrpcMessage::Response { .. })
+        ));
     }
 
     #[tokio::test(start_paused = true)]
@@ -2639,6 +2936,7 @@ mod tests {
             listen_port: 6881,
             bootstrap_nodes: Vec::new(),
             tracked_torrents_cap,
+            egress_policy: test_egress_policy(),
             tracked_torrents_rejected: 0,
             next_tx: 1,
             outstanding: HashMap::new(),
@@ -2666,6 +2964,62 @@ mod tests {
         }
 
         assert!(task.generations.len() <= tracked_torrents_cap * 2);
+    }
+
+    #[tokio::test]
+    async fn ipv6_pending_peer_forward_global_cap_does_not_create_empty_entries() {
+        let socket = match bind_ipv6_socket(0) {
+            Ok(socket) => socket,
+            Err(_) => return,
+        };
+        let local_id = NodeId::from_bytes([3; 20]);
+        let first_hash = [1; 20];
+        let second_hash = [2; 20];
+        let (cmd_tx, _cmd_rx) = mpsc::channel(1);
+        let mut task = DhtV6Task {
+            local_id,
+            table: RoutingTable6::new(local_id),
+            socket,
+            listen_port: 6881,
+            bootstrap_nodes: Vec::new(),
+            tracked_torrents_cap: 16_384,
+            egress_policy: test_egress_policy(),
+            tracked_torrents_rejected: 0,
+            next_tx: 1,
+            outstanding: HashMap::new(),
+            queried_nodes: HashMap::new(),
+            queried_node_count: 0,
+            torrents: HashMap::new(),
+            generations: HashMap::new(),
+            announced_peers: HashMap::new(),
+            announced_peer_count: 0,
+            last_full_lookup: HashMap::new(),
+            pending_peer_forwards: HashMap::from([(
+                first_hash,
+                PendingPeerForward {
+                    cmd_tx: cmd_tx.clone(),
+                    peers: vec![SocketAddr::from(([2001, 0xdb8, 0, 0, 0, 0, 0, 1], 1))],
+                },
+            )]),
+            pending_peer_count: DHT_PENDING_FORWARD_PEERS_GLOBAL_CAP,
+            last_bootstrap_at: None,
+            stats: Arc::new(Mutex::new(DhtV6Stats::default())),
+        };
+
+        task.queue_pending_peer_forward(
+            first_hash,
+            cmd_tx.clone(),
+            vec![SocketAddr::from(([2001, 0xdb8, 0, 0, 0, 0, 0, 2], 2))],
+        );
+        assert_eq!(task.pending_peer_forwards[&first_hash].peers.len(), 1);
+
+        task.queue_pending_peer_forward(
+            second_hash,
+            cmd_tx,
+            vec![SocketAddr::from(([2001, 0xdb8, 0, 0, 0, 0, 0, 3], 3))],
+        );
+        assert!(!task.pending_peer_forwards.contains_key(&second_hash));
+        assert_eq!(task.pending_peer_forwards.len(), 1);
     }
 
     #[test]
@@ -2770,6 +3124,7 @@ mod tests {
             listen_port: 6881,
             bootstrap_nodes: Vec::new(),
             tracked_torrents_cap: 16_384,
+            egress_policy: test_egress_policy(),
             tracked_torrents_rejected: 0,
             next_tx: u16::MAX,
             outstanding: HashMap::new(),
@@ -2802,6 +3157,7 @@ mod tests {
             listen_port: 6881,
             bootstrap_nodes: Vec::new(),
             tracked_torrents_cap: 16_384,
+            egress_policy: test_egress_policy(),
             tracked_torrents_rejected: 0,
             next_tx: 1,
             outstanding: HashMap::new(),
@@ -2840,6 +3196,7 @@ mod tests {
             listen_port: 6881,
             bootstrap_nodes: Vec::new(),
             tracked_torrents_cap: 16_384,
+            egress_policy: test_egress_policy(),
             tracked_torrents_rejected: 0,
             next_tx: 1,
             outstanding: HashMap::new(),
@@ -2874,6 +3231,7 @@ mod tests {
             listen_port: 6881,
             bootstrap_nodes: Vec::new(),
             tracked_torrents_cap: 16_384,
+            egress_policy: test_egress_policy(),
             tracked_torrents_rejected: 0,
             next_tx: 1,
             outstanding: HashMap::new(),
@@ -2925,6 +3283,7 @@ mod tests {
             listen_port: 6881,
             bootstrap_nodes: Vec::new(),
             tracked_torrents_cap: 16_384,
+            egress_policy: test_egress_policy(),
             tracked_torrents_rejected: 0,
             next_tx: 1,
             outstanding: HashMap::new(),
@@ -2965,6 +3324,7 @@ mod tests {
             listen_port: 6881,
             bootstrap_nodes: Vec::new(),
             tracked_torrents_cap: 16_384,
+            egress_policy: test_egress_policy(),
             tracked_torrents_rejected: 0,
             next_tx: 1,
             outstanding: HashMap::new(),
@@ -3096,6 +3456,7 @@ mod tests {
             listen_port: 6881,
             bootstrap_nodes: Vec::new(),
             tracked_torrents_cap: 16_384,
+            egress_policy: test_egress_policy(),
             tracked_torrents_rejected: 0,
             next_tx: 1,
             outstanding: HashMap::new(),
@@ -3174,6 +3535,7 @@ mod tests {
             listen_port: 6881,
             bootstrap_nodes: Vec::new(),
             tracked_torrents_cap: 16_384,
+            egress_policy: test_egress_policy(),
             tracked_torrents_rejected: 0,
             next_tx: 1,
             outstanding: HashMap::from([(
@@ -3223,6 +3585,7 @@ mod tests {
             listen_port: 51413,
             bootstrap_nodes: Vec::new(),
             tracked_torrents_cap: 16_384,
+            egress_policy: test_egress_policy(),
             tracked_torrents_rejected: 0,
             next_tx: 7,
             outstanding: HashMap::new(),
@@ -3279,6 +3642,7 @@ mod tests {
             listen_port: 6881,
             bootstrap_nodes: Vec::new(),
             tracked_torrents_cap: 16_384,
+            egress_policy: test_egress_policy(),
             tracked_torrents_rejected: 0,
             next_tx: 1,
             outstanding: HashMap::new(),
@@ -3331,6 +3695,7 @@ mod tests {
             listen_port: 6881,
             bootstrap_nodes: Vec::new(),
             tracked_torrents_cap: 16_384,
+            egress_policy: test_egress_policy(),
             tracked_torrents_rejected: 0,
             next_tx: 1,
             outstanding: HashMap::from([(
@@ -3395,6 +3760,7 @@ mod tests {
             listen_port: 6881,
             bootstrap_nodes: Vec::new(),
             tracked_torrents_cap: 16_384,
+            egress_policy: test_egress_policy(),
             tracked_torrents_rejected: 0,
             next_tx: 1,
             outstanding: HashMap::new(),
@@ -3447,6 +3813,7 @@ mod tests {
             listen_port: 6881,
             bootstrap_nodes: Vec::new(),
             tracked_torrents_cap: TEST_CAP,
+            egress_policy: test_egress_policy(),
             tracked_torrents_rejected: 0,
             next_tx: 1,
             outstanding: HashMap::new(),
@@ -3505,6 +3872,7 @@ mod tests {
                 listen_port: 6881,
                 bootstrap_nodes: Vec::new(),
                 tracked_torrents_cap: cap,
+                egress_policy: test_egress_policy(),
                 tracked_torrents_rejected: 0,
                 next_tx: 1,
                 outstanding: HashMap::new(),
@@ -3563,6 +3931,7 @@ mod tests {
             listen_port: 6881,
             bootstrap_nodes: Vec::new(),
             tracked_torrents_cap: 16_384,
+            egress_policy: test_egress_policy(),
             tracked_torrents_rejected: 0,
             next_tx: 1,
             outstanding: HashMap::from([(
@@ -3628,6 +3997,7 @@ mod tests {
             listen_port: 6881,
             bootstrap_nodes: Vec::new(),
             tracked_torrents_cap: 16_384,
+            egress_policy: test_egress_policy(),
             tracked_torrents_rejected: 0,
             next_tx: 1,
             outstanding: HashMap::from([(
@@ -3696,6 +4066,7 @@ mod tests {
             listen_port: 6881,
             bootstrap_nodes: Vec::new(),
             tracked_torrents_cap: 16_384,
+            egress_policy: test_egress_policy(),
             tracked_torrents_rejected: 0,
             next_tx: 1,
             outstanding: HashMap::from([(
@@ -3760,6 +4131,7 @@ mod tests {
             listen_port: 6881,
             bootstrap_nodes: Vec::new(),
             tracked_torrents_cap: 16_384,
+            egress_policy: test_egress_policy(),
             tracked_torrents_rejected: 0,
             next_tx: 1,
             outstanding: HashMap::new(),
@@ -3810,6 +4182,7 @@ mod tests {
             listen_port: 6881,
             bootstrap_nodes: Vec::new(),
             tracked_torrents_cap: 16_384,
+            egress_policy: test_egress_policy(),
             tracked_torrents_rejected: 0,
             next_tx: 1,
             outstanding: HashMap::new(),
@@ -3882,6 +4255,7 @@ mod tests {
             listen_port: 6881,
             bootstrap_nodes: Vec::new(),
             tracked_torrents_cap: 16_384,
+            egress_policy: test_egress_policy(),
             tracked_torrents_rejected: 0,
             next_tx: 1,
             outstanding: HashMap::from([(
@@ -3948,6 +4322,7 @@ mod tests {
             listen_port: 6881,
             bootstrap_nodes: Vec::new(),
             tracked_torrents_cap: 16_384,
+            egress_policy: test_egress_policy(),
             tracked_torrents_rejected: 0,
             next_tx: 1,
             outstanding: HashMap::from([(
@@ -4004,6 +4379,7 @@ mod tests {
             listen_port: 6881,
             bootstrap_nodes: Vec::new(),
             tracked_torrents_cap: 16_384,
+            egress_policy: test_egress_policy(),
             tracked_torrents_rejected: 0,
             next_tx: 1,
             outstanding: HashMap::from([
@@ -4057,6 +4433,7 @@ mod tests {
             listen_port: 6881,
             bootstrap_nodes: Vec::new(),
             tracked_torrents_cap: 16_384,
+            egress_policy: test_egress_policy(),
             tracked_torrents_rejected: 0,
             next_tx: 1,
             outstanding: HashMap::new(),

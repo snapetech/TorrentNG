@@ -29,7 +29,7 @@ use crate::{
     state::AppState,
 };
 use rt_api_model::{
-    api_token_allowed, csrf_request_allowed, has_session_cookie, request_fingerprint,
+    api_token_allowed, bearer_token, csrf_request_allowed, has_session_cookie, request_fingerprint,
     valid_idempotency_key, CachedResponse, IdempotencyClaim, MAX_IDEMPOTENCY_BODY_BYTES,
 };
 use tower::limit::GlobalConcurrencyLimitLayer;
@@ -212,8 +212,7 @@ async fn torrentng_idempotency_guard(
             | &axum::http::Method::PUT
             | &axum::http::Method::PATCH
             | &axum::http::Method::DELETE
-    ) || req.uri().path().ends_with("/auth/login")
-        || req.uri().path().ends_with("/auth/logout")
+    ) || torrentng_auth_path(req.uri().path())
     {
         return next.run(req).await;
     }
@@ -335,8 +334,7 @@ async fn torrentng_auth_guard(
         return next.run(req).await;
     }
 
-    if torrentng_bearer_token(req.headers())
-        .is_some_and(|token| api_token_allowed(&state.api_tokens, &token))
+    if bearer_token(req.headers()).is_some_and(|token| api_token_allowed(&state.api_tokens, &token))
     {
         return next.run(req).await;
     }
@@ -377,21 +375,17 @@ fn torrentng_public_path(path: &str) -> bool {
     )
 }
 
+fn torrentng_auth_path(path: &str) -> bool {
+    matches!(path, "/api/v1/auth/login" | "/api/v1/auth/logout")
+}
+
 fn torrentng_presented_token(headers: &HeaderMap) -> Option<String> {
-    torrentng_bearer_token(headers).or_else(|| {
+    bearer_token(headers).or_else(|| {
         headers
             .get(header::COOKIE)
             .and_then(|value| value.to_str().ok())
             .and_then(torrentng_session_cookie)
     })
-}
-
-fn torrentng_bearer_token(headers: &HeaderMap) -> Option<String> {
-    headers
-        .get(header::AUTHORIZATION)
-        .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.strip_prefix("Bearer "))
-        .map(str::to_owned)
 }
 
 fn torrentng_session_cookie(cookie: &str) -> Option<String> {
@@ -429,5 +423,18 @@ fn hex_value(byte: u8) -> Option<u8> {
         b'a'..=b'f' => Some(byte - b'a' + 10),
         b'A'..=b'F' => Some(byte - b'A' + 10),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::torrentng_auth_path;
+
+    #[test]
+    fn native_auth_paths_are_exact() {
+        assert!(torrentng_auth_path("/api/v1/auth/login"));
+        assert!(torrentng_auth_path("/api/v1/auth/logout"));
+        assert!(!torrentng_auth_path("/api/v1/nested/auth/login"));
+        assert!(!torrentng_auth_path("/api/v1/auth/logout/extra"));
     }
 }

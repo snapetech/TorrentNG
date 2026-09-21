@@ -48,8 +48,28 @@ static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 /// its own workload.
 const MAX_CONCURRENT_DAEMON_REQUESTS: usize = 256;
 
+fn install_panic_payload_redacting_hook() {
+    use std::io::Write as _;
+
+    std::panic::set_hook(Box::new(|panic| {
+        let mut stderr = std::io::stderr().lock();
+        if let Some(location) = panic.location() {
+            let _ = writeln!(
+                stderr,
+                "TorrentNG panic at {}:{}:{}; panic payload omitted",
+                location.file(),
+                location.line(),
+                location.column()
+            );
+        } else {
+            let _ = writeln!(stderr, "TorrentNG panic; panic payload omitted");
+        }
+    }));
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    install_panic_payload_redacting_hook();
     let argv: Vec<String> = std::env::args().collect();
     match argv.get(1).map(String::as_str) {
         Some("-h" | "--help" | "help") => {
@@ -64,13 +84,20 @@ async fn main() -> anyhow::Result<()> {
             let rest = argv[2..].to_vec();
             return tokio::task::spawn_blocking(move || migrate::run(&rest))
                 .await
-                .context("migrate task panicked")?;
+                .map_err(|error| {
+                    anyhow::Error::msg(rt_engine::task_join_error_summary(
+                        "migrate command",
+                        &error,
+                    ))
+                })?;
         }
         Some("export") => {
             let rest = argv[2..].to_vec();
             return tokio::task::spawn_blocking(move || export::run(&rest))
                 .await
-                .context("export task panicked")?;
+                .map_err(|error| {
+                    anyhow::Error::msg(rt_engine::task_join_error_summary("export command", &error))
+                })?;
         }
         _ => {}
     }
@@ -551,8 +578,12 @@ fn load_config() -> anyhow::Result<Config> {
 
 #[cfg(test)]
 mod tests {
-    use super::{bearer_token, daemon_public_path, request_id, skip_request_log, static_dir};
+    use super::{
+        bearer_token, daemon_public_path, install_panic_payload_redacting_hook, request_id,
+        skip_request_log, static_dir,
+    };
     use axum::http::{header, HeaderMap, HeaderValue};
+    use std::process::Command;
 
     #[test]
     fn request_log_skips_health_metrics_ws_and_static_assets() {
@@ -634,5 +665,32 @@ mod tests {
             "Bearer secret extra".parse().unwrap(),
         );
         assert!(bearer_token(&headers).is_none());
+    }
+
+    #[test]
+    #[ignore = "subprocess entrypoint for the panic-hook regression"]
+    fn panic_hook_child_entrypoint() {
+        install_panic_payload_redacting_hook();
+        panic!("panic-hook-canary");
+    }
+
+    #[test]
+    fn panic_hook_omits_payload_but_keeps_location_in_stderr() {
+        let executable = std::env::current_exe().unwrap();
+        let output = Command::new(executable)
+            .args([
+                "--exact",
+                "tests::panic_hook_child_entrypoint",
+                "--ignored",
+                "--nocapture",
+            ])
+            .output()
+            .unwrap();
+
+        assert!(!output.status.success());
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(stderr.contains("panic payload omitted"), "{stderr}");
+        assert!(stderr.contains("main.rs:"), "{stderr}");
+        assert!(!stderr.contains("panic-hook-canary"), "{stderr}");
     }
 }

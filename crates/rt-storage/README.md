@@ -13,8 +13,18 @@ scheduler used by the TorrentNG client.
   positioned `read_at` and `write_at`; `scheduled_read_owned` preserves a
   pooled `StorageRead::Frame` for exact backend reads when a caller can avoid
   converting to `Bytes`.
-- A bounded open-file pool avoids per-block fd churn and records hits, misses,
-  evictions, idle closes, and current open count.
+- The path-backed `MountScheduler` file pool avoids per-block fd churn and
+  records hits, misses, evictions, idle closes, and current cached-entry count.
+  Its configured capacity is capped at 60% of the raised soft `RLIMIT_NOFILE`
+  (up to 65,536 entries). A lifecycle lease bounds cached plus in-flight file
+  descriptors to each `FilePool`'s capacity; a zero-entry pool permits one
+  transient open. `StorageRuntime::HandleCache` has its own local lease cap,
+  and both cache types also share one process-level managed-storage lease
+  budget. `FilePoolStats.open_files` counts cached entries;
+  `active_descriptors` includes cached, opening, and in-flight leases. These are
+  per-cache counts; Prometheus also exports aggregate managed-storage lease
+  use, capacity, and admission waits. Unrelated process descriptors remain
+  outside this storage budget.
 - Disk operations are submitted through the selected `DiskBackend`, behind
   scheduler-owned bounded queues, instead of Tokio's shared blocking pool.
 - Piece and BEP52 hashing runs on a separate bounded hashing pool.
@@ -55,6 +65,9 @@ scheduler used by the TorrentNG client.
   writes receive a concrete mode.
 - Preallocation failures are surfaced before the engine marks blocks or pieces
   valid.
+- Recursive storage-plan walks for copy, delete, content length, and verification
+  stop at 64 directory levels and fail closed; a failed copy removes its partial
+  destination. The bound protects worker stacks from adversarially deep trees.
 
 ## Tests
 

@@ -3,6 +3,7 @@ pub mod device;
 pub mod elevator;
 pub mod error;
 pub mod fd_limit;
+mod file_handle;
 pub mod frame;
 pub mod handle_cache;
 pub mod io_class;

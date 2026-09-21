@@ -136,7 +136,7 @@ impl FastresumeStore {
         let dir = self.dir.clone();
         tokio::task::spawn_blocking(move || FastresumeStore { dir }.save(&state))
             .await
-            .unwrap_or_else(|join_error| Err(FastresumeError::Io(io::Error::other(join_error))))
+            .unwrap_or_else(|join_error| Err(fastresume_join_error(join_error)))
     }
 
     /// Delete fastresume state (on torrent removal).
@@ -158,6 +158,15 @@ impl FastresumeStore {
     pub fn dir(&self) -> &Path {
         &self.dir
     }
+}
+
+fn fastresume_join_error(error: tokio::task::JoinError) -> FastresumeError {
+    let message = if error.is_panic() {
+        "fastresume save worker panicked"
+    } else {
+        "fastresume save worker was cancelled"
+    };
+    FastresumeError::Io(io::Error::other(message))
 }
 
 /// Packs piece states into one bit per piece, MSB-first within each byte
@@ -581,5 +590,18 @@ mod tests {
             "save_async must not block the current-thread runtime; the ticker task never ran, \
              which means the blocking I/O executed inline instead of via spawn_blocking"
         );
+    }
+
+    #[tokio::test]
+    async fn fastresume_join_error_does_not_expose_panic_payload() {
+        let task = tokio::spawn(async {
+            panic!("join-payload-canary");
+        });
+        let error = task.await.unwrap_err();
+        let mapped = fastresume_join_error(error);
+        let message = mapped.to_string();
+
+        assert_eq!(message, "I/O error: fastresume save worker panicked");
+        assert!(!message.contains("join-payload-canary"));
     }
 }

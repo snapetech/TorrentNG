@@ -76,6 +76,9 @@ pub(crate) async fn run(
                         match context.peer_ingress.try_begin(peer_addr, Instant::now()) {
                             Ok(permit) => {
                                 let Ok(peer_permit) = context.network_budget.try_acquire_peer() else {
+                                    context
+                                        .peer_ingress
+                                        .record_peer_connection_budget_rejection();
                                     permit.cancel();
                                     warn!(
                                         component = "peer_listener",
@@ -89,6 +92,7 @@ pub(crate) async fn run(
                                 };
                                 let engine_tx = context.engine_tx.clone();
                                 let handshake_timeout = context.peer_ingress.config().handshake_timeout;
+                                let peer_ingress = Arc::clone(&context.peer_ingress);
                                 handshakes.spawn(async move {
                                     if let Err(error) = handle_incoming(
                                         stream,
@@ -96,6 +100,7 @@ pub(crate) async fn run(
                                         engine_tx,
                                         permit,
                                         peer_permit,
+                                        &peer_ingress,
                                         handshake_timeout,
                                     )
                                     .await
@@ -144,6 +149,9 @@ pub(crate) async fn run(
                         match context.peer_ingress.try_begin(peer_addr, Instant::now()) {
                             Ok(permit) => {
                                 let Ok(peer_permit) = context.network_budget.try_acquire_peer() else {
+                                    context
+                                        .peer_ingress
+                                        .record_peer_connection_budget_rejection();
                                     permit.cancel();
                                     warn!(
                                         component = "peer_listener",
@@ -157,6 +165,7 @@ pub(crate) async fn run(
                                 };
                                 let engine_tx = context.engine_tx.clone();
                                 let handshake_timeout = context.peer_ingress.config().handshake_timeout;
+                                let peer_ingress = Arc::clone(&context.peer_ingress);
                                 handshakes.spawn(async move {
                                     if let Err(error) = handle_incoming_utp(
                                         stream,
@@ -164,6 +173,7 @@ pub(crate) async fn run(
                                         engine_tx,
                                         permit,
                                         peer_permit,
+                                        &peer_ingress,
                                         handshake_timeout,
                                     )
                                     .await
@@ -231,7 +241,15 @@ pub(crate) async fn run(
     }
 
     if let Some(endpoint) = utp_endpoint.take() {
-        endpoint.shutdown().await;
+        if let Err(error) = endpoint.shutdown().await {
+            warn!(
+                component = "peer_listener",
+                operation = "shutdown_utp_endpoint",
+                result = "join_error",
+                error = %error,
+                "uTP receive task failed during shutdown"
+            );
+        }
     }
 
     // A stop signal must release every ingress and global-peer permit held by
@@ -251,7 +269,7 @@ fn debug_handshake_join_error(error: tokio::task::JoinError) {
             component = "peer_listener",
             operation = "handshake_shutdown",
             result = "error",
-            error = %error,
+            error = %crate::task_join_error_summary("peer handshake task", &error),
             "incoming peer handshake task failed during listener shutdown"
         );
     }
@@ -283,13 +301,28 @@ async fn handle_incoming(
     engine_tx: mpsc::Sender<EngineCmd>,
     _permit: PeerIngressPermit,
     peer_permit: OwnedSemaphorePermit,
+    peer_ingress: &PeerIngressBudget,
     handshake_timeout: Duration,
 ) -> anyhow::Result<()> {
     let mut hs = [0u8; HANDSHAKE_LEN];
-    timeout(handshake_timeout, stream.read_exact(&mut hs))
-        .await
-        .context("incoming TCP peer handshake timed out")??;
-    let handshake = Handshake::parse(&hs)?;
+    match timeout(handshake_timeout, stream.read_exact(&mut hs)).await {
+        Ok(Ok(_)) => {}
+        Ok(Err(error)) => {
+            peer_ingress.record_handshake_read_error();
+            return Err(error).context("incoming TCP peer handshake read failed");
+        }
+        Err(error) => {
+            peer_ingress.record_handshake_timeout();
+            return Err(error).context("incoming TCP peer handshake timed out");
+        }
+    }
+    let handshake = match Handshake::parse(&hs) {
+        Ok(handshake) => handshake,
+        Err(error) => {
+            peer_ingress.record_malformed_handshake();
+            return Err(error.into());
+        }
+    };
     let info_hash_hex: String = handshake
         .info_hash
         .iter()
@@ -326,13 +359,28 @@ async fn handle_incoming_utp(
     engine_tx: mpsc::Sender<EngineCmd>,
     _permit: PeerIngressPermit,
     peer_permit: OwnedSemaphorePermit,
+    peer_ingress: &PeerIngressBudget,
     handshake_timeout: Duration,
 ) -> anyhow::Result<()> {
     let mut hs = [0u8; HANDSHAKE_LEN];
-    timeout(handshake_timeout, stream.read_exact(&mut hs))
-        .await
-        .context("incoming uTP peer handshake timed out")??;
-    let handshake = Handshake::parse(&hs)?;
+    match timeout(handshake_timeout, stream.read_exact(&mut hs)).await {
+        Ok(Ok(_)) => {}
+        Ok(Err(error)) => {
+            peer_ingress.record_handshake_read_error();
+            return Err(error).context("incoming uTP peer handshake read failed");
+        }
+        Err(error) => {
+            peer_ingress.record_handshake_timeout();
+            return Err(error).context("incoming uTP peer handshake timed out");
+        }
+    }
+    let handshake = match Handshake::parse(&hs) {
+        Ok(handshake) => handshake,
+        Err(error) => {
+            peer_ingress.record_malformed_handshake();
+            return Err(error.into());
+        }
+    };
     let info_hash_hex: String = handshake
         .info_hash
         .iter()
@@ -367,7 +415,16 @@ async fn route_incoming_command(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tokio::sync::Barrier;
+    use tokio::{io::AsyncWriteExt, net::TcpStream, sync::Barrier};
+
+    async fn tcp_pair() -> (TcpStream, TcpStream, SocketAddr) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let client = TcpStream::connect(listener.local_addr().unwrap())
+            .await
+            .unwrap();
+        let (server, peer_addr) = listener.accept().await.unwrap();
+        (client, server, peer_addr)
+    }
 
     #[tokio::test]
     async fn listener_completion_wakes_all_shutdown_waiters() {
@@ -400,6 +457,85 @@ mod tests {
                 .expect("listener shutdown waiter timed out")
                 .expect("listener shutdown waiter panicked"));
         }
+    }
+
+    #[tokio::test]
+    async fn tcp_handshake_timeout_increments_ingress_counter() {
+        let (_client, stream, peer_addr) = tcp_pair().await;
+        let ingress = PeerIngressBudget::new(Default::default());
+        let permit = ingress.try_begin(peer_addr, Instant::now()).unwrap();
+        let peer_permit = Arc::new(tokio::sync::Semaphore::new(1))
+            .acquire_owned()
+            .await
+            .unwrap();
+        let (engine_tx, _) = mpsc::channel(1);
+
+        let error = handle_incoming(
+            stream,
+            peer_addr,
+            engine_tx,
+            permit,
+            peer_permit,
+            &ingress,
+            Duration::from_millis(10),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(error.to_string().contains("timed out"));
+        assert_eq!(ingress.stats().handshake_timeouts, 1);
+    }
+
+    #[tokio::test]
+    async fn malformed_tcp_handshake_increments_ingress_counter() {
+        let (mut client, stream, peer_addr) = tcp_pair().await;
+        let ingress = PeerIngressBudget::new(Default::default());
+        let permit = ingress.try_begin(peer_addr, Instant::now()).unwrap();
+        let peer_permit = Arc::new(tokio::sync::Semaphore::new(1))
+            .acquire_owned()
+            .await
+            .unwrap();
+        let (engine_tx, _) = mpsc::channel(1);
+        client.write_all(&[0; HANDSHAKE_LEN]).await.unwrap();
+
+        assert!(handle_incoming(
+            stream,
+            peer_addr,
+            engine_tx,
+            permit,
+            peer_permit,
+            &ingress,
+            Duration::from_secs(1),
+        )
+        .await
+        .is_err());
+        assert_eq!(ingress.stats().malformed_handshakes, 1);
+    }
+
+    #[tokio::test]
+    async fn truncated_tcp_handshake_increments_read_error_counter() {
+        let (client, stream, peer_addr) = tcp_pair().await;
+        drop(client);
+        let ingress = PeerIngressBudget::new(Default::default());
+        let permit = ingress.try_begin(peer_addr, Instant::now()).unwrap();
+        let peer_permit = Arc::new(tokio::sync::Semaphore::new(1))
+            .acquire_owned()
+            .await
+            .unwrap();
+        let (engine_tx, _) = mpsc::channel(1);
+
+        assert!(handle_incoming(
+            stream,
+            peer_addr,
+            engine_tx,
+            permit,
+            peer_permit,
+            &ingress,
+            Duration::from_secs(1),
+        )
+        .await
+        .is_err());
+        assert_eq!(ingress.stats().handshake_read_errors, 1);
     }
 
     #[test]

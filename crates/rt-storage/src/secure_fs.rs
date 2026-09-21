@@ -19,6 +19,7 @@ use std::sync::{Mutex, OnceLock};
 
 use sha1::{Digest, Sha1};
 
+use crate::plan::ensure_storage_tree_depth;
 use crate::{PlannedStorageAction, StorageError, StoragePlan, StoragePlanStep};
 
 // Serialize the check/open/rename sequence among TorrentNG workers that
@@ -235,7 +236,7 @@ fn verify_checkpointed_length(
     }
     let (parent, name) = open_parent(path, roots, false, step)?;
     let no_control = || Ok(());
-    let actual = content_len_at(&parent, &name, path, &no_control)?;
+    let actual = content_len_at(&parent, &name, path, 0, &no_control)?;
     if actual == expected_bytes {
         Ok(())
     } else {
@@ -386,7 +387,7 @@ fn secure_import(
             &source_name,
             &destination_parent,
             &destination_name,
-            (source, destination),
+            (source, destination, 0),
             expected_bytes,
             check_control,
         )
@@ -410,7 +411,7 @@ fn secure_copy(
         &source_name,
         &destination_parent,
         &destination_name,
-        (source, destination),
+        (source, destination, 0),
         expected_bytes,
         check_control,
     )
@@ -421,7 +422,7 @@ fn secure_copy_entry(
     source_name: &OsString,
     destination_parent: &File,
     destination_name: &OsString,
-    paths: (&Path, &Path),
+    paths: (&Path, &Path, usize),
     expected_bytes: u64,
     check_control: &dyn Fn() -> Result<(), StorageError>,
 ) -> Result<(), StorageError> {
@@ -480,16 +481,19 @@ fn secure_copy_entry_inner(
     source_name: &OsString,
     destination_parent: &File,
     destination_name: &OsString,
-    paths: (&Path, &Path),
+    paths: (&Path, &Path, usize),
     expected_bytes: u64,
     check_control: &dyn Fn() -> Result<(), StorageError>,
     destination_created: &mut bool,
 ) -> Result<(), StorageError> {
-    let (source_path, destination_path) = paths;
+    let (source_path, destination_path, depth) = paths;
     check_control()?;
     let source_type = entry_type(source_parent, source_name, source_path)?;
     if source_type.is_symlink() {
         return Err(unsafe_symlink(source_path, "copy-source"));
+    }
+    if source_type.is_dir() {
+        ensure_storage_tree_depth(depth, source_path, "copy-tree-depth")?;
     }
     ensure_destination_available(destination_parent, destination_name, destination_path)?;
 
@@ -506,6 +510,7 @@ fn secure_copy_entry_inner(
             &destination_dir,
             source_path,
             destination_path,
+            depth,
             check_control,
         )?;
     } else if source_type.is_file() {
@@ -538,8 +543,7 @@ fn secure_copy_entry_inner(
         source_name,
         destination_parent,
         destination_name,
-        source_path,
-        destination_path,
+        (source_path, destination_path, depth),
         check_control,
     )
 }
@@ -549,6 +553,7 @@ fn copy_directory_contents(
     destination_dir: &File,
     source_path: &Path,
     destination_path: &Path,
+    depth: usize,
     check_control: &dyn Fn() -> Result<(), StorageError>,
 ) -> Result<(), StorageError> {
     for name in directory_names(source_dir, source_path)? {
@@ -560,7 +565,7 @@ fn copy_directory_contents(
             &name,
             destination_dir,
             &name,
-            (&child_source, &child_destination),
+            (&child_source, &child_destination, depth.saturating_add(1)),
             u64::MAX,
             check_control,
         )?;
@@ -784,7 +789,15 @@ fn remove_entry_at(
     check_control: &dyn Fn() -> Result<(), StorageError>,
 ) -> Result<(), StorageError> {
     let mut removed = false;
-    match remove_entry_at_inner(parent, name, path, missing_ok, check_control, &mut removed) {
+    match remove_entry_at_inner(
+        parent,
+        name,
+        path,
+        missing_ok,
+        check_control,
+        &mut removed,
+        0,
+    ) {
         Err(error) if removed => Err(staged_uncertain(
             "delete",
             format!(
@@ -803,6 +816,7 @@ fn remove_entry_at_inner(
     missing_ok: bool,
     check_control: &dyn Fn() -> Result<(), StorageError>,
     removed: &mut bool,
+    depth: usize,
 ) -> Result<(), StorageError> {
     check_control()?;
     let kind = match entry_type(parent, name, path) {
@@ -811,6 +825,7 @@ fn remove_entry_at_inner(
         Err(error) => return Err(error),
     };
     if kind.is_dir() {
+        ensure_storage_tree_depth(depth, path, "delete-tree-depth")?;
         let child_dir = open_dir_at(parent, name, path)
             .map_err(|error| StorageError::io(path.display().to_string(), error))?;
         for child in directory_names(&child_dir, path)? {
@@ -821,6 +836,7 @@ fn remove_entry_at_inner(
                 missing_ok,
                 check_control,
                 removed,
+                depth.saturating_add(1),
             )?;
         }
         check_control()?;
@@ -969,8 +985,7 @@ fn verify_content_with_control(
         &source_name,
         &destination_parent,
         &destination_name,
-        source,
-        destination,
+        (source, destination, 0),
         check_control,
     )
 }
@@ -980,10 +995,10 @@ fn verify_content_at(
     source_name: &OsString,
     destination_parent: &File,
     destination_name: &OsString,
-    source_path: &Path,
-    destination_path: &Path,
+    paths: (&Path, &Path, usize),
     check_control: &dyn Fn() -> Result<(), StorageError>,
 ) -> Result<(), StorageError> {
+    let (source_path, destination_path, depth) = paths;
     check_control()?;
     let source_type = entry_type(source_parent, source_name, source_path)?;
     let destination_type = entry_type(destination_parent, destination_name, destination_path)?;
@@ -997,6 +1012,7 @@ fn verify_content_at(
         ));
     }
     if source_type.is_dir() {
+        ensure_storage_tree_depth(depth, source_path, "verify-tree-depth")?;
         if !destination_type.is_dir() {
             return Err(staged(
                 "verify-content",
@@ -1012,8 +1028,17 @@ fn verify_content_at(
         let destination_dir =
             open_dir_at(destination_parent, destination_name, destination_path)
                 .map_err(|error| StorageError::io(destination_path.display().to_string(), error))?;
-        let source_names = directory_names(&source_dir, source_path)?;
-        let destination_names = directory_names(&destination_dir, destination_path)?;
+        let mut source_names = directory_names(&source_dir, source_path)?;
+        let mut destination_names = directory_names(&destination_dir, destination_path)?;
+        if !sort_and_compare_directory_names(&mut source_names, &mut destination_names) {
+            return Err(staged(
+                "verify-content",
+                format!(
+                    "destination directory has entries absent from source: {}",
+                    destination_path.display()
+                ),
+            ));
+        }
         for name in &source_names {
             check_control()?;
             let child_source = source_path.join(name);
@@ -1023,22 +1048,9 @@ fn verify_content_at(
                 name,
                 &destination_dir,
                 name,
-                &child_source,
-                &child_destination,
+                (&child_source, &child_destination, depth.saturating_add(1)),
                 check_control,
             )?;
-        }
-        if destination_names
-            .iter()
-            .any(|name| !source_names.iter().any(|source_name| source_name == name))
-        {
-            return Err(staged(
-                "verify-content",
-                format!(
-                    "destination directory has entries absent from source: {}",
-                    destination_path.display()
-                ),
-            ));
         }
         Ok(())
     } else if source_type.is_file() {
@@ -1113,7 +1125,7 @@ fn verify_expected_length(
         return Ok(());
     }
     check_control()?;
-    let actual = content_len_at(parent, name, path, check_control)?;
+    let actual = content_len_at(parent, name, path, 0, check_control)?;
     if actual == expected_bytes {
         Ok(())
     } else {
@@ -1129,6 +1141,7 @@ fn content_len_at(
     parent: &File,
     name: &OsString,
     path: &Path,
+    depth: usize,
     check_control: &dyn Fn() -> Result<(), StorageError>,
 ) -> Result<u64, StorageError> {
     check_control()?;
@@ -1141,6 +1154,7 @@ fn content_len_at(
             .map_err(|error| StorageError::io(path.display().to_string(), error));
     }
     if kind.is_dir() {
+        ensure_storage_tree_depth(depth, path, "verify-tree-depth")?;
         let directory = open_dir_at(parent, name, path)
             .map_err(|error| StorageError::io(path.display().to_string(), error))?;
         let mut total = 0u64;
@@ -1150,6 +1164,7 @@ fn content_len_at(
                 &directory,
                 &child,
                 &path.join(&child),
+                depth.saturating_add(1),
                 check_control,
             )?);
         }
@@ -1509,6 +1524,12 @@ fn directory_names(directory: &File, path: &Path) -> Result<Vec<OsString>, Stora
     Ok(names)
 }
 
+fn sort_and_compare_directory_names(left: &mut [OsString], right: &mut [OsString]) -> bool {
+    left.sort_unstable();
+    right.sort_unstable();
+    left == right
+}
+
 #[cfg(any(target_os = "linux", target_os = "hurd", target_os = "redox"))]
 fn clear_errno() {
     unsafe { *libc::__errno_location() = 0 };
@@ -1636,6 +1657,15 @@ fn is_not_found(error: &StorageError) -> bool {
 mod tests {
     use super::*;
 
+    fn create_overdeep_directory_tree(root: &Path) {
+        std::fs::create_dir(root).unwrap();
+        let mut current = root.to_path_buf();
+        for _ in 0..=crate::plan::MAX_STORAGE_TREE_DEPTH {
+            current.push("nested");
+            std::fs::create_dir(&current).unwrap();
+        }
+    }
+
     #[test]
     fn directory_names_returns_all_entries() {
         let root = tempfile::tempdir().unwrap();
@@ -1650,5 +1680,61 @@ mod tests {
             names,
             vec![OsString::from("directory"), OsString::from("file")]
         );
+    }
+
+    #[test]
+    fn directory_name_comparison_is_order_independent_and_detects_extras() {
+        let mut source = vec![
+            OsString::from("c"),
+            OsString::from("a"),
+            OsString::from("b"),
+        ];
+        let mut destination = vec![
+            OsString::from("b"),
+            OsString::from("c"),
+            OsString::from("a"),
+        ];
+
+        assert!(sort_and_compare_directory_names(
+            &mut source,
+            &mut destination
+        ));
+        destination.push(OsString::from("extra"));
+        assert!(!sort_and_compare_directory_names(
+            &mut source,
+            &mut destination
+        ));
+    }
+
+    #[test]
+    fn overdeep_directory_walks_fail_closed_without_stack_recursion() {
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("source");
+        let destination = directory.path().join("destination");
+        create_overdeep_directory_tree(&source);
+        create_overdeep_directory_tree(&destination);
+        let roots = vec![directory.path().to_path_buf()];
+        let no_control = || Ok(());
+
+        let verify_error = verify_content(&source, &destination, &roots).unwrap_err();
+        assert!(verify_error.to_string().contains("directory nesting depth"));
+
+        let root = File::open(directory.path()).unwrap();
+        let content_error =
+            content_len_at(&root, &OsString::from("source"), &source, 0, &no_control).unwrap_err();
+        assert!(content_error
+            .to_string()
+            .contains("directory nesting depth"));
+
+        let copy_destination = directory.path().join("copy-destination");
+        let copy_error =
+            secure_copy(&source, &copy_destination, 0, &roots, &no_control).unwrap_err();
+        assert!(copy_error.to_string().contains("directory nesting depth"));
+        assert!(!copy_destination.exists(), "partial copy must be removed");
+
+        let delete_error = secure_delete(&source, &roots, false, &no_control).unwrap_err();
+        assert!(delete_error.to_string().contains("directory nesting depth"));
+        assert!(source.exists(), "rejected deep tree must remain intact");
+        assert!(destination.exists());
     }
 }

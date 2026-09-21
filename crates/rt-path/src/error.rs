@@ -12,6 +12,8 @@ pub enum PathError {
     NulByte,
     #[error("Windows reserved name: {0}")]
     WindowsReservedName(String),
+    #[error("torrent file paths collide on this platform: {0}")]
+    ConflictingPaths(String),
     #[error("path component contains illegal character: {0:?}")]
     IllegalCharacter(char),
     #[error("path component is too long: {len} > max {max}")]

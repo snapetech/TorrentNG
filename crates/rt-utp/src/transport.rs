@@ -345,12 +345,22 @@ impl UtpEndpoint {
     /// The endpoint owns a shared UDP socket, so merely dropping the task
     /// handle is insufficient: the receive task would otherwise keep the
     /// socket bound until the runtime happens to tear it down.
-    pub async fn shutdown(&self) {
+    pub async fn shutdown(&self) -> Result<(), UtpError> {
         let _ = self.stop.send(true);
-        let recv_task = self.recv_task.lock().ok().and_then(|mut task| task.take());
+        let recv_task = match self.recv_task.lock() {
+            Ok(mut task) => task.take(),
+            Err(poisoned) => poisoned.into_inner().take(),
+        };
         if let Some(recv_task) = recv_task {
-            let _ = recv_task.await;
+            recv_task.await.map_err(|error| {
+                if error.is_panic() {
+                    UtpError::ReceiveTaskPanicked
+                } else {
+                    UtpError::ReceiveTaskCancelled
+                }
+            })?;
         }
+        Ok(())
     }
 }
 
@@ -363,10 +373,12 @@ impl Drop for UtpEndpoint {
             return;
         }
         let _ = self.stop.send(true);
-        if let Ok(mut task) = self.recv_task.lock() {
-            if let Some(task) = task.take() {
-                task.abort();
-            }
+        let mut recv_task = match self.recv_task.lock() {
+            Ok(task) => task,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if let Some(task) = recv_task.take() {
+            task.abort();
         }
     }
 }
@@ -1274,13 +1286,58 @@ mod tests {
             .await
             .unwrap();
         let addr = endpoint.local_addr().unwrap();
-        endpoint.shutdown().await;
+        endpoint.shutdown().await.expect("endpoint shutdown");
         drop(endpoint);
 
         let rebound = UtpEndpoint::bind_with_config(addr, test_config())
             .await
             .expect("endpoint shutdown must release the UDP socket");
-        rebound.shutdown().await;
+        rebound.shutdown().await.expect("rebound endpoint shutdown");
+    }
+
+    #[tokio::test]
+    async fn utp_endpoint_shutdown_reports_receive_task_panic_without_payload() {
+        let endpoint = UtpEndpoint::bind_with_config("127.0.0.1:0".parse().unwrap(), test_config())
+            .await
+            .unwrap();
+        let original = endpoint
+            .recv_task
+            .lock()
+            .expect("receive-task lock")
+            .take()
+            .expect("receive task");
+        endpoint.stop.send(true).expect("receive task is listening");
+        original.await.expect("receive loop stops cleanly");
+
+        let panicked = tokio::spawn(async { std::panic::panic_any(()) });
+        *endpoint.recv_task.lock().expect("receive-task lock") = Some(panicked);
+
+        let error = endpoint
+            .shutdown()
+            .await
+            .expect_err("panicked receive task must be reported");
+        assert!(matches!(error, UtpError::ReceiveTaskPanicked));
+        assert_eq!(error.to_string(), "uTP receive task panicked");
+    }
+
+    #[tokio::test]
+    async fn utp_endpoint_shutdown_recovers_a_poisoned_task_handle_lock() {
+        let endpoint = UtpEndpoint::bind_with_config("127.0.0.1:0".parse().unwrap(), test_config())
+            .await
+            .unwrap();
+        endpoint.stop.send(true).expect("receive task is listening");
+
+        let task_slot = Arc::clone(&endpoint.recv_task);
+        let poison_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+            let _task_slot = task_slot.lock().expect("receive-task lock");
+            std::panic::panic_any(());
+        }));
+        assert!(poison_result.is_err());
+
+        endpoint
+            .shutdown()
+            .await
+            .expect("shutdown recovers and joins the receive task");
     }
 
     #[tokio::test]
@@ -1293,7 +1350,7 @@ mod tests {
             tokio::spawn(async move { endpoint.accept().await })
         };
 
-        endpoint.shutdown().await;
+        endpoint.shutdown().await.expect("endpoint shutdown");
         assert!(matches!(waiter.await.unwrap(), Err(UtpError::Closed)));
     }
 
@@ -1324,7 +1381,7 @@ mod tests {
 
         drop(client);
         drop(accepted);
-        endpoint.shutdown().await;
+        endpoint.shutdown().await.expect("endpoint shutdown");
     }
 
     #[tokio::test]

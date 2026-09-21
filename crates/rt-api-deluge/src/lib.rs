@@ -17,9 +17,9 @@ use axum::{
 };
 use base64::{engine::general_purpose, Engine as _};
 use rt_api_model::{
-    api_token_allowed, csrf_request_allowed, request_fingerprint, session_cookie_value,
-    valid_idempotency_key, CachedResponse, IdempotencyClaim, IdempotencyStore,
-    MAX_IDEMPOTENCY_BODY_BYTES,
+    api_token_allowed, bearer_token, csrf_request_allowed, request_fingerprint,
+    session_cookie_value, valid_idempotency_key, CachedResponse, IdempotencyClaim,
+    IdempotencyStore, MAX_IDEMPOTENCY_BODY_BYTES,
 };
 use rt_engine::{
     EngineHandle, EnginePeerSnapshot, EngineTorrentLimits, EngineTorrentMetadata,
@@ -348,11 +348,7 @@ async fn deluge_auth_guard(
 }
 
 fn request_bearer_token(req: &Request<Body>) -> Option<String> {
-    req.headers()
-        .get(header::AUTHORIZATION)
-        .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.strip_prefix("Bearer "))
-        .map(str::to_owned)
+    bearer_token(req.headers())
 }
 
 fn deluge_is_mutating(req: &Request<Body>) -> bool {
@@ -1382,8 +1378,9 @@ async fn load_deluge_runtime_projections(
             });
         }
         while let Some(result) = tasks.join_next().await {
-            let projection =
-                result.map_err(|error| format!("Deluge projection task failed: {error}"))??;
+            let projection = result.map_err(|error| {
+                rt_engine::task_join_error_summary("Deluge projection task", &error)
+            })??;
             projections.push(projection);
         }
     }
@@ -1404,8 +1401,9 @@ async fn load_deluge_tracker_snapshot_size(
             tasks.spawn(async move { engine.torrent_tracker_snapshot_size(info_hash).await });
         }
         while let Some(result) = tasks.join_next().await {
-            let (count, bytes) =
-                result.map_err(|error| format!("Deluge tracker size task failed: {error}"))??;
+            let (count, bytes) = result.map_err(|error| {
+                rt_engine::task_join_error_summary("Deluge tracker size task", &error)
+            })??;
             total_count = total_count.saturating_add(count);
             total_bytes = total_bytes.saturating_add(bytes);
         }
@@ -2308,12 +2306,15 @@ fn decode_deluge_torrent_data(data: &str) -> Result<Vec<u8>, String> {
         .map(|(_, payload)| payload)
         .unwrap_or(data)
         .trim();
-    general_purpose::STANDARD
-        .decode(payload)
-        .or_else(|_| general_purpose::URL_SAFE.decode(payload))
-        .or_else(|_| general_purpose::STANDARD_NO_PAD.decode(payload))
-        .or_else(|_| general_purpose::URL_SAFE_NO_PAD.decode(payload))
-        .map_err(|e| e.to_string())
+    let url_safe_alphabet = payload.bytes().any(|byte| matches!(byte, b'-' | b'_'));
+    let padded = payload.as_bytes().contains(&b'=');
+    let engine = match (url_safe_alphabet, padded) {
+        (false, true) => &general_purpose::STANDARD,
+        (true, true) => &general_purpose::URL_SAFE,
+        (false, false) => &general_purpose::STANDARD_NO_PAD,
+        (true, false) => &general_purpose::URL_SAFE_NO_PAD,
+    };
+    engine.decode(payload).map_err(|e| e.to_string())
 }
 
 async fn set_torrent_options(state: &AppState, params: &[Value]) -> Result<Value, String> {
@@ -4321,12 +4322,17 @@ mod tests {
     }
 
     #[test]
-    fn deluge_torrent_data_decoder_accepts_data_urls_and_unpadded_base64() {
+    fn deluge_torrent_data_decoder_selects_one_supported_base64_variant() {
         assert_eq!(
             decode_deluge_torrent_data("data:application/x-bittorrent;base64,ZHVtbXk=").unwrap(),
             b"dummy"
         );
         assert_eq!(decode_deluge_torrent_data("ZHVtbXk").unwrap(), b"dummy");
+        assert_eq!(decode_deluge_torrent_data("+/8=").unwrap(), [0xfb, 0xff]);
+        assert_eq!(decode_deluge_torrent_data("+/8").unwrap(), [0xfb, 0xff]);
+        assert_eq!(decode_deluge_torrent_data("-_8=").unwrap(), [0xfb, 0xff]);
+        assert_eq!(decode_deluge_torrent_data("-_8").unwrap(), [0xfb, 0xff]);
+        assert!(decode_deluge_torrent_data("+_8=").is_err());
     }
 
     #[test]

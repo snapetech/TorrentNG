@@ -1,8 +1,40 @@
 use std::collections::HashSet;
+#[cfg(windows)]
+use std::os::windows::fs::MetadataExt;
 use std::path::{Component, Path, PathBuf};
 
 use crate::StorageError;
 use rt_path::SafeRelPath;
+
+/// Bound recursive storage-plan walks below the stack-exhaustion threshold.
+/// Imported directories can be operator-provided and do not necessarily
+/// originate from validated metainfo, so each recursive walker enforces this
+/// independently. Raise this only after converting the walkers to iterative
+/// traversal or proving the stack bound on every supported target.
+pub(crate) const MAX_STORAGE_TREE_DEPTH: usize = 64;
+
+pub(crate) fn ensure_storage_tree_depth(
+    depth: usize,
+    path: &Path,
+    step: &'static str,
+) -> Result<(), StorageError> {
+    if depth <= MAX_STORAGE_TREE_DEPTH {
+        Ok(())
+    } else {
+        Err(StorageError::StagedMoveFailed {
+            step,
+            reason: format!(
+                "directory nesting depth {depth} exceeds the maximum of {MAX_STORAGE_TREE_DEPTH}: {}",
+                path.display()
+            ),
+        })
+    }
+}
+
+#[cfg(windows)]
+use windows_sys::Win32::Storage::FileSystem::{
+    FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT,
+};
 
 #[cfg(unix)]
 use crate::secure_fs;
@@ -27,6 +59,7 @@ pub enum PlanIssue {
     SourceMissing(PathBuf),
     DestinationExists(PathBuf),
     InsufficientCapacity { needed: u64, available: u64 },
+    AtomicNoReplaceRenameUnavailable,
     DeleteRequiresDryRunApproval,
 }
 
@@ -75,12 +108,22 @@ pub struct DeletePlanRequest {
 }
 
 pub fn plan_move(req: &MovePlanRequest) -> StoragePlan {
-    let issues = common_issues(
+    plan_move_with_rename_support(req, atomic_no_replace_rename_supported())
+}
+
+fn plan_move_with_rename_support(
+    req: &MovePlanRequest,
+    atomic_rename_supported: bool,
+) -> StoragePlan {
+    let mut issues = common_issues(
         &req.source,
         &req.destination,
         req.bytes,
         req.available_bytes,
     );
+    if !atomic_rename_supported {
+        issues.push(PlanIssue::AtomicNoReplaceRenameUnavailable);
+    }
     let same_device = same_filesystem(&req.source, &req.destination).unwrap_or(false);
     let action = if same_device {
         PlannedStorageAction::Rename
@@ -136,6 +179,17 @@ pub fn plan_move(req: &MovePlanRequest) -> StoragePlan {
     }
 }
 
+fn atomic_no_replace_rename_supported() -> bool {
+    // Keep this list aligned with `secure_fs::rename_without_replace` and the
+    // Windows `MoveFileW` implementation. Other targets reject that step.
+    cfg!(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "macos",
+        windows
+    ))
+}
+
 pub fn plan_move_under_roots(
     req: &MovePlanRequest,
     roots: &[PathBuf],
@@ -153,7 +207,14 @@ pub fn plan_move_under_roots(
 }
 
 pub fn plan_import(req: &ImportPlanRequest) -> StoragePlan {
-    let issues = common_issues(
+    plan_import_with_rename_support(req, atomic_no_replace_rename_supported())
+}
+
+fn plan_import_with_rename_support(
+    req: &ImportPlanRequest,
+    atomic_rename_supported: bool,
+) -> StoragePlan {
+    let mut issues = common_issues(
         &req.source,
         &req.destination,
         req.bytes,
@@ -166,6 +227,9 @@ pub fn plan_import(req: &ImportPlanRequest) -> StoragePlan {
     } else {
         PlannedStorageAction::CopyVerifyRename
     };
+    if matches!(action, PlannedStorageAction::CopyVerifyRename) && !atomic_rename_supported {
+        issues.push(PlanIssue::AtomicNoReplaceRenameUnavailable);
+    }
     let (steps, rollback_steps) = match action {
         PlannedStorageAction::ImportExisting => (
             vec![StoragePlanStep {
@@ -555,14 +619,14 @@ fn verify_reconciled_length(path: &Path, expected_bytes: u64) -> Result<(), Stor
     }
 }
 
-#[cfg(any(not(unix), test))]
+#[cfg(test)]
 pub(crate) fn execute_storage_plan(
     plan: &StoragePlan,
 ) -> Result<StoragePlanExecution, StorageError> {
     execute_storage_plan_with_checkpoints(plan, &[], |_, _| Ok(()))
 }
 
-#[cfg(any(not(unix), test))]
+#[cfg(test)]
 pub(crate) fn execute_storage_plan_with_checkpoints<F>(
     plan: &StoragePlan,
     completed_steps: &[usize],
@@ -941,11 +1005,12 @@ where
         // but it still must honor the worker control plane. Ignoring pause,
         // cancel, or shutdown here would turn a portability fallback into an
         // uninterruptible storage job.
+        let check_control_ref: &dyn Fn() -> Result<(), StorageError> = &check_control;
         execute_storage_plan_with_executor(
             plan,
             completed_steps,
             checkpoint_step,
-            execute_step,
+            |step| execute_step_with_control(step, check_control_ref),
             rollback_plan,
             |index, _step| storage_step_is_applied(plan, index, checkpointed.contains(&index)),
             &check_control,
@@ -979,6 +1044,16 @@ pub fn rollback_storage_plan_under_roots(
 
 #[cfg(any(not(unix), test))]
 fn execute_step(step: &StoragePlanStep) -> Result<(), StorageError> {
+    let no_control = || Ok(());
+    execute_step_with_control(step, &no_control)
+}
+
+#[cfg(any(not(unix), test))]
+fn execute_step_with_control(
+    step: &StoragePlanStep,
+    check_control: &dyn Fn() -> Result<(), StorageError>,
+) -> Result<(), StorageError> {
+    check_control()?;
     if let Some(source) = &step.source {
         reject_symlink_ancestors(source, "source-ancestor")?;
     }
@@ -994,25 +1069,40 @@ fn execute_step(step: &StoragePlanStep) -> Result<(), StorageError> {
             reject_symlink(source, "import-source")?;
             // Check before creating a hard link so a stale expected size does
             // not leave a destination behind after the import is rejected.
-            verify_path_len(source, step.bytes)?;
-            match std::fs::hard_link(source, destination) {
-                Ok(()) => {
-                    let verification = verify_path_len(destination, step.bytes);
-                    if let Err(error) = verification {
-                        if let Err(cleanup_error) = std::fs::remove_file(destination) {
-                            return Err(StorageError::FilesystemStateUncertain {
+            verify_path_len_with_control(source, step.bytes, check_control)?;
+            #[cfg(windows)]
+            {
+                // CreateHardLink resolves the source by path and follows a
+                // reparse point. Since Windows has no handle-relative
+                // hard-link primitive here, a path swap after the no-follow
+                // checks could link an unintended target. Copy from the
+                // no-follow source handle instead.
+                copy_verify_with_control(source, destination, step.bytes, check_control)
+            }
+            #[cfg(not(windows))]
+            {
+                match std::fs::hard_link(source, destination) {
+                    Ok(()) => {
+                        let verification =
+                            verify_path_len_with_control(destination, step.bytes, check_control);
+                        if let Err(error) = verification {
+                            if let Err(cleanup_error) = std::fs::remove_file(destination) {
+                                return Err(StorageError::FilesystemStateUncertain {
                                 step: "import-cleanup",
                                 reason: format!(
                                     "{error}; failed to remove hard-link destination {}: {cleanup_error}",
                                     destination.display()
                                 ),
                             });
+                            }
+                            return Err(error);
                         }
-                        return Err(error);
+                        Ok(())
                     }
-                    Ok(())
+                    Err(_) => {
+                        copy_verify_with_control(source, destination, step.bytes, check_control)
+                    }
                 }
-                Err(_) => copy_verify(source, destination, step.bytes),
             }
         }
         PlannedStorageAction::Rename => {
@@ -1024,15 +1114,18 @@ fn execute_step(step: &StoragePlanStep) -> Result<(), StorageError> {
             // Validate the source before the destructive rename. If the
             // caller supplied a stale size, moving first would leave the
             // source gone when the post-rename check failed.
-            verify_path_len(source, step.bytes)?;
-            std::fs::rename(source, destination)
+            verify_path_len_with_control(source, step.bytes, check_control)?;
+            rename_plan_no_replace(source, destination)
                 .map_err(|e| StorageError::io(destination.display().to_string(), e))?;
-            if let Err(error) = verify_path_len(destination, step.bytes) {
+            if let Err(error) = verify_path_len_with_control(destination, step.bytes, check_control)
+            {
                 // The source has disappeared by this point. Restore it
                 // before returning a verification failure; never leave a
                 // same-filesystem move stranded solely because the post-move
                 // check observed a changed file.
-                if !path_exists_no_follow(source) && std::fs::rename(destination, source).is_ok() {
+                if !path_exists_no_follow(source)
+                    && rename_plan_no_replace(destination, source).is_ok()
+                {
                     return Err(error);
                 }
                 return Err(StorageError::FilesystemStateUncertain {
@@ -1050,73 +1143,154 @@ fn execute_step(step: &StoragePlanStep) -> Result<(), StorageError> {
             let destination = required_path(step.destination.as_ref(), "copy-destination")?;
             ensure_destination_available(destination)?;
             create_parent(destination)?;
-            copy_verify(source, destination, step.bytes)
+            copy_verify_with_control(source, destination, step.bytes, check_control)
         }
         PlannedStorageAction::SafeDelete => {
             let source = required_path(step.source.as_ref(), "delete-source")?;
-            let metadata = safe_symlink_metadata(source, "delete-source")?;
-            let file_type = metadata.file_type();
-            if file_type.is_dir() {
-                std::fs::remove_dir_all(source)
-                    .map_err(|error| StorageError::FilesystemStateUncertain {
-                        step: "delete",
-                        reason: format!(
-                            "failed to remove directory {} after deletion may have partially applied: {error}",
-                            source.display()
-                        ),
-                    })
-            } else if file_type.is_file() || file_type.is_symlink() {
-                std::fs::remove_file(source)
-                    .map_err(|e| StorageError::io(source.display().to_string(), e))
-            } else {
-                Err(StorageError::StagedMoveFailed {
-                    step: "delete-source",
-                    reason: format!("unsupported file type: {}", source.display()),
-                })
-            }
+            safe_delete_with_control(source, false, check_control)
         }
         PlannedStorageAction::SafeDeleteIfPresent => {
             let source = required_path(step.source.as_ref(), "delete-source")?;
-            let metadata = match std::fs::symlink_metadata(source) {
-                Ok(metadata) => metadata,
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-                Err(error) => {
-                    return Err(StorageError::io(source.display().to_string(), error));
-                }
-            };
-            let file_type = metadata.file_type();
-            if file_type.is_dir() {
-                std::fs::remove_dir_all(source)
-                    .map_err(|error| StorageError::FilesystemStateUncertain {
-                        step: "delete",
-                        reason: format!(
-                            "failed to remove directory {} after deletion may have partially applied: {error}",
-                            source.display()
-                        ),
-                    })
-            } else if file_type.is_file() || file_type.is_symlink() {
-                match std::fs::remove_file(source) {
-                    Ok(()) => Ok(()),
-                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-                    Err(error) => Err(StorageError::io(source.display().to_string(), error)),
-                }
-            } else {
-                Err(StorageError::StagedMoveFailed {
-                    step: "delete-source",
-                    reason: format!("unsupported file type: {}", source.display()),
-                })
-            }
+            safe_delete_with_control(source, true, check_control)
         }
         PlannedStorageAction::PruneEmptyDirs => {
             let start = required_path(step.source.as_ref(), "prune-source")?;
             let root = required_path(step.destination.as_ref(), "prune-root")?;
-            prune_empty_dirs(start, root)
+            prune_empty_dirs_with_control(start, root, check_control)
         }
     }
 }
 
 #[cfg(any(not(unix), test))]
-fn prune_empty_dirs(mut current: &Path, root: &Path) -> Result<(), StorageError> {
+fn safe_delete_with_control(
+    path: &Path,
+    missing_ok: bool,
+    check_control: &dyn Fn() -> Result<(), StorageError>,
+) -> Result<(), StorageError> {
+    check_control()?;
+    let _parent_guard = match crate::open::hold_parent_dirs_no_follow(path) {
+        Ok(guard) => guard,
+        Err(error) if missing_ok && error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(StorageError::io(path.display().to_string(), error)),
+    };
+    let metadata = match std::fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if missing_ok && error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Err(StorageError::StagedMoveFailed {
+                step: "delete-source",
+                reason: format!(
+                    "path missing during move/import execution: {}",
+                    path.display()
+                ),
+            });
+        }
+        Err(error) => return Err(StorageError::io(path.display().to_string(), error)),
+    };
+    let file_type = metadata.file_type();
+    let root_is_reparse_point = metadata_is_reparse_point(&metadata);
+    let root_is_directory = file_type.is_dir() && !root_is_reparse_point;
+    let mut removed = false;
+    let result = if root_is_reparse_point {
+        check_control()?;
+        remove_reparse_point_no_follow(path, &metadata)
+            .map_err(|error| StorageError::io(path.display().to_string(), error))?;
+        removed = true;
+        Ok(())
+    } else if root_is_directory {
+        remove_directory_contents_with_control(path, 0, check_control, &mut removed).and_then(
+            |()| {
+                check_control()?;
+                std::fs::remove_dir(path)
+                    .map_err(|error| StorageError::io(path.display().to_string(), error))?;
+                removed = true;
+                Ok(())
+            },
+        )
+    } else if file_type.is_file() {
+        check_control()?;
+        std::fs::remove_file(path)
+            .map_err(|error| StorageError::io(path.display().to_string(), error))?;
+        removed = true;
+        Ok(())
+    } else {
+        Err(StorageError::StagedMoveFailed {
+            step: "delete-source",
+            reason: format!("unsupported file type: {}", path.display()),
+        })
+    };
+
+    match result {
+        Err(error) if removed || (root_is_directory && !is_cancellation_error(&error)) => {
+            Err(StorageError::FilesystemStateUncertain {
+                step: "delete",
+                reason: format!(
+                    "failed to remove {} after deletion may have partially applied: {error}",
+                    path.display()
+                ),
+            })
+        }
+        result => result,
+    }
+}
+
+#[cfg(any(not(unix), test))]
+fn remove_directory_contents_with_control(
+    path: &Path,
+    depth: usize,
+    check_control: &dyn Fn() -> Result<(), StorageError>,
+    removed: &mut bool,
+) -> Result<(), StorageError> {
+    check_control()?;
+    ensure_storage_tree_depth(depth, path, "delete-tree-depth")?;
+    let _directory_guard = crate::open::hold_directory_no_follow(path)
+        .map_err(|error| StorageError::io(path.display().to_string(), error))?;
+    for entry in std::fs::read_dir(path)
+        .map_err(|error| StorageError::io(path.display().to_string(), error))?
+    {
+        check_control()?;
+        let entry = entry.map_err(|error| StorageError::io(path.display().to_string(), error))?;
+        let child = entry.path();
+        let metadata = std::fs::symlink_metadata(&child)
+            .map_err(|error| StorageError::io(child.display().to_string(), error))?;
+        let file_type = metadata.file_type();
+        if metadata_is_reparse_point(&metadata) {
+            check_control()?;
+            remove_reparse_point_no_follow(&child, &metadata)
+                .map_err(|error| StorageError::io(child.display().to_string(), error))?;
+            *removed = true;
+        } else if file_type.is_dir() {
+            remove_directory_contents_with_control(
+                &child,
+                depth.saturating_add(1),
+                check_control,
+                removed,
+            )?;
+            check_control()?;
+            std::fs::remove_dir(&child)
+                .map_err(|error| StorageError::io(child.display().to_string(), error))?;
+            *removed = true;
+        } else if file_type.is_file() {
+            check_control()?;
+            std::fs::remove_file(&child)
+                .map_err(|error| StorageError::io(child.display().to_string(), error))?;
+            *removed = true;
+        } else {
+            return Err(StorageError::StagedMoveFailed {
+                step: "delete-source",
+                reason: format!("unsupported file type: {}", child.display()),
+            });
+        }
+    }
+    Ok(())
+}
+
+#[cfg(any(not(unix), test))]
+fn prune_empty_dirs_with_control(
+    mut current: &Path,
+    root: &Path,
+    check_control: &dyn Fn() -> Result<(), StorageError>,
+) -> Result<(), StorageError> {
     if !current.starts_with(root) {
         return Err(StorageError::StagedMoveFailed {
             step: "prune-root",
@@ -1129,6 +1303,40 @@ fn prune_empty_dirs(mut current: &Path, root: &Path) -> Result<(), StorageError>
     }
     let mut removed = false;
     while current != root {
+        if let Err(error) = check_control() {
+            if removed {
+                return Err(StorageError::FilesystemStateUncertain {
+                    step: "prune",
+                    reason: format!(
+                        "{error}; pruning of {} was only partially applied",
+                        root.display()
+                    ),
+                });
+            }
+            return Err(error);
+        }
+        let _parent_guard = match crate::open::hold_parent_dirs_no_follow(current) {
+            Ok(guard) => guard,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                current = current
+                    .parent()
+                    .ok_or_else(|| StorageError::StagedMoveFailed {
+                        step: "prune-parent",
+                        reason: format!("directory has no parent: {}", current.display()),
+                    })?;
+                continue;
+            }
+            Err(error) if removed => {
+                return Err(StorageError::FilesystemStateUncertain {
+                    step: "prune",
+                    reason: format!(
+                        "failed to hold {} after directory pruning partially applied: {error}",
+                        current.display()
+                    ),
+                });
+            }
+            Err(error) => return Err(StorageError::io(current.display().to_string(), error)),
+        };
         let metadata = match std::fs::symlink_metadata(current) {
             Ok(metadata) => metadata,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -1153,7 +1361,7 @@ fn prune_empty_dirs(mut current: &Path, root: &Path) -> Result<(), StorageError>
                 return Err(StorageError::io(current.display().to_string(), error));
             }
         };
-        if metadata.file_type().is_symlink() {
+        if metadata_is_reparse_point(&metadata) {
             if removed {
                 return Err(StorageError::FilesystemStateUncertain {
                     step: "prune",
@@ -1313,9 +1521,14 @@ fn ensure_path_under_roots(
 }
 
 fn resolve_confined_path(path: &Path) -> Result<PathBuf, StorageError> {
-    if path
+    let has_non_absolute_prefix = path
         .components()
-        .any(|component| matches!(component, Component::ParentDir | Component::Prefix(_)))
+        .any(|component| matches!(component, Component::Prefix(_)))
+        && !path.is_absolute();
+    if has_non_absolute_prefix
+        || path
+            .components()
+            .any(|component| matches!(component, Component::ParentDir))
     {
         return Err(StorageError::StagedMoveFailed {
             step: "path",
@@ -1385,10 +1598,30 @@ fn required_path<'a>(
 #[cfg(any(not(unix), test))]
 fn create_parent(path: &Path) -> Result<(), StorageError> {
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)
+        crate::open::create_dir_all_no_follow(parent)
             .map_err(|e| StorageError::io(parent.display().to_string(), e))?;
     }
     Ok(())
+}
+
+#[cfg(any(not(unix), test))]
+fn rename_plan_no_replace(source: &Path, destination: &Path) -> std::io::Result<()> {
+    #[cfg(windows)]
+    {
+        crate::open::rename_no_replace(source, destination)
+    }
+    #[cfg(unix)]
+    {
+        std::fs::rename(source, destination)
+    }
+    #[cfg(all(not(unix), not(windows)))]
+    {
+        let _ = (source, destination);
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "atomic no-replace rename is unavailable on this platform",
+        ))
+    }
 }
 
 #[cfg(any(not(unix), test))]
@@ -1403,13 +1636,19 @@ fn ensure_destination_available(path: &Path) -> Result<(), StorageError> {
 }
 
 #[cfg(any(not(unix), test))]
-fn copy_verify(source: &Path, destination: &Path, expected_bytes: u64) -> Result<(), StorageError> {
+fn copy_verify_with_control(
+    source: &Path,
+    destination: &Path,
+    expected_bytes: u64,
+    check_control: &dyn Fn() -> Result<(), StorageError>,
+) -> Result<(), StorageError> {
     let mut destination_created = false;
     let result = copy_verify_inner(
         source,
         destination,
         expected_bytes,
         &mut destination_created,
+        check_control,
     );
     if let Err(error) = result {
         if destination_created {
@@ -1434,31 +1673,26 @@ fn copy_verify_inner(
     destination: &Path,
     expected_bytes: u64,
     destination_created: &mut bool,
+    check_control: &dyn Fn() -> Result<(), StorageError>,
 ) -> Result<(), StorageError> {
+    check_control()?;
+    let _source_parent_guard = crate::open::hold_parent_dirs_no_follow(source)
+        .map_err(|error| StorageError::io(source.display().to_string(), error))?;
+    let _destination_parent_guard = crate::open::hold_parent_dirs_no_follow(destination)
+        .map_err(|error| StorageError::io(destination.display().to_string(), error))?;
     let metadata = safe_symlink_metadata(source, "copy-source")?;
     let file_type = metadata.file_type();
-    if file_type.is_symlink() {
+    if metadata_is_reparse_point(&metadata) {
         return Err(unsafe_symlink_error(source, "copy-source"));
     }
     if file_type.is_dir() {
+        ensure_storage_tree_depth(0, source, "copy-tree-depth")?;
         std::fs::create_dir(destination)
             .map_err(|e| StorageError::io(destination.display().to_string(), e))?;
         *destination_created = true;
-        copy_dir_contents(source, destination)?;
+        copy_dir_contents(source, destination, 0, check_control)?;
     } else if file_type.is_file() {
-        let mut source_file = std::fs::File::open(source)
-            .map_err(|e| StorageError::io(source.display().to_string(), e))?;
-        let mut destination_file = std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(destination)
-            .map_err(|e| StorageError::io(destination.display().to_string(), e))?;
-        *destination_created = true;
-        std::io::copy(&mut source_file, &mut destination_file)
-            .map_err(|e| StorageError::io(destination.display().to_string(), e))?;
-        destination_file
-            .sync_all()
-            .map_err(|e| StorageError::io(destination.display().to_string(), e))?;
+        copy_file_with_control(source, destination, destination_created, check_control)?;
     } else {
         return Err(StorageError::StagedMoveFailed {
             step: "copy-source",
@@ -1472,26 +1706,14 @@ fn copy_verify_inner(
     // incrementally during the copy above, so this also catches corruption
     // introduced by the destination write path itself, not just a bug in
     // the copy loop.
-    verify_path_len(destination, expected_bytes)?;
-    verify_content_matches(source, destination)
+    verify_path_len_with_control(destination, expected_bytes, check_control)?;
+    verify_content_matches_with_control(source, destination, check_control)
 }
 
 #[cfg(any(not(unix), test))]
 fn remove_partial_destination(destination: &Path) -> Result<(), StorageError> {
-    let metadata = match std::fs::symlink_metadata(destination) {
-        Ok(metadata) => metadata,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(error) => {
-            return Err(StorageError::io(destination.display().to_string(), error));
-        }
-    };
-    if metadata.file_type().is_dir() {
-        std::fs::remove_dir_all(destination)
-            .map_err(|e| StorageError::io(destination.display().to_string(), e))
-    } else {
-        std::fs::remove_file(destination)
-            .map_err(|e| StorageError::io(destination.display().to_string(), e))
-    }
+    let no_control = || Ok(());
+    safe_delete_with_control(destination, true, &no_control)
 }
 
 /// Recursively verifies that every regular file under `source` has bytes
@@ -1499,14 +1721,37 @@ fn remove_partial_destination(destination: &Path) -> Result<(), StorageError> {
 /// content hash (never loads a whole file into memory). Never follows
 /// symlinks on either side.
 fn verify_content_matches(source: &Path, destination: &Path) -> Result<(), StorageError> {
+    let no_control = || Ok(());
+    verify_content_matches_with_control(source, destination, &no_control)
+}
+
+fn verify_content_matches_with_control(
+    source: &Path,
+    destination: &Path,
+    check_control: &dyn Fn() -> Result<(), StorageError>,
+) -> Result<(), StorageError> {
+    let _source_parent_guard = crate::open::hold_parent_dirs_no_follow(source)
+        .map_err(|error| StorageError::io(source.display().to_string(), error))?;
+    let _destination_parent_guard = crate::open::hold_parent_dirs_no_follow(destination)
+        .map_err(|error| StorageError::io(destination.display().to_string(), error))?;
+    verify_content_matches_inner_with_control(source, destination, 0, check_control)
+}
+
+fn verify_content_matches_inner_with_control(
+    source: &Path,
+    destination: &Path,
+    depth: usize,
+    check_control: &dyn Fn() -> Result<(), StorageError>,
+) -> Result<(), StorageError> {
+    check_control()?;
     let source_meta = safe_symlink_metadata(source, "verify-content-source")?;
     let destination_meta = safe_symlink_metadata(destination, "verify-content-destination")?;
     let source_type = source_meta.file_type();
     let destination_type = destination_meta.file_type();
-    if source_type.is_symlink() {
+    if metadata_is_reparse_point(&source_meta) {
         return Err(unsafe_symlink_error(source, "verify-content-source"));
     }
-    if destination_type.is_symlink() {
+    if metadata_is_reparse_point(&destination_meta) {
         return Err(unsafe_symlink_error(
             destination,
             "verify-content-destination",
@@ -1514,6 +1759,7 @@ fn verify_content_matches(source: &Path, destination: &Path) -> Result<(), Stora
     }
 
     if source_type.is_dir() {
+        ensure_storage_tree_depth(depth, source, "verify-tree-depth")?;
         if !destination_type.is_dir() {
             return Err(StorageError::StagedMoveFailed {
                 step: "verify-content",
@@ -1524,25 +1770,64 @@ fn verify_content_matches(source: &Path, destination: &Path) -> Result<(), Stora
                 ),
             });
         }
+        let _source_directory_guard = crate::open::hold_directory_no_follow(source)
+            .map_err(|error| StorageError::io(source.display().to_string(), error))?;
+        let _destination_directory_guard = crate::open::hold_directory_no_follow(destination)
+            .map_err(|error| StorageError::io(destination.display().to_string(), error))?;
         for entry in std::fs::read_dir(source)
             .map_err(|e| StorageError::io(source.display().to_string(), e))?
         {
             let entry = entry.map_err(|e| StorageError::io(source.display().to_string(), e))?;
             let destination_child = destination.join(entry.file_name());
-            verify_content_matches(&entry.path(), &destination_child)?;
+            verify_content_matches_inner_with_control(
+                &entry.path(),
+                &destination_child,
+                depth.saturating_add(1),
+                check_control,
+            )?;
         }
         for entry in std::fs::read_dir(destination)
             .map_err(|e| StorageError::io(destination.display().to_string(), e))?
         {
+            check_control()?;
             let entry =
                 entry.map_err(|e| StorageError::io(destination.display().to_string(), e))?;
-            if !source.join(entry.file_name()).exists() {
+            let destination_child = entry.path();
+            let destination_child_metadata = std::fs::symlink_metadata(&destination_child)
+                .map_err(|error| {
+                    StorageError::io(destination_child.display().to_string(), error)
+                })?;
+            if metadata_is_reparse_point(&destination_child_metadata) {
+                return Err(unsafe_symlink_error(
+                    &destination_child,
+                    "verify-content-destination",
+                ));
+            }
+            let source_child = source.join(entry.file_name());
+            let source_child_metadata = match std::fs::symlink_metadata(&source_child) {
+                Ok(metadata) => metadata,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    return Err(StorageError::StagedMoveFailed {
+                        step: "verify-content",
+                        reason: format!(
+                            "destination directory has entries absent from source: {}",
+                            destination.display()
+                        ),
+                    });
+                }
+                Err(error) => {
+                    return Err(StorageError::io(source_child.display().to_string(), error))
+                }
+            };
+            if metadata_is_reparse_point(&source_child_metadata) {
+                return Err(unsafe_symlink_error(&source_child, "verify-content-source"));
+            }
+            if !source_child_metadata.file_type().is_file()
+                && !source_child_metadata.file_type().is_dir()
+            {
                 return Err(StorageError::StagedMoveFailed {
                     step: "verify-content",
-                    reason: format!(
-                        "destination directory has entries absent from source: {}",
-                        destination.display()
-                    ),
+                    reason: format!("unsupported source entry type: {}", source_child.display()),
                 });
             }
         }
@@ -1558,8 +1843,8 @@ fn verify_content_matches(source: &Path, destination: &Path) -> Result<(), Stora
                 ),
             });
         }
-        let source_hash = hash_file_sha1(source)?;
-        let destination_hash = hash_file_sha1(destination)?;
+        let source_hash = hash_file_sha1_with_control(source, check_control)?;
+        let destination_hash = hash_file_sha1_with_control(destination, check_control)?;
         if source_hash == destination_hash {
             Ok(())
         } else {
@@ -1580,24 +1865,19 @@ fn verify_content_matches(source: &Path, destination: &Path) -> Result<(), Stora
     }
 }
 
-fn hash_file_sha1(path: &Path) -> Result<[u8; 20], StorageError> {
+fn hash_file_sha1_with_control(
+    path: &Path,
+    check_control: &dyn Fn() -> Result<(), StorageError>,
+) -> Result<[u8; 20], StorageError> {
     use sha1::{Digest, Sha1};
-    use std::fs::OpenOptions;
     use std::io::Read;
 
-    let mut options = OpenOptions::new();
-    options.read(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.custom_flags(libc::O_NOFOLLOW);
-    }
-    let mut file = options
-        .open(path)
+    let mut file = crate::open::open_path_no_follow(path, false, false)
         .map_err(|e| StorageError::io(path.display().to_string(), e))?;
     let mut hasher = Sha1::new();
     let mut buf = [0u8; 64 * 1024];
     loop {
+        check_control()?;
         let read = file
             .read(&mut buf)
             .map_err(|e| StorageError::io(path.display().to_string(), e))?;
@@ -1610,8 +1890,14 @@ fn hash_file_sha1(path: &Path) -> Result<[u8; 20], StorageError> {
 }
 
 #[cfg(any(not(unix), test))]
-fn verify_path_len(path: &Path, expected_bytes: u64) -> Result<(), StorageError> {
-    let actual = path_content_len(path)?;
+fn verify_path_len_with_control(
+    path: &Path,
+    expected_bytes: u64,
+    check_control: &dyn Fn() -> Result<(), StorageError>,
+) -> Result<(), StorageError> {
+    let _parent_guard = crate::open::hold_parent_dirs_no_follow(path)
+        .map_err(|error| StorageError::io(path.display().to_string(), error))?;
+    let actual = path_content_len_with_control(path, 0, check_control)?;
     if actual == expected_bytes {
         Ok(())
     } else {
@@ -1624,32 +1910,59 @@ fn verify_path_len(path: &Path, expected_bytes: u64) -> Result<(), StorageError>
 }
 
 #[cfg(any(not(unix), test))]
-fn copy_dir_recursive(source: &Path, destination: &Path) -> Result<(), StorageError> {
+fn copy_dir_recursive(
+    source: &Path,
+    destination: &Path,
+    depth: usize,
+    check_control: &dyn Fn() -> Result<(), StorageError>,
+) -> Result<(), StorageError> {
+    check_control()?;
+    ensure_storage_tree_depth(depth, source, "copy-tree-depth")?;
     reject_symlink(source, "copy-source")?;
     std::fs::create_dir(destination)
         .map_err(|e| StorageError::io(destination.display().to_string(), e))?;
-    copy_dir_contents(source, destination)
+    copy_dir_contents(source, destination, depth, check_control)
 }
 
 #[cfg(any(not(unix), test))]
-fn copy_dir_contents(source: &Path, destination: &Path) -> Result<(), StorageError> {
+fn copy_dir_contents(
+    source: &Path,
+    destination: &Path,
+    depth: usize,
+    check_control: &dyn Fn() -> Result<(), StorageError>,
+) -> Result<(), StorageError> {
+    let _source_directory_guard = crate::open::hold_directory_no_follow(source)
+        .map_err(|error| StorageError::io(source.display().to_string(), error))?;
+    let _destination_directory_guard = crate::open::hold_directory_no_follow(destination)
+        .map_err(|error| StorageError::io(destination.display().to_string(), error))?;
     for entry in
         std::fs::read_dir(source).map_err(|e| StorageError::io(source.display().to_string(), e))?
     {
+        check_control()?;
         let entry = entry.map_err(|e| StorageError::io(source.display().to_string(), e))?;
         let source_path = entry.path();
         let destination_path = destination.join(entry.file_name());
         let metadata = safe_symlink_metadata(&source_path, "copy-source")?;
         let file_type = metadata.file_type();
-        if file_type.is_symlink() {
+        if metadata_is_reparse_point(&metadata) {
             return Err(unsafe_symlink_error(&source_path, "copy-source"));
         }
         if file_type.is_dir() {
-            copy_dir_recursive(&source_path, &destination_path)?;
+            copy_dir_recursive(
+                &source_path,
+                &destination_path,
+                depth.saturating_add(1),
+                check_control,
+            )?;
         } else if file_type.is_file() {
             ensure_destination_available(&destination_path)?;
-            std::fs::copy(&source_path, &destination_path)
-                .map_err(|e| StorageError::io(destination_path.display().to_string(), e))?;
+            let mut destination_created = false;
+            copy_file_with_control(
+                &source_path,
+                &destination_path,
+                &mut destination_created,
+                check_control,
+            )?;
         } else {
             return Err(StorageError::StagedMoveFailed {
                 step: "copy-source",
@@ -1661,18 +1974,38 @@ fn copy_dir_contents(source: &Path, destination: &Path) -> Result<(), StorageErr
 }
 
 fn path_content_len(path: &Path) -> Result<u64, StorageError> {
+    let no_control = || Ok(());
+    let _parent_guard = crate::open::hold_parent_dirs_no_follow(path)
+        .map_err(|error| StorageError::io(path.display().to_string(), error))?;
+    path_content_len_with_control(path, 0, &no_control)
+}
+
+fn path_content_len_with_control(
+    path: &Path,
+    depth: usize,
+    check_control: &dyn Fn() -> Result<(), StorageError>,
+) -> Result<u64, StorageError> {
+    check_control()?;
     let metadata = safe_symlink_metadata(path, "verify")?;
     let file_type = metadata.file_type();
-    if file_type.is_symlink() {
+    if metadata_is_reparse_point(&metadata) {
         return Err(unsafe_symlink_error(path, "verify"));
     }
     if file_type.is_dir() {
+        ensure_storage_tree_depth(depth, path, "verify-tree-depth")?;
+        let _directory_guard = crate::open::hold_directory_no_follow(path)
+            .map_err(|error| StorageError::io(path.display().to_string(), error))?;
         let mut total = 0u64;
         for entry in
             std::fs::read_dir(path).map_err(|e| StorageError::io(path.display().to_string(), e))?
         {
+            check_control()?;
             let entry = entry.map_err(|e| StorageError::io(path.display().to_string(), e))?;
-            total = total.saturating_add(path_content_len(&entry.path())?);
+            total = total.saturating_add(path_content_len_with_control(
+                &entry.path(),
+                depth.saturating_add(1),
+                check_control,
+            )?);
         }
         Ok(total)
     } else if file_type.is_file() {
@@ -1683,6 +2016,38 @@ fn path_content_len(path: &Path) -> Result<u64, StorageError> {
             reason: format!("unsupported file type: {}", path.display()),
         })
     }
+}
+
+#[cfg(any(not(unix), test))]
+fn copy_file_with_control(
+    source: &Path,
+    destination: &Path,
+    destination_created: &mut bool,
+    check_control: &dyn Fn() -> Result<(), StorageError>,
+) -> Result<(), StorageError> {
+    use std::io::{Read, Write};
+
+    let mut source_file = crate::open::open_path_no_follow(source, false, false)
+        .map_err(|e| StorageError::io(source.display().to_string(), e))?;
+    let mut destination_file = crate::open::create_new_file_no_follow(destination)
+        .map_err(|e| StorageError::io(destination.display().to_string(), e))?;
+    *destination_created = true;
+    let mut buffer = [0u8; 64 * 1024];
+    loop {
+        check_control()?;
+        let bytes_read = source_file
+            .read(&mut buffer)
+            .map_err(|e| StorageError::io(source.display().to_string(), e))?;
+        if bytes_read == 0 {
+            break;
+        }
+        destination_file
+            .write_all(&buffer[..bytes_read])
+            .map_err(|e| StorageError::io(destination.display().to_string(), e))?;
+    }
+    destination_file
+        .sync_all()
+        .map_err(|e| StorageError::io(destination.display().to_string(), e))
 }
 
 fn safe_symlink_metadata(
@@ -1704,9 +2069,40 @@ fn safe_symlink_metadata(
     })
 }
 
+fn metadata_is_reparse_point(metadata: &std::fs::Metadata) -> bool {
+    #[cfg(windows)]
+    {
+        metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+    }
+    #[cfg(not(windows))]
+    {
+        metadata.file_type().is_symlink()
+    }
+}
+
+#[cfg(any(windows, test))]
+fn remove_reparse_point_no_follow(
+    path: &Path,
+    metadata: &std::fs::Metadata,
+) -> std::io::Result<()> {
+    #[cfg(windows)]
+    {
+        if metadata.file_attributes() & FILE_ATTRIBUTE_DIRECTORY != 0 {
+            std::fs::remove_dir(path)
+        } else {
+            std::fs::remove_file(path)
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = metadata;
+        std::fs::remove_file(path)
+    }
+}
+
 #[cfg(any(not(unix), test))]
 fn reject_symlink(path: &Path, step: &'static str) -> Result<(), StorageError> {
-    if safe_symlink_metadata(path, step)?.file_type().is_symlink() {
+    if metadata_is_reparse_point(&safe_symlink_metadata(path, step)?) {
         Err(unsafe_symlink_error(path, step))
     } else {
         Ok(())
@@ -1717,13 +2113,13 @@ fn unsafe_symlink_error(path: &Path, step: &'static str) -> StorageError {
     StorageError::StagedMoveFailed {
         step,
         reason: format!(
-            "symlink entries are not allowed in move/import plans: {}",
+            "symlink/reparse-point entries are not allowed in move/import plans: {}",
             path.display()
         ),
     }
 }
 
-/// Re-checks that no ancestor directory of `path` is a symlink, immediately
+/// Re-checks that no ancestor directory of `path` is a reparse point, immediately
 /// before a mutating filesystem call uses that path.
 ///
 /// `validate_plan_paths_under_roots` canonicalizes and root-checks every step
@@ -1733,7 +2129,7 @@ fn unsafe_symlink_error(path: &Path, step: &'static str) -> StorageError {
 /// directory handles, so a symlink swapped in after validation cannot be
 /// followed. This fallback executor has no equivalent descriptor-anchoring
 /// primitive available portably, so it cannot close that window — but it can
-/// shrink it, by re-walking the ancestor chain and rejecting a symlink right
+/// shrink it, by re-walking the ancestor chain and rejecting a reparse point right
 /// before the syscall that would otherwise follow it, rather than trusting a
 /// validation result from earlier in a potentially long-running plan.
 #[cfg(any(not(unix), test))]
@@ -1742,9 +2138,14 @@ fn reject_symlink_ancestors(path: &Path, step: &'static str) -> Result<(), Stora
         if ancestor.as_os_str().is_empty() {
             continue;
         }
-        if let Ok(metadata) = std::fs::symlink_metadata(ancestor) {
-            if metadata.file_type().is_symlink() {
+        match std::fs::symlink_metadata(ancestor) {
+            Ok(metadata) if metadata_is_reparse_point(&metadata) => {
                 return Err(unsafe_symlink_error(ancestor, step));
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(StorageError::io(ancestor.display().to_string(), error));
             }
         }
     }
@@ -1806,7 +2207,15 @@ fn same_filesystem(source: &Path, destination: &Path) -> Option<bool> {
     Some(source_dev == dest_dev)
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
+fn same_filesystem(source: &Path, destination: &Path) -> Option<bool> {
+    let source_volume = crate::open::windows_path_volume_serial(source).ok()?;
+    let destination_parent = destination.parent()?;
+    let destination_volume = crate::open::windows_path_volume_serial(destination_parent).ok()?;
+    Some(source_volume == destination_volume)
+}
+
+#[cfg(not(any(unix, windows)))]
 fn same_filesystem(_source: &Path, _destination: &Path) -> Option<bool> {
     None
 }
@@ -1830,8 +2239,95 @@ mod tests {
             dry_run: true,
         });
 
-        assert!(plan.can_apply);
+        assert_eq!(plan.can_apply, atomic_no_replace_rename_supported());
+        assert_eq!(
+            plan.issues
+                .contains(&PlanIssue::AtomicNoReplaceRenameUnavailable),
+            !atomic_no_replace_rename_supported()
+        );
         assert_eq!(plan.steps[0].action, PlannedStorageAction::Rename);
+    }
+
+    #[test]
+    fn move_plan_fails_closed_when_atomic_rename_is_unavailable() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("source.bin");
+        let destination = dir.path().join("destination.bin");
+        std::fs::write(&source, b"data").unwrap();
+
+        let plan = plan_move_with_rename_support(
+            &MovePlanRequest {
+                source,
+                destination,
+                bytes: 4,
+                available_bytes: Some(100),
+                dry_run: true,
+            },
+            false,
+        );
+
+        assert!(!plan.can_apply);
+        assert!(plan
+            .issues
+            .contains(&PlanIssue::AtomicNoReplaceRenameUnavailable));
+    }
+
+    #[test]
+    fn staged_import_copy_fails_closed_when_atomic_rename_is_unavailable() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("source.bin");
+        let destination = dir.path().join("destination.bin");
+        std::fs::write(&source, b"data").unwrap();
+
+        let plan = plan_import_with_rename_support(
+            &ImportPlanRequest {
+                source,
+                destination,
+                bytes: 4,
+                available_bytes: Some(100),
+                hardlink_or_copy: false,
+                dry_run: true,
+            },
+            false,
+        );
+
+        assert!(!plan.can_apply);
+        assert!(plan
+            .issues
+            .contains(&PlanIssue::AtomicNoReplaceRenameUnavailable));
+
+        let direct_import = plan_import_with_rename_support(
+            &ImportPlanRequest {
+                source: dir.path().join("source.bin"),
+                destination: dir.path().join("linked.bin"),
+                bytes: 4,
+                available_bytes: Some(100),
+                hardlink_or_copy: true,
+                dry_run: true,
+            },
+            false,
+        );
+        assert!(direct_import.can_apply);
+        assert_eq!(
+            direct_import.steps[0].action,
+            PlannedStorageAction::ImportExisting
+        );
+        assert!(!direct_import
+            .issues
+            .contains(&PlanIssue::AtomicNoReplaceRenameUnavailable));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn confined_path_accepts_absolute_drive_prefixes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("stored.bin");
+        std::fs::write(&path, b"data").unwrap();
+
+        assert_eq!(
+            resolve_confined_path(&path).unwrap(),
+            std::fs::canonicalize(path).unwrap()
+        );
     }
 
     #[test]
@@ -2166,6 +2662,87 @@ mod tests {
         assert!(error
             .to_string()
             .contains("destination directory has entries absent from source"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn portable_tree_walks_reject_overdeep_directories_and_clean_partial_copy() {
+        fn create_overdeep_tree(root: &Path) {
+            std::fs::create_dir(root).unwrap();
+            let mut current = root.to_path_buf();
+            for _ in 0..=MAX_STORAGE_TREE_DEPTH {
+                current.push("nested");
+                std::fs::create_dir(&current).unwrap();
+            }
+        }
+
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("source");
+        let destination = directory.path().join("destination");
+        create_overdeep_tree(&source);
+        create_overdeep_tree(&destination);
+        let no_control = || Ok(());
+
+        let verify_error = verify_content_matches(&source, &destination).unwrap_err();
+        assert!(verify_error.to_string().contains("directory nesting depth"));
+        let length_error = path_content_len(&source).unwrap_err();
+        assert!(length_error.to_string().contains("directory nesting depth"));
+
+        let copy_destination = directory.path().join("copy-destination");
+        let copy_error =
+            copy_verify_with_control(&source, &copy_destination, 0, &no_control).unwrap_err();
+        assert!(copy_error.to_string().contains("directory nesting depth"));
+        assert!(!copy_destination.exists(), "partial copy must be removed");
+
+        let delete_error = safe_delete_with_control(&source, false, &no_control).unwrap_err();
+        assert!(delete_error.to_string().contains("directory nesting depth"));
+        assert!(source.exists(), "rejected deep tree must remain intact");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn verify_content_matches_rejects_source_symlink_swap_during_final_scan() {
+        use std::cell::Cell;
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("source");
+        let destination = dir.path().join("destination");
+        let source_child = source.join("payload.bin");
+        let destination_child = destination.join("payload.bin");
+        let outside = dir.path().join("outside.bin");
+        std::fs::create_dir_all(&source).unwrap();
+        std::fs::create_dir_all(&destination).unwrap();
+        std::fs::write(&source_child, []).unwrap();
+        std::fs::write(&destination_child, []).unwrap();
+        std::fs::write(&outside, []).unwrap();
+
+        let checks = Cell::new(0usize);
+        let check_control = || {
+            let count = checks.get() + 1;
+            checks.set(count);
+            if count == 5 {
+                std::fs::remove_file(&source_child).unwrap();
+                symlink(&outside, &source_child).unwrap();
+            }
+            Ok(())
+        };
+
+        let error =
+            verify_content_matches_with_control(&source, &destination, &check_control).unwrap_err();
+
+        assert_eq!(
+            checks.get(),
+            5,
+            "the swap must happen during the final scan"
+        );
+        assert!(matches!(
+            error,
+            StorageError::StagedMoveFailed {
+                step: "verify-content-source",
+                ..
+            }
+        ));
     }
 
     #[test]
@@ -2629,6 +3206,33 @@ mod tests {
         assert!(!destination.exists());
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn portable_copy_opens_source_without_following_a_file_reparse_point() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("target.bin");
+        let source = dir.path().join("source-link.bin");
+        let destination = dir.path().join("destination.bin");
+        std::fs::write(&target, b"outside").unwrap();
+        if let Err(error) = std::os::windows::fs::symlink_file(&target, &source) {
+            if error.kind() == std::io::ErrorKind::PermissionDenied {
+                return;
+            }
+            panic!("failed to create file symlink for copy regression test: {error}");
+        }
+
+        let no_control = || Ok(());
+        let mut destination_created = false;
+        let error =
+            copy_file_with_control(&source, &destination, &mut destination_created, &no_control)
+                .unwrap_err();
+
+        assert!(matches!(error, StorageError::Io { .. }));
+        assert!(!destination_created);
+        assert!(!destination.exists());
+        assert_eq!(std::fs::read(target).unwrap(), b"outside");
+    }
+
     #[cfg(unix)]
     #[test]
     fn execute_copy_verify_plan_rejects_nested_symlink_entry() {
@@ -3079,6 +3683,26 @@ mod tests {
         assert_eq!(std::fs::read(&destination).unwrap(), b"data");
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn portable_windows_import_does_not_create_a_path_based_hard_link() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("source.bin");
+        let destination = dir.path().join("dest.bin");
+        std::fs::write(&source, b"data").unwrap();
+
+        let step = StoragePlanStep {
+            action: PlannedStorageAction::ImportExisting,
+            source: Some(source.clone()),
+            destination: Some(destination.clone()),
+            bytes: 4,
+        };
+        execute_step(&step).unwrap();
+
+        std::fs::write(&source, b"edit").unwrap();
+        assert_eq!(std::fs::read(&destination).unwrap(), b"data");
+    }
+
     #[test]
     fn portable_execute_step_copy_verify_rename_copies_and_verifies_content() {
         let dir = tempfile::tempdir().unwrap();
@@ -3115,6 +3739,64 @@ mod tests {
         assert!(!target.exists());
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn portable_delete_removes_directory_reparse_points_without_following_targets() {
+        use std::os::windows::fs::symlink_dir;
+
+        let dir = tempfile::tempdir().unwrap();
+        let external_root = dir.path().join("external-root");
+        std::fs::create_dir(&external_root).unwrap();
+        let external_file = external_root.join("keep.bin");
+        std::fs::write(&external_file, b"preserve").unwrap();
+
+        let root_link = dir.path().join("root-link");
+        symlink_dir(&external_root, &root_link).unwrap();
+        let no_control = || Ok(());
+        safe_delete_with_control(&root_link, false, &no_control).unwrap();
+        assert!(
+            external_file.exists(),
+            "root link target must remain intact"
+        );
+        assert!(std::fs::symlink_metadata(&root_link).is_err());
+
+        let tree = dir.path().join("tree");
+        std::fs::create_dir(&tree).unwrap();
+        let nested_link = tree.join("nested-link");
+        symlink_dir(&external_root, &nested_link).unwrap();
+        safe_delete_with_control(&tree, false, &no_control).unwrap();
+        assert!(
+            external_file.exists(),
+            "nested link target must remain intact"
+        );
+        assert!(std::fs::symlink_metadata(&tree).is_err());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn portable_executor_rejects_directory_reparse_points_for_copy_and_ancestors() {
+        use std::os::windows::fs::symlink_dir;
+
+        let dir = tempfile::tempdir().unwrap();
+        let external_root = dir.path().join("external-root");
+        std::fs::create_dir(&external_root).unwrap();
+        let external_file = external_root.join("source.bin");
+        std::fs::write(&external_file, b"external").unwrap();
+        let alias = dir.path().join("alias");
+        symlink_dir(&external_root, &alias).unwrap();
+
+        let metadata = std::fs::symlink_metadata(&alias).unwrap();
+        assert!(metadata_is_reparse_point(&metadata));
+        assert!(reject_symlink(&alias, "test").is_err());
+        assert!(reject_symlink_ancestors(&alias.join("child.bin"), "test").is_err());
+
+        let destination = dir.path().join("copied.bin");
+        let no_control = || Ok(());
+        assert!(copy_verify_with_control(&alias, &destination, 8, &no_control).is_err());
+        assert!(!destination.exists());
+        assert_eq!(std::fs::read(&external_file).unwrap(), b"external");
+    }
+
     #[test]
     fn portable_execute_step_safe_delete_if_present_is_idempotent_when_missing() {
         let dir = tempfile::tempdir().unwrap();
@@ -3127,6 +3809,15 @@ mod tests {
             bytes: 0,
         };
         execute_step(&step).unwrap();
+
+        let nested_missing_target = dir.path().join("missing-parent").join("payload.bin");
+        let nested_step = StoragePlanStep {
+            action: PlannedStorageAction::SafeDeleteIfPresent,
+            source: Some(nested_missing_target),
+            destination: None,
+            bytes: 0,
+        };
+        execute_step(&nested_step).unwrap();
     }
 
     #[test]

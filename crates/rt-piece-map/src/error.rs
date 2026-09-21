@@ -30,6 +30,10 @@ pub enum PieceMapError {
         expected: u64,
         actual: u64,
     },
+    #[error("duplicate file span index: {0}")]
+    DuplicateFileIndex(u32),
+    #[error("padding file index {0} does not refer to a file span")]
+    UnknownPaddingFileIndex(u32),
     #[error("integer overflow while building piece map: {0}")]
     IntegerOverflow(&'static str),
     #[error("piece {0} has no mapped v2 file data")]

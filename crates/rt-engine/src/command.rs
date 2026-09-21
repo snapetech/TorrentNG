@@ -1,5 +1,6 @@
 /// Commands sent from the API layer down to the engine or individual torrent tasks.
 use std::{
+    collections::HashMap,
     net::SocketAddr,
     path::PathBuf,
     sync::atomic::{AtomicUsize, Ordering},
@@ -220,6 +221,52 @@ pub struct EngineTorrentMetadata {
     pub files: Vec<EngineTorrentFile>,
 }
 
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct SharedSchedulerStorageSnapshot {
+    file_pool_capacity: u64,
+    file_pool_open_files: u64,
+    file_pool_active_descriptors: u64,
+    file_pool_memory_bytes: u64,
+    file_pool_hits: u64,
+    file_pool_misses: u64,
+    file_pool_evictions: u64,
+    file_pool_idle_closes: u64,
+    io_queue_depth: u64,
+    hash_queue_depth: u64,
+}
+
+impl SharedSchedulerStorageSnapshot {
+    fn from_stats(storage: &StorageIoStats) -> Self {
+        Self {
+            file_pool_capacity: storage.file_pool.capacity as u64,
+            file_pool_open_files: storage.file_pool.open_files as u64,
+            file_pool_active_descriptors: storage.file_pool.active_descriptors as u64,
+            file_pool_memory_bytes: storage.file_pool.memory_bytes,
+            file_pool_hits: storage.file_pool.hits,
+            file_pool_misses: storage.file_pool.misses,
+            file_pool_evictions: storage.file_pool.evictions,
+            file_pool_idle_closes: storage.file_pool.idle_closes,
+            io_queue_depth: storage.io_queue_depth as u64,
+            hash_queue_depth: storage.hash_queue_depth as u64,
+        }
+    }
+
+    fn merge_observation(self, latest: Self) -> Self {
+        Self {
+            file_pool_capacity: latest.file_pool_capacity,
+            file_pool_open_files: latest.file_pool_open_files,
+            file_pool_active_descriptors: latest.file_pool_active_descriptors,
+            file_pool_memory_bytes: latest.file_pool_memory_bytes,
+            file_pool_hits: self.file_pool_hits.max(latest.file_pool_hits),
+            file_pool_misses: self.file_pool_misses.max(latest.file_pool_misses),
+            file_pool_evictions: self.file_pool_evictions.max(latest.file_pool_evictions),
+            file_pool_idle_closes: self.file_pool_idle_closes.max(latest.file_pool_idle_closes),
+            io_queue_depth: latest.io_queue_depth,
+            hash_queue_depth: latest.hash_queue_depth,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct EngineStats {
     pub torrents_total: u64,
@@ -280,6 +327,7 @@ pub struct EngineStats {
     pub dht_queried_nodes: u64,
     pub storage_file_pool_capacity: u64,
     pub storage_file_pool_open_files: u64,
+    pub storage_file_pool_active_descriptors: u64,
     pub storage_file_pool_memory_bytes: u64,
     pub storage_file_pool_hits: u64,
     pub storage_file_pool_misses: u64,
@@ -375,6 +423,24 @@ pub struct EngineSubsystemHealth {
     pub dht_healthy: bool,
 }
 
+/// Privacy-preserving operational counters for the native SQLite worker.
+/// Durations are cumulative nanoseconds; `/metrics` renders them as seconds.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct EngineDatabaseWorkerStats {
+    pub queue_depth: u64,
+    pub queue_capacity: u64,
+    pub commands_enqueued_total: u64,
+    pub commands_completed_total: u64,
+    pub command_failures_total: u64,
+    pub commands_cancelled_total: u64,
+    pub enqueue_timeouts_total: u64,
+    pub queue_wait_nanoseconds_total: u64,
+    pub command_latency_nanoseconds_total: u64,
+    pub batch_transactions_total: u64,
+    pub batch_transaction_failures_total: u64,
+    pub batch_transaction_nanoseconds_total: u64,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct HotTorrentMemoryStats {
     pub info_hash: String,
@@ -383,6 +449,8 @@ pub struct HotTorrentMemoryStats {
     pub peer_buffer_bytes: u64,
     pub tracker_peer_bytes: u64,
     pub peer_command_queue_bytes: u64,
+    /// Cache metadata is included only when storage ownership is torrent-local
+    /// or its shared-resource identity is unknown.
     pub storage_cache_bytes: u64,
 }
 
@@ -490,6 +558,24 @@ impl EngineStats {
     }
 
     pub fn add_torrent_runtime(&mut self, info_hash: String, runtime: TorrentRuntimeStats) {
+        self.add_torrent_runtime_inner(info_hash, runtime, None);
+    }
+
+    pub(crate) fn add_torrent_runtime_with_shared_storage_resources(
+        &mut self,
+        info_hash: String,
+        runtime: TorrentRuntimeStats,
+        shared_resources: &mut HashMap<u64, SharedSchedulerStorageSnapshot>,
+    ) {
+        self.add_torrent_runtime_inner(info_hash, runtime, Some(shared_resources));
+    }
+
+    fn add_torrent_runtime_inner(
+        &mut self,
+        info_hash: String,
+        runtime: TorrentRuntimeStats,
+        shared_resources: Option<&mut HashMap<u64, SharedSchedulerStorageSnapshot>>,
+    ) {
         self.record_hot_torrent_memory(info_hash, &runtime);
         self.torrent_tasks_active = self.torrent_tasks_active.saturating_add(1);
         self.download_rate = self.download_rate.saturating_add(runtime.download_rate);
@@ -545,33 +631,17 @@ impl EngineStats {
             .saturating_add(runtime.tracker_peer_cache_bytes);
 
         let storage = runtime.storage;
-        self.storage_file_pool_capacity = self
-            .storage_file_pool_capacity
-            .saturating_add(storage.file_pool.capacity as u64);
-        self.storage_file_pool_open_files = self
-            .storage_file_pool_open_files
-            .saturating_add(storage.file_pool.open_files as u64);
-        self.storage_file_pool_memory_bytes = self
-            .storage_file_pool_memory_bytes
-            .saturating_add(storage.file_pool.memory_bytes);
-        self.storage_file_pool_hits = self
-            .storage_file_pool_hits
-            .saturating_add(storage.file_pool.hits);
-        self.storage_file_pool_misses = self
-            .storage_file_pool_misses
-            .saturating_add(storage.file_pool.misses);
-        self.storage_file_pool_evictions = self
-            .storage_file_pool_evictions
-            .saturating_add(storage.file_pool.evictions);
-        self.storage_file_pool_idle_closes = self
-            .storage_file_pool_idle_closes
-            .saturating_add(storage.file_pool.idle_closes);
-        self.storage_io_queue_depth = self
-            .storage_io_queue_depth
-            .saturating_add(storage.io_queue_depth as u64);
-        self.storage_hash_queue_depth = self
-            .storage_hash_queue_depth
-            .saturating_add(storage.hash_queue_depth as u64);
+        let observed = SharedSchedulerStorageSnapshot::from_stats(&storage);
+        if storage.shared_resource_id == 0 {
+            self.merge_shared_scheduler_storage_snapshot(None, observed);
+        } else if let Some(shared_resources) = shared_resources {
+            let previous = shared_resources.get(&storage.shared_resource_id).copied();
+            let merged = previous.map_or(observed, |previous| previous.merge_observation(observed));
+            self.merge_shared_scheduler_storage_snapshot(previous, merged);
+            shared_resources.insert(storage.shared_resource_id, merged);
+        } else {
+            self.merge_shared_scheduler_storage_snapshot(None, observed);
+        }
         let storage_device_id = storage.device_id.clone();
         let storage_profile = storage_profile_label(&storage.profile).to_string();
         let shared_device_queue_already_counted =
@@ -810,13 +880,71 @@ impl EngineStats {
             .saturating_add(storage.sparse_seek_fallbacks);
     }
 
+    fn merge_shared_scheduler_storage_snapshot(
+        &mut self,
+        previous: Option<SharedSchedulerStorageSnapshot>,
+        current: SharedSchedulerStorageSnapshot,
+    ) {
+        let previous = previous.unwrap_or_default();
+        self.storage_file_pool_capacity = self
+            .storage_file_pool_capacity
+            .saturating_sub(previous.file_pool_capacity)
+            .saturating_add(current.file_pool_capacity);
+        self.storage_file_pool_open_files = self
+            .storage_file_pool_open_files
+            .saturating_sub(previous.file_pool_open_files)
+            .saturating_add(current.file_pool_open_files);
+        self.storage_file_pool_active_descriptors = self
+            .storage_file_pool_active_descriptors
+            .saturating_sub(previous.file_pool_active_descriptors)
+            .saturating_add(current.file_pool_active_descriptors);
+        self.storage_file_pool_memory_bytes = self
+            .storage_file_pool_memory_bytes
+            .saturating_sub(previous.file_pool_memory_bytes)
+            .saturating_add(current.file_pool_memory_bytes);
+        self.storage_file_pool_hits = self.storage_file_pool_hits.saturating_add(
+            current
+                .file_pool_hits
+                .saturating_sub(previous.file_pool_hits),
+        );
+        self.storage_file_pool_misses = self.storage_file_pool_misses.saturating_add(
+            current
+                .file_pool_misses
+                .saturating_sub(previous.file_pool_misses),
+        );
+        self.storage_file_pool_evictions = self.storage_file_pool_evictions.saturating_add(
+            current
+                .file_pool_evictions
+                .saturating_sub(previous.file_pool_evictions),
+        );
+        self.storage_file_pool_idle_closes = self.storage_file_pool_idle_closes.saturating_add(
+            current
+                .file_pool_idle_closes
+                .saturating_sub(previous.file_pool_idle_closes),
+        );
+        self.storage_io_queue_depth = self
+            .storage_io_queue_depth
+            .saturating_sub(previous.io_queue_depth)
+            .saturating_add(current.io_queue_depth);
+        self.storage_hash_queue_depth = self
+            .storage_hash_queue_depth
+            .saturating_sub(previous.hash_queue_depth)
+            .saturating_add(current.hash_queue_depth);
+    }
+
     fn record_hot_torrent_memory(&mut self, info_hash: String, runtime: &TorrentRuntimeStats) {
         let peer_buffer_bytes = runtime
             .peer_rx_buffer_bytes
             .saturating_add(runtime.peer_tx_buffer_bytes);
         let tracker_peer_bytes = runtime.tracker_peer_cache_bytes;
         let peer_command_queue_bytes = runtime.peer_command_queue_bytes;
-        let storage_cache_bytes = runtime.storage.file_pool.memory_bytes;
+        let storage_cache_bytes = if runtime.storage.shared_resource_id == 0 {
+            runtime.storage.file_pool.memory_bytes
+        } else {
+            // Known shared scheduler cache memory is reported once in the
+            // aggregate storage-pool metric, not attributed to every torrent.
+            0
+        };
         let estimated_bytes = runtime
             .piece_assembly_bytes
             .saturating_add(peer_buffer_bytes)
@@ -1619,6 +1747,7 @@ mod tests {
             file_pool: FilePoolStats {
                 capacity: 64,
                 open_files: 8,
+                active_descriptors: 9,
                 memory_bytes: 4096,
                 hits: 10,
                 misses: 2,
@@ -1700,6 +1829,7 @@ mod tests {
 
         assert_eq!(stats.storage_file_pool_capacity, 64);
         assert_eq!(stats.storage_file_pool_open_files, 8);
+        assert_eq!(stats.storage_file_pool_active_descriptors, 9);
         assert_eq!(stats.storage_file_pool_memory_bytes, 4096);
         assert_eq!(stats.storage_file_pool_hits, 10);
         assert_eq!(stats.storage_file_pool_misses, 2);
@@ -1868,6 +1998,112 @@ mod tests {
 
         assert_eq!(stats.storage_device_queue_capacity, 32);
         assert_eq!(stats.storage_device_queue_available, 31);
+    }
+
+    #[test]
+    fn engine_stats_deduplicates_shared_scheduler_snapshots() {
+        let mut shared = StorageIoStats {
+            shared_resource_id: 9001,
+            file_pool: FilePoolStats {
+                capacity: 64,
+                open_files: 8,
+                active_descriptors: 10,
+                memory_bytes: 4096,
+                hits: 10,
+                misses: 2,
+                evictions: 1,
+                idle_closes: 3,
+            },
+            io_queue_depth: 4,
+            hash_queue_depth: 5,
+            ..Default::default()
+        };
+        shared.read_ops_by_class[0] = 2;
+        shared.bytes_read_by_class[0] = 20;
+
+        let mut same_resources = shared.clone();
+        same_resources.file_pool.open_files = 9;
+        same_resources.file_pool.active_descriptors = 11;
+        same_resources.file_pool.memory_bytes = 4608;
+        same_resources.file_pool.hits = 12;
+        same_resources.file_pool.misses = 3;
+        same_resources.file_pool.evictions = 2;
+        same_resources.file_pool.idle_closes = 4;
+        same_resources.io_queue_depth = 6;
+        same_resources.hash_queue_depth = 7;
+        same_resources.read_ops_by_class[0] = 3;
+        same_resources.bytes_read_by_class[0] = 30;
+
+        let mut separate = StorageIoStats {
+            shared_resource_id: 9002,
+            file_pool: FilePoolStats {
+                capacity: 16,
+                open_files: 3,
+                active_descriptors: 4,
+                memory_bytes: 2048,
+                hits: 2,
+                misses: 1,
+                idle_closes: 1,
+                ..Default::default()
+            },
+            io_queue_depth: 2,
+            hash_queue_depth: 1,
+            ..Default::default()
+        };
+        separate.read_ops_by_class[0] = 7;
+        separate.bytes_read_by_class[0] = 70;
+
+        let mut stats = EngineStats::default();
+        let mut seen_shared_resources = HashMap::new();
+        stats.add_torrent_runtime_with_shared_storage_resources(
+            "hash-a".to_string(),
+            TorrentRuntimeStats {
+                connected_peers: 1,
+                piece_assembly_bytes: 100,
+                storage: shared,
+                ..Default::default()
+            },
+            &mut seen_shared_resources,
+        );
+        stats.add_torrent_runtime_with_shared_storage_resources(
+            "hash-b".to_string(),
+            TorrentRuntimeStats {
+                connected_peers: 2,
+                piece_assembly_bytes: 100,
+                storage: same_resources,
+                ..Default::default()
+            },
+            &mut seen_shared_resources,
+        );
+        stats.add_torrent_runtime_with_shared_storage_resources(
+            "hash-c".to_string(),
+            TorrentRuntimeStats {
+                connected_peers: 3,
+                piece_assembly_bytes: 100,
+                storage: separate,
+                ..Default::default()
+            },
+            &mut seen_shared_resources,
+        );
+
+        assert_eq!(stats.storage_file_pool_capacity, 80);
+        assert_eq!(stats.storage_file_pool_open_files, 12);
+        assert_eq!(stats.storage_file_pool_active_descriptors, 15);
+        assert_eq!(stats.storage_file_pool_memory_bytes, 6656);
+        assert_eq!(stats.storage_file_pool_hits, 14);
+        assert_eq!(stats.storage_file_pool_misses, 4);
+        assert_eq!(stats.storage_file_pool_evictions, 2);
+        assert_eq!(stats.storage_file_pool_idle_closes, 5);
+        assert_eq!(stats.storage_io_queue_depth, 8);
+        assert_eq!(stats.storage_hash_queue_depth, 8);
+        assert_eq!(stats.storage_read_ops, 12);
+        assert_eq!(stats.storage_bytes_read, 120);
+        assert_eq!(stats.connected_peers, 6);
+        assert_eq!(stats.hot_torrent_memory_top.len(), 3);
+        assert!(stats
+            .hot_torrent_memory_top
+            .iter()
+            .all(|torrent| torrent.storage_cache_bytes == 0));
     }
 
     #[test]

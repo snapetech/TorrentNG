@@ -7,9 +7,10 @@ use std::hash::{Hash, Hasher};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
 use std::path::PathBuf;
 use std::pin::Pin;
-use std::sync::Mutex;
+use std::sync::{Mutex, MutexGuard};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use bytes::BytesMut;
 use futures::{SinkExt, StreamExt};
 use reqwest::header::{CONTENT_RANGE, RANGE};
 use reqwest::StatusCode;
@@ -31,8 +32,8 @@ use rt_fastresume::{
     MAX_FASTRESUME_BLOCKS_PER_PARTIAL_PIECE,
 };
 #[cfg(test)]
-use rt_metainfo::TorrentMeta;
-use rt_metainfo::{torrent_info_bytes, TorrentFileV1, TorrentMetaV1};
+use rt_metainfo::{torrent_info_bytes, TorrentMeta};
+use rt_metainfo::{torrent_info_bytes_with_allocation_reservation, TorrentFileV1, TorrentMetaV1};
 use rt_metrics::{MemoryClass, MemoryLease, ResourceGovernor};
 use rt_path::{StorageProfile, StorageRootId};
 use rt_peer_manager::{
@@ -63,9 +64,10 @@ use crate::db_worker::DbExecutor;
 use crate::egress_policy::{OutboundEgressPolicy, OutboundTargetKind};
 use crate::network_budget::{GlobalNetworkBudget, RateLimitCancellation, SharedRateLimiter};
 use crate::tracker_runtime::{
-    announce_tracker, bounded_response_body, protocol_numwant, TrackerAnnounceContext,
-    TrackerAnnounceResult, TrackerAnnounceSpec, TrackerWorkers, MAX_TRACKER_ANNOUNCES_IN_FLIGHT,
-    STOPPED_TRACKER_ANNOUNCE_DEADLINE,
+    announce_tracker, bounded_response_body, first_tracker_key, next_tracker_key, protocol_numwant,
+    tracker_keys_for_announce, tracker_keys_for_stopped_announce, url_log_target,
+    TrackerAnnounceContext, TrackerAnnounceResult, TrackerAnnounceSpec, TrackerKey, TrackerWorkers,
+    MAX_TRACKER_ANNOUNCES_IN_FLIGHT, STOPPED_TRACKER_ANNOUNCE_DEADLINE,
 };
 use crate::{EnginePeerSnapshot, EngineTorrentLimits, EngineWebseedSnapshot, TorrentRuntimeStats};
 
@@ -73,6 +75,21 @@ const LOCAL_UT_METADATA_ID: u8 = 1;
 const LOCAL_UT_PEX_ID: u8 = 2;
 const METADATA_PIECE_SIZE: usize = 16 * 1024;
 const PEER_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
+
+fn lock_prepared_files(files: &Mutex<HashSet<u32>>) -> MutexGuard<'_, HashSet<u32>> {
+    match files.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => {
+            // Prepared-file membership is an optimization. Re-preparing is
+            // safe: storage refuses to shrink existing payloads and length
+            // setup is idempotent, so discard potentially stale membership.
+            let mut guard = poisoned.into_inner();
+            guard.clear();
+            files.clear_poison();
+            guard
+        }
+    }
+}
 const PEER_UPLOAD_READ_TIMEOUT: Duration = Duration::from_secs(30);
 const PEER_SOCKET_WRITE_TIMEOUT: Duration = Duration::from_secs(10);
 const PEER_UPLOAD_REQUEST_WINDOW: Duration = Duration::from_secs(10);
@@ -127,7 +144,7 @@ fn db_i64(value: u64) -> i64 {
 }
 
 fn build_piece_map(piece_length: u64, files: &[TorrentFileV1]) -> Result<Arc<PieceMap>, String> {
-    PieceMap::new(
+    PieceMap::new_with_padding(
         piece_length,
         files
             .iter()
@@ -138,9 +155,42 @@ fn build_piece_map(piece_length: u64, files: &[TorrentFileV1]) -> Result<Arc<Pie
                 length: file.length,
             })
             .collect(),
+        files
+            .iter()
+            .filter_map(|file| file.pad.then_some(file.index)),
     )
     .map(Arc::new)
     .map_err(|error| format!("building torrent piece map: {error}"))
+}
+
+fn validate_padding_block(
+    piece_map: &PieceMap,
+    piece: u32,
+    begin: u32,
+    data: &[u8],
+) -> anyhow::Result<()> {
+    let length = u32::try_from(data.len())
+        .map_err(|_| anyhow::anyhow!("peer block length does not fit in u32"))?;
+    let regions = piece_map.validate_request(piece, begin, length)?;
+    let mut data_offset = 0usize;
+    for region in regions {
+        let region_len = usize::try_from(region.length)
+            .map_err(|_| anyhow::anyhow!("piece region length does not fit in memory"))?;
+        let end = data_offset
+            .checked_add(region_len)
+            .ok_or_else(|| anyhow::anyhow!("piece region data offset overflow"))?;
+        let region_data = data
+            .get(data_offset..end)
+            .ok_or_else(|| anyhow::anyhow!("peer block does not cover mapped piece regions"))?;
+        if region.pad && region_data.iter().any(|byte| *byte != 0) {
+            anyhow::bail!("peer block contains non-zero bytes for BEP 47 padding");
+        }
+        data_offset = end;
+    }
+    if data_offset != data.len() {
+        anyhow::bail!("mapped piece regions do not cover the peer block");
+    }
+    Ok(())
 }
 
 const TORRENT_METADATA_MEMORY_BASE: usize = 64 * 1024;
@@ -897,7 +947,30 @@ fn prepare_metadata_payload(
     info_hash: &str,
     raw: &[u8],
 ) -> (Option<Arc<Vec<u8>>>, Option<MemoryLease>) {
-    match torrent_info_bytes(raw) {
+    let mut parse_memory_lease = match crate::engine::reserve_torrent_parse_memory(
+        resources,
+        raw.len(),
+        "metadata upload extraction",
+    ) {
+        Ok(lease) => lease,
+        Err(error) => {
+            warn!(
+                component = "memory",
+                operation = "extract_upload_payload",
+                torrent = %info_hash,
+                result = "denied",
+                error = %error,
+                "disabling metadata upload because parser memory admission failed"
+            );
+            return (None, None);
+        }
+    };
+    let mut reserve = |additional| {
+        u64::try_from(additional)
+            .map(|bytes| parse_memory_lease.try_grow(bytes))
+            .unwrap_or(false)
+    };
+    match torrent_info_bytes_with_allocation_reservation(raw, &mut reserve) {
         Ok(metadata) => match reserve_metadata_payload_bytes(resources, metadata.len()) {
             Ok(lease) => (Some(Arc::new(metadata)), Some(lease)),
             Err(error) => {
@@ -1363,6 +1436,7 @@ pub struct TorrentTask {
     fastresume: FastresumeStore,
     tracker_tiers: Vec<Vec<TrackerState>>,
     active_tracker_tier: usize,
+    private_tracker_key: Option<TrackerKey>,
     tracker_event: TrackerEvent,
     stopped_announced: bool,
     listen_port: u16,
@@ -1663,6 +1737,11 @@ impl TorrentTask {
                 Vec::new()
             }
         };
+        let private_tracker_key = if meta.private {
+            first_tracker_key(&tracker_tiers)
+        } else {
+            None
+        };
         let mut task = TorrentTask {
             info_hash_hex,
             meta,
@@ -1679,6 +1758,7 @@ impl TorrentTask {
             fastresume: FastresumeStore::new(fastresume_dir),
             tracker_tiers,
             active_tracker_tier: 0,
+            private_tracker_key,
             tracker_event: TrackerEvent::Started,
             stopped_announced: paused,
             listen_port,
@@ -2037,7 +2117,7 @@ impl TorrentTask {
                                 // files now live at a verified-identical
                                 // new path, so start clean rather than
                                 // trust stale state across the move.
-                                self.prepared_files.lock().expect("prepared_files mutex poisoned").clear();
+                                lock_prepared_files(&self.prepared_files).clear();
                             }
                             if !resume_paused {
                                 match self.prepare_resume().await {
@@ -2384,6 +2464,19 @@ impl TorrentTask {
             if self.active_peers.len() >= self.peer_capacity() {
                 break;
             }
+            if let Err(error) = self.egress_policy.validate_peer_addr(addr) {
+                debug!(
+                    component = "peer",
+                    operation = "connect_outgoing",
+                    torrent = %self.info_hash_hex,
+                    peer = %addr,
+                    result = "rejected",
+                    reason = "egress_address_policy",
+                    error = %error,
+                    "skipping outgoing peer denied by address policy"
+                );
+                continue;
+            }
             if self.registry.read().await.is_peer_banned(addr) {
                 debug!(
                     component = "peer",
@@ -2488,8 +2581,25 @@ impl TorrentTask {
     }
 
     async fn connect_priority_peers(&mut self, addrs: Vec<SocketAddr>) {
-        let preferred: HashSet<SocketAddr> = addrs.iter().copied().collect();
+        let mut allowed_addrs = Vec::with_capacity(addrs.len());
         for addr in addrs {
+            if let Err(error) = self.egress_policy.validate_peer_addr(addr) {
+                debug!(
+                    component = "peer",
+                    operation = "connect_priority",
+                    torrent = %self.info_hash_hex,
+                    peer = %addr,
+                    result = "rejected",
+                    reason = "egress_address_policy",
+                    error = %error,
+                    "skipping priority peer denied by address policy"
+                );
+                continue;
+            }
+            allowed_addrs.push(addr);
+        }
+        let preferred: HashSet<SocketAddr> = allowed_addrs.iter().copied().collect();
+        for addr in allowed_addrs {
             if self.active_peers.contains_key(&addr) {
                 continue;
             }
@@ -2565,20 +2675,24 @@ impl TorrentTask {
         if available == 0 {
             return;
         }
-        let candidates = self.tracker_tiers[tier_idx]
-            .iter()
-            .enumerate()
-            .filter(|(idx, tracker)| {
-                tracker.is_due() && !self.tracker_workers.contains((tier_idx, *idx))
-            })
-            .take(available)
-            .map(|(idx, tracker)| TrackerAnnounceSpec {
-                key: (tier_idx, idx),
+        let candidates = tracker_keys_for_announce(
+            &self.tracker_tiers,
+            tier_idx,
+            self.meta.private,
+            self.private_tracker_key,
+        )
+        .into_iter()
+        .filter_map(|key @ (selected_tier, tracker_index)| {
+            let tracker = self.tracker_tiers.get(selected_tier)?.get(tracker_index)?;
+            (tracker.is_due() && !self.tracker_workers.contains(key)).then(|| TrackerAnnounceSpec {
+                key,
                 url: tracker.url.clone(),
                 tracker_id: tracker.tracker_id.clone(),
                 event: self.tracker_event,
             })
-            .collect::<Vec<_>>();
+        })
+        .take(available)
+        .collect::<Vec<_>>();
         if candidates.is_empty() {
             return;
         }
@@ -2600,6 +2714,7 @@ impl TorrentTask {
         let Some(tracker) = tier.get_mut(tracker_idx) else {
             return;
         };
+        let failed = result.response.is_err();
         match result.response {
             Ok(resp) => {
                 let peers: Vec<SocketAddr> = resp.peers.iter().map(|peer| peer.addr).collect();
@@ -2615,7 +2730,7 @@ impl TorrentTask {
                     self.remember_tracker_peers(&peers);
                     info!(
                         torrent = %self.info_hash_hex,
-                        tracker = %result.url,
+                        tracker = %url_log_target(&result.url),
                         peers = peers.len(),
                         "tracker announce returned peers"
                     );
@@ -2627,7 +2742,7 @@ impl TorrentTask {
                     component = "tracker",
                     operation = "announce",
                     torrent = %self.info_hash_hex,
-                    tracker = %result.url,
+                    tracker = %url_log_target(&result.url),
                     result = "error",
                     error = %err,
                     "tracker announce failed"
@@ -2636,7 +2751,13 @@ impl TorrentTask {
                 self.persist_tracker_state().await;
             }
         }
-        self.maybe_advance_tracker_tier(tier_idx);
+        if self.meta.private {
+            if failed {
+                self.advance_private_tracker_after_failure((tier_idx, tracker_idx));
+            }
+        } else {
+            self.maybe_advance_tracker_tier(tier_idx);
+        }
     }
 
     fn tracker_announce_context(&self, uploaded: u64, downloaded: u64) -> TrackerAnnounceContext {
@@ -2668,6 +2789,47 @@ impl TorrentTask {
         }
     }
 
+    fn advance_private_tracker_after_failure(&mut self, failed: TrackerKey) {
+        if self.private_tracker_key != Some(failed) {
+            return;
+        }
+        let Some(next) = next_tracker_key(&self.tracker_tiers, failed) else {
+            return;
+        };
+        if next == failed {
+            return;
+        }
+
+        self.cancel_tracker_announces();
+        self.disconnect_private_tracker_peers();
+        self.private_tracker_key = Some(next);
+        self.active_tracker_tier = next.0;
+        if let Some(tracker) = self
+            .tracker_tiers
+            .get_mut(next.0)
+            .and_then(|tier| tier.get_mut(next.1))
+        {
+            tracker.schedule_immediate();
+        }
+        debug!(
+            component = "tracker",
+            operation = "private_failover",
+            torrent = %self.info_hash_hex,
+            from_tier = failed.0,
+            to_tier = next.0,
+            result = "switched",
+            "private torrent advanced to the next tracker after failure"
+        );
+    }
+
+    fn disconnect_private_tracker_peers(&mut self) {
+        self.known_tracker_peers.clear();
+        let peers = self.active_peers.keys().copied().collect::<Vec<_>>();
+        for peer in peers {
+            self.evict_peer(peer);
+        }
+    }
+
     async fn announce_stopped(&mut self) {
         if !consume_stopped_announce(&mut self.stopped_announced) {
             return;
@@ -2675,21 +2837,22 @@ impl TorrentTask {
 
         let (uploaded, downloaded) = self.transfer_snapshot().await;
         let context = self.tracker_announce_context(uploaded, downloaded);
-        let candidates = self
-            .tracker_tiers
-            .iter()
-            .enumerate()
-            .flat_map(|(tier_idx, tier)| {
-                tier.iter().enumerate().map(move |(tracker_idx, tracker)| {
-                    (
-                        tier_idx,
-                        tracker_idx,
-                        tracker.url.clone(),
-                        tracker.tracker_id.clone(),
-                    )
-                })
-            })
-            .collect::<Vec<_>>();
+        let candidates = tracker_keys_for_stopped_announce(
+            &self.tracker_tiers,
+            self.meta.private,
+            self.private_tracker_key,
+        )
+        .into_iter()
+        .filter_map(|(tier_idx, tracker_idx)| {
+            let tracker = self.tracker_tiers.get(tier_idx)?.get(tracker_idx)?;
+            Some((
+                tier_idx,
+                tracker_idx,
+                tracker.url.clone(),
+                tracker.tracker_id.clone(),
+            ))
+        })
+        .collect::<Vec<_>>();
         if candidates.is_empty() {
             return;
         }
@@ -2761,7 +2924,7 @@ impl TorrentTask {
                         component = "tracker",
                         operation = "announce_stopped",
                         torrent = %self.info_hash_hex,
-                        tracker = %url,
+                        tracker = %url_log_target(&url),
                         result = "error",
                         error = %err,
                         "tracker stopped announce failed"
@@ -3427,15 +3590,15 @@ impl TorrentTask {
                 }
                 debug!(
                     torrent = %self.info_hash_hex,
-                    webseed = %self.meta.webseeds[idx],
+                    webseed = %url_log_target(&self.meta.webseeds[idx]),
                     "webseed skipped: unsupported url"
                 );
                 continue;
             };
             debug!(
                 torrent = %self.info_hash_hex,
-                webseed = %self.meta.webseeds[idx],
-                url = %url,
+                webseed = %url_log_target(&self.meta.webseeds[idx]),
+                url = %url_log_target(url.as_str()),
                 piece = req.piece,
                 offset = req.begin,
                 length = req.length,
@@ -3484,7 +3647,7 @@ impl TorrentTask {
                     });
                 }
                 Err(e) => {
-                    let err = e.to_string();
+                    let err = webseed_error_for_log(&e);
                     let failures = if let Some(failures) = self.webseed_failures.get_mut(idx) {
                         if err.contains("HTTP 404") || err.contains("HTTP 410") {
                             *failures = (*failures).max(2);
@@ -3502,7 +3665,7 @@ impl TorrentTask {
                         component = "webseed",
                         operation = "fetch_block",
                         torrent = %self.info_hash_hex,
-                        webseed = %self.meta.webseeds[idx],
+                        webseed = %url_log_target(&self.meta.webseeds[idx]),
                         piece = req.piece,
                         offset = req.begin,
                         result = "error",
@@ -3540,7 +3703,8 @@ impl TorrentTask {
             .get(url.clone())
             .header(RANGE, format!("bytes={start}-{end}"))
             .send()
-            .await?;
+            .await
+            .map_err(|error| anyhow::anyhow!(error.without_url()))?;
         validate_webseed_range_response(response.status(), response.headers(), start, end)?;
         let bytes = bounded_response_body(response, req.length as usize)
             .await
@@ -3910,6 +4074,23 @@ impl TorrentTask {
                 reason = "duplicate_block",
                 "dropping a duplicate block already accepted for this piece"
             );
+            return;
+        }
+        if let Err(error) =
+            validate_padding_block(&self.piece_map, piece, block.offset, &block.data)
+        {
+            warn!(
+                component = "torrent",
+                operation = "receive_block",
+                torrent = %self.info_hash_hex,
+                piece,
+                offset = block.offset,
+                result = "rejected",
+                error = %error,
+                "peer supplied non-zero or malformed BEP 47 padding data"
+            );
+            self.picker.cancel_request(piece as usize, block.offset);
+            self.remove_piece_assembly(piece);
             return;
         }
         let aggregate_piece_write = self.can_aggregate_piece_write(piece);
@@ -4500,9 +4681,24 @@ impl TorrentTask {
     }
 
     fn schedule_trackers_now(&mut self) {
-        for tier in &mut self.tracker_tiers {
-            for tracker in tier {
-                tracker.schedule_immediate();
+        if self.meta.private {
+            if let Some(key) = self
+                .private_tracker_key
+                .or_else(|| first_tracker_key(&self.tracker_tiers))
+            {
+                if let Some(tracker) = self
+                    .tracker_tiers
+                    .get_mut(key.0)
+                    .and_then(|tier| tier.get_mut(key.1))
+                {
+                    tracker.schedule_immediate();
+                }
+            }
+        } else {
+            for tier in &mut self.tracker_tiers {
+                for tracker in tier {
+                    tracker.schedule_immediate();
+                }
             }
         }
     }
@@ -4511,8 +4707,16 @@ impl TorrentTask {
         let tracker_tiers = tracker_tiers_from_urls(&trackers);
         self.refresh_tracker_state_memory(&tracker_tiers, tracker_tiers.capacity())?;
         self.cancel_tracker_announces();
+        if self.meta.private {
+            self.disconnect_private_tracker_peers();
+        }
         self.tracker_tiers = tracker_tiers;
-        self.active_tracker_tier = 0;
+        self.private_tracker_key = if self.meta.private {
+            first_tracker_key(&self.tracker_tiers)
+        } else {
+            None
+        };
+        self.active_tracker_tier = self.private_tracker_key.map_or(0, |(tier, _)| tier);
         self.tracker_event = TrackerEvent::Empty;
         self.schedule_trackers_now();
 
@@ -4537,8 +4741,19 @@ impl TorrentTask {
             return;
         }
         let tier_idx = self.active_tracker_tier.min(self.tracker_tiers.len() - 1);
-        for tracker in &mut self.tracker_tiers[tier_idx] {
-            tracker.schedule_immediate();
+        for (selected_tier, tracker_idx) in tracker_keys_for_announce(
+            &self.tracker_tiers,
+            tier_idx,
+            self.meta.private,
+            self.private_tracker_key,
+        ) {
+            if let Some(tracker) = self
+                .tracker_tiers
+                .get_mut(selected_tier)
+                .and_then(|tier| tier.get_mut(tracker_idx))
+            {
+                tracker.schedule_immediate();
+            }
         }
     }
 
@@ -4589,7 +4804,10 @@ impl TorrentTask {
         }
 
         crate::engine::validate_file_path_projection(
-            effective_files.iter().map(|file| file.path.as_display()),
+            effective_files
+                .iter()
+                .filter(|file| !file.pad)
+                .map(|file| file.path.as_display()),
         )?;
 
         let paths_changed = self.meta.files.len() != effective_files.len()
@@ -4642,10 +4860,7 @@ impl TorrentTask {
             self.meta.files = effective_files;
             self.piece_map = piece_map;
             self._file_policy_memory_lease = file_policy_memory_lease;
-            self.prepared_files
-                .lock()
-                .expect("prepared_files mutex poisoned")
-                .clear();
+            lock_prepared_files(&self.prepared_files).clear();
         }
 
         let piece_count = self.piece_map.piece_count as usize;
@@ -4673,6 +4888,9 @@ impl TorrentTask {
             let mut any_high = false;
             let mut any_first_last = false;
             for region in regions {
+                if region.pad {
+                    continue;
+                }
                 let (wanted, priority) =
                     policy.get(&region.file_index).copied().unwrap_or((true, 1));
                 any_wanted |= wanted && priority > 0;
@@ -5427,10 +5645,7 @@ impl TorrentTask {
                                 ..Default::default()
                             },
                         );
-                        self.prepared_files
-                            .lock()
-                            .expect("prepared_files mutex poisoned")
-                            .clear();
+                        lock_prepared_files(&self.prepared_files).clear();
                     }
                     self.paused = resume_paused;
                     self.recheck_restore_state = resume_paused.then_some(TorrentState::Paused);
@@ -5559,32 +5774,41 @@ impl TorrentTask {
     }
 
     async fn write_block(&self, block: &BlockEvent) -> anyhow::Result<()> {
-        let regions =
-            self.piece_map
-                .validate_request(block.piece, block.offset, block.data.len() as u32)?;
+        let block_len = u32::try_from(block.data.len())
+            .map_err(|_| anyhow::anyhow!("peer block length does not fit in u32"))?;
+        let regions = self
+            .piece_map
+            .validate_request(block.piece, block.offset, block_len)?;
         let mut data_offset = 0usize;
 
         for region in regions {
+            let region_len = usize::try_from(region.length)
+                .map_err(|_| anyhow::anyhow!("piece region length does not fit in memory"))?;
+            let end = data_offset
+                .checked_add(region_len)
+                .ok_or_else(|| anyhow::anyhow!("piece region data offset overflow"))?;
+            let region_data = block
+                .data
+                .get(data_offset..end)
+                .ok_or_else(|| anyhow::anyhow!("peer block does not cover mapped piece regions"))?;
+            if region.pad {
+                if region_data.iter().any(|byte| *byte != 0) {
+                    anyhow::bail!("peer block contains non-zero bytes for BEP 47 padding");
+                }
+                data_offset = end;
+                continue;
+            }
             let file = self
                 .meta
                 .files
                 .iter()
                 .find(|file| file.index == region.file_index)
                 .ok_or_else(|| anyhow::anyhow!("file index {} out of range", region.file_index))?;
-            // Padding files are still written (even though real clients
-            // never create them): `PieceVerifier::verify_piece`
-            // (rt-storage/src/verify.rs) reads every region composing a
-            // piece from disk during recheck and treats a missing file as
-            // the whole piece being unverifiable, not as an implicit-zero
-            // region. Skipping the write here would make any piece that
-            // straddles a padding boundary permanently fail recheck. See
-            // also `file.pad` handling in `collect_file_hints`/rt-migrate,
-            // which does make padding files optional for fastresume trust.
             let path = file.path.resolve(&self.save_root);
             self.prepare_file_once(file.index, &path, file.length)
                 .await?;
-            let end = data_offset + region.length as usize;
-            let data = bytes::Bytes::copy_from_slice(&block.data[data_offset..end]);
+            let data = bytes::Bytes::copy_from_slice(region_data);
+            data_offset = end;
             scheduled_write(
                 &self.storage,
                 IoClass::PeerWrite,
@@ -5594,9 +5818,11 @@ impl TorrentTask {
                 true,
             )
             .await?;
-            data_offset = end;
         }
 
+        if data_offset != block.data.len() {
+            anyhow::bail!("mapped piece regions do not cover the peer block");
+        }
         Ok(())
     }
 
@@ -5608,13 +5834,15 @@ impl TorrentTask {
             .ok_or_else(|| anyhow::anyhow!("piece {piece} is not fully assembled"))?;
         let regions = self.piece_map.piece_to_file_regions(piece)?;
         for region in regions {
+            if region.pad {
+                continue;
+            }
             let file = self
                 .meta
                 .files
                 .iter()
                 .find(|file| file.index == region.file_index)
                 .ok_or_else(|| anyhow::anyhow!("file index {} out of range", region.file_index))?;
-            // Padding files are still written - see write_block.
             let path = file.path.resolve(&self.save_root);
             self.prepare_file_once(file.index, &path, file.length)
                 .await?;
@@ -5641,10 +5869,7 @@ impl TorrentTask {
         len: u64,
     ) -> anyhow::Result<()> {
         {
-            let prepared = self
-                .prepared_files
-                .lock()
-                .expect("prepared file registry mutex poisoned");
+            let prepared = lock_prepared_files(&self.prepared_files);
             if prepared.contains(&file_index) {
                 return Ok(());
             }
@@ -5654,10 +5879,7 @@ impl TorrentTask {
             .prepare_file(path, len, self.storage.io_config().preallocation_mode)
             .await?;
 
-        let mut prepared = self
-            .prepared_files
-            .lock()
-            .expect("prepared file registry mutex poisoned");
+        let mut prepared = lock_prepared_files(&self.prepared_files);
         prepared.insert(file_index);
         Ok(())
     }
@@ -6215,6 +6437,7 @@ pub(crate) fn outgoing_transport_policy_for_peer(
 fn collect_file_hints(root: &std::path::Path, meta: &TorrentMetaV1) -> Vec<FileHint> {
     meta.files
         .iter()
+        .filter(|file| !file.pad)
         .filter_map(|file| {
             let path = file.path.resolve(root);
             let metadata = match rt_storage::metadata_no_follow(&path) {
@@ -7062,6 +7285,7 @@ pub(crate) enum PeerIo {
 pub(crate) struct UtpPeerIo {
     stream: UtpStream,
     decoder: UtpFrameDecoder,
+    write_buffer: UtpWireBuffer,
 }
 
 impl UtpPeerIo {
@@ -7069,6 +7293,7 @@ impl UtpPeerIo {
         Self {
             stream,
             decoder: UtpFrameDecoder::new(resources),
+            write_buffer: UtpWireBuffer::default(),
         }
     }
 }
@@ -7098,14 +7323,89 @@ impl PeerIo {
 
 impl UtpPeerIo {
     async fn send(&mut self, msg: Message) -> anyhow::Result<()> {
-        let _wire_memory_lease = self.decoder.reserve_outbound_message(&msg)?;
-        let encoded = msg.encode();
-        self.stream.write_all(&encoded).await?;
+        let encoded = self.write_buffer.encode(&self.decoder, &msg)?;
+        self.stream.write_all(encoded).await?;
         Ok(())
     }
 
     async fn next(&mut self) -> anyhow::Result<Option<Message>> {
         self.decoder.next_message(&mut self.stream).await
+    }
+}
+
+/// Reusable uTP write storage. Unlike TCP's `Framed` write buffer, the uTP
+/// stream path previously allocated a new `Vec<u8>` for every message. Keep
+/// one bounded frame buffer per connection and retain its resource lease for
+/// as long as the allocation is retained.
+pub(crate) struct UtpWireBuffer {
+    buffer: BytesMut,
+    lease: Option<MemoryLease>,
+}
+
+impl Default for UtpWireBuffer {
+    fn default() -> Self {
+        Self {
+            buffer: BytesMut::new(),
+            lease: None,
+        }
+    }
+}
+
+impl UtpWireBuffer {
+    pub(crate) fn encode<'a>(
+        &'a mut self,
+        decoder: &UtpFrameDecoder,
+        msg: &Message,
+    ) -> anyhow::Result<&'a [u8]> {
+        let encoded_len = msg
+            .encoded_len()
+            .ok_or_else(|| anyhow::anyhow!("peer message exceeds the wire length limit"))?;
+        self.ensure_capacity(decoder, encoded_len)?;
+        self.buffer.clear();
+        msg.encode_into(&mut self.buffer)?;
+        Ok(self.buffer.as_ref())
+    }
+
+    fn ensure_capacity(
+        &mut self,
+        decoder: &UtpFrameDecoder,
+        required: usize,
+    ) -> anyhow::Result<()> {
+        if self.buffer.capacity() < required {
+            // Acquire the next frame allowance before replacing the existing
+            // buffer. This preserves the admission check if a peer requests a
+            // larger frame, while the old allocation remains reusable when
+            // the new reservation is denied.
+            let mut lease = decoder.reserve_outbound_buffer(required)?;
+            let old_buffer = std::mem::replace(&mut self.buffer, BytesMut::new());
+            let old_lease = self.lease.take();
+            drop(old_buffer);
+            drop(old_lease);
+
+            let buffer = BytesMut::with_capacity(required);
+            let capacity = u64::try_from(buffer.capacity())
+                .map_err(|_| anyhow::anyhow!("uTP peer write buffer capacity overflow"))?;
+            if capacity > lease.bytes() && !lease.try_grow(capacity - lease.bytes()) {
+                anyhow::bail!("uTP peer write buffer allocation denied");
+            }
+            self.buffer = buffer;
+            self.lease = Some(lease);
+        } else {
+            let capacity = u64::try_from(self.buffer.capacity())
+                .map_err(|_| anyhow::anyhow!("uTP peer write buffer capacity overflow"))?;
+            match &mut self.lease {
+                Some(lease) if lease.bytes() < capacity => {
+                    if !lease.try_grow(capacity - lease.bytes()) {
+                        anyhow::bail!("uTP peer write buffer allocation denied");
+                    }
+                }
+                None => {
+                    self.lease = Some(decoder.reserve_outbound_buffer(self.buffer.capacity())?);
+                }
+                _ => {}
+            }
+        }
+        Ok(())
     }
 }
 
@@ -7144,27 +7444,12 @@ impl UtpFrameDecoder {
         self.buffer.is_empty()
     }
 
-    pub(crate) fn reserve_outbound_message(&self, msg: &Message) -> anyhow::Result<MemoryLease> {
-        let encoded_len = msg
-            .encoded_len()
-            .ok_or_else(|| anyhow::anyhow!("peer message exceeds the wire length limit"))?;
-        let payload_len = match msg {
-            // Piece data is retained under the upload block lease until the
-            // send completes. The encoded frame is the additional copy that
-            // needs admission here.
-            Message::Piece { .. } => 0,
-            Message::Bitfield(bits) => bits.len(),
-            Message::Extended { payload, .. } => payload.len(),
-            _ => 0,
-        };
-        let peak_bytes = encoded_len
-            .checked_add(payload_len)
-            .ok_or_else(|| anyhow::anyhow!("peer message memory estimate overflow"))?;
-        let peak_bytes = u64::try_from(peak_bytes)
+    pub(crate) fn reserve_outbound_buffer(&self, bytes: usize) -> anyhow::Result<MemoryLease> {
+        let bytes = u64::try_from(bytes)
             .map_err(|_| anyhow::anyhow!("peer message memory estimate does not fit in u64"))?;
         self.resources
-            .try_acquire(MemoryClass::PeerBuffer, peak_bytes)
-            .ok_or_else(|| anyhow::anyhow!("peer message allocation of {peak_bytes} bytes denied"))
+            .try_acquire(MemoryClass::PeerBuffer, bytes)
+            .ok_or_else(|| anyhow::anyhow!("peer message allocation of {bytes} bytes denied"))
     }
 
     pub(crate) async fn next_message(
@@ -7972,7 +8257,10 @@ async fn run_peer_loop(
                             operation = "read_upload_block",
                             peer = %addr,
                             result = "worker_join_error",
-                            error = %error,
+                            error = %crate::task_join_error_summary(
+                                "upload block read task",
+                                &error
+                            ),
                             "upload block worker failed"
                         );
                         start_upload_reads(
@@ -8223,6 +8511,10 @@ async fn read_upload_block(
     let regions = upload.piece_map.validate_request(piece, begin, length)?;
     let mut data = Vec::with_capacity(length as usize);
     for region in regions {
+        if region.pad {
+            data.resize(data.len() + region.length as usize, 0);
+            continue;
+        }
         let path = region.path.resolve(&upload.save_root);
         let read = scheduled_read_owned(
             &upload.storage,
@@ -8471,8 +8763,13 @@ fn webseed_retry_delay(failures: u8) -> Duration {
         .min(WEBSEED_RETRY_MAX)
 }
 
+fn webseed_error_for_log(error: &anyhow::Error) -> String {
+    rt_tracker::sanitize_tracker_message(&error.to_string())
+}
+
 #[cfg(test)]
 mod tests {
+    use rt_path::SafeRelPath;
     use sha1::{Digest, Sha1};
 
     use super::*;
@@ -8738,6 +9035,76 @@ mod tests {
         );
     }
 
+    #[test]
+    fn utp_wire_buffer_reuses_and_releases_its_memory_lease() {
+        let mut caps = [0; rt_metrics::MEMORY_CLASS_COUNT];
+        caps[MemoryClass::PeerBuffer as usize] = 128;
+        let governor = ResourceGovernor::new(rt_metrics::ResourceGovernorConfig {
+            total_cap_bytes: 128,
+            class_caps_bytes: caps,
+            pressure_constrained_pct: 75,
+            pressure_critical_pct: 90,
+        });
+        let decoder = UtpFrameDecoder::new(governor.clone());
+        let mut buffer = UtpWireBuffer::default();
+
+        let first = buffer.encode(&decoder, &Message::Have(7)).unwrap();
+        assert_eq!(first, Message::Have(7).encode());
+        let held = governor.snapshot().classes[MemoryClass::PeerBuffer as usize].used_bytes;
+        assert_eq!(held, buffer.lease.as_ref().unwrap().bytes());
+
+        let second = buffer.encode(&decoder, &Message::KeepAlive).unwrap();
+        assert_eq!(second, [0, 0, 0, 0]);
+        assert_eq!(
+            governor.snapshot().classes[MemoryClass::PeerBuffer as usize].used_bytes,
+            held
+        );
+
+        drop(buffer);
+        assert_eq!(
+            governor.snapshot().classes[MemoryClass::PeerBuffer as usize].used_bytes,
+            0
+        );
+    }
+
+    #[test]
+    fn utp_wire_buffer_keeps_old_allocation_when_growth_is_denied() {
+        let mut caps = [0; rt_metrics::MEMORY_CLASS_COUNT];
+        caps[MemoryClass::PeerBuffer as usize] = 4;
+        let governor = ResourceGovernor::new(rt_metrics::ResourceGovernorConfig {
+            total_cap_bytes: 4,
+            class_caps_bytes: caps,
+            pressure_constrained_pct: 75,
+            pressure_critical_pct: 90,
+        });
+        let decoder = UtpFrameDecoder::new(governor.clone());
+        let mut buffer = UtpWireBuffer::default();
+
+        buffer.encode(&decoder, &Message::KeepAlive).unwrap();
+        assert!(buffer
+            .encode(
+                &decoder,
+                &Message::Piece {
+                    piece: 0,
+                    begin: 0,
+                    data: vec![0; 32].into(),
+                }
+            )
+            .is_err());
+        assert_eq!(buffer.buffer.len(), 4);
+        assert_eq!(buffer.buffer.capacity(), 4);
+        assert_eq!(
+            governor.snapshot().classes[MemoryClass::PeerBuffer as usize].used_bytes,
+            4
+        );
+
+        drop(buffer);
+        assert_eq!(
+            governor.snapshot().classes[MemoryClass::PeerBuffer as usize].used_bytes,
+            0
+        );
+    }
+
     #[tokio::test]
     async fn transfer_stats_are_batched_until_progress_flush() {
         let temp = tempfile::tempdir().unwrap();
@@ -8926,6 +9293,22 @@ mod tests {
         assert_eq!(trackers[0].url, new_tracker);
         assert_eq!(trackers[0].status, "never_announced");
         assert_eq!(trackers[0].tracker_id, None);
+    }
+
+    #[test]
+    fn poisoned_prepared_file_registry_is_cleared_and_rebuilt() {
+        let prepared = Arc::new(Mutex::new(HashSet::from([3_u32])));
+        let poisoner = Arc::clone(&prepared);
+        assert!(std::thread::spawn(move || {
+            let _guard = poisoner.lock().unwrap();
+            panic!("poison the derived prepared-file registry");
+        })
+        .join()
+        .is_err());
+        assert!(prepared.is_poisoned());
+
+        assert!(lock_prepared_files(&prepared).is_empty());
+        assert!(!prepared.is_poisoned());
     }
 
     #[tokio::test]
@@ -10391,6 +10774,28 @@ mod tests {
     }
 
     #[test]
+    fn webseed_error_log_text_redacts_credentials_and_controls() {
+        let error = anyhow::anyhow!(
+            "request failed for https://seed-user:seed-secret@cdn.example/private/key?token=query-secret#fragment\n\u{001b}[31mspoof"
+        );
+
+        let message = webseed_error_for_log(&error);
+
+        assert!(message.contains("https://cdn.example/"));
+        assert!(message.contains("spoof"));
+        assert!(!message.chars().any(char::is_control));
+        for secret in [
+            "seed-user",
+            "seed-secret",
+            "private",
+            "query-secret",
+            "fragment",
+        ] {
+            assert!(!message.contains(secret), "{message}");
+        }
+    }
+
+    #[test]
     fn webseed_range_response_requires_the_requested_content_range() {
         let mut headers = reqwest::header::HeaderMap::new();
         headers.insert(
@@ -10591,7 +10996,8 @@ mod tests {
         // every OTHER file that does exist on disk.
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("present.bin"), b"hello").unwrap();
-        // "missing.bin" is intentionally never created.
+        // The missing data file and synthetic pad entry are both omitted
+        // without suppressing a hint for the present payload file.
 
         let meta = TorrentMetaV1 {
             info_hash: [1; 20],
@@ -10618,6 +11024,13 @@ mod tests {
                     path: rt_path::SafeRelPath::from_name("missing.bin", false).unwrap(),
                     offset: 5,
                     pad: false,
+                },
+                rt_metainfo::TorrentFileV1 {
+                    index: 2,
+                    length: 11,
+                    path: rt_path::SafeRelPath::from_components(&[".pad", "11"], false).unwrap(),
+                    offset: 5,
+                    pad: true,
                 },
             ],
             private: false,
@@ -11947,6 +12360,106 @@ mod tests {
         ));
     }
 
+    #[tokio::test]
+    async fn private_tracker_failover_disconnects_old_peers_and_clears_allowlist() {
+        let temp = tempfile::tempdir().unwrap();
+        let conn = Connection::open_in_memory().unwrap();
+        rt_db::migrate(&conn).unwrap();
+        let meta = TorrentMetaV1 {
+            info_hash: [26; 20],
+            announce: None,
+            announce_list: Vec::new(),
+            webseeds: Vec::new(),
+            comment: None,
+            created_by: None,
+            creation_date: None,
+            name: "private-failover.bin".into(),
+            piece_length: 4,
+            pieces: vec![[0; 20]],
+            files: vec![rt_metainfo::TorrentFileV1 {
+                index: 0,
+                length: 4,
+                path: SafeRelPath::from_name("private-failover.bin", false).unwrap(),
+                offset: 0,
+                pad: false,
+            }],
+            private: true,
+            raw: Vec::new(),
+        };
+        let db = Arc::new(Mutex::new(conn));
+        let (_cmd_tx, cmd_rx) = mpsc::channel(1);
+        let mut task = TorrentTask::new(
+            meta,
+            temp.path().to_path_buf(),
+            false,
+            TorrentState::Downloading,
+            Arc::new(RwLock::new(SessionRegistry::new())),
+            DbExecutor::direct(Arc::clone(&db)),
+            ResourceGovernor::new(rt_metrics::ResourceGovernorConfig::default()),
+            cmd_rx,
+            temp.path().join("fastresume"),
+            8,
+            6881,
+            10,
+            10,
+            60,
+            1024 * 1024,
+            StorageIoConfig::default(),
+            false,
+            OutboundEgressPolicy::default(),
+            GlobalNetworkBudget::unlimited(),
+            10_000,
+            None,
+        )
+        .await;
+        task.tracker_tiers = vec![vec![
+            TrackerState::new("https://a.example/announce"),
+            TrackerState::new("https://b.example/announce"),
+        ]];
+        task.private_tracker_key = Some((0, 0));
+
+        let peer: SocketAddr = "127.0.0.1:6881".parse().unwrap();
+        let permits = Arc::new(tokio::sync::Semaphore::new(1));
+        let (_peer_id, _peer_cmd_rx) = task
+            .register_peer(peer, permits.acquire_owned().await.unwrap())
+            .expect("peer registration should fit the memory budget");
+        task.known_tracker_peers.insert(peer);
+
+        task.advance_private_tracker_after_failure((0, 0));
+
+        assert_eq!(task.private_tracker_key, Some((0, 1)));
+        assert!(task.active_peers.is_empty());
+        assert!(task.known_tracker_peers.is_empty());
+        assert!(task.tracker_tiers[0][1].is_due());
+    }
+
+    #[test]
+    fn v1_padding_bytes_must_be_zero() {
+        let files = vec![
+            TorrentFileV1 {
+                index: 0,
+                length: 3,
+                path: SafeRelPath::from_name("payload.bin", false).unwrap(),
+                offset: 0,
+                pad: false,
+            },
+            TorrentFileV1 {
+                index: 1,
+                length: 13,
+                path: SafeRelPath::from_components(&[".pad", "13"], false).unwrap(),
+                offset: 3,
+                pad: true,
+            },
+        ];
+        let piece_map = build_piece_map(16, &files).unwrap();
+        let mut block = b"abc".to_vec();
+        block.resize(16, 0);
+        assert!(validate_padding_block(&piece_map, 0, 0, &block).is_ok());
+
+        block[7] = 1;
+        assert!(validate_padding_block(&piece_map, 0, 0, &block).is_err());
+    }
+
     #[test]
     fn peer_availability_reconcile_counts_only_transitions() {
         let mut availability = Availability::new(4);
@@ -12051,6 +12564,46 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn upload_block_synthesizes_missing_bep47_padding() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("payload.bin"), b"abc").unwrap();
+        let files = vec![
+            FileSpan {
+                file_index: 0,
+                path: SafeRelPath::from_name("payload.bin", false).unwrap(),
+                content_offset: 0,
+                length: 3,
+            },
+            FileSpan {
+                file_index: 1,
+                path: SafeRelPath::from_components(&[".pad", "13"], false).unwrap(),
+                content_offset: 3,
+                length: 13,
+            },
+        ];
+        let piece_map = Arc::new(PieceMap::new_with_padding(16, files, [1]).unwrap());
+        let upload = UploadReadContext {
+            save_root: dir.path().to_path_buf(),
+            piece_map,
+            storage: MountScheduler::new_for_path(
+                StorageRootId::new(),
+                dir.path(),
+                &SchedulerConfig {
+                    profile: StorageProfile::Unknown,
+                    ..Default::default()
+                },
+            ),
+            resources: ResourceGovernor::new(rt_metrics::ResourceGovernorConfig::default()),
+        };
+
+        let block = read_upload_block(&upload, 0, 0, 16).await.unwrap();
+        let mut expected = b"abc".to_vec();
+        expected.resize(16, 0);
+        assert_eq!(block.data.as_ref(), expected.as_slice());
+        assert!(!dir.path().join(".pad/13").exists());
+    }
+
     #[test]
     fn upload_context_piece_map_is_shared_not_deep_cloned_per_peer() {
         // TNG-014: `UploadContext.piece_map` used to be an owned `PieceMap`,
@@ -12100,9 +12653,10 @@ mod tests {
         )]));
         let payload_len = torrent_info_bytes(&raw).unwrap().len();
         let mut class_caps_bytes = [0; rt_metrics::MEMORY_CLASS_COUNT];
-        class_caps_bytes[MemoryClass::Metadata as usize] = payload_len as u64;
+        let class_cap_bytes = payload_len as u64 + 1024 * 1024;
+        class_caps_bytes[MemoryClass::Metadata as usize] = class_cap_bytes;
         let governor = ResourceGovernor::new(rt_metrics::ResourceGovernorConfig {
-            total_cap_bytes: payload_len as u64,
+            total_cap_bytes: class_cap_bytes,
             class_caps_bytes,
             pressure_constrained_pct: 75,
             pressure_critical_pct: 90,

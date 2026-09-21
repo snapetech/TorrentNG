@@ -1,6 +1,6 @@
 /// BEP 3 peer wire messages.
 use crate::error::WireError;
-use bytes::Bytes;
+use bytes::{BufMut, Bytes, BytesMut};
 
 /// Hard cap: 2 MiB per message (largest legal piece block is 16 KiB, but allow some headroom).
 pub const MAX_MESSAGE_LEN: u32 = 2 * 1024 * 1024;
@@ -217,6 +217,123 @@ impl Message {
         }
     }
 
+    /// Append the length-prefixed wire frame directly to a reusable buffer.
+    ///
+    /// The regular [`Message::encode`] API remains convenient for protocol
+    /// callers that need an owned `Vec<u8>`. Engine socket paths can use this
+    /// method to avoid constructing that temporary vector before copying the
+    /// frame into a retained write buffer.
+    pub fn encode_into(&self, dst: &mut BytesMut) -> Result<(), WireError> {
+        let encoded_len = self
+            .encoded_len()
+            .ok_or(WireError::MessageTooLarge(u32::MAX))?;
+        if dst.remaining_mut() < encoded_len {
+            dst.reserve(encoded_len - dst.remaining_mut());
+        }
+
+        match self {
+            Message::KeepAlive => dst.put_u32(0),
+            Message::Choke => put_fixed(dst, 0, &[]),
+            Message::Unchoke => put_fixed(dst, 1, &[]),
+            Message::Interested => put_fixed(dst, 2, &[]),
+            Message::NotInterested => put_fixed(dst, 3, &[]),
+            Message::Have(idx) => put_fixed(dst, 4, &idx.to_be_bytes()),
+            Message::Bitfield(bits) => {
+                dst.put_u32((1 + bits.len()) as u32);
+                dst.put_u8(5);
+                dst.put_slice(bits);
+            }
+            Message::Request {
+                piece,
+                begin,
+                length,
+            } => put_fixed(dst, 6, &encode_3u32(*piece, *begin, *length)),
+            Message::Piece { piece, begin, data } => {
+                dst.put_u32((1 + 4 + 4 + data.len()) as u32);
+                dst.put_u8(7);
+                dst.put_u32(*piece);
+                dst.put_u32(*begin);
+                dst.put_slice(data);
+            }
+            Message::Cancel {
+                piece,
+                begin,
+                length,
+            } => put_fixed(dst, 8, &encode_3u32(*piece, *begin, *length)),
+            Message::Reject {
+                piece,
+                begin,
+                length,
+            } => put_fixed(dst, 16, &encode_3u32(*piece, *begin, *length)),
+            Message::HaveAll => put_fixed(dst, 14, &[]),
+            Message::HaveNone => put_fixed(dst, 15, &[]),
+            Message::Extended { ext_id, payload } => {
+                dst.put_u32((1 + 1 + payload.len()) as u32);
+                dst.put_u8(20);
+                dst.put_u8(*ext_id);
+                dst.put_slice(payload);
+            }
+            Message::HashRequest {
+                pieces_root,
+                base_layer,
+                index,
+                length,
+                proof_layers,
+            } => put_hash_exchange(
+                dst,
+                21,
+                &HashExchangeHeader {
+                    pieces_root,
+                    base_layer: *base_layer,
+                    index: *index,
+                    length: *length,
+                    proof_layers: *proof_layers,
+                },
+                &[],
+            ),
+            Message::Hashes {
+                pieces_root,
+                base_layer,
+                index,
+                length,
+                proof_layers,
+                hashes,
+            } => {
+                let hashes_len = hashes.len().saturating_mul(32);
+                let message_len = 1 + HASH_EXCHANGE_HEADER_LEN + hashes_len;
+                dst.put_u32(message_len as u32);
+                dst.put_u8(22);
+                dst.put_slice(pieces_root);
+                dst.put_u32(*base_layer);
+                dst.put_u32(*index);
+                dst.put_u32(*length);
+                dst.put_u32(*proof_layers);
+                for hash in hashes {
+                    dst.put_slice(hash);
+                }
+            }
+            Message::HashReject {
+                pieces_root,
+                base_layer,
+                index,
+                length,
+                proof_layers,
+            } => put_hash_exchange(
+                dst,
+                23,
+                &HashExchangeHeader {
+                    pieces_root,
+                    base_layer: *base_layer,
+                    index: *index,
+                    length: *length,
+                    proof_layers: *proof_layers,
+                },
+                &[],
+            ),
+        }
+        Ok(())
+    }
+
     /// Parse a single message from a complete payload (after length prefix has been consumed).
     /// `payload` is the bytes after the 4-byte length field; empty = keepalive.
     pub fn parse(payload: &[u8]) -> Result<Self, WireError> {
@@ -429,6 +546,32 @@ fn encode_fixed(id: u8, body: &[u8]) -> Vec<u8> {
     v
 }
 
+fn put_fixed(dst: &mut BytesMut, id: u8, body: &[u8]) {
+    dst.put_u32((1 + body.len()) as u32);
+    dst.put_u8(id);
+    dst.put_slice(body);
+}
+
+struct HashExchangeHeader<'a> {
+    pieces_root: &'a [u8; 32],
+    base_layer: u32,
+    index: u32,
+    length: u32,
+    proof_layers: u32,
+}
+
+fn put_hash_exchange(dst: &mut BytesMut, id: u8, header: &HashExchangeHeader<'_>, hashes: &[u8]) {
+    let message_len = 1 + HASH_EXCHANGE_HEADER_LEN + hashes.len();
+    dst.put_u32(message_len as u32);
+    dst.put_u8(id);
+    dst.put_slice(header.pieces_root);
+    dst.put_u32(header.base_layer);
+    dst.put_u32(header.index);
+    dst.put_u32(header.length);
+    dst.put_u32(header.proof_layers);
+    dst.put_slice(hashes);
+}
+
 fn encode_3u32(a: u32, b: u32, c: u32) -> [u8; 12] {
     let mut buf = [0u8; 12];
     buf[0..4].copy_from_slice(&a.to_be_bytes());
@@ -463,6 +606,39 @@ mod tests {
         let encoded = msg.encode();
         // Skip 4-byte length prefix
         Message::parse(&encoded[4..]).unwrap()
+    }
+
+    #[test]
+    fn encode_into_matches_owned_encoding() {
+        let messages = [
+            Message::KeepAlive,
+            Message::Have(42),
+            Message::Bitfield(vec![0xFF, 0xA0, 0x00]),
+            Message::Piece {
+                piece: 3,
+                begin: 16_384,
+                data: Bytes::from(vec![0xAB; 1024]),
+            },
+            Message::Extended {
+                ext_id: 3,
+                payload: b"d1:md11:ut_metadatai1eee".to_vec(),
+            },
+            Message::Hashes {
+                pieces_root: [0x22; 32],
+                base_layer: 1,
+                index: 0,
+                length: 2,
+                proof_layers: 0,
+                hashes: vec![[0x33; 32], [0x44; 32]],
+            },
+        ];
+
+        for message in messages {
+            let expected = message.encode();
+            let mut actual = BytesMut::new();
+            message.encode_into(&mut actual).unwrap();
+            assert_eq!(actual.as_ref(), expected.as_slice());
+        }
     }
 
     #[test]

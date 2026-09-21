@@ -2,7 +2,9 @@
 use std::fs::File;
 #[cfg(target_os = "linux")]
 use std::io::Read;
-use std::path::{Path, PathBuf};
+use std::path::Path;
+#[cfg(target_os = "linux")]
+use std::path::PathBuf;
 
 use rt_path::StorageProfile;
 

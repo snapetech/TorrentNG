@@ -8,7 +8,7 @@
 
 use std::{
     collections::HashMap,
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, MutexGuard},
     time::{Duration, Instant},
 };
 
@@ -103,8 +103,22 @@ impl IdempotencyStore {
         })
     }
 
+    fn lock_state(&self) -> MutexGuard<'_, StoreState> {
+        match self.state.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => {
+                // In-flight claims prevent duplicate mutations and completed
+                // entries serve exact retries. Retain both rather than
+                // clearing state and silently weakening idempotency.
+                let guard = poisoned.into_inner();
+                self.state.clear_poison();
+                guard
+            }
+        }
+    }
+
     pub fn claim(&self, key: &str, fingerprint: [u8; 32]) -> Claim {
-        let mut state = self.state.lock().expect("idempotency mutex poisoned");
+        let mut state = self.lock_state();
         let now = Instant::now();
         {
             let StoreState {
@@ -163,7 +177,7 @@ impl IdempotencyStore {
     pub fn complete(&self, key: &str, fingerprint: [u8; 32], response: CachedResponse) -> bool {
         let response_bytes = cached_response_size(&response);
         let (notify, cached) = {
-            let mut state = self.state.lock().expect("idempotency mutex poisoned");
+            let mut state = self.lock_state();
             let Some(entry) = state.entries.get(key) else {
                 return false;
             };
@@ -226,7 +240,7 @@ impl IdempotencyStore {
 
     pub fn abandon(&self, key: &str, fingerprint: [u8; 32]) {
         let notify = {
-            let mut state = self.state.lock().expect("idempotency mutex poisoned");
+            let mut state = self.lock_state();
             let should_remove = state
                 .entries
                 .get(key)
@@ -390,5 +404,35 @@ mod tests {
         assert!(matches!(store.claim("cache-2", second), Claim::Replay(_)));
         let third = fingerprint(b"cache-3");
         assert!(matches!(store.claim("cache-3", third), Claim::Replay(_)));
+    }
+
+    #[test]
+    fn poisoned_store_preserves_inflight_claim_and_replay_state() {
+        let store = IdempotencyStore::new();
+        let key = "request-after-poison";
+        let fp = fingerprint(b"same mutation");
+        assert!(matches!(store.claim(key, fp), Claim::Execute));
+
+        let poisoner = Arc::clone(&store.state);
+        assert!(std::thread::spawn(move || {
+            let _guard = poisoner.lock().unwrap();
+            panic!("poison idempotency state");
+        })
+        .join()
+        .is_err());
+        assert!(store.state.is_poisoned());
+
+        assert!(matches!(store.claim(key, fp), Claim::Wait(_)));
+        assert!(!store.state.is_poisoned());
+        assert!(store.complete(
+            key,
+            fp,
+            CachedResponse {
+                status: 204,
+                headers: Vec::new(),
+                body: Vec::new(),
+            },
+        ));
+        assert!(matches!(store.claim(key, fp), Claim::Replay(response) if response.status == 204));
     }
 }

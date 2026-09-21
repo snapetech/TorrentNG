@@ -2,9 +2,10 @@
 //!
 //! Wires the three Storage NG primitives together — the open-handle cache,
 //! the bounded frame pool, and the disk backend — behind one accessor.
-//! Resources are *global* by design: a single fd budget and a single byte
-//! budget shared by every torrent, so cost scales with active transfer,
-//! not with torrent count.
+//! The frame-pool byte budget is process-wide. Each storage file cache uses
+//! the RLIMIT-derived local ceiling for cache-plus-in-flight descriptor
+//! admission, and all such caches draw from one shared managed-storage lease
+//! quota. Unrelated process descriptors remain separate.
 //!
 //! Configuration is read from the environment at first use (defaults are
 //! sized for a large seedbox):
@@ -14,7 +15,6 @@
 //! - `TNG_STORAGE_DISK_THREADS`     backend worker threads (default: cores/2)
 //! - `TNG_STORAGE_HANDLE_IDLE_SECS` idle handle TTL      (default 30)
 
-use std::fs::File;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
@@ -25,9 +25,9 @@ use crate::backend::{
     BackendKind, BackendRequest, DiskBackend, FixedBufferStrategy, SelectedDiskBackend,
 };
 use crate::error::StorageError;
-use crate::fd_limit::{handle_cache_capacity, raise_nofile_limit};
+use crate::fd_limit::process_handle_cache_capacity;
 use crate::frame::{global_frame_pool, Frame, FramePool};
-use crate::handle_cache::HandleCache;
+use crate::handle_cache::{HandleCache, OpenFile};
 
 const DEFAULT_HANDLE_IDLE_SECS: u64 = 30;
 /// How often the background sweeper closes idle handles.
@@ -42,8 +42,7 @@ pub struct StorageRuntime {
 
 impl StorageRuntime {
     fn from_env() -> Self {
-        let soft_nofile = raise_nofile_limit();
-        let cap = handle_cache_capacity(soft_nofile);
+        let cap = process_handle_cache_capacity();
 
         let idle_secs = env_u64("TNG_STORAGE_HANDLE_IDLE_SECS", DEFAULT_HANDLE_IDLE_SECS);
         let handles = HandleCache::new(cap, Duration::from_secs(idle_secs));
@@ -118,6 +117,11 @@ impl StorageRuntime {
         self.handles.len()
     }
 
+    /// Descriptor leases held by cached entries, open attempts, or storage jobs.
+    pub fn handles_active(&self) -> usize {
+        self.handles.active_descriptors()
+    }
+
     /// Frame-pool bytes currently checked out.
     pub fn frame_in_use_bytes(&self) -> u64 {
         self.frames.in_use_bytes()
@@ -161,17 +165,17 @@ impl StorageRuntime {
         self.backend.fixed_buffer_strategy()
     }
 
-    fn open_read(&self, path: &Path) -> Result<Arc<File>, StorageError> {
+    async fn open_read(&self, path: &Path) -> Result<Arc<OpenFile>, StorageError> {
         self.handles
-            .get_or_open(path, false, false)
-            .map(|h| h.file())
+            .get_or_open_async(path, false, false)
+            .await
             .map_err(|e| StorageError::io(path.display().to_string(), e))
     }
 
-    fn open_write(&self, path: &Path, create: bool) -> Result<Arc<File>, StorageError> {
+    async fn open_write(&self, path: &Path, create: bool) -> Result<Arc<OpenFile>, StorageError> {
         self.handles
-            .get_or_open(path, true, create)
-            .map(|h| h.file())
+            .get_or_open_async(path, true, create)
+            .await
             .map_err(|e| StorageError::io(path.display().to_string(), e))
     }
 
@@ -184,14 +188,18 @@ impl StorageRuntime {
         offset: u64,
         len: usize,
     ) -> Result<Frame, StorageError> {
-        let file = self.open_read(path)?;
+        let file = self.open_read(path).await?;
         let frame = self
             .frames
             .try_acquire(len)
             .ok_or_else(|| StorageError::QueueFull {
                 mount: "frame-pool".to_string(),
             })?;
-        match self.backend.pread(file, frame, offset).await {
+        match self
+            .backend
+            .pread_leased(file.leased_handle(), frame, offset)
+            .await
+        {
             Ok(Ok(frame)) => Ok(frame),
             Ok(Err(e)) => Err(map_backend_io_error(path, e, Some(len))),
             Err(_) => Err(StorageError::Cancelled),
@@ -207,9 +215,13 @@ impl StorageRuntime {
         data: bytes::Bytes,
         create: bool,
     ) -> Result<(), StorageError> {
-        let file = self.open_write(path, create)?;
+        let file = self.open_write(path, create).await?;
         let len = data.len();
-        match self.backend.pwrite(file, data, offset).await {
+        match self
+            .backend
+            .pwrite_leased(file.leased_handle(), data, offset)
+            .await
+        {
             Ok(Ok(())) => Ok(()),
             Ok(Err(e)) => Err(map_backend_io_error(path, e, Some(len))),
             Err(_) => Err(StorageError::Cancelled),

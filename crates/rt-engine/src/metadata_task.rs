@@ -2,13 +2,16 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::future::Future;
 use std::mem::size_of;
 use std::net::SocketAddr;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::Context;
 use futures::{stream::FuturesUnordered, SinkExt, StreamExt};
-use rt_bencode::decode;
+use rt_bencode::decode_with_allocation_reservation;
 use rt_hash::{hash_pair, merkle_root, V2_BLOCK_SIZE};
-use rt_metainfo::{v2_piece_layer_requirements, V2PieceLayerRequirement};
+use rt_metainfo::{
+    v2_piece_layer_requirements_with_allocation_reservation, V2PieceLayerRequirement,
+};
 use rt_metrics::{MemoryClass, MemoryLease, ResourceGovernor};
 use rt_peer_wire::{
     codec::PeerCodec,
@@ -16,6 +19,7 @@ use rt_peer_wire::{
     handshake::{ExtensionFlags, Handshake},
     message::Message,
 };
+use rt_session::SessionRegistry;
 use rt_tracker::{
     udp::{UdpAnnounceRequest, UdpAnnounceResponse, UdpConnectRequest, UdpConnectResponse},
     AnnounceRequest, AnnounceResponse, InfoHash, TrackerError, TrackerEvent, MAX_TRACKER_PEERS,
@@ -25,7 +29,7 @@ use sha1::{Digest as Sha1Digest, Sha1};
 use sha2::{Digest as Sha2Digest, Sha256};
 use tokio::net::TcpStream;
 use tokio::net::UdpSocket;
-use tokio::sync::{mpsc, OwnedSemaphorePermit};
+use tokio::sync::{mpsc, OwnedSemaphorePermit, RwLock};
 use tokio::time::{interval, timeout, Interval};
 use tokio_util::codec::Framed;
 use tracing::{debug, warn};
@@ -34,8 +38,8 @@ use url::Url;
 use crate::command::EngineCmd;
 use crate::egress_policy::{OutboundEgressPolicy, OutboundTargetKind};
 use crate::network_budget::GlobalNetworkBudget;
-use crate::torrent_task::{TorrentCmd, UtpFrameDecoder};
-use crate::tracker_runtime::{is_udp_tracker_url, protocol_numwant};
+use crate::torrent_task::{TorrentCmd, UtpFrameDecoder, UtpWireBuffer};
+use crate::tracker_runtime::{is_udp_tracker_url, protocol_numwant, url_log_target};
 
 const METADATA_PIECE_SIZE: usize = 16 * 1024;
 const MAX_METADATA_SIZE: u32 = 16 * 1024 * 1024;
@@ -75,6 +79,7 @@ struct FetchedMetadata {
 pub(crate) enum MetadataInfoHash {
     V1([u8; 20]),
     V2([u8; 32]),
+    Hybrid { v1: [u8; 20], v2: [u8; 32] },
 }
 
 impl MetadataInfoHash {
@@ -82,6 +87,7 @@ impl MetadataInfoHash {
         match self {
             Self::V1(hash) => hash,
             Self::V2(hash) => hash[..20].try_into().expect("v2 hash has 20-byte prefix"),
+            Self::Hybrid { v1, .. } => v1,
         }
     }
 
@@ -104,6 +110,21 @@ pub(crate) fn parse_metadata_info_hash_hex(value: &str) -> Result<MetadataInfoHa
             Ok(MetadataInfoHash::V2(bytes.try_into().map_err(|_| ())?))
         }
         _ => Err(()),
+    }
+}
+
+/// Restore the full expected identity for a metadata-pending magnet. Hybrid
+/// magnets use the v1 hash as their durable row key but must retain and verify
+/// the v2 digest supplied by the same magnet.
+pub(crate) fn metadata_info_hash_with_v2(
+    value: &str,
+    expected_v2_hash: Option<[u8; 32]>,
+) -> Result<MetadataInfoHash, ()> {
+    match (parse_metadata_info_hash_hex(value)?, expected_v2_hash) {
+        (MetadataInfoHash::V1(v1), Some(v2)) => Ok(MetadataInfoHash::Hybrid { v1, v2 }),
+        (MetadataInfoHash::V2(_), Some(_)) => Err(()),
+        (MetadataInfoHash::Hybrid { .. }, _) => Err(()),
+        (identity, None) => Ok(identity),
     }
 }
 
@@ -294,6 +315,7 @@ pub async fn run_metadata_task(
     mut cmd_rx: mpsc::Receiver<TorrentCmd>,
     engine_tx: mpsc::Sender<EngineCmd>,
     task_tx: mpsc::Sender<TorrentCmd>,
+    registry: Arc<RwLock<SessionRegistry>>,
     resources: ResourceGovernor,
     listen_port: u16,
     max_peers: usize,
@@ -328,9 +350,11 @@ pub async fn run_metadata_task(
                     &trackers,
                     direct_peers.clone(),
                     max_peers,
+                    &egress_policy,
                     &mut peer_attempts,
                     &engine_tx,
                     &task_tx,
+                    &registry,
                     &resources,
                     &network_budget,
                 ),
@@ -378,9 +402,11 @@ pub async fn run_metadata_task(
                                 &trackers,
                                 peers,
                                 max_peers,
+                                &egress_policy,
                                 &mut peer_attempts,
                                 &engine_tx,
                                 &task_tx,
+                                &registry,
                                 &resources,
                                 &network_budget,
                             ),
@@ -673,9 +699,11 @@ pub async fn run_metadata_task(
                             &trackers,
                             direct_peers.clone(),
                             max_peers,
+                            &egress_policy,
                             &mut peer_attempts,
                             &engine_tx,
                             &task_tx,
+                            &registry,
                             &resources,
                             &network_budget,
                         )
@@ -705,9 +733,11 @@ pub async fn run_metadata_task(
                         &trackers,
                         peers,
                         max_peers,
+                        &egress_policy,
                         &mut peer_attempts,
                         &engine_tx,
                         &task_tx,
+                        &registry,
                         &resources,
                         &network_budget,
                     )
@@ -951,19 +981,26 @@ async fn try_fetch_from_peers(
     trackers: &[String],
     peers: Vec<SocketAddr>,
     max_peers: usize,
+    egress_policy: &OutboundEgressPolicy,
     peer_attempts: &mut HashMap<SocketAddr, Instant>,
     engine_tx: &mpsc::Sender<EngineCmd>,
     task_tx: &mpsc::Sender<TorrentCmd>,
+    registry: &Arc<RwLock<SessionRegistry>>,
     resources: &ResourceGovernor,
     network_budget: &GlobalNetworkBudget,
 ) -> bool {
-    let mut candidates = metadata_fetch_candidates(
-        peers,
-        peer_attempts,
-        Instant::now(),
-        metadata_peer_attempt_cache_cap(max_peers),
-        metadata_peer_candidate_cap(max_peers),
-    );
+    let mut candidates = {
+        let registry = registry.read().await;
+        metadata_fetch_candidates(
+            peers,
+            egress_policy,
+            &registry,
+            peer_attempts,
+            Instant::now(),
+            metadata_peer_attempt_cache_cap(max_peers),
+            metadata_peer_candidate_cap(max_peers),
+        )
+    };
     let mut in_flight = FuturesUnordered::new();
 
     while in_flight.len() < MAX_METADATA_FETCH_CONCURRENCY {
@@ -975,6 +1012,8 @@ async fn try_fetch_from_peers(
             info_hash,
             resources.clone(),
             network_budget.clone(),
+            Arc::clone(registry),
+            *egress_policy,
         ));
     }
 
@@ -1004,6 +1043,8 @@ async fn try_fetch_from_peers(
                 info_hash,
                 resources.clone(),
                 network_budget.clone(),
+                Arc::clone(registry),
+                *egress_policy,
             ));
         }
     }
@@ -1077,6 +1118,8 @@ fn metadata_tracker_peer_collection_bytes(peer_cap: usize) -> u64 {
 
 fn metadata_fetch_candidates(
     peers: Vec<SocketAddr>,
+    egress_policy: &OutboundEgressPolicy,
+    registry: &SessionRegistry,
     peer_attempts: &mut HashMap<SocketAddr, Instant>,
     now: Instant,
     attempt_cap: usize,
@@ -1087,6 +1130,29 @@ fn metadata_fetch_candidates(
     for peer in peers {
         if candidates.len() >= candidate_cap {
             break;
+        }
+        if registry.is_peer_banned(peer) {
+            debug!(
+                component = "metadata",
+                operation = "fetch_peer",
+                peer = %peer,
+                result = "rejected",
+                reason = "peer_banned",
+                "skipping banned metadata peer"
+            );
+            continue;
+        }
+        if let Err(error) = egress_policy.validate_peer_addr(peer) {
+            debug!(
+                component = "metadata",
+                operation = "fetch_peer",
+                peer = %peer,
+                result = "rejected",
+                reason = "egress_address_policy",
+                error = %error,
+                "skipping metadata peer denied by address policy"
+            );
+            continue;
         }
         if !should_retry_peer(peer_attempts, peer, now) {
             continue;
@@ -1120,7 +1186,38 @@ async fn metadata_fetch_attempt(
     info_hash: MetadataInfoHash,
     resources: ResourceGovernor,
     network_budget: GlobalNetworkBudget,
+    registry: Arc<RwLock<SessionRegistry>>,
+    egress_policy: OutboundEgressPolicy,
 ) -> (SocketAddr, anyhow::Result<FetchedMetadata>) {
+    if let Err(error) = egress_policy.validate_peer_addr(peer) {
+        debug!(
+            component = "metadata",
+            operation = "connect_peer",
+            peer = %peer,
+            result = "rejected",
+            reason = "egress_address_policy",
+            error = %error,
+            "denying metadata peer before opening an outbound transport"
+        );
+        return (
+            peer,
+            Err(anyhow::anyhow!(
+                "metadata peer denied by egress policy: {error}"
+            )),
+        );
+    }
+    let peer_banned = registry.read().await.is_peer_banned(peer);
+    if peer_banned {
+        debug!(
+            component = "metadata",
+            operation = "connect_peer",
+            peer = %peer,
+            result = "rejected",
+            reason = "peer_banned",
+            "denying banned metadata peer before opening an outbound transport"
+        );
+        return (peer, Err(anyhow::anyhow!("metadata peer is banned")));
+    }
     let result = match network_budget.try_acquire_peer() {
         Ok(_peer_permit) => match metadata_outgoing_transport_policy() {
             MetadataTransportPolicy::TcpOnly => {
@@ -1315,7 +1412,7 @@ async fn announce_trackers(
                         component = "metadata",
                         operation = "tracker_announce",
                         torrent = %info_hash_hex,
-                        tracker = %tracker,
+                        tracker = %url_log_target(tracker),
                         result = "error",
                         error = %err,
                         "metadata tracker announce failed"
@@ -1399,7 +1496,7 @@ async fn announce_http(
         if e.is_timeout() {
             TrackerError::Timeout
         } else {
-            TrackerError::Network(e.to_string())
+            TrackerError::Network(e.without_url().to_string())
         }
     })?;
     if !response.status().is_success() {
@@ -1598,6 +1695,7 @@ async fn fetch_from_outgoing_utp_peer(
         MetadataPeerIo::Utp {
             stream: Box::new(stream),
             decoder: UtpFrameDecoder::new(resources.clone()),
+            write_buffer: UtpWireBuffer::default(),
         },
         remote_hs.reserved.supports_extension_protocol(),
         remote_hs.reserved.supports_v2(),
@@ -1624,6 +1722,7 @@ async fn fetch_from_incoming_utp_peer(
         MetadataPeerIo::Utp {
             stream: Box::new(stream),
             decoder: UtpFrameDecoder::new(resources.clone()),
+            write_buffer: UtpWireBuffer::default(),
         },
         remote_hs.reserved.supports_extension_protocol(),
         remote_hs.reserved.supports_v2(),
@@ -1819,14 +1918,24 @@ async fn fetch_metadata_over_io_inner(
     }
 
     metadata.truncate(metadata_size as usize);
-    decode(&metadata).context("fetched metadata is not valid bencode")?;
+    let mut reserve_parser_memory = |additional| {
+        u64::try_from(additional)
+            .map(|bytes| lease.try_grow(bytes))
+            .unwrap_or(false)
+    };
+    decode_with_allocation_reservation(&metadata, &mut reserve_parser_memory)
+        .context("fetched metadata is not valid bencode")?;
     validate_metadata_info_hash(&metadata, expected_info_hash)?;
     if expected_info_hash.is_v2() && !remote_supports_v2 {
         anyhow::bail!("pure-v2 metadata peer does not advertise BEP 52 support");
     }
 
-    let requirements = v2_piece_layer_requirements(&metadata)
-        .context("fetched metadata has an invalid v2 file tree")?;
+    let requirements = v2_piece_layer_requirements_with_allocation_reservation(
+        &metadata,
+        &mut reserve_parser_memory,
+    )
+    .context("fetched metadata has an invalid v2 file tree")?;
+    drop(reserve_parser_memory);
     let mut piece_layers = Vec::new();
     if let Some(requirements) = requirements {
         if !requirements.files.is_empty() && !remote_supports_v2 {
@@ -1859,6 +1968,7 @@ enum MetadataPeerIo {
     Utp {
         stream: Box<UtpStream>,
         decoder: UtpFrameDecoder,
+        write_buffer: UtpWireBuffer,
     },
 }
 
@@ -1867,10 +1977,13 @@ impl MetadataPeerIo {
         timeout(METADATA_PEER_WRITE_TIMEOUT, async {
             match self {
                 MetadataPeerIo::Tcp(framed) => framed.send(msg).await.map_err(Into::into),
-                MetadataPeerIo::Utp { stream, decoder } => {
-                    let _wire_memory_lease = decoder.reserve_outbound_message(&msg)?;
-                    let encoded = msg.encode();
-                    stream.write_all(&encoded).await?;
+                MetadataPeerIo::Utp {
+                    stream,
+                    decoder,
+                    write_buffer,
+                } => {
+                    let encoded = write_buffer.encode(decoder, &msg)?;
+                    stream.write_all(encoded).await?;
                     Ok(())
                 }
             }
@@ -1885,7 +1998,9 @@ impl MetadataPeerIo {
                 Some(result) => result.map(Some).map_err(Into::into),
                 None => Ok(None),
             },
-            MetadataPeerIo::Utp { stream, decoder } => decoder.next_message(stream).await,
+            MetadataPeerIo::Utp {
+                stream, decoder, ..
+            } => decoder.next_message(stream).await,
         }
     }
 }
@@ -1906,29 +2021,43 @@ fn validate_metadata_info_hash(
 ) -> anyhow::Result<()> {
     match expected_info_hash {
         MetadataInfoHash::V1(expected) => {
-            let mut hasher = Sha1::new();
-            hasher.update(metadata);
-            let actual: [u8; 20] = hasher.finalize().into();
-            if actual != expected {
-                anyhow::bail!(
-                    "fetched metadata infohash {} does not match expected {}",
-                    hex::encode(actual),
-                    hex::encode(expected)
-                );
-            }
+            validate_metadata_v1_hash(metadata, expected)?;
         }
         MetadataInfoHash::V2(expected) => {
-            let mut hasher = Sha256::new();
-            hasher.update(metadata);
-            let actual: [u8; 32] = hasher.finalize().into();
-            if actual != expected {
-                anyhow::bail!(
-                    "fetched metadata infohash {} does not match expected {}",
-                    hex::encode(actual),
-                    hex::encode(expected)
-                );
-            }
+            validate_metadata_v2_hash(metadata, expected)?;
         }
+        MetadataInfoHash::Hybrid { v1, v2 } => {
+            validate_metadata_v1_hash(metadata, v1)?;
+            validate_metadata_v2_hash(metadata, v2)?;
+        }
+    }
+    Ok(())
+}
+
+fn validate_metadata_v1_hash(metadata: &[u8], expected: [u8; 20]) -> anyhow::Result<()> {
+    let mut hasher = Sha1::new();
+    hasher.update(metadata);
+    let actual: [u8; 20] = hasher.finalize().into();
+    if actual != expected {
+        anyhow::bail!(
+            "fetched metadata v1 infohash {} does not match expected {}",
+            hex::encode(actual),
+            hex::encode(expected)
+        );
+    }
+    Ok(())
+}
+
+fn validate_metadata_v2_hash(metadata: &[u8], expected: [u8; 32]) -> anyhow::Result<()> {
+    let mut hasher = Sha256::new();
+    hasher.update(metadata);
+    let actual: [u8; 32] = hasher.finalize().into();
+    if actual != expected {
+        anyhow::bail!(
+            "fetched metadata v2 infohash {} does not match expected {}",
+            hex::encode(actual),
+            hex::encode(expected)
+        );
     }
     Ok(())
 }
@@ -2455,6 +2584,10 @@ mod tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
 
+    fn empty_registry() -> Arc<RwLock<SessionRegistry>> {
+        Arc::new(RwLock::new(SessionRegistry::new()))
+    }
+
     #[test]
     fn validates_metadata_piece_lengths() {
         validate_metadata_piece(0, 20_000, 20_000, METADATA_PIECE_SIZE).unwrap();
@@ -2475,6 +2608,38 @@ mod tests {
 
         validate_metadata_info_hash(info, MetadataInfoHash::V1(expected)).unwrap();
         assert!(validate_metadata_info_hash(info, MetadataInfoHash::V1([0; 20])).is_err());
+    }
+
+    #[test]
+    fn validates_both_hashes_for_hybrid_metadata() {
+        let info = b"d4:name4:teste";
+        let mut sha1 = Sha1::new();
+        sha1.update(info);
+        let v1: [u8; 20] = sha1.finalize().into();
+        let mut sha256 = Sha256::new();
+        sha256.update(info);
+        let v2: [u8; 32] = sha256.finalize().into();
+        let identity = MetadataInfoHash::Hybrid { v1, v2 };
+
+        validate_metadata_info_hash(info, identity).unwrap();
+        assert!(
+            validate_metadata_info_hash(info, MetadataInfoHash::Hybrid { v1: [0; 20], v2 })
+                .is_err()
+        );
+        assert!(
+            validate_metadata_info_hash(info, MetadataInfoHash::Hybrid { v1, v2: [0; 32] })
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn restores_hybrid_identity_from_v1_key_and_persisted_v2_hash() {
+        let v1 = [0x31; 20];
+        let v2 = [0x72; 32];
+        let identity = metadata_info_hash_with_v2(&hex::encode(v1), Some(v2)).unwrap();
+        assert_eq!(identity, MetadataInfoHash::Hybrid { v1, v2 });
+        assert_eq!(identity.wire_hash(), v1);
+        assert!(metadata_info_hash_with_v2(&hex::encode(v2), Some([0; 32])).is_err());
     }
 
     #[test]
@@ -2520,6 +2685,10 @@ mod tests {
     #[test]
     fn metadata_fetch_candidates_are_bounded_and_prune_retry_history() {
         let now = Instant::now();
+        let egress_policy = OutboundEgressPolicy {
+            allow_loopback: true,
+            ..OutboundEgressPolicy::default()
+        };
         let mut attempts = HashMap::from([
             (
                 "127.0.0.1:6881".parse().unwrap(),
@@ -2534,13 +2703,134 @@ mod tests {
             "127.0.0.4:6881".parse().unwrap(),
         ];
 
-        let candidates = metadata_fetch_candidates(peers, &mut attempts, now, 2, 2);
+        let registry = SessionRegistry::new();
+        let candidates =
+            metadata_fetch_candidates(peers, &egress_policy, &registry, &mut attempts, now, 2, 2);
 
         assert_eq!(candidates.len(), 2);
         assert!(candidates.contains(&"127.0.0.1:6881".parse().unwrap()));
         assert!(candidates.contains(&"127.0.0.3:6881".parse().unwrap()));
         assert_eq!(attempts.len(), 2);
         assert!(attempts.contains_key(&"127.0.0.3:6881".parse().unwrap()));
+    }
+
+    #[test]
+    fn metadata_fetch_candidates_skip_denied_addresses_without_retry_state() {
+        let now = Instant::now();
+        let policy = OutboundEgressPolicy::default();
+        let loopback = "127.0.0.1:6881".parse().unwrap();
+        let private = "10.0.0.2:6881".parse().unwrap();
+        let public = "8.8.8.8:6881".parse().unwrap();
+        let mut attempts = HashMap::new();
+        let registry = SessionRegistry::new();
+
+        let candidates = metadata_fetch_candidates(
+            vec![loopback, private, public],
+            &policy,
+            &registry,
+            &mut attempts,
+            now,
+            8,
+            8,
+        );
+
+        assert_eq!(candidates.into_iter().collect::<Vec<_>>(), vec![public]);
+        assert_eq!(attempts.len(), 1);
+        assert!(attempts.contains_key(&public));
+        assert!(!attempts.contains_key(&loopback));
+        assert!(!attempts.contains_key(&private));
+    }
+
+    #[test]
+    fn metadata_fetch_candidates_skip_banned_peers_without_retry_state() {
+        let now = Instant::now();
+        let policy = OutboundEgressPolicy::default();
+        let banned = "8.8.8.8:6881".parse().unwrap();
+        let allowed = "8.8.4.4:6881".parse().unwrap();
+        let mut registry = SessionRegistry::new();
+        assert_eq!(registry.ban_peers([banned]), 1);
+        let mut attempts = HashMap::new();
+
+        let candidates = metadata_fetch_candidates(
+            vec![banned, allowed],
+            &policy,
+            &registry,
+            &mut attempts,
+            now,
+            8,
+            8,
+        );
+
+        assert_eq!(candidates.into_iter().collect::<Vec<_>>(), vec![allowed]);
+        assert_eq!(attempts.len(), 1);
+        assert!(attempts.contains_key(&allowed));
+        assert!(!attempts.contains_key(&banned));
+    }
+
+    #[tokio::test]
+    async fn metadata_fetch_attempt_rejects_loopback_before_connecting() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let peer = listener.local_addr().unwrap();
+        let resources = ResourceGovernor::new(rt_metrics::ResourceGovernorConfig::default());
+
+        let (attempted_peer, result) = timeout(
+            Duration::from_millis(100),
+            metadata_fetch_attempt(
+                peer,
+                MetadataInfoHash::V1([0; 20]),
+                resources,
+                GlobalNetworkBudget::unlimited(),
+                empty_registry(),
+                OutboundEgressPolicy::default(),
+            ),
+        )
+        .await
+        .expect("policy rejection should not wait on a peer handshake");
+
+        assert_eq!(attempted_peer, peer);
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("metadata peer denied by egress policy"));
+        assert!(timeout(Duration::from_millis(20), listener.accept())
+            .await
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn metadata_fetch_attempt_rejects_banned_peer_before_connecting() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let peer = listener.local_addr().unwrap();
+        let registry = empty_registry();
+        registry.write().await.ban_peers([peer]);
+        let resources = ResourceGovernor::new(rt_metrics::ResourceGovernorConfig::default());
+        let policy = OutboundEgressPolicy {
+            allow_loopback: true,
+            ..OutboundEgressPolicy::default()
+        };
+
+        let (attempted_peer, result) = timeout(
+            Duration::from_millis(100),
+            metadata_fetch_attempt(
+                peer,
+                MetadataInfoHash::V1([0; 20]),
+                resources,
+                GlobalNetworkBudget::unlimited(),
+                registry,
+                policy,
+            ),
+        )
+        .await
+        .expect("ban rejection should not wait on a peer handshake");
+
+        assert_eq!(attempted_peer, peer);
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("metadata peer is banned"));
+        assert!(timeout(Duration::from_millis(20), listener.accept())
+            .await
+            .is_err());
     }
 
     #[test]
@@ -2741,6 +3031,7 @@ mod tests {
             cmd_rx,
             engine_tx,
             cmd_tx.clone(),
+            empty_registry(),
             resources,
             6881,
             8,
@@ -2795,6 +3086,73 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn metadata_task_stops_fetching_when_global_peer_is_banned() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let peer_addr = listener.local_addr().unwrap();
+        let resources = ResourceGovernor::new(rt_metrics::ResourceGovernorConfig::default());
+        let (_, task_memory) =
+            prepare_metadata_task_memory_with_peers(&resources, Vec::new(), vec![peer_addr], 8)
+                .unwrap();
+        let (cmd_tx, cmd_rx) = mpsc::channel(8);
+        let (engine_tx, _engine_rx) = mpsc::channel(8);
+        let registry = empty_registry();
+        let task = tokio::spawn(run_metadata_task(
+            MetadataInfoHash::V1([0; 20]),
+            "00".repeat(40),
+            Vec::new(),
+            task_memory,
+            cmd_rx,
+            engine_tx,
+            cmd_tx.clone(),
+            Arc::clone(&registry),
+            resources,
+            6881,
+            8,
+            1,
+            1,
+            false,
+            OutboundEgressPolicy {
+                allow_loopback: true,
+                ..OutboundEgressPolicy::default()
+            },
+            GlobalNetworkBudget::unlimited(),
+        ));
+
+        let (mut peer_stream, _) = timeout(Duration::from_secs(1), listener.accept())
+            .await
+            .expect("metadata task should try the permitted direct peer")
+            .unwrap();
+        let mut handshake = [0u8; 68];
+        timeout(
+            Duration::from_secs(1),
+            peer_stream.read_exact(&mut handshake),
+        )
+        .await
+        .expect("metadata task should send its peer handshake")
+        .unwrap();
+
+        registry.write().await.ban_peers([peer_addr]);
+        cmd_tx.send(TorrentCmd::EvictBannedPeers).await.unwrap();
+        let mut trailing = [0u8; 1];
+        assert_eq!(
+            timeout(Duration::from_secs(1), peer_stream.read(&mut trailing))
+                .await
+                .expect("ban eviction should cancel the active metadata fetch")
+                .unwrap(),
+            0
+        );
+        assert!(timeout(Duration::from_millis(50), listener.accept())
+            .await
+            .is_err());
+
+        cmd_tx.send(TorrentCmd::Shutdown).await.unwrap();
+        timeout(Duration::from_secs(1), task)
+            .await
+            .expect("metadata task should stop after shutdown")
+            .unwrap();
+    }
+
+    #[tokio::test]
     async fn metadata_task_pause_acknowledges_before_slow_stopped_announce() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let tracker_addr = listener.local_addr().unwrap();
@@ -2827,6 +3185,7 @@ mod tests {
             cmd_rx,
             engine_tx,
             cmd_tx.clone(),
+            empty_registry(),
             resources,
             6881,
             8,
@@ -2898,6 +3257,7 @@ mod tests {
             cmd_rx,
             engine_tx,
             cmd_tx.clone(),
+            empty_registry(),
             resources,
             6881,
             8,
@@ -3009,6 +3369,7 @@ mod tests {
         });
         let (engine_tx, mut engine_rx) = mpsc::channel(1);
         let (task_tx, _task_rx) = mpsc::channel(1);
+        let registry = empty_registry();
         let mut attempts = HashMap::new();
 
         assert!(
@@ -3018,9 +3379,14 @@ mod tests {
                 &[],
                 vec![peer_addr],
                 8,
+                &OutboundEgressPolicy {
+                    allow_loopback: true,
+                    ..OutboundEgressPolicy::default()
+                },
                 &mut attempts,
                 &engine_tx,
                 &task_tx,
+                &registry,
                 &governor,
                 &GlobalNetworkBudget::unlimited(),
             )
@@ -3168,6 +3534,7 @@ mod tests {
             task_rx,
             engine_tx,
             task_tx.clone(),
+            empty_registry(),
             governor,
             6881,
             8,
