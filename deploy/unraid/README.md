@@ -134,3 +134,27 @@ Either way, before submitting:
   in their `<Overview>`/field descriptions -- don't trim it out when
   editing; a shared/hardcoded peer_id previously got a real user banned
   from a private tracker.
+- **The rTorrent backend hard-fails on startup if it can't reach/identify
+  rTorrent; the other three don't.** Verified by actually running the
+  container against an unreachable SCGI address: after 3 retries over
+  ~15 seconds it logs "refusing to serve until rTorrent tracker identity
+  is applied" and the process exits -- Docker/Unraid's restart policy then
+  crash-loops it. qBittorrent/Transmission/Deluge instead come up
+  immediately and just report `"status":"degraded"` on `/health` while
+  retrying the backend in the background. This is existing, intentional
+  behavior in the compatible-client service (the identity push is a safety
+  gate, not a bug), but it means the rTorrent SCGI address has to be
+  correct *before* first start, unlike the other three backends where you
+  can fix it after. Documented on the "SCGI TCP Address" field.
+- **All of the above was verified against locally built images from
+  current source, not asserted from reading the Dockerfiles.** Confirmed:
+  the currently-published `ghcr.io/snapetech/torrentng/{native,sidecar}`
+  images predate every fix in this change (the release workflow only
+  publishes on a `main-*` tag push, not on every commit to `main`) --
+  installing either template today, before a new tag is cut, will fail.
+  `torrentng.xml` fails outright (missing token file, old image has no
+  entrypoint fallback); `torrentng-webui.xml`'s "front an existing
+  rTorrent" path silently falls back to the old always-bundle-rTorrent
+  behavior. A `main-*` tag needs to be pushed (or the release workflow
+  run via `workflow_dispatch`) before either template is actually
+  installable.
