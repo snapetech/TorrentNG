@@ -89,13 +89,24 @@ Either way, before submitting:
   `Display="advanced"` and per-field descriptions saying which "Backend
   Type" selection they apply to, following the same pattern used by
   multi-provider templates like binhex's VPN-enabled containers.
-- **`--user 99:100` in `<ExtraParams>` on both templates.** Neither
-  `torrentngd` nor the compatible-client service has Unraid-style
-  PUID/PGID env-var handling; both images bake a fixed non-root user at
-  build time. Overriding to Unraid's standard `nobody:users` (99:100) at
-  `docker run` time is the standard fix for non-LSIO images on Unraid --
-  make sure the appdata/data folders are owned by 99:100 (Unraid's Tools ->
-  New Permissions handles this).
+- **Neither image takes a `--user` override; both templates rely on the
+  image's own fixed UID/GID.** Tried overriding to Unraid's standard
+  `nobody:users` (99:100) first, since neither `torrentngd` nor the
+  compatible-client service has PUID/PGID env-var handling -- verified by
+  actually running both images locally rather than assuming, and that
+  override broke the compatible-client service outright (`mkdir: can't
+  create directory '/run/rtorrent': Permission denied`, crash loop
+  regardless of backend), because its internal, non-bind-mounted paths
+  (`/run/rtorrent`, `/var/log/rtorrent`) are baked `chown`ed to a fixed
+  UID at build time with no group/other write bit. `deploy/native/Dockerfile`
+  also used a bare `useradd --system` for `torrentngd` with no pinned UID,
+  which is a different bug: an unpredictable UID (999 in one build) that
+  can't be documented for operators to `chown` their appdata to. Fixed
+  both the same way the compatible-client service's Dockerfile already
+  did it: pin `TNG_UID`/`TNG_GID` build args (default 1000:1000) so the
+  image's own baked user matches a documented, stable value. Don't set
+  `--user` in `<ExtraParams>` on either template -- just `chown -R
+  1000:1000` the appdata/data folders to match the image.
 - **`torrentngd` has no per-field env var overrides by design** (see
   `crates/rt-config`), unlike the compatible-client service. Its Unraid
   template (`torrentng.xml`) and `deploy/native/entrypoint.sh` bridge this
