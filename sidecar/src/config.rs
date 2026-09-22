@@ -6,6 +6,12 @@ use crate::safe_file::open_regular_read;
 
 const MAX_CONFIG_BYTES: u64 = 1024 * 1024;
 
+/// Keep tracker-facing user-agent mutations bounded independently of the
+/// ordinary JSON request limit. A user-agent is carried through XML-RPC and
+/// HTTP headers, so accepting megabytes here only moves the allocation and
+/// failure point deeper into the backend boundary.
+pub(crate) const MAX_RUNTIME_USER_AGENT_BYTES: usize = 1024;
+
 /// Default user-agent announced to trackers via rTorrent.
 ///
 /// Keep this paired with DEFAULT_PEER_ID. Do not strip it to
@@ -619,6 +625,8 @@ impl Config {
                     bail!("rtorrent: only one of scgi_socket or scgi_addr may be set")
                 }
                 _ => {
+                    normalize_runtime_user_agent(&self.rtorrent.user_agent)
+                        .context("rtorrent: validate user_agent")?;
                     if self.rtorrent.peer_id.len() != 20 || !self.rtorrent.peer_id.is_ascii() {
                         bail!("rtorrent: peer_id must be exactly 20 ASCII bytes");
                     }
@@ -716,6 +724,22 @@ impl Config {
     pub fn rtorrent_log_poll_interval(&self) -> Duration {
         Duration::from_secs(self.rtorrent.logs.poll_interval_secs.max(1))
     }
+}
+
+pub(crate) fn normalize_runtime_user_agent(value: &str) -> Result<String> {
+    let value = value.trim();
+    if value.is_empty() {
+        bail!("user_agent must not be empty");
+    }
+    if value.len() > MAX_RUNTIME_USER_AGENT_BYTES {
+        bail!(
+            "user_agent must be at most {MAX_RUNTIME_USER_AGENT_BYTES} UTF-8 bytes"
+        );
+    }
+    if value.chars().any(|character| character.is_control()) {
+        bail!("user_agent must not contain control characters");
+    }
+    Ok(value.to_owned())
 }
 
 fn is_placeholder_secret(value: &str) -> bool {
@@ -934,6 +958,22 @@ mod tests {
         let path = dir.path().join("config.toml");
         std::fs::write(&path, vec![b' '; (MAX_CONFIG_BYTES + 1) as usize]).unwrap();
         assert!(Config::load(Some(path.to_str().unwrap())).is_err());
+    }
+
+    #[test]
+    fn runtime_user_agent_is_trimmed_and_bounded() {
+        assert_eq!(
+            normalize_runtime_user_agent("  TorrentNG/test  ").unwrap(),
+            "TorrentNG/test"
+        );
+        assert!(normalize_runtime_user_agent(" \t ").is_err());
+        assert!(normalize_runtime_user_agent("line\nbreak").is_err());
+        assert!(normalize_runtime_user_agent(&"x".repeat(MAX_RUNTIME_USER_AGENT_BYTES + 1))
+            .is_err());
+
+        let mut cfg = Config::test_default();
+        cfg.rtorrent.user_agent = "x".repeat(MAX_RUNTIME_USER_AGENT_BYTES + 1);
+        assert!(cfg.validate().unwrap_err().to_string().contains("user_agent"));
     }
 
     #[test]

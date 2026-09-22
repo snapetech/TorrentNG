@@ -55,6 +55,12 @@ fn validate_torrent_projection(torrent: &RawTorrent) -> anyhow::Result<()> {
         }
         Ok(())
     }
+    fn check_nonnegative(name: &str, value: i64) -> anyhow::Result<()> {
+        if value < 0 {
+            bail!("backend torrent {name} must not be negative");
+        }
+        Ok(())
+    }
 
     if torrent.hash.trim().is_empty() {
         bail!("backend torrent hash must not be empty");
@@ -71,6 +77,27 @@ fn validate_torrent_projection(torrent: &RawTorrent) -> anyhow::Result<()> {
     )?;
     check_field("message", &torrent.message, MAX_SYNC_MESSAGE_BYTES)?;
     check_field("tags", &torrent.tags, MAX_SYNC_TAGS_BYTES)?;
+    for (name, value) in [
+        ("size_bytes", torrent.size_bytes),
+        ("down_rate", torrent.down_rate),
+        ("up_rate", torrent.up_rate),
+        ("up_total", torrent.up_total),
+        ("down_total", torrent.down_total),
+        ("ratio", torrent.ratio),
+        ("priority", torrent.priority),
+        ("peers_connected", torrent.peers_connected),
+        ("peers_complete", torrent.peers_complete),
+    ] {
+        check_nonnegative(name, value)?;
+    }
+    check_nonnegative("bytes_done", torrent.bytes_done)?;
+    if torrent.bytes_done > torrent.size_bytes {
+        bail!(
+            "backend torrent bytes_done {} exceeds size_bytes {}",
+            torrent.bytes_done,
+            torrent.size_bytes
+        );
+    }
     Ok(())
 }
 
@@ -568,7 +595,24 @@ async fn tick_bounded(
             });
         }
     } else {
-        bounded.page_offset += MULTICALL_RANGE_PAGE_SIZE;
+        let Some(next_offset) = bounded
+            .page_offset
+            .checked_add(MULTICALL_RANGE_PAGE_SIZE)
+        else {
+            warn!(
+                component = backend.backend_type().as_str(),
+                operation = "bounded_sync_offset",
+                result = "error",
+                offset = bounded.page_offset,
+                "bounded sync page offset exhausted; restarting the cycle"
+            );
+            bounded.page_offset = 0;
+            bounded.snapshot = None;
+            bounded.full_cycle_seen.clear();
+            bounded.full_cycle_had_errors = false;
+            return Err(anyhow::anyhow!("bounded torrent sync page offset exhausted"));
+        };
+        bounded.page_offset = next_offset;
     }
 
     sync_error.map_or(Ok(bounded.counts.clone()), Err)
@@ -638,9 +682,24 @@ fn fetch_range_resilient(
                 let right_limit = limit - left_limit;
                 let mut left = fetch_range_resilient(backend, offset, left_limit, snapshot).await;
                 let right_snapshot = left.snapshot.or(snapshot);
+                let Some(right_offset) = offset.checked_add(left_limit) else {
+                    warn!(
+                        component = backend.backend_type().as_str(),
+                        operation = "list_torrents_range_bisect",
+                        result = "error",
+                        offset,
+                        left_limit,
+                        "range bisect offset overflowed; preserving the left half"
+                    );
+                    return ResilientFetch {
+                        torrents: left.torrents,
+                        snapshot: left.snapshot.or(snapshot),
+                        had_errors: true,
+                    };
+                };
                 let right = fetch_range_resilient(
                     backend,
-                    offset + left_limit,
+                    right_offset,
                     right_limit,
                     right_snapshot,
                 )
@@ -753,15 +812,15 @@ async fn upsert_torrent(
         .await
         .with_context(|| format!("persist torrent cache row {}", t.hash))?;
     if state == 3 {
-        counts.errored += 1;
+        counts.errored = counts.errored.saturating_add(1);
     } else if !t.is_active {
-        counts.stopped += 1;
+        counts.stopped = counts.stopped.saturating_add(1);
     } else if t.complete {
-        counts.seeding += 1;
+        counts.seeding = counts.seeding.saturating_add(1);
     } else {
-        counts.downloading += 1;
+        counts.downloading = counts.downloading.saturating_add(1);
     }
-    counts.peers += t.peers_connected;
+    counts.peers = counts.peers.saturating_add(t.peers_connected);
     if changed {
         let _ = tx.send(Event::TorrentUpdated {
             hash: t.hash.clone(),
@@ -950,7 +1009,7 @@ mod tests {
     }
 
     #[test]
-    fn torrent_projection_rejects_oversized_backend_strings() {
+    fn torrent_projection_rejects_oversized_or_invalid_backend_fields() {
         fn valid_torrent() -> RawTorrent {
             RawTorrent {
                 hash: "valid-hash".to_owned(),
@@ -1043,6 +1102,36 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("must not be empty"));
+
+        macro_rules! rejects_negative {
+            ($field:ident) => {
+                let mut torrent = valid_torrent();
+                torrent.$field = -1;
+                assert!(validate_torrent_projection(&torrent)
+                    .unwrap_err()
+                    .to_string()
+                    .contains(stringify!($field)));
+            };
+        }
+
+        rejects_negative!(size_bytes);
+        rejects_negative!(bytes_done);
+        rejects_negative!(down_rate);
+        rejects_negative!(up_rate);
+        rejects_negative!(up_total);
+        rejects_negative!(down_total);
+        rejects_negative!(ratio);
+        rejects_negative!(priority);
+        rejects_negative!(peers_connected);
+        rejects_negative!(peers_complete);
+
+        let mut torrent = valid_torrent();
+        torrent.size_bytes = 10;
+        torrent.bytes_done = 11;
+        assert!(validate_torrent_projection(&torrent)
+            .unwrap_err()
+            .to_string()
+            .contains("bytes_done"));
     }
 
     #[test]

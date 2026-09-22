@@ -1652,7 +1652,10 @@ async fn app_set_preferences(
     let user_agent = match prefs.get("network_http_user_agent") {
         None => None,
         Some(value) => match value.as_str() {
-            Some(value) => Some(value),
+            Some(value) => match crate::config::normalize_runtime_user_agent(value) {
+                Ok(value) => Some(value),
+                Err(_) => return StatusCode::BAD_REQUEST,
+            },
             None => return StatusCode::BAD_REQUEST,
         },
     };
@@ -1713,7 +1716,7 @@ async fn app_set_preferences(
                 "qBit user-agent preference ignored because backend does not support runtime user-agent updates"
             );
         } else {
-            match s.backend.set_user_agent(ua).await {
+            match s.backend.set_user_agent(&ua).await {
                 Ok(_) => {
                     record_operator_event(
                         &s,

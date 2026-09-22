@@ -216,12 +216,14 @@ impl Client {
             let mut page = self
                 .list_torrents_range(view, offset, MULTICALL_RANGE_PAGE_SIZE)
                 .await?;
-            let page_len = page.len() as i64;
+            let page_len = i64::try_from(page.len()).context("rTorrent page length exceeds i64")?;
             torrents.append(&mut page);
             if page_len < MULTICALL_RANGE_PAGE_SIZE {
                 break;
             }
-            offset += page_len;
+            offset = offset
+                .checked_add(page_len)
+                .ok_or_else(|| anyhow!("rTorrent torrent page offset overflowed"))?;
         }
         Ok(torrents)
     }
@@ -485,11 +487,14 @@ impl Client {
                 .with_context(|| {
                     format!("set rTorrent download local_id values at offset {offset}")
                 })?;
-            let count = result.try_into_array()?.len() as i64;
+            let count = i64::try_from(result.try_into_array()?.len())
+                .context("rTorrent identity page length exceeds i64")?;
             if count == 0 {
                 break;
             }
-            offset += count;
+            offset = offset
+                .checked_add(count)
+                .ok_or_else(|| anyhow!("rTorrent identity page offset overflowed"))?;
             if count < 1000 {
                 break;
             }
@@ -522,11 +527,14 @@ impl Client {
                 .with_context(|| {
                     format!("resume rTorrent downloads after identity gate at offset {offset}")
                 })?;
-            let count = result.try_into_array()?.len() as i64;
+            let count = i64::try_from(result.try_into_array()?.len())
+                .context("rTorrent resume page length exceeds i64")?;
             if count == 0 {
                 break;
             }
-            offset += count;
+            offset = offset
+                .checked_add(count)
+                .ok_or_else(|| anyhow!("rTorrent resume page offset overflowed"))?;
             if count < 1000 {
                 break;
             }
