@@ -5,7 +5,6 @@
   <Registry>https://github.com/snapetech/TorrentNG/pkgs/container/torrentng%2Fsidecar</Registry>
   <Network>bridge</Network>
   <Privileged>false</Privileged>
-  <ExtraParams>--user 99:100</ExtraParams>
   <Shell>sh</Shell>
 
   <Icon>https://raw.githubusercontent.com/snapetech/TorrentNG/main/deploy/unraid/icon.png</Icon>
@@ -23,7 +22,9 @@ SETUP: pick "Backend Type" below and fill in only that backend's section (all fo
 
 IMPORTANT -- rTorrent identity: on every start, TorrentNG pushes its own User-Agent and peer_id to whatever rTorrent it's connected to (this is how the compatible API keeps *arr tools working). Pointing this at an rTorrent that already has an established tracker history under a different identity will silently rewrite that identity going forward. This is expected and safe for a install TorrentNG will manage long-term, but understand it before connecting to a client you don't want touched. See docs/TRACKER-IDENTITY.md in the TorrentNG repository. Never set the same Peer ID Override across more than one install -- a shared peer_id has gotten real users banned from private trackers for "running multiple clients."
 
-Secret Key and API Tokens are required before first start regardless of backend -- they protect the WebUI and API themselves, not your torrent client. Generate both with e.g. `openssl rand -hex 32`.</Overview>
+Secret Key and API Tokens are required before first start regardless of backend -- they protect the WebUI and API themselves, not your torrent client. Generate both with e.g. `openssl rand -hex 32`.
+
+This container always runs as a fixed UID 1000 / GID 1000 baked into the image. Make sure the Downloads/Data and Appdata/State folders are owned by 1000:1000 before first start -- from the Unraid terminal: `chown -R 1000:1000 /mnt/user/appdata/torrentng-webui/`.</Overview>
 
   <Category>Downloaders:</Category>
   <Category>Network:Web</Category>

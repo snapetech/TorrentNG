@@ -14,11 +14,14 @@ COPY webui/ ./
 RUN TNG_WEBUI_OUT_DIR=dist npm run build
 
 FROM debian:bookworm-slim
+ARG TNG_UID=1000
+ARG TNG_GID=1000
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates curl tini \
     && rm -rf /var/lib/apt/lists/* \
-    && useradd --system --home /var/lib/torrentngd --create-home --shell /usr/sbin/nologin torrentngd \
+    && groupadd --system --gid "$TNG_GID" torrentngd \
+    && useradd --system --uid "$TNG_UID" --gid "$TNG_GID" --home /var/lib/torrentngd --create-home --shell /usr/sbin/nologin torrentngd \
     && mkdir -p /data /config /var/lib/torrentngd /usr/share/torrentng/webui /run/secrets \
     && chown -R torrentngd:torrentngd /data /config /var/lib/torrentngd /run/secrets
 
