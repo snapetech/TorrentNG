@@ -59,6 +59,8 @@ const QBIT_LIVE_TORRENT_INFO_EXTRA_BYTES: u64 = 64 * 1024;
 // parser from retaining an attacker-controlled number of distinct fields even
 // when the request body is otherwise within the multipart/body byte limit.
 const MAX_QBIT_FORM_FIELDS: usize = 1_024;
+const MAX_QBIT_SEARCH_JOBS: usize = 256;
+const MAX_QBIT_SEARCH_FIELD_BYTES: usize = 16 * 1024;
 
 // These compatibility settings are deliberately separate from the engine's
 // runtime settings.  They are qBittorrent WebUI state, not TorrentNG-client transport
@@ -4018,24 +4020,49 @@ pub async fn search_update_plugins() -> impl IntoResponse {
     StatusCode::OK
 }
 
-pub async fn search_start(State(state): State<AppState>, body: String) -> impl IntoResponse {
+pub async fn search_start(State(state): State<AppState>, body: String) -> Response {
     let params = parse_form_body(&body);
+    if params.overflowed {
+        return StatusCode::PAYLOAD_TOO_LARGE.into_response();
+    }
+    let pattern = params.get("pattern").cloned().unwrap_or_default();
+    let plugins = params
+        .get("plugins")
+        .cloned()
+        .unwrap_or_else(|| "all".to_owned());
+    let category = params
+        .get("category")
+        .cloned()
+        .unwrap_or_else(|| "all".to_owned());
+    if [pattern.as_str(), plugins.as_str(), category.as_str()]
+        .iter()
+        .any(|value| value.len() > MAX_QBIT_SEARCH_FIELD_BYTES)
+    {
+        return StatusCode::PAYLOAD_TOO_LARGE.into_response();
+    }
+
+    let mut jobs = state.search_jobs.write().await;
+    if jobs.len() >= MAX_QBIT_SEARCH_JOBS {
+        return StatusCode::TOO_MANY_REQUESTS.into_response();
+    }
     let mut next_id = state.next_search_id.write().await;
     let id = *next_id;
-    *next_id += 1;
-    drop(next_id);
+    let Some(next_value) = next_id.checked_add(1) else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    *next_id = next_value;
 
     let job = serde_json::json!({
         "id": id,
-        "pattern": params.get("pattern").cloned().unwrap_or_default(),
-        "plugins": params.get("plugins").cloned().unwrap_or_else(|| "all".to_owned()),
-        "category": params.get("category").cloned().unwrap_or_else(|| "all".to_owned()),
+        "pattern": pattern,
+        "plugins": plugins,
+        "category": category,
         "status": "Stopped",
         "total": 0,
         "results": [],
     });
-    state.search_jobs.write().await.insert(id.to_string(), job);
-    (StatusCode::OK, Json(serde_json::json!({ "id": id })))
+    jobs.insert(id.to_string(), job);
+    (StatusCode::OK, Json(serde_json::json!({ "id": id }))).into_response()
 }
 
 pub async fn search_stop(State(state): State<AppState>, body: String) -> impl IntoResponse {
@@ -6009,6 +6036,30 @@ mod tests {
             validate_qbit_filter(Some("stalled")).unwrap_err().0,
             StatusCode::NOT_IMPLEMENTED
         );
+    }
+
+    #[tokio::test]
+    async fn qbit_search_jobs_bound_retained_input_and_job_count() {
+        let state = AppState::new();
+        let oversized = search_start(
+            State(state.clone()),
+            format!("pattern={}", "x".repeat(MAX_QBIT_SEARCH_FIELD_BYTES + 1)),
+        )
+        .await
+        .into_response();
+        assert_eq!(oversized.status(), StatusCode::PAYLOAD_TOO_LARGE);
+
+        for _ in 0..MAX_QBIT_SEARCH_JOBS {
+            let response = search_start(State(state.clone()), "pattern=ok".to_owned())
+                .await
+                .into_response();
+            assert_eq!(response.status(), StatusCode::OK);
+        }
+        let response = search_start(State(state.clone()), "pattern=overflow".to_owned())
+            .await
+            .into_response();
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(state.search_jobs.read().await.len(), MAX_QBIT_SEARCH_JOBS);
     }
 
     #[test]

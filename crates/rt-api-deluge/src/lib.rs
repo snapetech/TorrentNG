@@ -25,7 +25,7 @@ use rt_engine::{
     EngineHandle, EnginePeerSnapshot, EngineTorrentLimits, EngineTorrentMetadata,
     EngineTrackerSnapshot, QueueMove,
 };
-use rt_metainfo::parse_magnet;
+use rt_metainfo::{parse_magnet, MAX_TORRENT_BYTES};
 use rt_metrics::{MemoryClass, MemoryLease};
 use rt_session::SessionRegistry;
 use serde::Deserialize;
@@ -47,6 +47,10 @@ const MAX_DELUGE_MUTATION_ITEMS: usize = 16_384;
 // disproportionate to the small token they produce.
 const MAX_DELUGE_PENDING_URL_DOWNLOADS: usize = 1_024;
 const MAX_DELUGE_URL_BYTES: usize = 16 * 1024;
+const MAX_DELUGE_PATH_BYTES: usize = 16 * 1024;
+const MAX_DELUGE_LABEL_BYTES: usize = 256;
+const MAX_DELUGE_TRACKER_URL_BYTES: usize = 8 * 1024;
+const MAX_DELUGE_TRACKER_BYTES: usize = 4 * 1024 * 1024;
 const DELUGE_RUNTIME_PROJECTION_CONCURRENCY: usize = 64;
 
 struct DelugeRuntimeProjection {
@@ -939,6 +943,7 @@ async fn move_storage(state: &AppState, params: &[Value]) -> Result<Value, Strin
         .map(str::trim)
         .filter(|location| !location.is_empty())
         .ok_or_else(|| "missing storage path".to_owned())?;
+    validate_deluge_text(location, MAX_DELUGE_PATH_BYTES, "storage path")?;
     let hashes = canonical_torrent_hashes(state, params.first(), "torrent ids").await?;
     let engine = deluge_engine(state)?;
     for hash in hashes {
@@ -1603,6 +1608,7 @@ async fn add_label(state: &AppState, params: &[Value]) -> Result<Value, String> 
         .map(str::trim)
         .filter(|name| !name.is_empty())
         .ok_or_else(|| "missing label name".to_owned())?;
+    validate_deluge_text(name, MAX_DELUGE_LABEL_BYTES, "label name")?;
     if params
         .get(1)
         .and_then(Value::as_object)
@@ -1626,6 +1632,7 @@ async fn remove_label(state: &AppState, params: &[Value]) -> Result<Value, Strin
         .map(str::trim)
         .filter(|name| !name.is_empty())
         .ok_or_else(|| "missing label name".to_owned())?;
+    validate_deluge_text(name, MAX_DELUGE_LABEL_BYTES, "label name")?;
     deluge_engine(state)?
         .remove_categories(vec![name.to_owned()])
         .await?;
@@ -1635,6 +1642,7 @@ async fn remove_label(state: &AppState, params: &[Value]) -> Result<Value, Strin
 async fn set_label(state: &AppState, hash: &str, label: &str) -> Result<(), String> {
     let hash = canonical_torrent_hash(state, hash).await?;
     let label = label.trim();
+    validate_deluge_text(label, MAX_DELUGE_LABEL_BYTES, "label name")?;
     let category = if label.is_empty() {
         None
     } else {
@@ -1758,6 +1766,13 @@ fn ensure_deluge_input_bound(count: usize, field: &str) -> Result<(), String> {
         return Err(format!(
             "{field} contains {count} items; maximum is {MAX_DELUGE_MUTATION_ITEMS}"
         ));
+    }
+    Ok(())
+}
+
+fn validate_deluge_text(value: &str, maximum: usize, field: &str) -> Result<(), String> {
+    if value.len() > maximum {
+        return Err(format!("Deluge {field} exceeds the {maximum} byte limit"));
     }
     Ok(())
 }
@@ -2314,7 +2329,23 @@ fn decode_deluge_torrent_data(data: &str) -> Result<Vec<u8>, String> {
         (false, false) => &general_purpose::STANDARD_NO_PAD,
         (true, false) => &general_purpose::URL_SAFE_NO_PAD,
     };
-    engine.decode(payload).map_err(|e| e.to_string())
+    let max_encoded_bytes = MAX_TORRENT_BYTES
+        .saturating_add(2)
+        .saturating_div(3)
+        .saturating_mul(4)
+        .saturating_add(4);
+    if payload.len() > max_encoded_bytes {
+        return Err(format!(
+            "torrent payload exceeds the {MAX_TORRENT_BYTES} byte decoded limit"
+        ));
+    }
+    let decoded = engine.decode(payload).map_err(|e| e.to_string())?;
+    if decoded.len() > MAX_TORRENT_BYTES {
+        return Err(format!(
+            "torrent payload exceeds the {MAX_TORRENT_BYTES} byte decoded limit"
+        ));
+    }
+    Ok(decoded)
 }
 
 async fn set_torrent_options(state: &AppState, params: &[Value]) -> Result<Value, String> {
@@ -2516,6 +2547,8 @@ async fn rename_folder(state: &AppState, params: &[Value]) -> Result<Value, Stri
         .get(2)
         .and_then(Value::as_str)
         .ok_or_else(|| "missing new folder path".to_owned())?;
+    validate_deluge_text(old_path, MAX_DELUGE_PATH_BYTES, "old folder path")?;
+    validate_deluge_text(new_path, MAX_DELUGE_PATH_BYTES, "new folder path")?;
     let engine = deluge_engine(state)?;
     engine
         .rename_folder_path(hash.to_owned(), old_path.to_owned(), new_path.to_owned())
@@ -2874,20 +2907,32 @@ fn deluge_file_priority(priority: i64) -> i64 {
 fn deluge_trackers_arg(value: Option<&Value>) -> Result<Vec<String>, String> {
     let value = value.ok_or_else(|| "missing tracker list".to_owned())?;
     let mut trackers = Vec::new();
-    collect_deluge_trackers(value, &mut trackers)?;
+    let mut bytes = 0;
+    collect_deluge_trackers(value, &mut trackers, &mut bytes)?;
     Ok(normalize_deluge_trackers(trackers))
 }
 
-fn collect_deluge_trackers(value: &Value, out: &mut Vec<String>) -> Result<(), String> {
+fn collect_deluge_trackers(
+    value: &Value,
+    out: &mut Vec<String>,
+    bytes: &mut usize,
+) -> Result<(), String> {
     match value {
         Value::String(value) if !value.trim().is_empty() => {
             ensure_deluge_input_bound(out.len().saturating_add(1), "Deluge tracker list")?;
+            validate_deluge_text(value, MAX_DELUGE_TRACKER_URL_BYTES, "tracker URL")?;
+            *bytes = bytes.saturating_add(value.len());
+            if *bytes > MAX_DELUGE_TRACKER_BYTES {
+                return Err(format!(
+                    "Deluge tracker list exceeds the {MAX_DELUGE_TRACKER_BYTES} byte limit"
+                ));
+            }
             out.push(value.to_owned());
         }
         Value::String(_) => return Err("tracker URL must not be empty".to_owned()),
         Value::Array(values) => {
             for value in values {
-                collect_deluge_trackers(value, out)?;
+                collect_deluge_trackers(value, out, bytes)?;
             }
         }
         Value::Object(obj) => {
@@ -2901,6 +2946,13 @@ fn collect_deluge_trackers(value: &Value, out: &mut Vec<String>) -> Result<(), S
                 return Err("tracker entry must contain a non-empty url".to_owned());
             };
             ensure_deluge_input_bound(out.len().saturating_add(1), "Deluge tracker list")?;
+            validate_deluge_text(url, MAX_DELUGE_TRACKER_URL_BYTES, "tracker URL")?;
+            *bytes = bytes.saturating_add(url.len());
+            if *bytes > MAX_DELUGE_TRACKER_BYTES {
+                return Err(format!(
+                    "Deluge tracker list exceeds the {MAX_DELUGE_TRACKER_BYTES} byte limit"
+                ));
+            }
             out.push(url.to_owned());
         }
         _ => return Err("tracker list contains an invalid entry".to_owned()),
@@ -2981,6 +3033,7 @@ fn deluge_rename_file_arg(value: &Value) -> Result<(u32, String), String> {
                 .filter(|path| !path.trim().is_empty())
                 .ok_or_else(|| "file rename path is required".to_owned())?
                 .to_owned();
+            validate_deluge_text(&path, MAX_DELUGE_PATH_BYTES, "file rename path")?;
             Ok((id, path))
         }
         Value::Object(obj) => {
@@ -3006,6 +3059,7 @@ fn deluge_rename_file_arg(value: &Value) -> Result<(u32, String), String> {
                 .filter(|path| !path.trim().is_empty())
                 .ok_or_else(|| "file rename path is required".to_owned())?
                 .to_owned();
+            validate_deluge_text(&path, MAX_DELUGE_PATH_BYTES, "file rename path")?;
             Ok((id, path))
         }
         _ => Err("file rename must be an array or object".to_owned()),
@@ -3536,6 +3590,22 @@ mod tests {
         assert!(strict_hashes_from_param(Some(&oversized_strings())).is_err());
         assert!(deluge_trackers_arg(Some(&oversized_strings())).is_err());
         assert!(deluge_rename_file_args(Some(&oversized_strings())).is_err());
+        assert!(deluge_trackers_arg(Some(&json!([format!(
+            "https://example.invalid/{}",
+            "x".repeat(MAX_DELUGE_TRACKER_URL_BYTES)
+        )])))
+        .is_err());
+        assert!(deluge_rename_file_args(Some(&json!([[
+            1,
+            "x".repeat(MAX_DELUGE_PATH_BYTES + 1)
+        ]])))
+        .is_err());
+        assert!(validate_deluge_text(
+            &"x".repeat(MAX_DELUGE_LABEL_BYTES + 1),
+            MAX_DELUGE_LABEL_BYTES,
+            "label name"
+        )
+        .is_err());
 
         let oversized_numbers = Value::Array(
             (0..=MAX_DELUGE_MUTATION_ITEMS)
