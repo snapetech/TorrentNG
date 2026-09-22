@@ -257,8 +257,7 @@ pub fn gather(
             skipped.push(SkippedExport {
                 info_hash: torrent.info_hash.clone(),
                 reason: format!(
-                    "skipped because retained export state would exceed the {} byte budget",
-                    MAX_EXPORT_MATERIALIZED_BYTES
+                    "skipped because retained export state would exceed the {MAX_EXPORT_MATERIALIZED_BYTES} byte budget"
                 ),
             });
             continue;
