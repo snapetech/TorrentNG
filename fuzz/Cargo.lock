@@ -556,6 +556,7 @@ dependencies = [
  "serde",
  "thiserror",
  "uuid",
+ "windows-sys",
 ]
 
 [[package]]
