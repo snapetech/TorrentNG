@@ -3710,8 +3710,8 @@ impl TorrentTask {
             .await
             .map_err(|error| anyhow::anyhow!(error))?;
         let _lease = reserve_webseed_body_bytes(&self.resources, req.length)?;
-        let start = req.piece as u64 * self.meta.piece_length + req.begin as u64;
-        let end = start + req.length as u64 - 1;
+        let (start, end) =
+            webseed_byte_range(req.piece, self.meta.piece_length, req.begin, req.length)?;
         let response = client
             .get(url.clone())
             .header(RANGE, format!("bytes={start}-{end}"))
@@ -5863,9 +5863,18 @@ impl TorrentTask {
             let path = file.path.resolve(&self.save_root);
             self.prepare_file_once(file.index, &path, file.length)
                 .await?;
-            let start = region.piece_offset as usize;
-            let end = start + region.length as usize;
-            let data = bytes::Bytes::copy_from_slice(&assembly.data[start..end]);
+            let start = usize::try_from(region.piece_offset)
+                .map_err(|_| anyhow::anyhow!("piece region offset does not fit in memory"))?;
+            let region_len = usize::try_from(region.length)
+                .map_err(|_| anyhow::anyhow!("piece region length does not fit in memory"))?;
+            let end = start
+                .checked_add(region_len)
+                .ok_or_else(|| anyhow::anyhow!("piece region data offset overflow"))?;
+            let region_data = assembly
+                .data
+                .get(start..end)
+                .ok_or_else(|| anyhow::anyhow!("piece assembly does not cover mapped region"))?;
+            let data = bytes::Bytes::copy_from_slice(region_data);
             scheduled_write(
                 &self.storage,
                 IoClass::PeerWrite,
@@ -6678,6 +6687,30 @@ fn webseed_block_url(meta: &TorrentMetaV1, webseed: &str) -> Option<Url> {
     } else {
         Some(parsed)
     }
+}
+
+fn webseed_byte_range(
+    piece: u32,
+    piece_length: u64,
+    begin: u32,
+    length: u32,
+) -> anyhow::Result<(u64, u64)> {
+    if piece_length == 0 {
+        anyhow::bail!("webseed piece length must not be zero");
+    }
+    if length == 0 || length > MAX_BLOCK_SIZE {
+        anyhow::bail!("webseed block length {length} is invalid");
+    }
+    let piece_start = u64::from(piece)
+        .checked_mul(piece_length)
+        .ok_or_else(|| anyhow::anyhow!("webseed piece offset overflow"))?;
+    let start = piece_start
+        .checked_add(u64::from(begin))
+        .ok_or_else(|| anyhow::anyhow!("webseed block start overflow"))?;
+    let end = start
+        .checked_add(u64::from(length - 1))
+        .ok_or_else(|| anyhow::anyhow!("webseed block end overflow"))?;
+    Ok((start, end))
 }
 
 fn validate_webseed_range_response(
@@ -10788,6 +10821,17 @@ mod tests {
             validate_webseed_range_response(StatusCode::OK, &headers, 16_384, 32_767).unwrap_err();
 
         assert!(error.to_string().contains("did not honor byte range"));
+    }
+
+    #[test]
+    fn webseed_byte_range_rejects_invalid_or_overflowing_coordinates() {
+        assert_eq!(
+            webseed_byte_range(2, 16_384, 4, 8).unwrap(),
+            (32_772, 32_779)
+        );
+        assert!(webseed_byte_range(0, 16_384, 0, 0).is_err());
+        assert!(webseed_byte_range(u32::MAX, u64::MAX, 0, 1).is_err());
+        assert!(webseed_byte_range(0, 16_384, 0, MAX_BLOCK_SIZE + 1).is_err());
     }
 
     #[test]
