@@ -417,11 +417,10 @@ impl FastresumeState {
             }
         }
         self.partial_pieces.retain(|partial| {
-            !self
-                .durability
+            self.durability
                 .dirty_pieces_since_barrier
                 .binary_search(&partial.piece)
-                .is_ok()
+                .is_err()
         });
         self.clean_shutdown = true;
         self.durability.dirty_pieces_since_barrier.clear();

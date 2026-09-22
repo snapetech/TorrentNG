@@ -122,9 +122,7 @@ async fn bench_qb_torrents_info_50k_under_500ms() {
     assert_eq!(res.status(), 200);
     let body: Vec<serde_json::Value> = res.json().await.unwrap();
     assert_eq!(body.len(), requested);
-    println!(
-        "qBit torrents/info corpus={count}, page={requested} rows: {elapsed:?}"
-    );
+    println!("qBit torrents/info corpus={count}, page={requested} rows: {elapsed:?}");
     assert!(
         elapsed.as_millis() < 500,
         "qBit torrents/info exceeded 500ms target: {elapsed:?}"
@@ -142,10 +140,7 @@ async fn bench_qb_sync_maindata_delta_under_50ms() {
 
     let started = Instant::now();
     let res = client
-        .get(url(
-            addr,
-            &format!("/api/qb/v2/sync/maindata?rid={rid}"),
-        ))
+        .get(url(addr, &format!("/api/qb/v2/sync/maindata?rid={rid}")))
         .send()
         .await
         .unwrap();

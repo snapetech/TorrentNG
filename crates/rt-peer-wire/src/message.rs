@@ -385,8 +385,7 @@ impl Message {
                 let data_len = body.len() - 8;
                 if data_len as u32 > MAX_BLOCK_SIZE {
                     return Err(WireError::InvalidMessage(format!(
-                        "Piece block {} bytes exceeds MAX_BLOCK_SIZE {}",
-                        data_len, MAX_BLOCK_SIZE
+                        "Piece block {data_len} bytes exceeds MAX_BLOCK_SIZE {MAX_BLOCK_SIZE}"
                     )));
                 }
                 let data = Bytes::copy_from_slice(&body[8..]);
