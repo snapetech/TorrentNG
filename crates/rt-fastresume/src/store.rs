@@ -7,7 +7,10 @@ use tracing::instrument;
 
 use crate::{
     error::FastresumeError,
-    state::{FastresumeState, PieceState, MAX_FASTRESUME_PIECES},
+    state::{
+        DurabilityWatermark, FastresumeState, FileHint, ImportPolicy, PartialPieceState,
+        PieceState, MAX_FASTRESUME_PIECES,
+    },
 };
 
 /// A fast-resume record is metadata, not a torrent payload. Keep a corrupt or
@@ -50,6 +53,47 @@ const CONTAINER_VERSION: u8 = 1;
 /// on crash.
 pub struct FastresumeStore {
     dir: PathBuf,
+}
+
+/// The JSON header carried by the packed container. Keeping the piece bitmap
+/// out of this type is what makes format 2 scale with one bit per piece during
+/// both encoding and decoding; converting the full state through
+/// `serde_json::Value` would temporarily recreate one JSON value per piece.
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+struct FastresumeHeader {
+    version: u32,
+    info_hash: String,
+    session_generation: u64,
+    #[serde(default)]
+    #[serde(deserialize_with = "crate::state::deserialize_partial_pieces")]
+    partial_pieces: Vec<PartialPieceState>,
+    #[serde(deserialize_with = "crate::state::deserialize_file_hints")]
+    file_hints: Vec<FileHint>,
+    last_full_verify: u64,
+    clean_shutdown: bool,
+    uploaded_bytes: u64,
+    downloaded_bytes: u64,
+    import_policy: ImportPolicy,
+    #[serde(default)]
+    durability: DurabilityWatermark,
+}
+
+impl From<&FastresumeState> for FastresumeHeader {
+    fn from(state: &FastresumeState) -> Self {
+        Self {
+            version: state.version,
+            info_hash: state.info_hash.clone(),
+            session_generation: state.session_generation,
+            partial_pieces: state.partial_pieces.clone(),
+            file_hints: state.file_hints.clone(),
+            last_full_verify: state.last_full_verify,
+            clean_shutdown: state.clean_shutdown,
+            uploaded_bytes: state.uploaded_bytes,
+            downloaded_bytes: state.downloaded_bytes,
+            import_policy: state.import_policy,
+            durability: state.durability.clone(),
+        }
+    }
 }
 
 impl FastresumeStore {
@@ -222,11 +266,7 @@ fn encode_container(state: &FastresumeState) -> Result<Vec<u8>, FastresumeError>
         ))
     })?;
 
-    let mut header_value = serde_json::to_value(state)?;
-    if let Some(object) = header_value.as_object_mut() {
-        object.remove("pieces");
-    }
-    let header_json = serde_json::to_vec(&header_value)?;
+    let header_json = serde_json::to_vec(&FastresumeHeader::from(state))?;
     let header_len = u32::try_from(header_json.len()).map_err(|_| {
         FastresumeError::Io(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -248,12 +288,9 @@ fn encode_container(state: &FastresumeState) -> Result<Vec<u8>, FastresumeError>
 }
 
 /// Decodes the packed-bitfield container format written by
-/// [`encode_container`]. Reuses `FastresumeState`'s existing (bounded)
-/// `Deserialize` impl for every field but `pieces`: the decoded bitfield is
-/// re-inserted into the parsed header as a normal JSON array of piece-state
-/// strings before the final `serde_json::from_value`, so all the existing
-/// field validation (e.g. bounded partial-piece/file-hint vectors) still
-/// applies unchanged.
+/// [`encode_container`]. Deserializes the bounded metadata header directly,
+/// then expands only the packed bitfield into `FastresumeState::pieces`; the
+/// decoder never creates a JSON value per piece.
 fn decode_container(data: &[u8]) -> Result<FastresumeState, FastresumeError> {
     fn corrupt(message: &str) -> FastresumeError {
         FastresumeError::Io(io::Error::new(
@@ -280,7 +317,7 @@ fn decode_container(data: &[u8]) -> Result<FastresumeState, FastresumeError> {
         return Err(corrupt("header length exceeds file size"));
     }
     let (header_json, rest) = rest.split_at(header_len);
-    let mut header_value: serde_json::Value = serde_json::from_slice(header_json)?;
+    let header: FastresumeHeader = serde_json::from_slice(header_json)?;
 
     let (count_bytes, rest) = rest
         .split_at_checked(4)
@@ -295,13 +332,20 @@ fn decode_container(data: &[u8]) -> Result<FastresumeState, FastresumeError> {
     }
 
     let pieces = decode_piece_bitfield(rest, piece_count as usize);
-    let pieces_value = serde_json::to_value(&pieces)?;
-    header_value
-        .as_object_mut()
-        .ok_or_else(|| corrupt("header is not a JSON object"))?
-        .insert("pieces".to_string(), pieces_value);
-
-    Ok(serde_json::from_value(header_value)?)
+    Ok(FastresumeState {
+        version: header.version,
+        info_hash: header.info_hash,
+        session_generation: header.session_generation,
+        pieces,
+        partial_pieces: header.partial_pieces,
+        file_hints: header.file_hints,
+        last_full_verify: header.last_full_verify,
+        clean_shutdown: header.clean_shutdown,
+        uploaded_bytes: header.uploaded_bytes,
+        downloaded_bytes: header.downloaded_bytes,
+        import_policy: header.import_policy,
+        durability: header.durability,
+    })
 }
 
 fn is_safe_hash_component(value: &str) -> bool {
@@ -551,6 +595,28 @@ mod tests {
             new_size.saturating_mul(10) < legacy_size,
             "expected new format ({new_size} bytes) to be at least 10x smaller than legacy ({legacy_size} bytes)"
         );
+    }
+
+    #[test]
+    fn packed_format_round_trips_large_piece_maps_without_json_piece_values() {
+        let piece_count = 1_000_003u32;
+        let hash = [11u8; 20];
+        let mut state =
+            FastresumeState::new_empty(&hash, piece_count, ImportPolicy::RequireVerification);
+        state.pieces[0] = PieceState::Valid;
+        state.pieces[500_001] = PieceState::Valid;
+        state.pieces[piece_count as usize - 1] = PieceState::Valid;
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = FastresumeStore::new(dir.path());
+        store.save(&state).unwrap();
+
+        let loaded = store.load(&hex::encode(hash)).unwrap();
+        assert_eq!(loaded.pieces.len(), piece_count as usize);
+        assert_eq!(loaded.pieces[0], PieceState::Valid);
+        assert_eq!(loaded.pieces[500_001], PieceState::Valid);
+        assert_eq!(loaded.pieces[piece_count as usize - 1], PieceState::Valid);
+        assert_eq!(loaded.pieces[1], PieceState::Unknown);
     }
 
     #[tokio::test(flavor = "current_thread")]
