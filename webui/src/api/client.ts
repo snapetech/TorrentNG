@@ -66,13 +66,19 @@ function normalizeLiveStats(body: unknown): LiveTorrentStatsResponse {
       const stat = item as Partial<LiveTorrentStat>
       return typeof stat.hash === 'string'
         && typeof stat.amount_left === 'number'
+        && Number.isFinite(stat.amount_left)
         && typeof stat.download_rate === 'number'
+        && Number.isFinite(stat.download_rate)
         && typeof stat.upload_rate === 'number'
+        && Number.isFinite(stat.upload_rate)
         && typeof stat.sampled_at === 'number'
+        && Number.isFinite(stat.sampled_at)
     })
     : []
   return {
-    sampled_at: typeof value.sampled_at === 'number' ? value.sampled_at : 0,
+    sampled_at: typeof value.sampled_at === 'number' && Number.isFinite(value.sampled_at)
+      ? value.sampled_at
+      : 0,
     torrents,
   }
 }
@@ -144,9 +150,19 @@ function torrentStateCode(state: string): number {
   }
 }
 
+function finiteNonNegative(value: unknown, fallback = 0): number {
+  const parsed = Number(value)
+  return Number.isFinite(parsed) && parsed >= 0 ? parsed : fallback
+}
+
+function normalizePageValue(value: number | undefined, fallback: number): number {
+  if (value === undefined || !Number.isFinite(value)) return fallback
+  return Math.min(Number.MAX_SAFE_INTEGER, Math.max(0, Math.floor(value)))
+}
+
 function normalizeTorrentNgTorrent(t: TorrentNgTorrentSummary): TorrentSummary {
-  const size = Number(t.total_length ?? 0)
-  const downloaded = Number(t.downloaded ?? 0)
+  const size = finiteNonNegative(t.total_length)
+  const downloaded = finiteNonNegative(t.downloaded)
   const rawAmountLeft = Number(t.amount_left)
   const hasLiveAmountLeft = Number.isFinite(rawAmountLeft) && rawAmountLeft >= 0
   // Older TorrentNG API servers did not expose amount_left. Keep their payload
@@ -165,9 +181,9 @@ function normalizeTorrentNgTorrent(t: TorrentNgTorrentSummary): TorrentSummary {
     bytes_done: done,
     down_rate: 0,
     up_rate: 0,
-    up_total: Number(t.uploaded ?? 0),
+    up_total: finiteNonNegative(t.uploaded),
     down_total: downloaded,
-    ratio: Math.round(Number(t.ratio ?? 0) * 1000),
+    ratio: Math.round(finiteNonNegative(t.ratio) * 1000),
     is_active: active,
     is_open: open,
     complete,
@@ -176,11 +192,11 @@ function normalizeTorrentNgTorrent(t: TorrentNgTorrentSummary): TorrentSummary {
     category: t.category ?? '',
     base_path: t.save_path,
     directory: t.save_path,
-    creation_date: Number(t.added_at ?? 0),
-    timestamp_finished: Number(t.completed_at ?? 0),
+    creation_date: finiteNonNegative(t.added_at),
+    timestamp_finished: finiteNonNegative(t.completed_at),
     tracker_focus: 0,
-    peers_connected: Number(t.num_peers ?? 0),
-    peers_complete: Number(t.num_seeds ?? 0),
+    peers_connected: finiteNonNegative(t.num_peers),
+    peers_complete: finiteNonNegative(t.num_seeds),
     message: t.tracker_message ?? '',
     tracker_url: '',
     tags: Array.isArray(t.tags) ? t.tags.join(', ') : '',
@@ -205,8 +221,10 @@ function normalizeTorrentList(
   const torrents = body.map(item =>
     isTorrentNgTorrentSummary(item) ? normalizeTorrentNgTorrent(item) : item,
   )
-  const offset = Math.max(0, Number(params.offset ?? 0))
-  const limit = params.limit === undefined ? torrents.length : Math.max(0, Number(params.limit))
+  const offset = normalizePageValue(params.offset, 0)
+  const limit = params.limit === undefined
+    ? torrents.length
+    : normalizePageValue(params.limit, 0)
   return {
     total: torrents.length,
     torrents: torrents.slice(offset, offset + limit),
