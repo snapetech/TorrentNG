@@ -5,6 +5,11 @@ pub(crate) const MAX_MULTIPART_TORRENT_BYTES: usize = 64 * 1024 * 1024;
 pub(crate) const MAX_MULTIPART_ENVELOPE_BYTES: usize = 1024 * 1024;
 pub(crate) const MAX_MULTIPART_REQUEST_BODY_BYTES: usize =
     MAX_MULTIPART_TORRENT_BYTES + MAX_MULTIPART_ENVELOPE_BYTES;
+/// Keep ordinary JSON/Form routes at Axum's established 2 MiB default instead
+/// of inheriting the much larger multipart upload ceiling. Individual routes
+/// can opt into the upload limit above.
+pub(crate) const MAX_DEFAULT_REQUEST_BODY_BYTES: usize = 2 * 1024 * 1024;
+pub(crate) const MAX_AUTH_REQUEST_BODY_BYTES: usize = 16 * 1024;
 
 pub(crate) async fn read_bounded_multipart_bytes(
     mut field: Field<'_>,

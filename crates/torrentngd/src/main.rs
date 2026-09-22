@@ -20,7 +20,8 @@ use tracing::info;
 
 use rt_api_deluge::AppState as DelugeState;
 use rt_api_model::{
-    api_token_allowed, csrf_request_allowed, session_cookie_value, ApiRuntimeMetrics,
+    api_token_allowed, csrf_request_allowed, has_browser_request_headers, session_cookie_value,
+    ApiRuntimeMetrics,
 };
 use rt_api_native::state::AppState as TorrentNgApiState;
 use rt_api_qbit::state::AppState as QbitState;
@@ -402,11 +403,36 @@ async fn daemon_auth_guard(
     req: Request<Body>,
     next: Next,
 ) -> Response {
-    if api_tokens.is_empty() || daemon_public_path(req.uri().path()) {
+    let path = req.uri().path();
+    if api_tokens.is_empty() {
+        if daemon_is_mutating(&req)
+            && has_browser_request_headers(req.headers())
+            && !csrf_request_allowed(req.headers())
+        {
+            return (
+                StatusCode::FORBIDDEN,
+                "cross-origin browser request rejected",
+            )
+                .into_response();
+        }
         return next.run(req).await;
     }
 
     if bearer_token(req.headers()).is_some_and(|token| api_token_allowed(&api_tokens, &token)) {
+        return next.run(req).await;
+    }
+    if daemon_public_path(path) {
+        if daemon_public_auth_path(path)
+            && daemon_is_mutating(&req)
+            && has_browser_request_headers(req.headers())
+            && !csrf_request_allowed(req.headers())
+        {
+            return (
+                StatusCode::FORBIDDEN,
+                "cross-origin browser authentication request rejected",
+            )
+                .into_response();
+        }
         return next.run(req).await;
     }
     if session_cookie_value(req.headers(), &["tng_session", "SID"])
@@ -467,6 +493,18 @@ fn daemon_public_path(path: &str) -> bool {
             | "/api/v2/auth/login"
             | "/api/v2/auth/logout"
     ) || is_webui_path(path)
+}
+
+fn daemon_public_auth_path(path: &str) -> bool {
+    matches!(
+        path,
+        "/api/v1/auth/login"
+            | "/api/v1/auth/logout"
+            | "/api/qb/v2/auth/login"
+            | "/api/qb/v2/auth/logout"
+            | "/api/v2/auth/login"
+            | "/api/v2/auth/logout"
+    )
 }
 
 fn bearer_token(headers: &HeaderMap) -> Option<String> {
@@ -579,8 +617,8 @@ fn load_config() -> anyhow::Result<Config> {
 #[cfg(test)]
 mod tests {
     use super::{
-        bearer_token, daemon_public_path, install_panic_payload_redacting_hook, request_id,
-        skip_request_log, static_dir,
+        bearer_token, daemon_public_auth_path, daemon_public_path,
+        install_panic_payload_redacting_hook, request_id, skip_request_log, static_dir,
     };
     use axum::http::{header, HeaderMap, HeaderValue};
     use std::process::Command;
@@ -625,6 +663,28 @@ mod tests {
             "/ws",
         ] {
             assert!(!daemon_public_path(path), "{path}");
+        }
+    }
+
+    #[test]
+    fn daemon_public_auth_paths_are_exact() {
+        for path in [
+            "/api/v1/auth/login",
+            "/api/v1/auth/logout",
+            "/api/qb/v2/auth/login",
+            "/api/qb/v2/auth/logout",
+            "/api/v2/auth/login",
+            "/api/v2/auth/logout",
+        ] {
+            assert!(daemon_public_auth_path(path), "{path}");
+        }
+        for path in [
+            "/health",
+            "/api/v1/auth/refresh",
+            "/api/qb/v2/auth/login/extra",
+            "/api/v2/torrents/info",
+        ] {
+            assert!(!daemon_public_auth_path(path), "{path}");
         }
     }
 

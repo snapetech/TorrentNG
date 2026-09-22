@@ -167,7 +167,12 @@ fn hash_resolution_status(error: &anyhow::Error) -> StatusCode {
 pub fn build_router(_state: AppState) -> Router<AppState> {
     Router::new()
         // Auth
-        .route("/auth/login", post(auth_login))
+        .route(
+            "/auth/login",
+            post(auth_login).layer(DefaultBodyLimit::max(
+                crate::multipart::MAX_AUTH_REQUEST_BODY_BYTES,
+            )),
+        )
         .route("/auth/logout", post(auth_logout))
         // App
         .route("/app/version", get(app_version).post(app_version))
