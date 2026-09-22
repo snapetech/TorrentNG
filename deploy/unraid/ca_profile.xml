@@ -1,6 +1,6 @@
 <CommunityApplications>
   <Profile>
-This repository hosts the Community Applications templates for **TorrentNG**, a modern torrent management stack built for headless power-user seeding at scale (10k-100k torrents, 200+ TB).
+This repository hosts the Community Applications templates for **TorrentNG**, a modern torrent management stack built for headless power-user seeding at scale (10k-100k+ torrents, 200-500+ TB).
 
 Two templates are provided:
 

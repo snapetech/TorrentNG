@@ -3,7 +3,7 @@
 ## What this project is
 
 **TorrentNG** is a modern torrent management stack targeting headless
-power-user seeding at scale (10k–100k torrents, 200+ TB).
+power-user seeding at scale (10k-100k+ torrents, 200-500+ TB).
 
 It is NOT a ruTorrent cosmetic fork. TorrentNG is the shared WebUI/API product:
 it can sit in front of an existing compatible torrent client or run its own
@@ -161,7 +161,7 @@ historical track remains available as the rTorrent integration and comparison
 path.
 
 **Track 2 — TorrentNG client**: ground-up Rust BitTorrent client daemon,
-10k–100k torrents, 200+ TB, seeding-first. This is the first-party owned
+10k-100k+ torrents, 200-500+ TB, seeding-first. This is the first-party owned
 transfer path. See `docs/ENGINE_REWRITE.md` and `docs/ENGINE.md`.
 
 ### Track 1 phases
