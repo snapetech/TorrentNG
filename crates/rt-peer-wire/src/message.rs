@@ -110,111 +110,27 @@ impl Message {
     }
 
     /// Encode into length-prefixed wire format.
+    ///
+    /// This method keeps the historical infallible API for callers that have
+    /// already validated their message. Use [`Message::try_encode`] when the
+    /// message may exceed the protocol frame limit.
     pub fn encode(&self) -> Vec<u8> {
-        match self {
-            Message::KeepAlive => vec![0, 0, 0, 0],
-            Message::Choke => encode_fixed(0, &[]),
-            Message::Unchoke => encode_fixed(1, &[]),
-            Message::Interested => encode_fixed(2, &[]),
-            Message::NotInterested => encode_fixed(3, &[]),
-            Message::Have(idx) => encode_fixed(4, &idx.to_be_bytes()),
-            Message::Bitfield(bits) => {
-                let len = (1 + bits.len()) as u32;
-                let mut v = Vec::with_capacity(4 + 1 + bits.len());
-                v.extend_from_slice(&len.to_be_bytes());
-                v.push(5);
-                v.extend_from_slice(bits);
-                v
-            }
-            Message::Request {
-                piece,
-                begin,
-                length,
-            } => encode_fixed(6, &encode_3u32(*piece, *begin, *length)),
-            Message::Piece { piece, begin, data } => {
-                let len = (1 + 4 + 4 + data.len()) as u32;
-                let mut v = Vec::with_capacity(4 + 1 + 8 + data.len());
-                v.extend_from_slice(&len.to_be_bytes());
-                v.push(7);
-                v.extend_from_slice(&piece.to_be_bytes());
-                v.extend_from_slice(&begin.to_be_bytes());
-                v.extend_from_slice(data);
-                v
-            }
-            Message::Cancel {
-                piece,
-                begin,
-                length,
-            } => encode_fixed(8, &encode_3u32(*piece, *begin, *length)),
-            Message::Reject {
-                piece,
-                begin,
-                length,
-            } => encode_fixed(16, &encode_3u32(*piece, *begin, *length)),
-            Message::HaveAll => encode_fixed(14, &[]),
-            Message::HaveNone => encode_fixed(15, &[]),
-            Message::Extended { ext_id, payload } => {
-                let len = (1 + 1 + payload.len()) as u32;
-                let mut v = Vec::with_capacity(4 + 1 + 1 + payload.len());
-                v.extend_from_slice(&len.to_be_bytes());
-                v.push(20);
-                v.push(*ext_id);
-                v.extend_from_slice(payload);
-                v
-            }
-            Message::HashRequest {
-                pieces_root,
-                base_layer,
-                index,
-                length,
-                proof_layers,
-            } => encode_hash_exchange(
-                21,
-                pieces_root,
-                *base_layer,
-                *index,
-                *length,
-                *proof_layers,
-                &[],
-            ),
-            Message::Hashes {
-                pieces_root,
-                base_layer,
-                index,
-                length,
-                proof_layers,
-                hashes,
-            } => {
-                let mut hash_bytes = Vec::with_capacity(hashes.len().saturating_mul(32));
-                for hash in hashes {
-                    hash_bytes.extend_from_slice(hash);
-                }
-                encode_hash_exchange(
-                    22,
-                    pieces_root,
-                    *base_layer,
-                    *index,
-                    *length,
-                    *proof_layers,
-                    &hash_bytes,
-                )
-            }
-            Message::HashReject {
-                pieces_root,
-                base_layer,
-                index,
-                length,
-                proof_layers,
-            } => encode_hash_exchange(
-                23,
-                pieces_root,
-                *base_layer,
-                *index,
-                *length,
-                *proof_layers,
-                &[],
-            ),
-        }
+        self.try_encode()
+            .expect("peer message exceeds the wire length limit")
+    }
+
+    /// Fallibly encode a length-prefixed wire frame.
+    ///
+    /// All owned-frame encoding goes through the same checked implementation
+    /// used by [`Message::encode_into`], so oversized messages cannot be
+    /// emitted with a truncated `u32` length prefix.
+    pub fn try_encode(&self) -> Result<Vec<u8>, WireError> {
+        let encoded_len = self
+            .encoded_len()
+            .ok_or(WireError::MessageTooLarge(u32::MAX))?;
+        let mut dst = BytesMut::with_capacity(encoded_len);
+        self.encode_into(&mut dst)?;
+        Ok(dst.to_vec())
     }
 
     /// Append the length-prefixed wire frame directly to a reusable buffer.
@@ -470,30 +386,6 @@ impl Message {
     }
 }
 
-fn encode_hash_exchange(
-    id: u8,
-    pieces_root: &[u8; 32],
-    base_layer: u32,
-    index: u32,
-    length: u32,
-    proof_layers: u32,
-    hashes: &[u8],
-) -> Vec<u8> {
-    let message_len = 1usize
-        .saturating_add(HASH_EXCHANGE_HEADER_LEN)
-        .saturating_add(hashes.len());
-    let mut out = Vec::with_capacity(4usize.saturating_add(message_len));
-    out.extend_from_slice(&(message_len as u32).to_be_bytes());
-    out.push(id);
-    out.extend_from_slice(pieces_root);
-    out.extend_from_slice(&base_layer.to_be_bytes());
-    out.extend_from_slice(&index.to_be_bytes());
-    out.extend_from_slice(&length.to_be_bytes());
-    out.extend_from_slice(&proof_layers.to_be_bytes());
-    out.extend_from_slice(hashes);
-    out
-}
-
 type HashExchange = ([u8; 32], u32, u32, u32, u32, Vec<[u8; 32]>);
 
 fn parse_hash_exchange(body: &[u8], with_hashes: bool) -> Result<HashExchange, WireError> {
@@ -534,15 +426,6 @@ fn validate_request(length: u32) -> Result<(), WireError> {
         )));
     }
     Ok(())
-}
-
-fn encode_fixed(id: u8, body: &[u8]) -> Vec<u8> {
-    let len = (1 + body.len()) as u32;
-    let mut v = Vec::with_capacity(4 + 1 + body.len());
-    v.extend_from_slice(&len.to_be_bytes());
-    v.push(id);
-    v.extend_from_slice(body);
-    v
 }
 
 fn put_fixed(dst: &mut BytesMut, id: u8, body: &[u8]) {
@@ -922,5 +805,16 @@ mod tests {
         let len = u32::from_be_bytes(encoded[..4].try_into().unwrap());
         assert_eq!(len, 13);
         assert_eq!(encoded.len(), 17);
+    }
+
+    #[test]
+    fn try_encode_rejects_oversized_frame_before_length_truncation() {
+        let message = Message::Bitfield(vec![0; MAX_MESSAGE_LEN as usize]);
+
+        assert!(message.encoded_len().is_none());
+        assert!(matches!(
+            message.try_encode(),
+            Err(WireError::MessageTooLarge(_))
+        ));
     }
 }
