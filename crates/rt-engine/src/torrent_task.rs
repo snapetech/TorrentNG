@@ -1558,6 +1558,19 @@ impl TorrentTask {
             })
     }
 
+    fn reserve_file_policy_workspace_memory(&self) -> Result<Option<MemoryLease>, String> {
+        let bytes = persistent_file_graph_memory_bytes(&self.metainfo_files);
+        if bytes == 0 {
+            return Ok(None);
+        }
+        let bytes = u64::try_from(bytes)
+            .map_err(|_| "file-policy workspace memory estimate does not fit in u64".to_owned())?;
+        self.resources
+            .try_acquire(MemoryClass::Metadata, bytes)
+            .map(Some)
+            .ok_or_else(|| format!("file-policy workspace allocation of {bytes} bytes denied"))
+    }
+
     fn refresh_tracker_state_memory(
         &mut self,
         tracker_tiers: &[Vec<TrackerState>],
@@ -4769,6 +4782,10 @@ impl TorrentTask {
             })
             .await?;
         let has_file_policy = !rows.is_empty();
+        // Admission must precede the clone and replacement map construction;
+        // reserving only after those allocations lets a large durable policy
+        // briefly bypass the metadata governor during reload.
+        let _file_policy_workspace_memory_lease = self.reserve_file_policy_workspace_memory()?;
         let mut effective_files = self.metainfo_files.clone();
         let mut policy = HashMap::with_capacity(rows.len());
         for row in rows {
