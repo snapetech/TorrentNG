@@ -1918,24 +1918,25 @@ async fn fetch_metadata_over_io_inner(
     }
 
     metadata.truncate(metadata_size as usize);
-    let mut reserve_parser_memory = |additional| {
-        u64::try_from(additional)
-            .map(|bytes| lease.try_grow(bytes))
-            .unwrap_or(false)
-    };
-    decode_with_allocation_reservation(&metadata, &mut reserve_parser_memory)
-        .context("fetched metadata is not valid bencode")?;
-    validate_metadata_info_hash(&metadata, expected_info_hash)?;
-    if expected_info_hash.is_v2() && !remote_supports_v2 {
-        anyhow::bail!("pure-v2 metadata peer does not advertise BEP 52 support");
-    }
+    let requirements = {
+        let mut reserve_parser_memory = |additional| {
+            u64::try_from(additional)
+                .map(|bytes| lease.try_grow(bytes))
+                .unwrap_or(false)
+        };
+        decode_with_allocation_reservation(&metadata, &mut reserve_parser_memory)
+            .context("fetched metadata is not valid bencode")?;
+        validate_metadata_info_hash(&metadata, expected_info_hash)?;
+        if expected_info_hash.is_v2() && !remote_supports_v2 {
+            anyhow::bail!("pure-v2 metadata peer does not advertise BEP 52 support");
+        }
 
-    let requirements = v2_piece_layer_requirements_with_allocation_reservation(
-        &metadata,
-        &mut reserve_parser_memory,
-    )
-    .context("fetched metadata has an invalid v2 file tree")?;
-    drop(reserve_parser_memory);
+        v2_piece_layer_requirements_with_allocation_reservation(
+            &metadata,
+            &mut reserve_parser_memory,
+        )
+        .context("fetched metadata has an invalid v2 file tree")?
+    };
     let mut piece_layers = Vec::new();
     if let Some(requirements) = requirements {
         if !requirements.files.is_empty() && !remote_supports_v2 {
