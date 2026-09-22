@@ -44,6 +44,15 @@ pub const STORAGE_LATENCY_BUCKET_COUNT: usize = STORAGE_LATENCY_BUCKETS_NS.len()
 const QUEUED_DISK_JOB_OVERHEAD_BYTES: u64 = 1024;
 const MAX_HASH_QUEUE_RETRIES: usize = 10_000;
 
+fn checked_file_range_end(path: &Path, offset: u64, len: u64) -> Result<u64, StorageError> {
+    offset.checked_add(len).ok_or_else(|| {
+        StorageError::io(
+            path.display().to_string(),
+            io::Error::new(io::ErrorKind::InvalidInput, "file range overflows u64"),
+        )
+    })
+}
+
 fn lock_recover<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     match mutex.lock() {
         Ok(guard) => guard,
@@ -1406,13 +1415,33 @@ fn peer_read_batches(mut requests: Vec<PeerReadRequest>) -> Vec<PeerReadBatch> {
 
     let mut batches: Vec<PeerReadBatch> = Vec::with_capacity(requests.len());
     for request in requests {
-        let request_end = request.offset.saturating_add(request.len as u64);
+        let Some(request_end) = request.offset.checked_add(request.len as u64) else {
+            batches.push(PeerReadBatch {
+                path: request.path.clone(),
+                offset: request.offset,
+                len: request.len,
+                requests: vec![request],
+            });
+            continue;
+        };
         if let Some(last) = batches.last_mut() {
-            let last_end = last.offset.saturating_add(last.len as u64);
+            let last_end = last.offset.checked_add(last.len as u64);
             if normalized_key(&last.path) == normalized_key(&request.path)
-                && request.offset <= last_end
+                && last_end.is_some_and(|end| request.offset <= end)
             {
-                last.len = request_end.saturating_sub(last.offset).max(last.len as u64) as usize;
+                let Some(merged_len) = request_end
+                    .checked_sub(last.offset)
+                    .and_then(|length| usize::try_from(length).ok())
+                else {
+                    batches.push(PeerReadBatch {
+                        path: request.path.clone(),
+                        offset: request.offset,
+                        len: request.len,
+                        requests: vec![request],
+                    });
+                    continue;
+                };
+                last.len = merged_len.max(last.len);
                 last.requests.push(request);
                 continue;
             }
@@ -2013,6 +2042,7 @@ impl MountScheduler {
         offset: u64,
         len: usize,
     ) -> Result<StorageRead, StorageError> {
+        checked_file_range_end(path, offset, len as u64)?;
         let _permit = self.acquire(class).await?;
         let pool = self.file_pool.clone();
         let disk_backend = self.disk_backend.clone();
@@ -2241,6 +2271,7 @@ impl MountScheduler {
         data: bytes::Bytes,
         create: bool,
     ) -> Result<(), StorageError> {
+        checked_file_range_end(path, offset, data.len() as u64)?;
         let _permit = self.acquire(class).await?;
         let strict = self.io_config.durability_mode == DurabilityMode::Strict;
         let pool = self.file_pool.clone();
@@ -2537,6 +2568,7 @@ impl MountScheduler {
         if len == 0 {
             return Ok(Vec::new());
         }
+        checked_file_range_end(path, offset, len)?;
         let pool = self.file_pool.clone();
         let counters = self.counters.clone();
         let path = path.to_path_buf();
@@ -2548,7 +2580,12 @@ impl MountScheduler {
                 .metadata()
                 .map_err(|e| StorageError::io(&path_str, e))?
                 .len();
-            let requested_end = offset.saturating_add(len);
+            let requested_end = offset.checked_add(len).ok_or_else(|| {
+                StorageError::io(
+                    &path_str,
+                    io::Error::new(io::ErrorKind::InvalidInput, "file range overflows u64"),
+                )
+            })?;
             if offset >= file_len || requested_end > file_len {
                 return Err(StorageError::ShortIo {
                     path: path_str,
@@ -2941,7 +2978,9 @@ fn seek_data_extents(
     {
         use std::os::fd::AsRawFd;
 
-        let end = offset.saturating_add(len);
+        let end = offset.checked_add(len).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidInput, "file range overflows u64")
+        })?;
         if len == 0 {
             return Ok((Vec::new(), false));
         }
@@ -3552,6 +3591,41 @@ mod tests {
         .await;
         assert!(result.is_err());
         assert!(!path.exists());
+    }
+
+    #[tokio::test]
+    async fn file_range_overflow_is_rejected_before_storage_access() {
+        let sched = ssd_scheduler();
+        let path = PathBuf::from("range-overflow.bin");
+
+        let read = sched.read_at(IoClass::Foreground, &path, u64::MAX, 1).await;
+        assert!(matches!(
+            read,
+            Err(StorageError::Io { source, .. })
+                if source.kind() == io::ErrorKind::InvalidInput
+        ));
+
+        let write = sched
+            .write_at(
+                IoClass::Foreground,
+                &path,
+                u64::MAX,
+                bytes::Bytes::from_static(b"x"),
+                true,
+            )
+            .await;
+        assert!(matches!(
+            write,
+            Err(StorageError::Io { source, .. })
+                if source.kind() == io::ErrorKind::InvalidInput
+        ));
+
+        let extents = sched.data_extents(&path, u64::MAX, 1).await;
+        assert!(matches!(
+            extents,
+            Err(StorageError::Io { source, .. })
+                if source.kind() == io::ErrorKind::InvalidInput
+        ));
     }
 
     #[tokio::test]
