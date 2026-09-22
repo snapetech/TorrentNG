@@ -2,6 +2,7 @@
 
 use std::{
     collections::{HashMap, HashSet},
+    convert::Infallible,
     net::SocketAddr,
     sync::Arc,
 };
@@ -34,6 +35,7 @@ use tokio::{
     sync::{Notify, RwLock},
     task::JoinSet,
 };
+use tower::limit::GlobalConcurrencyLimitLayer;
 
 // Deluge's compatibility API has no offset/cursor contract. Keep its legacy
 // full-list calls bounded rather than allowing one client request to turn
@@ -52,6 +54,10 @@ const MAX_DELUGE_LABEL_BYTES: usize = 256;
 const MAX_DELUGE_TRACKER_URL_BYTES: usize = 8 * 1024;
 const MAX_DELUGE_TRACKER_BYTES: usize = 4 * 1024 * 1024;
 const DELUGE_RUNTIME_PROJECTION_CONCURRENCY: usize = 64;
+const MAX_DELUGE_AUTH_BODY_BYTES: usize = 16 * 1024;
+const MAX_DELUGE_LARGE_BODY_REQUESTS: usize = 4;
+const MAX_DELUGE_DEFAULT_BODY_BYTES: usize = 8 * 1024 * 1024;
+const MAX_DELUGE_TORRENT_REQUEST_BODY_BYTES: usize = (MAX_TORRENT_BYTES / 3 + 1) * 4 + 1024 * 1024;
 
 struct DelugeRuntimeProjection {
     info_hash: String,
@@ -179,9 +185,27 @@ pub struct JsonRpcRequest {
 }
 
 pub fn build_deluge_router(state: AppState) -> Router {
+    let large_body_limit = GlobalConcurrencyLimitLayer::new(MAX_DELUGE_LARGE_BODY_REQUESTS);
     Router::new()
-        .route("/json", post(json_rpc))
-        .route("/deluge/json", post(json_rpc))
+        // Deluge carries base64 metainfo inside the single JSON-RPC endpoint;
+        // keep the 64 MiB decoded torrent ceiling reachable while admitting
+        // only a small number of these memory-heavy requests concurrently.
+        .route(
+            "/json",
+            post(json_rpc)
+                .layer::<_, Infallible>(DefaultBodyLimit::max(
+                    MAX_DELUGE_TORRENT_REQUEST_BODY_BYTES,
+                ))
+                .layer::<_, Infallible>(large_body_limit.clone()),
+        )
+        .route(
+            "/deluge/json",
+            post(json_rpc)
+                .layer::<_, Infallible>(DefaultBodyLimit::max(
+                    MAX_DELUGE_TORRENT_REQUEST_BODY_BYTES,
+                ))
+                .layer::<_, Infallible>(large_body_limit),
+        )
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
             deluge_idempotency_guard,
@@ -190,7 +214,7 @@ pub fn build_deluge_router(state: AppState) -> Router {
             state.clone(),
             deluge_auth_guard,
         ))
-        .layer(DefaultBodyLimit::max(8 * 1024 * 1024))
+        .layer(DefaultBodyLimit::max(MAX_DELUGE_DEFAULT_BODY_BYTES))
         .with_state(state)
 }
 
@@ -322,7 +346,7 @@ async fn deluge_auth_guard(
     }
 
     let (parts, body) = req.into_parts();
-    let body = match to_bytes(body, 1024 * 1024).await {
+    let body = match to_bytes(body, MAX_DELUGE_AUTH_BODY_BYTES).await {
         Ok(body) => body,
         Err(_) => {
             return StatusCode::PAYLOAD_TOO_LARGE.into_response();
@@ -3130,6 +3154,31 @@ mod tests {
         let body = axum::body::to_bytes(login.into_body(), 4096).await.unwrap();
         let body: Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(body["result"], true);
+    }
+
+    #[tokio::test]
+    async fn deluge_rpc_route_reaches_the_decoded_torrent_size_boundary() {
+        let padding = "x".repeat(MAX_DELUGE_DEFAULT_BODY_BYTES + 1024);
+        let body = serde_json::to_vec(&serde_json::json!({
+            "id": 1,
+            "method": "daemon.info",
+            "params": [],
+            "padding": padding,
+        }))
+        .unwrap();
+        let app = build_deluge_router(AppState::new(Arc::new(RwLock::new(SessionRegistry::new()))));
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/json")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
     }
 
     #[tokio::test]

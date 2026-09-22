@@ -2,6 +2,7 @@
 
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap, HashSet},
+    convert::Infallible,
     sync::Arc,
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -35,6 +36,7 @@ use tokio::{
     sync::{Mutex, Notify, RwLock},
     task::JoinSet,
 };
+use tower::limit::GlobalConcurrencyLimitLayer;
 
 const SESSION_ID: &str = "TorrentNG";
 const MAX_TRANSMISSION_BATCH_REQUESTS: usize = 128;
@@ -52,6 +54,10 @@ const MAX_TRANSMISSION_SUBSCRIPTION_BYTES: usize = 256;
 const MAX_TRANSMISSION_SUBSCRIPTIONS: usize = 1_024;
 const MAX_TRANSMISSION_TRACKER_BYTES: usize = 4 * 1024 * 1024;
 const MAX_TRANSMISSION_METAINFO_ENCODED_BYTES: usize = (MAX_TORRENT_BYTES / 3 + 1) * 4 + 4;
+const MAX_TRANSMISSION_LARGE_BODY_REQUESTS: usize = 4;
+const MAX_TRANSMISSION_DEFAULT_BODY_BYTES: usize = 8 * 1024 * 1024;
+const MAX_TRANSMISSION_TORRENT_REQUEST_BODY_BYTES: usize =
+    MAX_TRANSMISSION_METAINFO_ENCODED_BYTES + 1024 * 1024;
 // Transmission's torrent-get contract has no page/cursor parameter. Bound
 // the compatibility fallback so one request cannot allocate and enrich an
 // arbitrarily large full-list response.
@@ -484,9 +490,27 @@ fn merge_transmission_runtime_projections(
 }
 
 pub fn build_transmission_router(state: AppState) -> Router {
+    let large_body_limit = GlobalConcurrencyLimitLayer::new(MAX_TRANSMISSION_LARGE_BODY_REQUESTS);
     Router::new()
-        .route("/transmission/rpc", post(rpc))
-        .route("/api/transmission/rpc", post(rpc))
+        // Transmission carries base64 metainfo inside the single JSON-RPC
+        // endpoint; keep the 64 MiB decoded torrent ceiling reachable while
+        // admitting only a small number of these memory-heavy requests.
+        .route(
+            "/transmission/rpc",
+            post(rpc)
+                .layer::<_, Infallible>(DefaultBodyLimit::max(
+                    MAX_TRANSMISSION_TORRENT_REQUEST_BODY_BYTES,
+                ))
+                .layer::<_, Infallible>(large_body_limit.clone()),
+        )
+        .route(
+            "/api/transmission/rpc",
+            post(rpc)
+                .layer::<_, Infallible>(DefaultBodyLimit::max(
+                    MAX_TRANSMISSION_TORRENT_REQUEST_BODY_BYTES,
+                ))
+                .layer::<_, Infallible>(large_body_limit),
+        )
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
             transmission_idempotency_guard,
@@ -495,7 +519,7 @@ pub fn build_transmission_router(state: AppState) -> Router {
             state.clone(),
             transmission_auth_guard,
         ))
-        .layer(DefaultBodyLimit::max(8 * 1024 * 1024))
+        .layer(DefaultBodyLimit::max(MAX_TRANSMISSION_DEFAULT_BODY_BYTES))
         .with_state(state)
 }
 
@@ -4023,6 +4047,33 @@ mod tests {
         // independent checks, and auth must run first (see the 401 case
         // above) without masking or short-circuiting the second one.
         assert_eq!(allowed.status(), StatusCode::CONFLICT);
+    }
+
+    #[tokio::test]
+    async fn transmission_rpc_route_reaches_the_decoded_torrent_size_boundary() {
+        let padding = "x".repeat(MAX_TRANSMISSION_DEFAULT_BODY_BYTES + 1024);
+        let body = serde_json::to_vec(&serde_json::json!({
+            "id": 1,
+            "method": "session-get",
+            "arguments": {},
+            "padding": padding,
+        }))
+        .unwrap();
+        let app =
+            build_transmission_router(AppState::new(Arc::new(RwLock::new(SessionRegistry::new()))));
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/transmission/rpc")
+                    .header("content-type", "application/json")
+                    .header("x-transmission-session-id", SESSION_ID)
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
     }
 
     #[tokio::test]
