@@ -18,4 +18,5 @@ pub use state::{
 };
 pub use transport::{
     stats_snapshot, UtpEndpoint, UtpListener, UtpStats, UtpStream, UtpTransportConfig,
+    MAX_UDP_DATAGRAM_LEN,
 };

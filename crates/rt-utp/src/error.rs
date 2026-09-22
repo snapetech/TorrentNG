@@ -62,4 +62,7 @@ pub enum UtpError {
 
     #[error("uTP receive buffer exceeded {max} bytes (attempted {actual})")]
     ReceiveBufferFull { max: usize, actual: usize },
+
+    #[error("invalid uTP transport configuration: {0}")]
+    InvalidConfig(&'static str),
 }
