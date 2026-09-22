@@ -20,7 +20,7 @@ FIRST RUN: torrentngd reads its settings from a config.toml file, not environmen
 2. Either leave it empty to run with the packaged defaults (0.0.0.0:8080 WebUI, port 44444 for peer traffic, DHT on), or copy in a customized config.toml -- see deploy/native/config.toml in the TorrentNG repository for every field.
 3. Set the "API Token" variable below to a random string; the container writes it to the path the packaged config already expects for authenticating the WebUI/API. Generate one with e.g. `openssl rand -hex 32` on any Linux box, or the Unraid terminal.
 
-This container always runs as a fixed UID 1000 / GID 1000 baked into the image (torrentngd has no PUID/PGID handling, so it can't adapt to whatever the container is started as). Make sure the Data, Config, and State/DB appdata folders are owned by 1000:1000 before first start -- from the Unraid terminal: `chown -R 1000:1000 /mnt/user/appdata/torrentng/`.</Overview>
+This container always runs as a fixed UID 1000 / GID 1000 baked into the image (torrentngd has no PUID/PGID handling, so it can't adapt to whatever the container is started as). Make sure the Data, Config, and State/DB appdata folders are owned by 1000:1000 before first start. For the default paths shown below, use Unraid's Tools -> New Permissions on both `/mnt/user/downloads/torrentng` and `/mnt/user/appdata/torrentng`, or run from the Unraid terminal: `chown -R 1000:1000 /mnt/user/downloads/torrentng /mnt/user/appdata/torrentng`.</Overview>
 
   <Category>Downloaders:</Category>
   <Category>Network:Web</Category>

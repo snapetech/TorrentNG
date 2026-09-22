@@ -89,6 +89,16 @@ Either way, before submitting:
   `Display="advanced"` and per-field descriptions saying which "Backend
   Type" selection they apply to, following the same pattern used by
   multi-provider templates like binhex's VPN-enabled containers.
+- **Both images require host-path access for UID/GID `1000:1000`.** Use
+  Unraid's Tools -> New Permissions on every mounted Data/Downloads and
+  appdata path before first start. With the default paths in these templates,
+  the equivalent terminal commands are:
+  `chown -R 1000:1000 /mnt/user/downloads/torrentng /mnt/user/appdata/torrentng`
+  for the native template, and
+  `chown -R 1000:1000 /mnt/user/downloads /mnt/user/appdata/torrentng-webui`
+  for the WebUI template. If the WebUI Data path is shared with another
+  torrent client, preserve that client's access too; UID 1000 still needs
+  read/write access for file-management operations.
 - **Neither image takes a `--user` override; both templates rely on the
   image's own fixed UID/GID.** Tried overriding to Unraid's standard
   `nobody:users` (99:100) first, since neither `torrentngd` nor the

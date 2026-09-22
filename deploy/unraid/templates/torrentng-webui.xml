@@ -24,7 +24,7 @@ IMPORTANT -- rTorrent identity: on every start, TorrentNG pushes its own User-Ag
 
 Secret Key and API Tokens are required before first start regardless of backend -- they protect the WebUI and API themselves, not your torrent client. Generate both with e.g. `openssl rand -hex 32`.
 
-This container always runs as a fixed UID 1000 / GID 1000 baked into the image. Make sure the Downloads/Data and Appdata/State folders are owned by 1000:1000 before first start -- from the Unraid terminal: `chown -R 1000:1000 /mnt/user/appdata/torrentng-webui/`.</Overview>
+This container always runs as a fixed UID 1000 / GID 1000 baked into the image. Make sure the Downloads/Data and Appdata/State folders are owned by 1000:1000 before first start. For the default paths shown below, use Unraid's Tools -> New Permissions on `/mnt/user/downloads` and `/mnt/user/appdata/torrentng-webui`, or run from the Unraid terminal: `chown -R 1000:1000 /mnt/user/downloads /mnt/user/appdata/torrentng-webui`.</Overview>
 
   <Category>Downloaders:</Category>
   <Category>Network:Web</Category>
