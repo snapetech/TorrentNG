@@ -20,6 +20,8 @@ ARG TNG_GID=1000
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates curl tini \
     && rm -rf /var/lib/apt/lists/* \
+    && case "$TNG_UID" in ''|*[!0-9]*) echo "TNG_UID must be a nonzero numeric ID" >&2; exit 1;; *[1-9]*) :;; *) echo "TNG_UID must be a nonzero numeric ID" >&2; exit 1;; esac \
+    && case "$TNG_GID" in ''|*[!0-9]*) echo "TNG_GID must be a nonzero numeric ID" >&2; exit 1;; *[1-9]*) :;; *) echo "TNG_GID must be a nonzero numeric ID" >&2; exit 1;; esac \
     && groupadd --system --gid "$TNG_GID" torrentngd \
     && useradd --system --uid "$TNG_UID" --gid "$TNG_GID" --home /var/lib/torrentngd --create-home --shell /usr/sbin/nologin torrentngd \
     && mkdir -p /data /config /var/lib/torrentngd /usr/share/torrentng/webui /run/secrets \

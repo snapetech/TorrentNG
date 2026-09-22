@@ -188,6 +188,26 @@ class WorkflowSecurityTests(unittest.TestCase):
                 source = (ROOT / relative_path).read_text(encoding="utf-8")
                 self.assertIn(f'- "{binding}"', source)
 
+    def test_native_deployments_pin_non_root_privileges(self) -> None:
+        dockerfile = (ROOT / "deploy/native/Dockerfile").read_text(encoding="utf-8")
+        compose = (ROOT / "deploy/native/compose.yml").read_text(encoding="utf-8")
+        interop = (ROOT / "deploy/interop/compose.yml").read_text(encoding="utf-8")
+        statefulset = (ROOT / "deploy/native/kubernetes/statefulset.yaml").read_text(
+            encoding="utf-8"
+        )
+
+        self.assertIn('TNG_UID must be a nonzero numeric ID', dockerfile)
+        self.assertIn('TNG_GID must be a nonzero numeric ID', dockerfile)
+        for source in (compose, interop):
+            self.assertIn("cap_drop:\n      - ALL", source)
+            self.assertIn("no-new-privileges:true", source)
+        self.assertIn("runAsNonRoot: true", statefulset)
+        self.assertIn("runAsUser: 1000", statefulset)
+        self.assertIn("runAsGroup: 1000", statefulset)
+        self.assertIn("allowPrivilegeEscalation: false", statefulset)
+        self.assertIn("type: RuntimeDefault", statefulset)
+        self.assertIn("automountServiceAccountToken: false", statefulset)
+
     def test_default_rtorrent_settings_overlay_uses_persistent_writable_state(self) -> None:
         compose = (ROOT / "deploy/docker/compose.yml").read_text(encoding="utf-8")
         entrypoint = (ROOT / "deploy/docker/entrypoint.sh").read_text(encoding="utf-8")

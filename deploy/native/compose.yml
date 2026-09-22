@@ -5,6 +5,10 @@ services:
       context: ../..
       dockerfile: deploy/native/Dockerfile
     restart: unless-stopped
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
     ports:
       - "127.0.0.1:28082:8080"
       - "44444:44444"

@@ -13,6 +13,10 @@ services:
       context: ../..
       dockerfile: deploy/native/Dockerfile
     restart: unless-stopped
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
     ports:
       - "127.0.0.1:${INTEROP_RUST_HOST_PORT:-28180}:8080"
       - "${INTEROP_RUST_PEER_PORT:-29181}:6881"

@@ -176,18 +176,22 @@ if command -v docker >/dev/null 2>&1 && docker compose version >"$TMP_DIR/compos
       ] as $management_ports
       | ($management_ports | length) == 8
         and all($management_ports[]; .host_ip == "127.0.0.1")
+        and ((.services.torrentngd.cap_drop // []) | index("ALL")) != null
+        and ((.services.torrentngd.security_opt // []) | index("no-new-privileges:true")) != null
     ' "$TMP_DIR/interop-compose.json" >/dev/null &&
     TORRENTNG_API_TOKEN=local-native-compose-validation-token \
       docker compose --profile observability \
         -f "$ROOT/deploy/native/compose.yml" config --format json \
         >"$TMP_DIR/native-compose.json" 2>>"$TMP_DIR/compose.log" &&
-    jq -e '
-      any(.services.torrentngd.ports[]?;
-        .target == 8080 and .host_ip == "127.0.0.1")
-      and any(.services.prometheus.ports[]?;
-        .target == 9090 and .host_ip == "127.0.0.1")
-      and any(.services.grafana.ports[]?;
-        .target == 3000 and .host_ip == "127.0.0.1")
+      jq -e '
+        any(.services.torrentngd.ports[]?;
+          .target == 8080 and .host_ip == "127.0.0.1")
+        and ((.services.torrentngd.cap_drop // []) | index("ALL")) != null
+        and ((.services.torrentngd.security_opt // []) | index("no-new-privileges:true")) != null
+        and any(.services.prometheus.ports[]?;
+          .target == 9090 and .host_ip == "127.0.0.1")
+        and any(.services.grafana.ports[]?;
+          .target == 3000 and .host_ip == "127.0.0.1")
     ' "$TMP_DIR/native-compose.json" >/dev/null &&
     grep -Fq 'php/getsettings.php' "$ROOT/deploy/docker/compose.phase1.yml" &&
     grep -Fq 'php/getsettings.php' "$ROOT/scripts/phase1_certification.sh" &&
@@ -205,6 +209,13 @@ if command -v docker >/dev/null 2>&1 && docker compose version >"$TMP_DIR/compos
     grep -Fq '"/var/lib/torrentng"' "$ROOT/deploy/docker/Dockerfile" &&
     grep -Fq 'USER 1000:1000' "$ROOT/deploy/docker/Dockerfile" &&
     grep -Fq 'USER 1000:1000' "$ROOT/deploy/docker/Dockerfile.phase1" &&
+    grep -Fq 'TNG_UID must be a nonzero numeric ID' "$ROOT/deploy/native/Dockerfile" &&
+    grep -Fq 'cap_drop:' "$ROOT/deploy/native/compose.yml" &&
+    grep -Fq 'no-new-privileges:true' "$ROOT/deploy/native/compose.yml" &&
+    grep -Fq 'cap_drop:' "$ROOT/deploy/interop/compose.yml" &&
+    grep -Fq 'no-new-privileges:true' "$ROOT/deploy/interop/compose.yml" &&
+    grep -Fq 'runAsNonRoot: true' "$ROOT/deploy/native/kubernetes/statefulset.yaml" &&
+    grep -Fq 'automountServiceAccountToken: false' "$ROOT/deploy/native/kubernetes/statefulset.yaml" &&
     grep -Fq "user: \"\${PUID:-1000}:\${PGID:-1000}\"" "$ROOT/deploy/docker/compose.yml" &&
     grep -Fq "user: \"\${PUID:-1000}:\${PGID:-1000}\"" "$ROOT/deploy/docker/compose.phase1.yml" &&
     grep -Fq './config:/config:ro' "$ROOT/deploy/docker/compose.yml" &&

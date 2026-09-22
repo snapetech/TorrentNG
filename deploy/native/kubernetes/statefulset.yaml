@@ -14,12 +14,23 @@ spec:
       labels:
         app.kubernetes.io/name: torrentngd
     spec:
+      automountServiceAccountToken: false
       securityContext:
         fsGroup: 1000
+        runAsGroup: 1000
+        runAsNonRoot: true
+        runAsUser: 1000
+        seccompProfile:
+          type: RuntimeDefault
       containers:
         - name: torrentngd
           image: torrentng/torrentngd:local
           imagePullPolicy: IfNotPresent
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
           env:
             - name: TORRENTNGD_CONFIG
               value: /etc/torrentngd/config.toml
