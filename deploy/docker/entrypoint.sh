@@ -13,6 +13,20 @@ BACKEND=${TNG_BACKEND:-rtorrent}
 export TERM="${TERM:-xterm}"
 umask 0002
 
+# MANAGE_RTORRENT selects whether this container spawns and owns an rTorrent
+# process (the default, matching every existing compose profile) or the
+# compatible-client service only talks to an rTorrent instance the operator
+# already runs elsewhere (TNG_RTORRENT_MANAGED=0, paired with TNG_SCGI_ADDR or
+# TNG_SCGI_SOCKET pointed at that instance). Only meaningful when BACKEND is
+# rtorrent; every other backend already skips the local rTorrent process.
+MANAGE_RTORRENT=0
+if [ "$BACKEND" = "rtorrent" ]; then
+  case "${TNG_RTORRENT_MANAGED:-1}" in
+    0 | false | no | NO | False) MANAGE_RTORRENT=0 ;;
+    *) MANAGE_RTORRENT=1 ;;
+  esac
+fi
+
 mkdir -p /run/rtorrent /session /data /var/lib/torrentng /var/log/rtorrent /config
 rm -f "$RTORRENT_SOCKET" /session/rtorrent.lock
 
@@ -22,7 +36,7 @@ else
   : > /run/rtorrent/user.rc
 fi
 
-if [ "$BACKEND" = "rtorrent" ] && [ -n "${TNG_RTORRENT_OVERLAY:-}" ]; then
+if [ "$MANAGE_RTORRENT" = "1" ] && [ -n "${TNG_RTORRENT_OVERLAY:-}" ]; then
   RTORRENT_UI_OVERLAY=$TNG_RTORRENT_OVERLAY
   case "$RTORRENT_UI_OVERLAY" in
     /*) ;;
@@ -70,7 +84,7 @@ if [ ! -r "$CONFIG_FILE" ]; then
   fi
 fi
 
-if [ "$BACKEND" = "rtorrent" ]; then
+if [ "$MANAGE_RTORRENT" = "1" ]; then
   cd /data
 
   # Start rTorrent in background
@@ -114,6 +128,8 @@ if [ "$BACKEND" = "rtorrent" ]; then
     echo "Waiting ${startup_grace_secs}s for rTorrent session replay to finish..." >&2
     sleep "$startup_grace_secs"
   fi
+elif [ "$BACKEND" = "rtorrent" ]; then
+  echo "Starting TorrentNG compatible-client service against an external rTorrent instance (TNG_RTORRENT_MANAGED=0)"
 else
   echo "Starting TorrentNG compatible-client service with external backend: $BACKEND"
 fi

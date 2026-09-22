@@ -1,0 +1,17 @@
+<CommunityApplications>
+  <Profile>
+This repository hosts the Community Applications templates for **TorrentNG**, a modern torrent management stack built for headless power-user seeding at scale (10k-100k torrents, 200+ TB).
+
+Two templates are provided:
+
+- **torrentng-webui** -- a replacement WebUI/API for an rTorrent, qBittorrent, Transmission, or Deluge install you already run. No built-in torrent engine; it fronts your existing client.
+- **torrentng** -- the full first-party stack: `torrentngd`, TorrentNG's own Rust BitTorrent client daemon, with its built-in WebUI/API and no external client dependency.
+
+Both ship a qBittorrent-compatible API so Prowlarr, Sonarr, Radarr, autobrr, and cross-seed keep working unchanged.
+
+Source, issues, and documentation: https://github.com/snapetech/TorrentNG
+  </Profile>
+  <Icon>https://raw.githubusercontent.com/snapetech/TorrentNG/main/deploy/unraid/icon.png</Icon>
+  <WebPage>https://github.com/snapetech/TorrentNG</WebPage>
+  <Forum>https://github.com/snapetech/TorrentNG/issues</Forum>
+</CommunityApplications>

@@ -113,6 +113,12 @@ local testing. For systemd or a direct binary deployment, use a root-owned
 token file and set `auth.api_tokens_file` to its path, or use inline
 `auth.api_tokens` in a private config.
 
+For Unraid, see [deploy/unraid/README.md](../deploy/unraid/README.md) and the
+`torrentng` Community Applications template -- it runs the same image behind
+a thin entrypoint that fills in `auth.api_tokens_file` from a plain
+`TORRENTNGD_API_TOKEN` environment variable, since `torrentngd` itself has no
+per-field environment overrides.
+
 ## systemd
 
 Example unit and tmpfiles definitions are in [deploy/native/systemd](../deploy/native/systemd).

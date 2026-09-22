@@ -1,0 +1,72 @@
+<?xml version="1.0"?>
+<Container version="2">
+  <Name>torrentng-webui</Name>
+  <Repository>ghcr.io/snapetech/torrentng/sidecar:latest</Repository>
+  <Registry>https://github.com/snapetech/TorrentNG/pkgs/container/torrentng%2Fsidecar</Registry>
+  <Network>bridge</Network>
+  <Privileged>false</Privileged>
+  <ExtraParams>--user 99:100</ExtraParams>
+  <Shell>sh</Shell>
+
+  <Icon>https://raw.githubusercontent.com/snapetech/TorrentNG/main/deploy/unraid/icon.png</Icon>
+
+  <WebUI>http://[IP]:[PORT:8080]</WebUI>
+
+  <Overview>TorrentNG WebUI is a modern replacement web interface and API for an rTorrent, qBittorrent, Transmission, or Deluge install you already run -- on this box or elsewhere on your network. It does not run its own torrent engine; your existing client keeps owning transfer/session state. TorrentNG polls it, caches state for a fast virtualized 10k-100k-row table, pushes live updates over WebSocket, and exposes a qBittorrent-compatible API so Prowlarr/Sonarr/Radarr/autobrr/cross-seed keep working unchanged.
+
+If you don't already run one of those four clients and just want one box that does everything, use the "TorrentNG" (native) template instead -- it runs TorrentNG's own first-party client with no external dependency.
+
+SETUP: pick "Backend Type" below and fill in only that backend's section (all four are listed since Unraid templates can't hide fields conditionally -- the others are ignored):
+
+- qBittorrent / Transmission / Deluge: point the matching URL variable at your existing container's WebUI/RPC address (e.g. http://192.168.1.10:8080 for qBittorrent). These already speak HTTP over the network, so this is normally a two-field job: URL + credentials.
+- rTorrent: leave "Managed" at 0 (the default) to connect to an rTorrent you already run, and set "SCGI TCP Address" to host:port. This requires your existing rTorrent to have SCGI bound to a TCP address rather than a private Unix socket inside its own container -- check that client's own config/template. If your setup only exposes a Unix socket, mount the host directory holding that socket file into this container yourself (extra Path in this template's Unraid config) and point "SCGI Socket Path" at it instead. Set "Managed" to 1 only if you want this container to launch and own its own brand-new rTorrent (rarely what you want alongside an existing install).
+
+IMPORTANT -- rTorrent identity: on every start, TorrentNG pushes its own User-Agent and peer_id to whatever rTorrent it's connected to (this is how the compatible API keeps *arr tools working). Pointing this at an rTorrent that already has an established tracker history under a different identity will silently rewrite that identity going forward. This is expected and safe for a install TorrentNG will manage long-term, but understand it before connecting to a client you don't want touched. See docs/TRACKER-IDENTITY.md in the TorrentNG repository. Never set the same Peer ID Override across more than one install -- a shared peer_id has gotten real users banned from private trackers for "running multiple clients."
+
+Secret Key and API Tokens are required before first start regardless of backend -- they protect the WebUI and API themselves, not your torrent client. Generate both with e.g. `openssl rand -hex 32`.</Overview>
+
+  <Category>Downloaders:</Category>
+  <Category>Network:Web</Category>
+
+  <Support>https://github.com/snapetech/TorrentNG/issues</Support>
+  <Project>https://github.com/snapetech/TorrentNG</Project>
+  <TemplateURL>https://raw.githubusercontent.com/snapetech/TorrentNG/main/deploy/unraid/templates/torrentng-webui.xml</TemplateURL>
+  <ReadMe>https://raw.githubusercontent.com/snapetech/TorrentNG/main/deploy/unraid/README.md</ReadMe>
+
+  <ExtraSearchTerms>rutorrent replacement webui bittorrent rtorrent qbittorrent transmission deluge prowlarr sonarr radarr autobrr cross-seed</ExtraSearchTerms>
+  <Requires>An existing rTorrent, qBittorrent, Transmission, or Deluge install reachable on your network. Set Secret Key and API Tokens before first start.</Requires>
+  <Changes>Initial Community Applications template.</Changes>
+  <Date>2026-09-21</Date>
+  <MinVer>6.9</MinVer>
+  <License>GPL-3.0-or-later</License>
+
+  <Config Name="WebUI/API Port" Target="8080" Default="8080" Mode="tcp" Description="TorrentNG WebUI, REST/SSE/WebSocket API, and qBittorrent-compatible API (used by Prowlarr/Sonarr/Radarr/autobrr/cross-seed)." Type="Port" Display="always" Required="true" Mask="false"/>
+
+  <Config Name="Backend Type" Target="TNG_BACKEND" Default="rtorrent|qbittorrent|transmission|deluge" Description="Which existing torrent client this WebUI talks to. Fill in only the matching section below." Type="Variable" Display="always" Required="true" Mask="false"/>
+  <Config Name="Secret Key" Target="TNG_SECRET_KEY" Default="" Description="Random secret used to sign the WebUI's session cookies. Required. Generate with: openssl rand -hex 32" Type="Variable" Display="always" Required="true" Mask="true"/>
+  <Config Name="API Tokens" Target="TNG_API_TOKENS" Default="" Description="Comma-separated bearer token(s) for the REST/qBittorrent-compatible API (used by Prowlarr/Sonarr/Radarr/autobrr/cross-seed). Required. Generate with: openssl rand -hex 32" Type="Variable" Display="always" Required="true" Mask="true"/>
+
+  <Config Name="Downloads/Data" Target="/data" Default="/mnt/user/downloads" Mode="rw" Description="Mount the SAME host folder your existing torrent client stores files in. TorrentNG reads this for file browsing and free-space reporting; it does not need to match exactly if your client only reports state remotely, but file-management API calls need it." Type="Path" Display="always" Required="true" Mask="false"/>
+  <Config Name="Appdata/State" Target="/var/lib/torrentng" Default="/mnt/user/appdata/torrentng-webui/state" Mode="rw" Description="TorrentNG's own cache database and the generated per-install peer_id suffix (see docs/TRACKER-IDENTITY.md) live here. Back this up if you want the same identity to persist across container recreates." Type="Path" Display="always" Required="true" Mask="false"/>
+  <Config Name="Config (optional)" Target="/config" Default="/mnt/user/appdata/torrentng-webui/config" Mode="ro" Description="Optional config.toml/rtorrent.rc overrides. Leave the folder empty to run entirely from the Variables below and the packaged defaults." Type="Path" Display="advanced" Required="false" Mask="false"/>
+
+  <Config Name="rTorrent: Managed (bundled)" Target="TNG_RTORRENT_MANAGED" Default="0" Description="0 (default): connect to an rTorrent you already run, using SCGI TCP Address or SCGI Socket Path below. 1: this container also launches and owns its own new rTorrent process (rarely wanted when fronting an existing install)." Type="Variable" Display="advanced" Required="false" Mask="false"/>
+  <Config Name="rTorrent: SCGI TCP Address" Target="TNG_SCGI_ADDR" Default="" Description="host:port of your existing rTorrent's SCGI listener, e.g. 192.168.1.10:5000. Requires that rTorrent to have network.scgi.open_port bound to a TCP address rather than a local Unix socket." Type="Variable" Display="advanced" Required="false" Mask="false"/>
+  <Config Name="rTorrent: SCGI Socket Path" Target="TNG_SCGI_SOCKET" Default="" Description="Alternative to SCGI TCP Address: container-side path to a Unix socket, for when you've mounted the host folder holding your existing rTorrent's socket file into this container yourself (add an extra Path in this template's Unraid settings)." Type="Variable" Display="advanced" Required="false" Mask="false"/>
+  <Config Name="rTorrent: Bundled Peer Port TCP" Target="50000" Default="50000" Mode="tcp" Description="Only used when rTorrent: Managed is set to 1. Ignored when connecting to an existing rTorrent." Type="Port" Display="advanced" Required="false" Mask="false"/>
+  <Config Name="rTorrent: Bundled Peer Port UDP" Target="50000" Default="50000" Mode="udp" Description="Only used when rTorrent: Managed is set to 1. Ignored when connecting to an existing rTorrent." Type="Port" Display="advanced" Required="false" Mask="false"/>
+  <Config Name="rTorrent: User-Agent" Target="TNG_USER_AGENT" Default="rtorrent/0.16.11/0.16.11" Description="Tracker-facing identity pushed to rTorrent on every start. Leave at the default unless you have a specific reason to change it -- see docs/TRACKER-IDENTITY.md." Type="Variable" Display="advanced" Required="false" Mask="false"/>
+  <Config Name="rTorrent: Peer ID Override" Target="TNG_PEER_ID" Default="" Description="Leave empty (recommended): a unique 20-byte peer_id is generated and persisted per install automatically. Only set this to pin one specific, reproducible value -- e.g. a test fixture. NEVER copy the same value into more than one install/template: a shared peer_id has gotten real users banned from private trackers for 'running multiple clients'." Type="Variable" Display="advanced" Required="false" Mask="false"/>
+
+  <Config Name="qBittorrent: URL" Target="TNG_QBITTORRENT_URL" Default="" Description="WebUI URL of your existing qBittorrent, e.g. http://192.168.1.10:8080" Type="Variable" Display="advanced" Required="false" Mask="false"/>
+  <Config Name="qBittorrent: Username" Target="TNG_QBITTORRENT_USERNAME" Default="" Description="qBittorrent WebUI username." Type="Variable" Display="advanced" Required="false" Mask="false"/>
+  <Config Name="qBittorrent: Password" Target="TNG_QBITTORRENT_PASSWORD" Default="" Description="qBittorrent WebUI password." Type="Variable" Display="advanced" Required="false" Mask="true"/>
+  <Config Name="qBittorrent: No Auth" Target="TNG_QBITTORRENT_NO_AUTH" Default="0" Description="Set to 1 only if that qBittorrent's WebUI authentication is disabled for trusted-network access (its own 'Bypass authentication for clients on localhost/whitelisted subnet' setting)." Type="Variable" Display="advanced" Required="false" Mask="false"/>
+
+  <Config Name="Transmission: URL" Target="TNG_TRANSMISSION_URL" Default="" Description="RPC URL of your existing Transmission, e.g. http://192.168.1.10:9091/transmission/rpc" Type="Variable" Display="advanced" Required="false" Mask="false"/>
+  <Config Name="Transmission: Username" Target="TNG_TRANSMISSION_USERNAME" Default="" Description="Transmission RPC username." Type="Variable" Display="advanced" Required="false" Mask="false"/>
+  <Config Name="Transmission: Password" Target="TNG_TRANSMISSION_PASSWORD" Default="" Description="Transmission RPC password." Type="Variable" Display="advanced" Required="false" Mask="true"/>
+
+  <Config Name="Deluge: URL" Target="TNG_DELUGE_URL" Default="" Description="JSON-RPC URL of your existing Deluge (deluge-web), e.g. http://192.168.1.10:8112/json" Type="Variable" Display="advanced" Required="false" Mask="false"/>
+  <Config Name="Deluge: Password" Target="TNG_DELUGE_PASSWORD" Default="" Description="Deluge Web UI password." Type="Variable" Display="advanced" Required="false" Mask="true"/>
+</Container>

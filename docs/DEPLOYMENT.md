@@ -184,6 +184,12 @@ docker compose --env-file .env \
 
 Use the corresponding overlay and profile name for Transmission or Deluge.
 
+To front an rTorrent instance you already run elsewhere instead of one of
+these bundled overlays, set `TNG_BACKEND=rtorrent`, `TNG_RTORRENT_MANAGED=0`,
+and `TNG_SCGI_ADDR` (or `TNG_SCGI_SOCKET`) to that instance -- the same knobs
+the Unraid `torrentng-webui` template uses (see
+[deploy/unraid/README.md](../deploy/unraid/README.md)).
+
 ### Home live-main updater
 
 For a home test instance that should follow GitHub `main`, run the updater from
