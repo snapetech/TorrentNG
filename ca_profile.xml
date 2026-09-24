@@ -11,7 +11,7 @@ Both ship a qBittorrent-compatible API so Prowlarr, Sonarr, Radarr, autobrr, and
 
 Source, issues, and documentation: https://github.com/snapetech/TorrentNG
   </Profile>
-  <Icon>https://raw.githubusercontent.com/snapetech/TorrentNG/main/deploy/unraid/icon.png</Icon>
+  <Icon>https://raw.githubusercontent.com/snapetech/TorrentNG/main/icon.png</Icon>
   <WebPage>https://github.com/snapetech/TorrentNG</WebPage>
   <Forum>https://github.com/snapetech/TorrentNG/issues</Forum>
 </CommunityApplications>

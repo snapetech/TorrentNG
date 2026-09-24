@@ -7,7 +7,7 @@
   <Privileged>false</Privileged>
   <Shell>sh</Shell>
 
-  <Icon>https://raw.githubusercontent.com/snapetech/TorrentNG/main/deploy/unraid/icon.png</Icon>
+  <Icon>https://raw.githubusercontent.com/snapetech/TorrentNG/main/icon.png</Icon>
 
   <WebUI>http://[IP]:[PORT:8080]</WebUI>
 
@@ -31,7 +31,7 @@ The image supports runtime PUID/PGID handling. This template defaults to Unraid'
 
   <Support>https://github.com/snapetech/TorrentNG/issues</Support>
   <Project>https://github.com/snapetech/TorrentNG</Project>
-  <TemplateURL>https://raw.githubusercontent.com/snapetech/TorrentNG/main/deploy/unraid/templates/torrentng-webui.xml</TemplateURL>
+  <TemplateURL>https://raw.githubusercontent.com/snapetech/TorrentNG/main/templates/torrentng-webui.xml</TemplateURL>
   <ReadMe>https://raw.githubusercontent.com/snapetech/TorrentNG/main/deploy/unraid/README.md</ReadMe>
 
   <ExtraSearchTerms>rutorrent replacement webui bittorrent rtorrent qbittorrent transmission deluge prowlarr sonarr radarr autobrr cross-seed</ExtraSearchTerms>

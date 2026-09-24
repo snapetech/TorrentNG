@@ -1,4 +1,4 @@
-# deploy/unraid/
+# Unraid deployment
 
 Unraid Community Applications (CA) templates for TorrentNG. See
 [deploy/README.md](../README.md) for the underlying Docker images and
@@ -8,10 +8,10 @@ non-Unraid deployment paths these templates wrap.
 
 | Path | What it is |
 |---|---|
-| `templates/torrentng-webui.xml` | WebUI/API replacement for an rTorrent, qBittorrent, Transmission, or Deluge install you already run. Image: `ghcr.io/snapetech/torrentng/sidecar`. |
-| `templates/torrentng.xml` | Full first-party stack: `torrentngd` with its built-in WebUI/API, no external client. Image: `ghcr.io/snapetech/torrentng/native`. |
-| `ca_profile.xml` | Repository profile shown by Community Applications (author/support info). Must live at the root of whatever repo is actually submitted to CA -- see "Getting listed in Community Applications" below. |
-| `icon.svg`, `icon.png` | App icon referenced by both templates and `ca_profile.xml`. `icon.png` is the rasterized 256x256 version (`rsvg-convert -w 256 -h 256 icon.svg -o icon.png`); regenerate it if `icon.svg` changes. |
+| `../../templates/torrentng-webui.xml` | WebUI/API replacement for an rTorrent, qBittorrent, Transmission, or Deluge install you already run. Image: `ghcr.io/snapetech/torrentng/sidecar`. |
+| `../../templates/torrentng.xml` | Full first-party stack: `torrentngd` with its built-in WebUI/API, no external client. Image: `ghcr.io/snapetech/torrentng/native`. |
+| `../../ca_profile.xml` | Repository profile shown by Community Applications (author/support info), at the repository root. |
+| `../../icon.svg`, `../../icon.png` | App icon referenced by both templates and `ca_profile.xml`. `icon.png` is the rasterized 256x256 version; from the repository root, regenerate it with `rsvg-convert -w 256 -h 256 icon.svg -o icon.png`. |
 
 ## Which template
 
@@ -33,7 +33,7 @@ or review required:
 1. Docker tab -> **Add Container**.
 2. In the **Template** field at the top, paste the raw GitHub URL of the
    template you want, e.g.
-   `https://raw.githubusercontent.com/snapetech/TorrentNG/main/deploy/unraid/templates/torrentng-webui.xml`.
+   `https://raw.githubusercontent.com/snapetech/TorrentNG/main/templates/torrentng-webui.xml`.
 3. The form populates from the template. Fill in the required fields
    (Secret Key, API Tokens, and the backend URL/credentials for
    `torrentng-webui`; the API Token and Config path for `torrentng`) and
@@ -44,42 +44,30 @@ TorrentNG users before/without a formal CA listing.
 
 ## Getting listed in Community Applications
 
-Full discoverability (searchable in the Apps tab for every Unraid user
-without them having anything pasted in first) goes through
-<https://ca.unraid.net/submit>, which live-scans a **repository root** for
-`ca_profile.xml` plus one XML per app under `templates/`.
+Full discoverability goes through <https://ca.unraid.net/submit>. The
+Community Apps portal scans a repository as a unit: `ca_profile.xml` is at
+the repository root, and each Docker app has one XML under `templates/`.
+TorrentNG now uses that layout directly in this repository, so a scan finds
+both app templates as entries under one publisher profile.
 
-`ca_profile.xml` in this directory is written as if `deploy/unraid/` *is*
-that repository root (matching the layout of
-<https://github.com/unraid/unraid-community-apps-starter>, the official
-starter template). Since TorrentNG is a monorepo, submitting requires one
-of:
+If the native template is already submitted from this repository, the
+WebUI template is included in the same repository scan; it does not need a
+second submission. To publish the WebUI as a separate repository/listing,
+create a dedicated public repository containing its own root
+`ca_profile.xml`, `icon.png`, and only `templates/torrentng-webui.xml`, then
+change its profile text to describe the WebUI app alone. Update the raw
+GitHub URLs in the profile and template, especially `<Icon>` and
+`<TemplateURL>`, to point at the new repository.
 
-1. **Mirror `deploy/unraid/` into a dedicated repo** (e.g.
-   `snapetech/torrentng-unraid-templates`), matching how most multi-app
-   maintainers do this (binhex, ibracorp, etc. all keep templates in a repo
-   separate from the application source). Recommended: keeps template
-   release cadence independent of the main TorrentNG repo, and matches
-   what CA moderators expect to see. After creating it, update every
-   `raw.githubusercontent.com/snapetech/TorrentNG/main/deploy/unraid/...`
-   URL in `ca_profile.xml` and both template XMLs to the new repo's raw
-   URLs (including each template's own `<TemplateURL>` -- it must point at
-   itself).
-2. **Submit the TorrentNG repo directly**, moving `ca_profile.xml` to the
-   repo root and updating the same URLs to drop the `deploy/unraid/`
-   segment. Simpler, but puts CA-specific metadata at the top level of an
-   otherwise unrelated software repo.
+Before submitting or rescanning:
 
-Either way, before submitting:
-
-- Push the icon, `ca_profile.xml`, and both templates so the raw URLs
-  referenced in the XML actually resolve (the CA scanner fetches them
-  live).
-- Run **Validate** then **Scan** at `/submit/new` and fix anything it
-  flags.
+- Push `icon.png`, `ca_profile.xml`, and the templates so the raw URLs
+  referenced in the XML resolve.
+- Run **Validate** then **Scan** at <https://ca.unraid.net/submit> and fix
+  anything it flags. Confirm both app names appear in the preview.
 - Confirm the repository has an OSI-approved license covering the
-  submitted templates/metadata (TorrentNG's existing `LICENSE` applies if
-  submitting the main repo; a mirrored repo needs its own).
+  submitted templates and metadata. TorrentNG's root `LICENSE` applies to
+  this repository.
 
 ## Design notes for future edits
 
