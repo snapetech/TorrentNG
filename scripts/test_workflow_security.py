@@ -190,6 +190,7 @@ class WorkflowSecurityTests(unittest.TestCase):
 
     def test_native_deployments_pin_non_root_privileges(self) -> None:
         dockerfile = (ROOT / "deploy/native/Dockerfile").read_text(encoding="utf-8")
+        identity = (ROOT / "deploy/container/identity.sh").read_text(encoding="utf-8")
         compose = (ROOT / "deploy/native/compose.yml").read_text(encoding="utf-8")
         interop = (ROOT / "deploy/interop/compose.yml").read_text(encoding="utf-8")
         statefulset = (ROOT / "deploy/native/kubernetes/statefulset.yaml").read_text(
@@ -198,9 +199,16 @@ class WorkflowSecurityTests(unittest.TestCase):
 
         self.assertIn('TNG_UID must be a nonzero numeric ID', dockerfile)
         self.assertIn('TNG_GID must be a nonzero numeric ID', dockerfile)
+        self.assertIn('USER root', dockerfile)
+        self.assertIn('tng_identity_enter', identity)
+        self.assertIn('--bounding-set=-all', identity)
+        self.assertIn('PUID', identity)
+        self.assertIn('PGID', identity)
         for source in (compose, interop):
             self.assertIn("cap_drop:\n      - ALL", source)
             self.assertIn("no-new-privileges:true", source)
+            for capability in ("CHOWN", "DAC_OVERRIDE", "FOWNER", "SETGID", "SETUID"):
+                self.assertIn(capability, source)
         self.assertIn("runAsNonRoot: true", statefulset)
         self.assertIn("runAsUser: 1000", statefulset)
         self.assertIn("runAsGroup: 1000", statefulset)

@@ -89,34 +89,24 @@ Either way, before submitting:
   `Display="advanced"` and per-field descriptions saying which "Backend
   Type" selection they apply to, following the same pattern used by
   multi-provider templates like binhex's VPN-enabled containers.
-- **Both images require host-path access for UID/GID `1000:1000`.** Use
-  Unraid's Tools -> New Permissions on every mounted Data/Downloads and
-  appdata path before first start. With the default paths in these templates,
-  the equivalent terminal commands are:
-  `chown -R 1000:1000 /mnt/user/downloads/torrentng /mnt/user/appdata/torrentng`
+- **Both images accept runtime `PUID`/`PGID`.** The Unraid templates default
+  to the standard `nobody:users` identity, `99:100`; generic Docker/Compose
+  deployments default to `1000:1000`. The entrypoint starts with the minimal
+  setup privileges needed to assign the small internal runtime directory
+  roots, then launches Tini and the TorrentNG process as the selected
+  non-root identity. It never recursively chowns a mounted download tree.
+- **Do not set `--user` in `<ExtraParams>`.** The entrypoint needs its short
+  setup phase. A direct Docker `--user` override bypasses that phase and will
+  fail when the selected identity cannot write `/run/rtorrent`,
+  `/var/log/rtorrent`, `/run/secrets`, or the state directory. Set `PUID` and
+  `PGID` instead. The mounted Data/Downloads and Config/State paths must
+  already be accessible to that identity; for the default template paths use
+  Unraid's Tools -> New Permissions, or:
+  `chown -R 99:100 /mnt/user/downloads/torrentng /mnt/user/appdata/torrentng`
   for the native template, and
-  `chown -R 1000:1000 /mnt/user/downloads /mnt/user/appdata/torrentng-webui`
+  `chown -R 99:100 /mnt/user/downloads /mnt/user/appdata/torrentng-webui`
   for the WebUI template. If the WebUI Data path is shared with another
-  torrent client, preserve that client's access too; UID 1000 still needs
-  read/write access for file-management operations.
-- **Neither image takes a `--user` override; both templates rely on the
-  image's own fixed UID/GID.** Tried overriding to Unraid's standard
-  `nobody:users` (99:100) first, since neither `torrentngd` nor the
-  compatible-client service has PUID/PGID env-var handling -- verified by
-  actually running both images locally rather than assuming, and that
-  override broke the compatible-client service outright (`mkdir: can't
-  create directory '/run/rtorrent': Permission denied`, crash loop
-  regardless of backend), because its internal, non-bind-mounted paths
-  (`/run/rtorrent`, `/var/log/rtorrent`) are baked `chown`ed to a fixed
-  UID at build time with no group/other write bit. `deploy/native/Dockerfile`
-  also used a bare `useradd --system` for `torrentngd` with no pinned UID,
-  which is a different bug: an unpredictable UID (999 in one build) that
-  can't be documented for operators to `chown` their appdata to. Fixed
-  both the same way the compatible-client service's Dockerfile already
-  did it: pin `TNG_UID`/`TNG_GID` build args (default 1000:1000) so the
-  image's own baked user matches a documented, stable value. Don't set
-  `--user` in `<ExtraParams>` on either template -- just `chown -R
-  1000:1000` the appdata/data folders to match the image.
+  torrent client, preserve that client's access too.
 - **`torrentngd` has no per-field env var overrides by design** (see
   `crates/rt-config`), unlike the compatible-client service. Its Unraid
   template (`torrentng.xml`) and `deploy/native/entrypoint.sh` bridge this

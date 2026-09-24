@@ -108,10 +108,14 @@ BitTorrent peer ports remain published separately. Compatibility session
 cookies carry `Secure` by default; disable `auth.secure_cookies` only for an
 explicitly trusted loopback HTTP setup.
 
-Both compatible-client images run without root privileges. `PUID` and `PGID`
-select the runtime and initial named-volume ownership (default `1000:1000`);
-set them in the Compose environment before building. The same values are
-passed to the LinuxServer backend containers so they can share downloads.
+The native, compatible-client, and Phase 1 images accept runtime `PUID` and
+`PGID` values. Generic Compose deployments default to `1000:1000`; the
+Unraid templates default to `99:100`. The entrypoint starts with only the
+capabilities needed to assign the small internal runtime directory roots,
+then launches Tini and the service as the selected non-root identity. It does
+not recursively chown mounted download trees, and Compose no longer passes a
+`user:` override that would bypass this setup. The same `PUID`/`PGID` values
+are passed to the LinuxServer backend containers so they can share downloads.
 
 For a volume created by an older root-running image, stop the TorrentNG
 service and every other process using shared downloads, make a backup, then

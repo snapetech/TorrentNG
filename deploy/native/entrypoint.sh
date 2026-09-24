@@ -1,6 +1,14 @@
 #!/bin/sh
 set -e
 
+TNG_INIT=/usr/bin/tini
+TNG_IDENTITY_PATHS="/data /downloads /var/lib/torrentngd /run/secrets"
+. /usr/local/lib/torrentng/identity.sh
+tng_identity_enter "$@"
+if [ "${1:-}" = --tng-identity-dropped ]; then
+  shift
+fi
+
 # torrentngd only reads TORRENTNGD_CONFIG plus the standard config-file
 # search path (see docs conventions) -- it has no per-field env override
 # layer by design. This entrypoint bridges that to a plain `docker run` /

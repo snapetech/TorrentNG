@@ -121,6 +121,11 @@ if command -v docker >/dev/null 2>&1 && docker compose version >"$TMP_DIR/compos
         and all(["torrentng-qbittorrent", "torrentng-transmission", "torrentng-deluge"][];
           . as $name | any($cfg.services[$name].ports[]?;
             .target == 8080 and .host_ip == "127.0.0.1"))
+        and all($names[];
+          . as $name
+          | (all(["CHOWN", "DAC_OVERRIDE", "FOWNER", "SETGID", "SETUID"][];
+              . as $cap | (($cfg.services[$name].cap_add // []) | index($cap)) != null)
+             and ($cfg.services[$name].user // null) == null))
         and any($cfg.services.qbittorrent.ports[]?;
           .target == 8080 and .host_ip == "127.0.0.1")
         and any($cfg.services.transmission.ports[]?;
@@ -138,6 +143,9 @@ if command -v docker >/dev/null 2>&1 && docker compose version >"$TMP_DIR/compos
       . as $cfg
       | $cfg.services.torrentng as $service
       | (($service.cap_drop // []) | index("ALL")) != null
+        and all(["CHOWN", "DAC_OVERRIDE", "FOWNER", "SETGID", "SETUID"][];
+          . as $cap | (($service.cap_add // []) | index($cap)) != null)
+        and ($service.user // null) == null
         and (($service.security_opt // []) | index("no-new-privileges:true")) != null
         and any($service.volumes[]?;
           .target == "/var/lib/torrentng" and .type == "volume")
@@ -148,8 +156,15 @@ if command -v docker >/dev/null 2>&1 && docker compose version >"$TMP_DIR/compos
     ' "$TMP_DIR/certification-compose.json" >/dev/null &&
     docker compose -f "$ROOT/deploy/docker/compose.phase1.yml" config --format json \
       >"$TMP_DIR/phase1-compose.json" 2>>"$TMP_DIR/compose.log" &&
-    jq -e 'any(.services["torrentng-phase1"].ports[]?;
-      .target == 8080 and .host_ip == "127.0.0.1")' \
+    jq -e '
+      .services["torrentng-phase1"] as $service
+      | (($service.cap_drop // []) | index("ALL")) != null
+        and all(["CHOWN", "DAC_OVERRIDE", "FOWNER", "SETGID", "SETUID"][];
+          . as $cap | (($service.cap_add // []) | index($cap)) != null)
+        and ($service.user // null) == null
+        and (($service.security_opt // []) | index("no-new-privileges:true")) != null
+        and any($service.ports[]?;
+          .target == 8080 and .host_ip == "127.0.0.1")' \
       "$TMP_DIR/phase1-compose.json" >/dev/null &&
     PHASE1_INCOMING_PORT=51001 PHASE1_CONTAINER_INCOMING_PORT=52000 \
       docker compose -f "$ROOT/deploy/docker/compose.phase1.yml" config --format json \
@@ -165,32 +180,40 @@ if command -v docker >/dev/null 2>&1 && docker compose version >"$TMP_DIR/compos
     docker compose -f "$ROOT/deploy/interop/compose.yml" config --format json \
       >"$TMP_DIR/interop-compose.json" 2>>"$TMP_DIR/compose.log" &&
     jq -e '
-      [
-        (.services.torrentngd.ports[] | select(.target == 8080)),
-        (.services.qbittorrent.ports[] | select(.target == 8080)),
-        (.services.transmission.ports[] | select(.target == 9091)),
-        (.services.deluge.ports[] | select(.target == 8112)),
-        (.services.deluge.ports[] | select(.target == 58846)),
-        (.services.opentracker.ports[] | select(.target == 6969)),
-        (.services["fixture-http"].ports[] | select(.target == 80))
+      . as $cfg
+      | [
+        ($cfg.services.torrentngd.ports[] | select(.target == 8080)),
+        ($cfg.services.qbittorrent.ports[] | select(.target == 8080)),
+        ($cfg.services.transmission.ports[] | select(.target == 9091)),
+        ($cfg.services.deluge.ports[] | select(.target == 8112)),
+        ($cfg.services.deluge.ports[] | select(.target == 58846)),
+        ($cfg.services.opentracker.ports[] | select(.target == 6969)),
+        ($cfg.services["fixture-http"].ports[] | select(.target == 80))
       ] as $management_ports
       | ($management_ports | length) == 8
         and all($management_ports[]; .host_ip == "127.0.0.1")
-        and ((.services.torrentngd.cap_drop // []) | index("ALL")) != null
-        and ((.services.torrentngd.security_opt // []) | index("no-new-privileges:true")) != null
+        and (($cfg.services.torrentngd.cap_drop // []) | index("ALL")) != null
+        and all(["CHOWN", "DAC_OVERRIDE", "FOWNER", "SETGID", "SETUID"][];
+          . as $cap | (($cfg.services.torrentngd.cap_add // []) | index($cap)) != null)
+        and ($cfg.services.torrentngd.user // null) == null
+        and (($cfg.services.torrentngd.security_opt // []) | index("no-new-privileges:true")) != null
     ' "$TMP_DIR/interop-compose.json" >/dev/null &&
     TORRENTNG_API_TOKEN=local-native-compose-validation-token \
       docker compose --profile observability \
         -f "$ROOT/deploy/native/compose.yml" config --format json \
         >"$TMP_DIR/native-compose.json" 2>>"$TMP_DIR/compose.log" &&
       jq -e '
-        any(.services.torrentngd.ports[]?;
+        . as $cfg
+        | any($cfg.services.torrentngd.ports[]?;
           .target == 8080 and .host_ip == "127.0.0.1")
-        and ((.services.torrentngd.cap_drop // []) | index("ALL")) != null
-        and ((.services.torrentngd.security_opt // []) | index("no-new-privileges:true")) != null
-        and any(.services.prometheus.ports[]?;
+        and (($cfg.services.torrentngd.cap_drop // []) | index("ALL")) != null
+        and all(["CHOWN", "DAC_OVERRIDE", "FOWNER", "SETGID", "SETUID"][];
+          . as $cap | (($cfg.services.torrentngd.cap_add // []) | index($cap)) != null)
+        and ($cfg.services.torrentngd.user // null) == null
+        and (($cfg.services.torrentngd.security_opt // []) | index("no-new-privileges:true")) != null
+        and any($cfg.services.prometheus.ports[]?;
           .target == 9090 and .host_ip == "127.0.0.1")
-        and any(.services.grafana.ports[]?;
+        and any($cfg.services.grafana.ports[]?;
           .target == 3000 and .host_ip == "127.0.0.1")
     ' "$TMP_DIR/native-compose.json" >/dev/null &&
     grep -Fq 'php/getsettings.php' "$ROOT/deploy/docker/compose.phase1.yml" &&
@@ -207,8 +230,12 @@ if command -v docker >/dev/null 2>&1 && docker compose version >"$TMP_DIR/compos
     grep -Fq -- '--security-opt no-new-privileges:true' \
       "$ROOT/deploy/systemd/rtorrentng-prod-readonly-datapool.conf" &&
     grep -Fq '"/var/lib/torrentng"' "$ROOT/deploy/docker/Dockerfile" &&
-    grep -Fq 'USER 1000:1000' "$ROOT/deploy/docker/Dockerfile" &&
-    grep -Fq 'USER 1000:1000' "$ROOT/deploy/docker/Dockerfile.phase1" &&
+    grep -Fq 'USER root' "$ROOT/deploy/docker/Dockerfile" &&
+    grep -Fq 'USER root' "$ROOT/deploy/docker/Dockerfile.phase1" &&
+    grep -Fq 'deploy/container/identity.sh' "$ROOT/deploy/docker/Dockerfile.phase1" &&
+    grep -Fq 'USER root' "$ROOT/deploy/native/Dockerfile" &&
+    grep -Fq 'deploy/container/identity.sh' "$ROOT/deploy/docker/Dockerfile" &&
+    grep -Fq 'deploy/container/identity.sh' "$ROOT/deploy/native/Dockerfile" &&
     grep -Fq 'TNG_UID must be a nonzero numeric ID' "$ROOT/deploy/native/Dockerfile" &&
     grep -Fq 'cap_drop:' "$ROOT/deploy/native/compose.yml" &&
     grep -Fq 'no-new-privileges:true' "$ROOT/deploy/native/compose.yml" &&
@@ -216,15 +243,14 @@ if command -v docker >/dev/null 2>&1 && docker compose version >"$TMP_DIR/compos
     grep -Fq 'no-new-privileges:true' "$ROOT/deploy/interop/compose.yml" &&
     grep -Fq 'runAsNonRoot: true' "$ROOT/deploy/native/kubernetes/statefulset.yaml" &&
     grep -Fq 'automountServiceAccountToken: false' "$ROOT/deploy/native/kubernetes/statefulset.yaml" &&
-    grep -Fq "user: \"\${PUID:-1000}:\${PGID:-1000}\"" "$ROOT/deploy/docker/compose.yml" &&
-    grep -Fq "user: \"\${PUID:-1000}:\${PGID:-1000}\"" "$ROOT/deploy/docker/compose.phase1.yml" &&
+    ! grep -Fq "user: \"\${PUID:-1000}:\${PGID:-1000}\"" "$ROOT/deploy/docker/compose.phase1.yml" &&
     grep -Fq './config:/config:ro' "$ROOT/deploy/docker/compose.yml" &&
     grep -Fq './config:/config:ro' "$ROOT/deploy/docker/compose.phase1.yml" &&
-    grep -Fq 'Refusing to run the compatible-client service as root' \
+    grep -Fq 'tng_identity_enter' \
       "$ROOT/deploy/docker/entrypoint.sh" &&
-    grep -Fq 'Refusing to run the Phase 1 service as root' \
+    grep -Fq 'tng_identity_enter' \
       "$ROOT/deploy/docker/entrypoint.phase1.sh"; then
-    mark "container deployment hardening" "PASS" "non-root images, read-only config binds, default seccomp, capability drops, durable sidecar state, loopback HTTP/API management ports, and required profile auth validated"
+    mark "container deployment hardening" "PASS" "controlled runtime identity, read-only config binds, default seccomp, capability drops, durable sidecar state, loopback HTTP/API management ports, and required profile auth validated"
   else
     cat "$TMP_DIR/compose.log" >&2
     mark "container deployment hardening" "FAIL" "Compose security, non-root image, backend-auth, state-volume, PHP health, or loopback-port contract failed"

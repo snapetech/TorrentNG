@@ -1,9 +1,12 @@
 #!/bin/sh
 set -e
 
-if [ "$(id -u)" -eq 0 ]; then
-  echo "Refusing to run the compatible-client service as root" >&2
-  exit 1
+TNG_INIT=/sbin/tini
+TNG_IDENTITY_PATHS="/data /session /var/lib/torrentng /var/log/rtorrent /run/rtorrent"
+. /usr/local/lib/torrentng/identity.sh
+tng_identity_enter "$@"
+if [ "${1:-}" = --tng-identity-dropped ]; then
+  shift
 fi
 
 RTORRENT_SOCKET=${RTORRENT_SCGI_SOCKET:-/run/rtorrent/rpc.sock}

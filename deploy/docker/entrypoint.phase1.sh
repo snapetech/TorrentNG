@@ -1,9 +1,13 @@
 #!/bin/sh
 set -e
 
-if [ "$(id -u)" -eq 0 ]; then
-    echo "Refusing to run the Phase 1 service as root" >&2
-    exit 1
+TNG_INIT=/sbin/tini
+TNG_IDENTITY_PATHS="/data /session /run/rtorrent /var/log/rtorrent /run/nginx /run/php-fpm83 /var/log/nginx /var/log/php83 /var/lib/nginx /var/lib/php83 /var/www/rutorrent/share"
+TNG_IDENTITY_RECURSIVE_PATHS="/var/lib/nginx /var/lib/php83 /var/www/rutorrent/share"
+. /usr/local/lib/torrentng/identity.sh
+tng_identity_enter "$@"
+if [ "${1:-}" = --tng-identity-dropped ]; then
+    shift
 fi
 
 SOCKET=${RTORRENT_SCGI_SOCKET:-/run/rtorrent/rpc.sock}

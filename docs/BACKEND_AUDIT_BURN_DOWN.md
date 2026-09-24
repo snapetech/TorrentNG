@@ -3030,10 +3030,11 @@ Existing invalid config files no longer silently fall back to defaults;
 defaults apply only when no config file exists. TorrentNG-client deployment templates
 use the declared peer port, Docker builds use `--locked`, and rendered Compose
 configuration validates locally. The compatible-client and Phase 1 images now
-run as configurable nonzero UID/GID, reject UID 0 in both entrypoints, and
-mount user configuration read-only. Their writable named-volume roots are
-owned by the selected build UID/GID; Compose passes matching `PUID`/`PGID` to
-the runtime and optional LinuxServer backends. Phase 1 nginx listens on
+run as configurable nonzero UID/GID, reject UID 0 during identity setup, and
+mount user configuration read-only. Their writable runtime roots are prepared
+by a short setup phase and the service then runs as the selected `PUID`/`PGID`;
+Compose passes matching values to the runtime and optional LinuxServer
+backends. Phase 1 nginx listens on
 unprivileged container port 8080. Existing root-owned volumes have an explicit
 one-time migration command in `docs/DEPLOYMENT.md`.
 

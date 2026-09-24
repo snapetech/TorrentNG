@@ -24,7 +24,7 @@ IMPORTANT -- rTorrent identity: on every start, TorrentNG pushes its own User-Ag
 
 Secret Key and API Tokens are required before first start regardless of backend -- they protect the WebUI and API themselves, not your torrent client. Generate both with e.g. `openssl rand -hex 32`.
 
-This container always runs as a fixed UID 1000 / GID 1000 baked into the image. Make sure the Downloads/Data and Appdata/State folders are owned by 1000:1000 before first start. For the default paths shown below, use Unraid's Tools -> New Permissions on `/mnt/user/downloads` and `/mnt/user/appdata/torrentng-webui`, or run from the Unraid terminal: `chown -R 1000:1000 /mnt/user/downloads /mnt/user/appdata/torrentng-webui`.</Overview>
+The image supports runtime PUID/PGID handling. This template defaults to Unraid's standard nobody:users identity, 99:100; the entrypoint prepares its small internal runtime directories and then drops to that non-root identity. Do not add an ExtraParams `--user` override: the entrypoint needs its short setup phase. Make sure the Downloads/Data and Appdata/State folders are owned by the selected PUID:PGID before first start. For the default paths shown below, use Unraid's Tools -> New Permissions on `/mnt/user/downloads` and `/mnt/user/appdata/torrentng-webui`, or run from the Unraid terminal: `chown -R 99:100 /mnt/user/downloads /mnt/user/appdata/torrentng-webui`. The container never recursively chowns mounted download trees at startup.</Overview>
 
   <Category>Downloaders:</Category>
   <Category>Network:Web</Category>
@@ -37,11 +37,14 @@ This container always runs as a fixed UID 1000 / GID 1000 baked into the image. 
   <ExtraSearchTerms>rutorrent replacement webui bittorrent rtorrent qbittorrent transmission deluge prowlarr sonarr radarr autobrr cross-seed</ExtraSearchTerms>
   <Requires>An existing rTorrent, qBittorrent, Transmission, or Deluge install reachable on your network. Set Secret Key and API Tokens before first start.</Requires>
   <Changes>Initial Community Applications template.</Changes>
-  <Date>2026-09-21</Date>
+  <Date>2026-09-23</Date>
   <MinVer>6.9</MinVer>
   <License>GPL-3.0-or-later</License>
 
   <Config Name="WebUI/API Port" Target="8080" Default="8080" Mode="tcp" Description="TorrentNG WebUI, REST/SSE/WebSocket API, and qBittorrent-compatible API (used by Prowlarr/Sonarr/Radarr/autobrr/cross-seed)." Type="Port" Display="always" Required="true" Mask="false"/>
+
+  <Config Name="Process UID (PUID)" Target="PUID" Default="99" Description="Non-root Linux UID for the WebUI/API service. Defaults to Unraid's nobody UID 99. The entrypoint uses this value after its short setup phase; do not also set ExtraParams --user." Type="Variable" Display="advanced" Required="true" Mask="false"/>
+  <Config Name="Process GID (PGID)" Target="PGID" Default="100" Description="Non-root Linux GID for the WebUI/API service. Defaults to Unraid's users GID 100. Make the mounted Downloads/Data and Appdata paths accessible to this group." Type="Variable" Display="advanced" Required="true" Mask="false"/>
 
   <Config Name="Backend Type" Target="TNG_BACKEND" Default="rtorrent|qbittorrent|transmission|deluge" Description="Which existing torrent client this WebUI talks to. Fill in only the matching section below." Type="Variable" Display="always" Required="true" Mask="false"/>
   <Config Name="Secret Key" Target="TNG_SECRET_KEY" Default="" Description="Random secret used to sign the WebUI's session cookies. Required. Generate with: openssl rand -hex 32" Type="Variable" Display="always" Required="true" Mask="true"/>

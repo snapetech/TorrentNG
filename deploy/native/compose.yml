@@ -7,6 +7,12 @@ services:
     restart: unless-stopped
     cap_drop:
       - ALL
+    cap_add:
+      - CHOWN
+      - DAC_OVERRIDE
+      - FOWNER
+      - SETGID
+      - SETUID
     security_opt:
       - no-new-privileges:true
     ports:
@@ -18,6 +24,8 @@ services:
       - torrentngd-state:/var/lib/torrentngd
       - downloads:/data
     environment:
+      PUID: "${PUID:-1000}"
+      PGID: "${PGID:-1000}"
       TORRENTNGD_CONFIG: /etc/torrentngd/config.toml
       RUST_LOG: "${RUST_LOG:-info}"
     secrets:
