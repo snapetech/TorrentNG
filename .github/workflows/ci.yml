@@ -287,7 +287,9 @@ jobs:
 
   webui:
     timeout-minutes: 20
-    runs-on: ${{ github.event_name == 'push' && fromJSON('["self-hosted","Linux","X64"]') || fromJSON('["ubuntu-latest"]') }}
+    # Chromium's D-Bus/desktop-portal session is unstable on the persistent
+    # self-hosted runner, so keep browser certification on an ephemeral host.
+    runs-on: ubuntu-latest
     steps:
       - name: Checkout
         uses: actions/checkout@v7
@@ -318,7 +320,7 @@ jobs:
 
       - name: Run webui browser certification
         working-directory: webui
-        run: dbus-run-session -- npm run test:e2e -- --reporter=line
+        run: npm run test:e2e -- --reporter=line
 
   backup-restore:
     name: Backup and restore drill
