@@ -146,15 +146,11 @@ Either way, before submitting:
   gate, not a bug), but it means the rTorrent SCGI address has to be
   correct *before* first start, unlike the other three backends where you
   can fix it after. Documented on the "SCGI TCP Address" field.
-- **All of the above was verified against locally built images from
-  current source, not asserted from reading the Dockerfiles.** Confirmed:
-  the currently-published `ghcr.io/snapetech/torrentng/{native,sidecar}`
-  images predate every fix in this change (the release workflow only
-  publishes on a `main-*` tag push, not on every commit to `main`) --
-  installing either template today, before a new tag is cut, will fail.
-  `torrentng.xml` fails outright (missing token file, old image has no
-  entrypoint fallback); `torrentng-webui.xml`'s "front an existing
-  rTorrent" path silently falls back to the old always-bundle-rTorrent
-  behavior. A `main-*` tag needs to be pushed (or the release workflow
-  run via `workflow_dispatch`) before either template is actually
-  installable.
+- **Published-image cadence.** These runtime and template behaviors were
+  verified against locally built images from current source, not asserted
+  from reading the Dockerfiles. The templates use `:latest`, but the release
+  workflow publishes that tag only from a `main-*` release tag; a commit on
+  `main` alone does not update GHCR. After changing deployment behavior,
+  push a release tag, wait for the image workflow to complete, and verify the
+  native and sidecar package pages before installing from the raw template
+  URLs.
