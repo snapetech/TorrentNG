@@ -4044,6 +4044,26 @@ async fn qb_file_priority_indices_are_bounded_before_backend_calls() {
     assert_eq!(res.status(), StatusCode::BAD_REQUEST);
 }
 
+#[cfg(target_pointer_width = "64")]
+#[tokio::test]
+async fn qb_file_rename_rejects_indexes_outside_signed_backend_range() {
+    let (addr, client, db) =
+        spawn_server_with_backend(Config::test_default(), successful_backend()).await;
+    seed_torrent(&db, "rename-range", "File rename");
+
+    let res = client
+        .post(url(addr, "/api/qb/v2/torrents/renameFile"))
+        .form(&[
+            ("hash", "rename-range"),
+            ("id", "9223372036854775808"),
+            ("name", "must-not-wrap"),
+        ])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+}
+
 // --- Bulk actions (empty hash list → OK with no-op) ---
 
 #[tokio::test]

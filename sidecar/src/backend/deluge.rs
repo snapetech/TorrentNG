@@ -5,8 +5,8 @@ use reqwest::Url;
 use serde_json::{json, Value};
 
 use super::{
-    response_json_bounded, BackendCapabilities, BackendStatus, BackendType, TorrentBackend,
-    MAX_BACKEND_JSON_BYTES,
+    checked_backend_file_index, response_json_bounded, BackendCapabilities, BackendStatus,
+    BackendType, TorrentBackend, MAX_BACKEND_JSON_BYTES,
 };
 use crate::{
     config::DelugeConfig,
@@ -395,11 +395,9 @@ impl TorrentBackend for DelugeBackend {
     }
 
     async fn rename_file(&self, hash: &str, file_index: usize, name: &str) -> Result<()> {
+        let file_index = checked_backend_file_index(file_index, "Deluge")?;
         let result = self
-            .rpc(
-                "core.rename_files",
-                json!([hash, [[file_index as i64, name]]]),
-            )
+            .rpc("core.rename_files", json!([hash, [[file_index, name]]]))
             .await?;
         require_not_false(result, "core.rename_files")?;
         Ok(())

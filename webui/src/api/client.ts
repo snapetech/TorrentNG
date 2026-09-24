@@ -155,6 +155,13 @@ function finiteNonNegative(value: unknown, fallback = 0): number {
   return Number.isFinite(parsed) && parsed >= 0 ? parsed : fallback
 }
 
+function ratioThousandths(value: unknown): number {
+  const scaled = finiteNonNegative(value) * 1000
+  return !Number.isFinite(scaled) || scaled >= Number.MAX_SAFE_INTEGER
+    ? Number.MAX_SAFE_INTEGER
+    : Math.round(scaled)
+}
+
 function normalizePageValue(value: number | undefined, fallback: number): number {
   if (value === undefined || !Number.isFinite(value)) return fallback
   return Math.min(Number.MAX_SAFE_INTEGER, Math.max(0, Math.floor(value)))
@@ -183,7 +190,7 @@ function normalizeTorrentNgTorrent(t: TorrentNgTorrentSummary): TorrentSummary {
     up_rate: 0,
     up_total: finiteNonNegative(t.uploaded),
     down_total: downloaded,
-    ratio: Math.round(finiteNonNegative(t.ratio) * 1000),
+    ratio: ratioThousandths(t.ratio),
     is_active: active,
     is_open: open,
     complete,

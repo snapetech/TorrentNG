@@ -63,4 +63,26 @@ describe('authentication API', () => {
     expect(torrent.peers_complete).toBe(0)
     expect(Object.values(torrent).every(value => typeof value !== 'number' || Number.isFinite(value))).toBe(true)
   })
+
+  it('saturates a finite compatibility ratio that would overflow when scaled', async () => {
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(new Response(JSON.stringify({
+      torrents: [{
+        info_hash: 'b'.repeat(40),
+        name: 'large ratio',
+        state: 'seeding',
+        total_length: 1,
+        downloaded: 1,
+        uploaded: 1,
+        ratio: '1e308',
+        save_path: '/downloads',
+        tags: [],
+      }],
+    }), { status: 200, headers: { 'Content-Type': 'application/json' } })))
+
+    const result = await api.torrents.list()
+    const [torrent] = result.torrents
+
+    expect(torrent.ratio).toBe(Number.MAX_SAFE_INTEGER)
+    expect(Number.isFinite(torrent.ratio)).toBe(true)
+  })
 })

@@ -3766,6 +3766,9 @@ async fn torrents_rename_file(
     let Some(id) = f.id else {
         return StatusCode::BAD_REQUEST;
     };
+    if crate::backend::checked_backend_file_index(id, "qBittorrent").is_err() {
+        return StatusCode::BAD_REQUEST;
+    }
     let Some(name) = f.name else {
         return StatusCode::BAD_REQUEST;
     };

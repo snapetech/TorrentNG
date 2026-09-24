@@ -425,11 +425,16 @@ pub(crate) fn ratio_milli(value: Option<f64>) -> i64 {
     }
 }
 
+pub(crate) fn checked_backend_file_index(file_index: usize, backend: &str) -> Result<i64> {
+    i64::try_from(file_index)
+        .with_context(|| format!("{backend} file index exceeds signed 64-bit range"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        bounded_remote_client, bounded_remote_dns_addresses, is_public_unicast, is_valid_unicast,
-        ratio_milli, MAX_REMOTE_DNS_ADDRESSES,
+        bounded_remote_client, bounded_remote_dns_addresses, checked_backend_file_index,
+        is_public_unicast, is_valid_unicast, ratio_milli, MAX_REMOTE_DNS_ADDRESSES,
     };
     use std::{
         io::{Read, Write},
@@ -438,6 +443,13 @@ mod tests {
         thread,
         time::{Duration, Instant},
     };
+
+    #[test]
+    fn backend_file_indices_must_fit_signed_rpc_integers() {
+        assert_eq!(checked_backend_file_index(42, "test").unwrap(), 42);
+        #[cfg(target_pointer_width = "64")]
+        assert!(checked_backend_file_index(i64::MAX as usize + 1, "test").is_err());
+    }
 
     #[test]
     fn remote_address_policy_rejects_local_and_reserved_targets() {

@@ -2204,6 +2204,30 @@ Both exceptions now match only the exact registered paths. Regression coverage
 rejects nested, suffixed, and unrelated paths while retaining the four
 qBittorrent and two native auth routes.
 
+### TNG-143 — Finite compatibility ratios overflow during unit conversion
+
+**Status: Resolved locally with a normalization regression** · **Priority: P2** · **Confidence: high**
+
+The WebUI compatibility normalizer rejected `NaN` and infinities before
+presenting numeric fields, but a very large finite ratio such as `1e308`
+passed that check and overflowed to `Infinity` when converted to thousandths.
+Ratio conversion now saturates at `Number.MAX_SAFE_INTEGER`, preserving a
+finite UI value. A regression covers the large finite input and exact
+saturation result.
+
+### TNG-144 — Unsigned file indexes wrapped at signed backend RPC boundaries
+
+**Status: Resolved locally with a signed-range regression** · **Priority: P2** · **Confidence: high**
+
+The sidecar accepted `usize` file indexes from qBittorrent-compatible rename
+requests, then Deluge and rTorrent adapters cast them to `i64`. Values above
+`i64::MAX` therefore wrapped into negative RPC indexes instead of being
+rejected. The request handler now rejects those values, and Deluge plus
+rTorrent rename/priority operations use a checked conversion as a second
+boundary. Regressions cover the signed conversion and verify that the
+qBittorrent-compatible rename route returns `400` for a value above the
+backend's signed range.
+
 ### TNG-005 — Outbound tracker/webseed egress policy is not wired
 
 **Status: Functional implementation complete; evidence deferred** · **Priority: P0** · **Confidence: high**
@@ -3976,6 +4000,8 @@ claims:
 | 2026-09-21 UTC | Closed TNG-140: shared native/qBittorrent CSRF admission now fails closed for every present Fetch Metadata value except case-insensitive `same-origin`. | Locked offline `rt-api-model` tests (23), native/qBittorrent facade suites, warnings-denied Clippy, root/sidecar formatting, and `git diff --check` pass; sidecar auth suite passes (252). | This closes local Fetch Metadata authorization parity; no public-network request, torrent-count proof, or soak was run. |
 | 2026-09-21 UTC | Closed TNG-141: native, qBittorrent, Transmission, Deluge, and sidecar Bearer parsing now accepts case-insensitive schemes with an exact two-token shape through shared/parity helpers. | Locked offline `rt-api-model` (23), native (99), qBittorrent (91), Transmission (45), Deluge (30), and sidecar (252) tests pass; warnings-denied Clippy, formatting, and `git diff --check` pass. | This closes local daemon/facade authentication-parser parity; no public-network request, torrent-count proof, or soak was run. |
 | 2026-09-21 UTC | Closed TNG-142: qBittorrent auth and native idempotency public exceptions now match exact registered auth paths rather than suffixes. | Locked offline qBittorrent router regression and native facade suite pass; warnings-denied Clippy, formatting, and `git diff --check` pass. | This closes local public-path allowlist drift; no public-network request, torrent-count proof, or soak was run. |
+| 2026-09-24 UTC | Closed TNG-143: WebUI compatibility ratio normalization now saturates large finite values before the thousandths conversion can overflow to `Infinity`. | The focused WebUI client suite passes all 4 tests, including the `1e308` ratio regression; WebUI lint, `tsc --noEmit`, and `git diff --check` pass. | Compatibility normalization remains local UI behavior; no network or release-capacity evidence is implied. |
+| 2026-09-24 UTC | Closed TNG-144: qBittorrent-compatible file indexes above the signed backend RPC range are rejected instead of wrapping during Deluge/rTorrent rename and rTorrent priority operations. | Sidecar tests pass (260 library / 3 binary / 117 compatibility; two synthetic benchmarks ignored), including the checked conversion and `400` response regressions; warnings-denied Clippy, formatting, and `git diff --check` pass. | Only malformed out-of-range indexes are affected; no backend network call, release-capacity proof, or client-interoperability claim is implied. |
 
 ## Release gate
 

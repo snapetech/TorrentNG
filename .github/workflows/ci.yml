@@ -318,7 +318,7 @@ jobs:
 
       - name: Run webui browser certification
         working-directory: webui
-        run: npm run test:e2e -- --reporter=line
+        run: dbus-run-session -- npm run test:e2e -- --reporter=line
 
   backup-restore:
     name: Backup and restore drill

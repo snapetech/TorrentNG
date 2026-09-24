@@ -71,12 +71,13 @@ impl Client {
         if !(0..=2).contains(&priority) {
             bail!("rTorrent file priority must be between 0 and 2");
         }
+        let file_index = crate::backend::checked_backend_file_index(file_index, "rTorrent")?;
         // f.priority.set takes hash, index, priority
         self.call(
             "f.priority.set",
             &[
                 hash.into(),
-                XmlValue::Int(file_index as i64),
+                XmlValue::Int(file_index),
                 XmlValue::Int(priority),
             ],
         )
@@ -85,9 +86,10 @@ impl Client {
     }
 
     pub async fn rename_file(&self, hash: &str, file_index: usize, name: &str) -> Result<()> {
+        let file_index = crate::backend::checked_backend_file_index(file_index, "rTorrent")?;
         self.call(
             "f.path.set",
-            &[hash.into(), XmlValue::Int(file_index as i64), name.into()],
+            &[hash.into(), XmlValue::Int(file_index), name.into()],
         )
         .await?;
         Ok(())
