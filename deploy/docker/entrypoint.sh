@@ -31,7 +31,9 @@ if [ "$BACKEND" = "rtorrent" ]; then
 fi
 
 mkdir -p /run/rtorrent /session /data /var/lib/torrentng /var/log/rtorrent /config
-rm -f "$RTORRENT_SOCKET" /session/rtorrent.lock
+if [ "$MANAGE_RTORRENT" = "1" ]; then
+  rm -f "$RTORRENT_SOCKET" /session/rtorrent.lock
+fi
 
 if [ -r /config/rtorrent.rc ]; then
   cp /config/rtorrent.rc /run/rtorrent/user.rc

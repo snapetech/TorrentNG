@@ -228,6 +228,15 @@ class WorkflowSecurityTests(unittest.TestCase):
         self.assertIn('grep -Fqx "import = $RTORRENT_UI_OVERLAY"', entrypoint)
         self.assertIn('printf \'\\nimport = %s\\n\'', entrypoint)
 
+    def test_unmanaged_rtorrent_mode_does_not_remove_managed_socket_or_lock(self) -> None:
+        entrypoint = (ROOT / "deploy/docker/entrypoint.sh").read_text(encoding="utf-8")
+        self.assertIn(
+            'if [ "$MANAGE_RTORRENT" = "1" ]; then\n'
+            '  rm -f "$RTORRENT_SOCKET" /session/rtorrent.lock\n'
+            "fi",
+            entrypoint,
+        )
+
     def test_arr_fixture_never_deletes_a_fixed_download_directory(self) -> None:
         source = (ROOT / "scripts" / "arr_app_certification.sh").read_text(encoding="utf-8")
         self.assertIn("FIXTURE_DOWNLOAD_DIR=\"cert-arr-fixture-$FIXTURE_ID\"", source)
