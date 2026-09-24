@@ -112,7 +112,7 @@ jobs:
         run: cargo build --workspace --all-targets --locked
 
       - name: Test TorrentNG client workspace at declared MSRV
-        run: cargo test --workspace --all-targets --locked
+        run: cargo test --workspace --all-targets --locked -- --test-threads=1
 
   msrv-check-sidecar:
     name: Compatible-client service MSRV gate
