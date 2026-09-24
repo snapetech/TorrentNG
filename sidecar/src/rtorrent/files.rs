@@ -46,13 +46,7 @@ impl Client {
             let size_chunks = required_i64(&f, 2, "f.size_chunks")?;
             let completed_chunks = required_i64(&f, 3, "f.completed_chunks")?;
             let priority = required_i64(&f, 4, "f.priority")?;
-            validate_file_projection(
-                i,
-                size_bytes,
-                size_chunks,
-                completed_chunks,
-                priority,
-            )?;
+            validate_file_projection(i, size_bytes, size_chunks, completed_chunks, priority)?;
             out.push(RawFile {
                 index: i,
                 path: required_path(&f, 0)?,

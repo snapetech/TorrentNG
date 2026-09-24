@@ -732,9 +732,7 @@ pub(crate) fn normalize_runtime_user_agent(value: &str) -> Result<String> {
         bail!("user_agent must not be empty");
     }
     if value.len() > MAX_RUNTIME_USER_AGENT_BYTES {
-        bail!(
-            "user_agent must be at most {MAX_RUNTIME_USER_AGENT_BYTES} UTF-8 bytes"
-        );
+        bail!("user_agent must be at most {MAX_RUNTIME_USER_AGENT_BYTES} UTF-8 bytes");
     }
     if value.chars().any(|character| character.is_control()) {
         bail!("user_agent must not contain control characters");
@@ -968,12 +966,17 @@ mod tests {
         );
         assert!(normalize_runtime_user_agent(" \t ").is_err());
         assert!(normalize_runtime_user_agent("line\nbreak").is_err());
-        assert!(normalize_runtime_user_agent(&"x".repeat(MAX_RUNTIME_USER_AGENT_BYTES + 1))
-            .is_err());
+        assert!(
+            normalize_runtime_user_agent(&"x".repeat(MAX_RUNTIME_USER_AGENT_BYTES + 1)).is_err()
+        );
 
         let mut cfg = Config::test_default();
         cfg.rtorrent.user_agent = "x".repeat(MAX_RUNTIME_USER_AGENT_BYTES + 1);
-        assert!(cfg.validate().unwrap_err().to_string().contains("user_agent"));
+        assert!(cfg
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("user_agent"));
     }
 
     #[test]

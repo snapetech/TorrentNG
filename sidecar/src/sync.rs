@@ -595,10 +595,7 @@ async fn tick_bounded(
             });
         }
     } else {
-        let Some(next_offset) = bounded
-            .page_offset
-            .checked_add(MULTICALL_RANGE_PAGE_SIZE)
-        else {
+        let Some(next_offset) = bounded.page_offset.checked_add(MULTICALL_RANGE_PAGE_SIZE) else {
             warn!(
                 component = backend.backend_type().as_str(),
                 operation = "bounded_sync_offset",
@@ -610,7 +607,9 @@ async fn tick_bounded(
             bounded.snapshot = None;
             bounded.full_cycle_seen.clear();
             bounded.full_cycle_had_errors = false;
-            return Err(anyhow::anyhow!("bounded torrent sync page offset exhausted"));
+            return Err(anyhow::anyhow!(
+                "bounded torrent sync page offset exhausted"
+            ));
         };
         bounded.page_offset = next_offset;
     }
@@ -697,13 +696,8 @@ fn fetch_range_resilient(
                         had_errors: true,
                     };
                 };
-                let right = fetch_range_resilient(
-                    backend,
-                    right_offset,
-                    right_limit,
-                    right_snapshot,
-                )
-                .await;
+                let right =
+                    fetch_range_resilient(backend, right_offset, right_limit, right_snapshot).await;
                 left.torrents.extend(right.torrents);
                 let snapshot_mismatch = left
                     .snapshot

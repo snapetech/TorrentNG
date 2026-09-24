@@ -1115,9 +1115,7 @@ fn write_rtorrent_overlay(
     if out.len() > MAX_RTORRENT_OVERLAY_BYTES {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
-            format!(
-                "rTorrent overlay exceeds the {MAX_RTORRENT_OVERLAY_BYTES}-byte size limit"
-            ),
+            format!("rTorrent overlay exceeds the {MAX_RTORRENT_OVERLAY_BYTES}-byte size limit"),
         ));
     }
     if let Some(parent) = path.parent() {
@@ -2901,9 +2899,7 @@ pub async fn update_torrent(
     if save_path.len() > MAX_API_CATEGORY_PATH_BYTES {
         return (
             StatusCode::BAD_REQUEST,
-            format!(
-                "save_path must be at most {MAX_API_CATEGORY_PATH_BYTES} UTF-8 bytes"
-            ),
+            format!("save_path must be at most {MAX_API_CATEGORY_PATH_BYTES} UTF-8 bytes"),
         )
             .into_response();
     }
@@ -4694,8 +4690,8 @@ mod tests {
         parse_torrent_live_hashes, read_script_output, rss_magnet_failure_summary,
         rtorrent_overlay_is_writable, rtorrent_settings, statvfs_block_size,
         tracker_failure_summary, write_rtorrent_overlay, ApplyRssRuleBody, TestRssRuleBody,
-        MAX_RSS_RULE_FIELD_BYTES, MAX_TORRENT_LIVE_HASH_QUERY_BYTES, MAX_TORRENT_LIVE_STATS,
-        MAX_RTORRENT_OVERLAY_BYTES,
+        MAX_RSS_RULE_FIELD_BYTES, MAX_RTORRENT_OVERLAY_BYTES, MAX_TORRENT_LIVE_HASH_QUERY_BYTES,
+        MAX_TORRENT_LIVE_STATS,
     };
     use crate::cache::TorrentLiveRow;
     use std::collections::BTreeMap;
