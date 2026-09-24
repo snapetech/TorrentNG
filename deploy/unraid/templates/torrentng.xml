@@ -1,0 +1,53 @@
+<?xml version="1.0"?>
+<Container version="2">
+  <Name>torrentng</Name>
+  <Repository>ghcr.io/snapetech/torrentng/native:latest</Repository>
+  <Registry>https://github.com/snapetech/TorrentNG/pkgs/container/torrentng%2Fnative</Registry>
+  <Network>bridge</Network>
+  <Privileged>false</Privileged>
+  <Shell>sh</Shell>
+
+  <Icon>https://raw.githubusercontent.com/snapetech/TorrentNG/main/deploy/unraid/icon.png</Icon>
+
+  <WebUI>http://[IP]:[PORT:8080]</WebUI>
+
+  <Overview>TorrentNG is a modern torrent management stack for headless power-user seeding at 10k-100k+ torrents and 200-500+ TB. This template runs torrentngd, TorrentNG's own first-party Rust BitTorrent client daemon, with its built-in WebUI, REST/SSE API, and qBittorrent-compatible API (for Prowlarr/Sonarr/Radarr/autobrr/cross-seed) all in one container. torrentngd owns torrent state, peer traffic, tracker state, storage, rechecks, jobs, and metrics directly -- it does not run or depend on rTorrent.
+
+Use this template if you want a single self-contained TorrentNG install with no external torrent client. If you already run rTorrent, qBittorrent, Transmission, or Deluge and just want TorrentNG's WebUI/API in front of it instead, use the "TorrentNG WebUI" template.
+
+FIRST RUN: torrentngd reads its settings from a config.toml file, not environment variables (this is intentional -- see the project's deployment docs). Before starting the container for the first time:
+1. Create the appdata folder for Config below (e.g. /mnt/user/appdata/torrentng/config).
+2. Either leave it empty to run with the packaged defaults (0.0.0.0:8080 WebUI, port 44444 for peer traffic, DHT on), or copy in a customized config.toml -- see deploy/native/config.toml in the TorrentNG repository for every field.
+3. Set the "API Token" variable below to a random string; the container writes it to the path the packaged config already expects for authenticating the WebUI/API. Generate one with e.g. `openssl rand -hex 32` on any Linux box, or the Unraid terminal.
+
+The image supports runtime PUID/PGID handling. This template defaults to Unraid's standard nobody:users identity, 99:100; the entrypoint prepares its small internal runtime directories and then drops to that non-root identity. Do not add an ExtraParams `--user` override: the entrypoint needs its short setup phase. Make sure the Data, Config, and State/DB appdata folders are owned by the selected PUID:PGID before first start. For the default paths shown below, use Unraid's Tools -> New Permissions on both `/mnt/user/downloads/torrentng` and `/mnt/user/appdata/torrentng`, or run from the Unraid terminal: `chown -R 99:100 /mnt/user/downloads/torrentng /mnt/user/appdata/torrentng`. The container never recursively chowns mounted download trees at startup.</Overview>
+
+  <Category>Downloaders:</Category>
+  <Category>Network:Web</Category>
+
+  <Support>https://github.com/snapetech/TorrentNG/issues</Support>
+  <Project>https://github.com/snapetech/TorrentNG</Project>
+  <TemplateURL>https://raw.githubusercontent.com/snapetech/TorrentNG/main/deploy/unraid/templates/torrentng.xml</TemplateURL>
+  <ReadMe>https://raw.githubusercontent.com/snapetech/TorrentNG/main/deploy/unraid/README.md</ReadMe>
+
+  <ExtraSearchTerms>bittorrent torrent client seedbox rtorrent qbittorrent transmission deluge torrentngd</ExtraSearchTerms>
+  <Requires>Create the config appdata folder (optionally with a config.toml inside) and set an API token before first start -- see Overview.</Requires>
+  <Changes>Initial Community Applications template.</Changes>
+  <Date>2026-09-23</Date>
+  <MinVer>6.9</MinVer>
+  <License>GPL-3.0-or-later</License>
+
+  <Config Name="WebUI/API Port" Target="8080" Default="8080" Mode="tcp" Description="TorrentNG WebUI, REST/SSE API, and qBittorrent-compatible API (used by Prowlarr/Sonarr/Radarr/autobrr/cross-seed)." Type="Port" Display="always" Required="true" Mask="false"/>
+  <Config Name="Peer Port TCP" Target="44444" Default="44444" Mode="tcp" Description="Incoming BitTorrent peer connections. Forward this port on your router for best connectivity." Type="Port" Display="always" Required="true" Mask="false"/>
+  <Config Name="Peer Port UDP" Target="44444" Default="44444" Mode="udp" Description="Incoming BitTorrent peer connections (uTP/DHT). Forward this port on your router for best connectivity." Type="Port" Display="always" Required="true" Mask="false"/>
+
+  <Config Name="Process UID (PUID)" Target="PUID" Default="99" Description="Non-root Linux UID for torrentngd. Defaults to Unraid's nobody UID 99. The entrypoint uses this value after its short setup phase; do not also set ExtraParams --user." Type="Variable" Display="advanced" Required="true" Mask="false"/>
+  <Config Name="Process GID (PGID)" Target="PGID" Default="100" Description="Non-root Linux GID for torrentngd. Defaults to Unraid's users GID 100. Make the mounted Data, Config, and State paths accessible to this group." Type="Variable" Display="advanced" Required="true" Mask="false"/>
+
+  <Config Name="Data" Target="/data" Default="/mnt/user/downloads/torrentng" Mode="rw" Description="Downloaded/seeding file storage. torrentngd's userspace disk scheduler manages this directly." Type="Path" Display="always" Required="true" Mask="false"/>
+  <Config Name="Config" Target="/config" Default="/mnt/user/appdata/torrentng/config" Mode="rw" Description="Optional config.toml goes here. Leave empty to run with the packaged defaults. See Overview / Requires before first start." Type="Path" Display="always" Required="true" Mask="false"/>
+  <Config Name="State/DB" Target="/var/lib/torrentngd" Default="/mnt/user/appdata/torrentng/state" Mode="rw" Description="Session state, SQLite database (state.db), and durability journals. Back this up like you would a database -- torrent history and resume state live here." Type="Path" Display="always" Required="true" Mask="false"/>
+
+  <Config Name="API Token" Target="TORRENTNGD_API_TOKEN" Default="" Description="Bearer token for the WebUI and REST/qBittorrent-compatible API. Required on first start unless your mounted config.toml already sets auth.api_tokens/api_tokens_file itself. Generate with: openssl rand -hex 32" Type="Variable" Display="always" Required="true" Mask="true"/>
+  <Config Name="Log Level" Target="RUST_LOG" Default="info" Description="Rust tracing filter, e.g. info, debug, or torrentngd=debug,warn." Type="Variable" Display="advanced" Required="false" Mask="false"/>
+</Container>

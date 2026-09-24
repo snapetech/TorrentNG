@@ -6,6 +6,11 @@ Unraid Community Applications (CA) templates for TorrentNG. See
 [docs/NATIVE_DEPLOYMENT.md](../../docs/NATIVE_DEPLOYMENT.md) for the
 non-Unraid deployment paths these templates wrap.
 
+The Community Apps submission files now live at the repository root and in
+`/templates/`. Copies under `deploy/unraid/` remain for compatibility with
+existing direct links. Keep those legacy XML and icon copies in sync when
+changing a template; Community Apps scans the root layout.
+
 | Path | What it is |
 |---|---|
 | `../../templates/torrentng-webui.xml` | WebUI/API replacement for an rTorrent, qBittorrent, Transmission, or Deluge install you already run. Image: `ghcr.io/snapetech/torrentng/sidecar`. |
