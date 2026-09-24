@@ -6,10 +6,10 @@ Unraid Community Applications (CA) templates for TorrentNG. See
 [docs/NATIVE_DEPLOYMENT.md](../../docs/NATIVE_DEPLOYMENT.md) for the
 non-Unraid deployment paths these templates wrap.
 
-The Community Apps submission files now live at the repository root and in
-`/templates/`. Copies under `deploy/unraid/` remain for compatibility with
-existing direct links. Keep those legacy XML and icon copies in sync when
-changing a template; Community Apps scans the root layout.
+The Community Apps submission files live at the repository root and in
+`/templates/`; `deploy/unraid/` contains this documentation only. Use the
+root template URLs below so the Community Apps scan sees exactly the two
+maintained templates.
 
 | Path | What it is |
 |---|---|
