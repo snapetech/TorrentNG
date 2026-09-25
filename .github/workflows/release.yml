@@ -404,50 +404,66 @@ jobs:
         run: |
           set -euo pipefail
           suffix="${GITHUB_RUN_ID}"
-          log_volume="torrentng-identity-log-smoke-${suffix}"
-          data_volume="torrentng-identity-data-smoke-${suffix}"
-          container="torrentng-identity-smoke-${suffix}"
+          containers=()
+          volumes=()
           cleanup() {
-            docker rm -f "$container" >/dev/null 2>&1 || true
-            docker volume rm "$log_volume" "$data_volume" >/dev/null 2>&1 || true
+            docker rm -f "${containers[@]}" >/dev/null 2>&1 || true
+            docker volume rm "${volumes[@]}" >/dev/null 2>&1 || true
           }
           trap cleanup EXIT
 
-          docker volume create "$log_volume" >/dev/null
-          docker volume create "$data_volume" >/dev/null
-          docker run --rm --entrypoint /bin/sh \
-            -v "$log_volume:/var/log/rtorrent" \
-            -v "$data_volume:/var/lib/rtorrentng" alpine:3.20 \
-            -c 'touch /var/log/rtorrent/rtorrent.log /var/lib/rtorrentng/cache.db && chmod 0664 /var/log/rtorrent/rtorrent.log /var/lib/rtorrentng/cache.db'
-          docker run -d --name "$container" --network none --read-only \
-            --tmpfs /tmp:rw,nosuid,nodev,size=1g \
-            --tmpfs /run:rw,nosuid,nodev,size=128m \
-            -v "$log_volume:/var/log/rtorrent" \
-            -v "$data_volume:/var/lib/rtorrentng" \
-            -e TNG_DATA_DIR=/var/lib/rtorrentng \
-            -e RTORRENT_STARTUP_GRACE_SECS=0 \
-            -e TNG_SECRET_KEY=release-smoke-only-session-secret \
-            -e TNG_API_TOKENS=release-smoke-only-token \
-            "torrentng:${RELEASE_TAG}" >/dev/null
+          run_smoke() {
+            local name="torrentng-identity-smoke-${suffix}-$1"
+            local data_dir="$2"
+            local log_volume="${name}-log"
+            local default_volume="${name}-default-data"
+            local override_volume="${name}-override-data"
+            containers+=("$name")
+            volumes+=("$log_volume" "$default_volume" "$override_volume")
+            docker volume create "$log_volume" >/dev/null
+            docker volume create "$default_volume" >/dev/null
+            docker volume create "$override_volume" >/dev/null
+            docker run --rm --entrypoint /bin/sh \
+              -v "$log_volume:/var/log/rtorrent" \
+              -v "$default_volume:/var/lib/torrentng" \
+              -v "$override_volume:/var/lib/rtorrentng" alpine:3.20 \
+              -c 'touch /var/log/rtorrent/rtorrent.log /var/lib/torrentng/cache.db /var/lib/rtorrentng/cache.db && chmod 0664 /var/log/rtorrent/rtorrent.log /var/lib/torrentng/cache.db /var/lib/rtorrentng/cache.db'
+            docker run -d --name "$name" --network none --read-only \
+              --tmpfs /tmp:rw,nosuid,nodev,size=1g \
+              --tmpfs /run:rw,nosuid,nodev,size=128m \
+              -v "$log_volume:/var/log/rtorrent" \
+              -v "$default_volume:/var/lib/torrentng" \
+              -v "$override_volume:/var/lib/rtorrentng" \
+              -e "TNG_DATA_DIR=$data_dir" \
+              -e RTORRENT_STARTUP_GRACE_SECS=0 \
+              -e TNG_SECRET_KEY=release-smoke-only-session-secret \
+              -e TNG_API_TOKENS=release-smoke-only-token \
+              "torrentng:${RELEASE_TAG}" >/dev/null
 
-          healthy=0
-          for _ in $(seq 1 60); do
-            if docker exec "$container" wget -qO- http://127.0.0.1:8080/health >/dev/null 2>&1; then
-              healthy=1
-              break
+            local healthy=0
+            for _ in $(seq 1 60); do
+              if docker exec "$name" wget -qO- http://127.0.0.1:8080/health >/dev/null 2>&1; then
+                healthy=1
+                break
+              fi
+              sleep 1
+            done
+            if [[ "$healthy" != 1 ]]; then
+              docker logs "$name"
+              return 1
             fi
-            sleep 1
-          done
-          if [[ "$healthy" != 1 ]]; then
-            docker logs "$container"
-            exit 1
-          fi
-          docker exec "$container" test -S /run/rtorrent/rpc.sock
-          docker exec --user 1000:1000 "$container" sh -c 'test -w /var/log/rtorrent/rtorrent.log'
-          [[ "$(docker exec "$container" stat -c '%u:%g' /var/log/rtorrent/rtorrent.log)" == "1000:1000" ]]
-          docker exec --user 1000:1000 "$container" sh -c 'test -w /var/lib/rtorrentng && test -w /var/lib/rtorrentng/cache.db'
-          [[ "$(docker exec "$container" stat -c '%u:%g' /var/lib/rtorrentng)" == "1000:1000" ]]
-          [[ "$(docker exec "$container" stat -c '%u:%g' /var/lib/rtorrentng/cache.db)" == "1000:1000" ]]
+            docker exec "$name" test -S /run/rtorrent/rpc.sock
+            docker exec --user 1000:1000 "$name" sh -c 'test -w /var/log/rtorrent/rtorrent.log && test -w /var/lib/torrentng && test -w /var/lib/torrentng/cache.db && test -w /var/lib/rtorrentng && test -w /var/lib/rtorrentng/cache.db'
+            [[ "$(docker exec "$name" stat -c '%u:%g' /var/log/rtorrent/rtorrent.log)" == "1000:1000" ]]
+            [[ "$(docker exec "$name" stat -c '%u:%g' /var/lib/torrentng)" == "1000:1000" ]]
+            [[ "$(docker exec "$name" stat -c '%u:%g' /var/lib/torrentng/cache.db)" == "1000:1000" ]]
+            [[ "$(docker exec "$name" stat -c '%u:%g' /var/lib/rtorrentng)" == "1000:1000" ]]
+            [[ "$(docker exec "$name" stat -c '%u:%g' /var/lib/rtorrentng/cache.db)" == "1000:1000" ]]
+            docker rm "$name" >/dev/null
+          }
+
+          run_smoke override /var/lib/rtorrentng
+          run_smoke default /var/lib/torrentng
 
       - name: Publish Docker images
         env:
