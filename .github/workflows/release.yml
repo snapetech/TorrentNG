@@ -338,6 +338,49 @@ jobs:
           docker build --network host -f deploy/docker/Dockerfile -t "torrentng:${RELEASE_TAG}" .
           docker build --network host -f deploy/docker/Dockerfile.phase1 -t "torrentng-phase1:${RELEASE_TAG}" .
 
+      - name: Smoke compatible-client image with root-owned log file
+        env:
+          RELEASE_TAG: ${{ needs.validate-release-tag.outputs.tag }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          suffix="${GITHUB_RUN_ID}"
+          volume="torrentng-identity-smoke-${suffix}"
+          container="torrentng-identity-smoke-${suffix}"
+          cleanup() {
+            docker rm -f "$container" >/dev/null 2>&1 || true
+            docker volume rm "$volume" >/dev/null 2>&1 || true
+          }
+          trap cleanup EXIT
+
+          docker volume create "$volume" >/dev/null
+          docker run --rm --entrypoint /bin/sh -v "$volume:/var/log/rtorrent" alpine:3.20 \
+            -c 'touch /var/log/rtorrent/rtorrent.log && chmod 0664 /var/log/rtorrent/rtorrent.log'
+          docker run -d --name "$container" --network none --read-only \
+            --tmpfs /tmp:rw,nosuid,nodev,size=1g \
+            --tmpfs /run:rw,nosuid,nodev,size=128m \
+            -v "$volume:/var/log/rtorrent" \
+            -e RTORRENT_STARTUP_GRACE_SECS=0 \
+            -e TNG_SECRET_KEY=release-smoke-only-session-secret \
+            -e TNG_API_TOKENS=release-smoke-only-token \
+            "torrentng:${RELEASE_TAG}" >/dev/null
+
+          healthy=0
+          for _ in $(seq 1 60); do
+            if docker exec "$container" wget -qO- http://127.0.0.1:8080/health >/dev/null 2>&1; then
+              healthy=1
+              break
+            fi
+            sleep 1
+          done
+          if [[ "$healthy" != 1 ]]; then
+            docker logs "$container"
+            exit 1
+          fi
+          docker exec "$container" test -S /run/rtorrent/rpc.sock
+          docker exec --user 1000:1000 "$container" sh -c 'test -w /var/log/rtorrent/rtorrent.log'
+          [[ "$(docker exec "$container" stat -c '%u:%g' /var/log/rtorrent/rtorrent.log)" == "1000:1000" ]]
+
       - name: Publish Docker images
         env:
           GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}

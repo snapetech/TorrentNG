@@ -48,6 +48,25 @@ tng_identity_prepare_paths() {
     chown -R "$PUID:$PGID" "$identity_path" ||
       tng_identity_fail "cannot assign $PUID:$PGID recursively to $identity_path"
   done
+  for identity_file in ${TNG_IDENTITY_FILES:-}; do
+    case "$identity_file" in
+      /*) ;;
+      *) tng_identity_fail "identity file must be absolute: $identity_file" ;;
+    esac
+    if [ -L "$identity_file" ]; then
+      tng_identity_fail "identity file must not be a symlink: $identity_file"
+    elif [ -e "$identity_file" ] && [ ! -f "$identity_file" ]; then
+      tng_identity_fail "identity path is not a regular file: $identity_file"
+    elif [ ! -e "$identity_file" ]; then
+      if ! (umask 0022; set -C; : > "$identity_file") 2>/dev/null; then
+        if [ ! -f "$identity_file" ] || [ -L "$identity_file" ]; then
+          tng_identity_fail "cannot create identity file $identity_file"
+        fi
+      fi
+    fi
+    chown "$PUID:$PGID" "$identity_file" ||
+      tng_identity_fail "cannot assign $PUID:$PGID to $identity_file"
+  done
 }
 
 tng_identity_check_nonroot() {
@@ -66,6 +85,13 @@ tng_identity_check_nonroot() {
     [ -e "$identity_path" ] || continue
     [ -w "$identity_path" ] ||
       tng_identity_fail "recursive identity path is not writable as $PUID:$PGID: $identity_path; start without a --user override so the entrypoint can prepare it"
+  done
+  for identity_file in ${TNG_IDENTITY_FILES:-}; do
+    [ -e "$identity_file" ] || continue
+    [ -f "$identity_file" ] && [ ! -L "$identity_file" ] ||
+      tng_identity_fail "identity file is not a regular file: $identity_file"
+    [ -w "$identity_file" ] ||
+      tng_identity_fail "identity file is not writable as $PUID:$PGID: $identity_file; start without a --user override so the entrypoint can prepare it"
   done
 }
 
