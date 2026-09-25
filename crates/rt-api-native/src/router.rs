@@ -20,11 +20,12 @@ use crate::{
         list_workflow_runs, live_torrent_stats, logs, metrics, patch_torrent_files,
         patch_torrent_trackers, pause_job, pause_torrent, reannounce_torrent, recheck_torrent,
         remove_torrent_tags, restart_engine, resume_job, resume_torrent, rtorrent_settings,
-        run_json_workflow, save_rtorrent_settings, session_features, set_torrent_category,
-        set_user_agent, sidebar_facets, storage, storage_execute_plan, storage_preview_plan,
-        stream_events, tags, test_rss_rules, torrent_limits, tracker_health, transfer_info,
-        transfer_limits, update_session_features, update_torrent, update_torrent_limits,
-        update_torrent_queue, update_transfer_limits, upsert_category, upsert_json_map,
+        run_json_workflow, save_rtorrent_settings, session_features, session_settings,
+        set_torrent_category, set_user_agent, sidebar_facets, storage, storage_execute_plan,
+        storage_preview_plan, stream_events, tags, test_rss_rules, torrent_limits, tracker_health,
+        transfer_info, transfer_limits, update_session_features, update_session_settings,
+        update_torrent, update_torrent_limits, update_torrent_queue, update_transfer_limits,
+        upsert_category, upsert_json_map,
     },
     state::AppState,
 };
@@ -101,6 +102,10 @@ pub fn build_router(state: AppState) -> Router {
         .route(
             "/api/v1/session/features",
             get(session_features).put(update_session_features),
+        )
+        .route(
+            "/api/v1/session/settings",
+            get(session_settings).patch(update_session_settings),
         )
         .route(
             "/api/v1/torrents/:hash/tags",

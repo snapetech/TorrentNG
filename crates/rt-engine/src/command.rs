@@ -1639,6 +1639,13 @@ pub(crate) enum EngineCmd {
     GetNetworkFeatures {
         reply: oneshot::Sender<CmdResult<EngineNetworkFeatures>>,
     },
+    GetListenPort {
+        reply: oneshot::Sender<CmdResult<u16>>,
+    },
+    UpdateListenPort {
+        port: u16,
+        reply: oneshot::Sender<CmdResult<()>>,
+    },
     UpdateNetworkFeatures {
         features: EngineNetworkFeatures,
         reply: oneshot::Sender<CmdResult<()>>,

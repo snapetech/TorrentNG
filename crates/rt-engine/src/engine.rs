@@ -3,7 +3,7 @@ use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::future::Future;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::sync::OnceLock;
 use std::sync::{Mutex, MutexGuard};
@@ -1051,6 +1051,7 @@ const SETTING_GLOBAL_UPLOAD_LIMIT: &str = "transfer.upload_limit";
 const SETTING_GLOBAL_SPEED_LIMITS_MODE: &str = "transfer.speed_limits_mode";
 const SETTING_NETWORK_DHT: &str = "network.dht";
 const SETTING_NETWORK_PEX: &str = "network.pex";
+const SETTING_NETWORK_LISTEN_PORT: &str = "network.listen_port";
 const SETTING_NETWORK_USER_AGENT: &str = "network.user_agent";
 const SETTING_QUEUE_PREFIX: &str = "torrent.queue.";
 const SETTING_GLOBAL_TAGS: &str = "labels.tags";
@@ -1253,9 +1254,21 @@ struct SpawnedDhtTask {
 /// port. An explicitly configured collision is rejected so an operator does
 /// not get a daemon that starts with one of the two UDP services silently
 /// dead.
+#[cfg(test)]
 fn resolve_dht_bind_port(config: &Config, incoming_utp: bool) -> Result<u16, String> {
-    let dht_port = config.dht_port();
-    let listen_port = config.network.listen_port;
+    resolve_dht_bind_port_for(config, config.network.listen_port, incoming_utp)
+}
+
+fn resolve_dht_bind_port_for(
+    config: &Config,
+    listen_port: u16,
+    incoming_utp: bool,
+) -> Result<u16, String> {
+    let dht_port = if config.dht.port == 0 {
+        listen_port
+    } else {
+        config.dht.port
+    };
     if !incoming_utp || listen_port == 0 || dht_port != listen_port {
         return Ok(dht_port);
     }
@@ -1333,10 +1346,10 @@ async fn wait_for_dht_restart(
 fn spawn_dht_task(
     config: &Config,
     dht_port: u16,
+    listen_port: Arc<AtomicU16>,
     engine_tx: mpsc::Sender<EngineCmd>,
 ) -> SpawnedDhtTask {
     let (dht_tx, mut dht_rx) = mpsc::channel(DHT_COMMAND_CHANNEL_CAPACITY);
-    let listen_port = config.network.listen_port;
     let bootstrap_nodes = config.dht.bootstrap_nodes.clone();
     let runtime_config = DhtRuntimeConfig {
         tracked_torrents_cap: config.dht.tracked_torrents_cap,
@@ -1348,7 +1361,7 @@ fn spawn_dht_task(
         loop {
             match run_dht(
                 dht_port,
-                listen_port,
+                Arc::clone(&listen_port),
                 bootstrap_nodes.clone(),
                 runtime_config,
                 &mut dht_rx,
@@ -2469,6 +2482,23 @@ impl EngineHandle {
         await_engine_reply(rx).await
     }
 
+    pub async fn listen_port(&self) -> CmdResult<u16> {
+        let (reply, rx) = tokio::sync::oneshot::channel();
+        self.send_command(EngineCmd::GetListenPort { reply })
+            .await?;
+        await_engine_reply(rx).await
+    }
+
+    pub async fn update_listen_port(&self, port: u16) -> CmdResult<()> {
+        if port == 0 {
+            return Err("listen_port must be between 1 and 65535".to_owned());
+        }
+        let (reply, rx) = tokio::sync::oneshot::channel();
+        self.send_command(EngineCmd::UpdateListenPort { port, reply })
+            .await?;
+        await_engine_reply(rx).await
+    }
+
     pub async fn update_network_features(&self, features: EngineNetworkFeatures) -> CmdResult<()> {
         let (reply, rx) = tokio::sync::oneshot::channel();
         self.send_command(EngineCmd::UpdateNetworkFeatures { features, reply })
@@ -3066,6 +3096,7 @@ impl Engine {
             (config.network.download_rate_limit > 0).then_some(config.network.download_rate_limit),
             (config.network.upload_rate_limit > 0).then_some(config.network.upload_rate_limit),
         );
+        network_budget.set_listen_port(config.network.listen_port);
         let mut engine = Engine {
             config: config.clone(),
             registry,
@@ -3100,7 +3131,20 @@ impl Engine {
                 }
             };
         }
+        let configured_listen_port = config.network.listen_port;
         let dht_default = config.dht.enabled;
+        let persisted_listen_port = startup_try!(engine
+            .run_db("load_persisted_listen_port", move |db| {
+                setting_listen_port_with_default_checked(db, configured_listen_port)
+                    .map_err(|error| error.to_string())
+            })
+            .await
+            .map_err(anyhow::Error::msg)
+            .context("loading persisted peer listen port"));
+        engine
+            .services
+            .network_budget
+            .set_listen_port(persisted_listen_port);
         let dht_enabled = startup_try!(engine
             .run_db("load_persisted_dht_setting", move |db| {
                 setting_bool_with_default_checked(db, SETTING_NETWORK_DHT, dht_default)
@@ -3111,10 +3155,19 @@ impl Engine {
             .context("loading persisted DHT setting"));
         let incoming_utp = incoming_utp_enabled();
         if dht_enabled {
-            let dht_port = startup_try!(resolve_dht_bind_port(&config, incoming_utp)
-                .map_err(anyhow::Error::msg)
-                .context("resolving DHT UDP port"));
-            engine.install_dht_task(spawn_dht_task(&config, dht_port, engine.cmd_tx.clone()));
+            let dht_port = startup_try!(resolve_dht_bind_port_for(
+                &config,
+                persisted_listen_port,
+                incoming_utp
+            )
+            .map_err(anyhow::Error::msg)
+            .context("resolving DHT UDP port"));
+            engine.install_dht_task(spawn_dht_task(
+                &config,
+                dht_port,
+                engine.services.network_budget.listen_port_shared(),
+                engine.cmd_tx.clone(),
+            ));
         }
         let persisted_peer_bans = startup_try!(engine
             .run_db("load_persisted_peer_bans", |db| {
@@ -3173,7 +3226,7 @@ impl Engine {
             EVENT_ENGINE_STARTED,
             Some("TorrentNG client started"),
             serde_json::json!({
-                "listen_port": config.network.listen_port,
+                "listen_port": engine.services.network_budget.listen_port(),
                 "dht_enabled": dht_enabled,
             }),
         );
@@ -3192,13 +3245,20 @@ impl Engine {
         startup_try!(engine.resume_recovered_storage_jobs().await);
 
         // Spawn TCP listener.
-        let listen_addr: SocketAddr =
-            startup_try!(format!("0.0.0.0:{}", config.network.listen_port)
-                .parse()
-                .context("invalid listen_port"));
+        let requested_listen_port = engine.services.network_budget.listen_port();
+        let listen_addr: SocketAddr = startup_try!(format!("0.0.0.0:{requested_listen_port}")
+            .parse()
+            .context("invalid listen_port"));
         let listener = startup_try!(TcpListener::bind(listen_addr)
             .await
             .with_context(|| format!("binding peer listener to {listen_addr}")));
+        let listen_addr = startup_try!(listener
+            .local_addr()
+            .context("reading bound peer listener address"));
+        engine
+            .services
+            .network_budget
+            .set_listen_port(listen_addr.port());
         info!(
             component = "peer_listener",
             operation = "listen",
@@ -5212,6 +5272,13 @@ impl Engine {
                     .await
                     .map_err(|error| format!("network feature worker failed: {error}"))
                 });
+            }
+            EngineCmd::GetListenPort { reply } => {
+                let _ = reply.send(Ok(self.services.network_budget.listen_port()));
+            }
+            EngineCmd::UpdateListenPort { port, reply } => {
+                let result = self.update_listen_port_inner(port).await;
+                let _ = reply.send(result);
             }
             EngineCmd::UpdateNetworkFeatures { features, reply } => {
                 let result = self.update_network_features_inner(features).await;
@@ -13150,6 +13217,103 @@ impl Engine {
         Ok(())
     }
 
+    async fn update_listen_port_inner(&mut self, port: u16) -> CmdResult<()> {
+        if port == 0 {
+            return Err("listen_port must be between 1 and 65535".to_owned());
+        }
+        let current_port = self.services.network_budget.listen_port();
+        if port == current_port {
+            return Ok(());
+        }
+
+        let incoming_utp = incoming_utp_enabled();
+        let dht_running = self
+            .services
+            .dht_tx
+            .as_ref()
+            .is_some_and(|tx| !tx.is_closed());
+        if incoming_utp && dht_running {
+            let dht_port = resolve_dht_bind_port_for(&self.config, current_port, true)?;
+            if port == dht_port {
+                return Err(format!(
+                    "listen_port {port} conflicts with the active DHT UDP port while incoming uTP is enabled"
+                ));
+            }
+        }
+        let replacement_dht_port = (dht_running && self.config.dht.port == 0)
+            .then(|| resolve_dht_bind_port_for(&self.config, port, incoming_utp))
+            .transpose()?;
+
+        self.services
+            .network_budget
+            .rebind_peer_listener(port)
+            .await?;
+
+        let now = unix_now_i64();
+        let persist_result = self
+            .run_db("update_listen_port", move |db| {
+                let tx = db.transaction().map_err(|e| e.to_string())?;
+                rt_db::set_setting_in_tx(&tx, SETTING_NETWORK_LISTEN_PORT, &port.to_string(), now)
+                    .map_err(|error| error.to_string())?;
+                tx.commit().map_err(|error| error.to_string())
+            })
+            .await;
+        if let Err(error) = persist_result {
+            return match self
+                .services
+                .network_budget
+                .rebind_peer_listener(current_port)
+                .await
+            {
+                Ok(()) => Err(error),
+                Err(rollback_error) => {
+                    self.apply_runtime_listen_port(port, replacement_dht_port)
+                        .await;
+                    Err(format!(
+                        "persisting listen_port failed ({error}); restoring listener to {current_port} also failed ({rollback_error}); runtime is using port {port}"
+                    ))
+                }
+            };
+        }
+
+        self.apply_runtime_listen_port(port, replacement_dht_port)
+            .await;
+        Ok(())
+    }
+
+    async fn apply_runtime_listen_port(&mut self, port: u16, replacement_dht_port: Option<u16>) {
+        self.services.network_budget.set_listen_port(port);
+        if let Some(dht_port) = replacement_dht_port {
+            if let Some(dht_tx) = self.services.dht_tx.take() {
+                shutdown_dht_task(dht_tx, self.take_dht_task(), Duration::from_secs(10)).await;
+            }
+            self.install_dht_task(spawn_dht_task(
+                &self.config,
+                dht_port,
+                self.services.network_budget.listen_port_shared(),
+                self.cmd_tx.clone(),
+            ));
+            self.register_all_dht_torrents().await;
+        }
+        let torrent_channels = self
+            .runtime
+            .torrent_chans
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+        for channel in torrent_channels {
+            if channel.try_send(TorrentCmd::Reannounce).is_err() {
+                debug!(
+                    component = "engine",
+                    operation = "listen_port_reannounce",
+                    result = "deferred",
+                    port,
+                    "torrent mailbox is busy; tracker will use the new port on its next announce"
+                );
+            }
+        }
+    }
+
     #[cfg(test)]
     fn network_features_inner(&self) -> CmdResult<EngineNetworkFeatures> {
         let db = self.db.lock().expect("database mutex poisoned");
@@ -13177,7 +13341,11 @@ impl Engine {
             .as_ref()
             .is_some_and(|tx| !tx.is_closed());
         let replacement_dht_port = if features.dht && !dht_running {
-            Some(resolve_dht_bind_port(&self.config, incoming_utp_enabled())?)
+            Some(resolve_dht_bind_port_for(
+                &self.config,
+                self.services.network_budget.listen_port(),
+                incoming_utp_enabled(),
+            )?)
         } else {
             None
         };
@@ -13220,6 +13388,7 @@ impl Engine {
                 self.install_dht_task(spawn_dht_task(
                     &self.config,
                     replacement_dht_port.expect("DHT replacement port was resolved above"),
+                    self.services.network_budget.listen_port_shared(),
                     self.cmd_tx.clone(),
                 ));
                 self.register_all_dht_torrents().await;
@@ -18956,6 +19125,25 @@ fn setting_bool_with_default_checked(
         Ok(value) if matches!(value.as_str(), "1" | "true") => Ok(true),
         Ok(value) if matches!(value.as_str(), "0" | "false") => Ok(false),
         Ok(value) => Err(format!("invalid persisted boolean setting {key}: {value}")),
+        Err(rt_db::DbError::NotFound(_)) => Ok(default),
+        Err(error) => Err(error.to_string()),
+    }
+}
+
+fn setting_listen_port_with_default_checked(conn: &Connection, default: u16) -> CmdResult<u16> {
+    match rt_db::get_setting(conn, SETTING_NETWORK_LISTEN_PORT) {
+        Ok(value) => {
+            let port = value.parse::<u16>().map_err(|error| {
+                format!("invalid persisted peer listen port {SETTING_NETWORK_LISTEN_PORT}: {error}")
+            })?;
+            if port == 0 {
+                Err(format!(
+                    "invalid persisted peer listen port {SETTING_NETWORK_LISTEN_PORT}: port must be nonzero"
+                ))
+            } else {
+                Ok(port)
+            }
+        }
         Err(rt_db::DbError::NotFound(_)) => Ok(default),
         Err(error) => Err(error.to_string()),
     }

@@ -107,6 +107,22 @@ impl QbittorrentBackend {
         Ok(())
     }
 
+    async fn get_text(&self, path: &str) -> Result<String> {
+        self.ensure_login().await?;
+        let body = response_bytes_bounded(
+            self.client
+                .get(self.url(path)?)
+                .send()
+                .await
+                .map_err(reqwest::Error::without_url)
+                .with_context(|| format!("qBittorrent GET {path}"))?,
+            16 * 1024,
+            &format!("qBittorrent GET {path}"),
+        )
+        .await?;
+        String::from_utf8(body).with_context(|| format!("decode qBittorrent GET {path} response"))
+    }
+
     async fn limit_map(&self, path: &str, hashes: &[String]) -> Result<BTreeMap<String, i64>> {
         self.ensure_login().await?;
         let hashes_param = hashes.join("|");
@@ -187,7 +203,6 @@ struct QbitTransferInfo {
     up_info_speed: i64,
     dl_rate_limit: i64,
     up_rate_limit: i64,
-    use_alt_speed_limits: bool,
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -597,10 +612,19 @@ impl TorrentBackend for QbittorrentBackend {
 
     async fn global_limits(&self) -> Result<BackendTransferLimits> {
         let info: QbitTransferInfo = self.get_json("api/v2/transfer/info").await?;
+        let speed_limits_mode = match self
+            .get_text("api/v2/transfer/speedLimitsMode")
+            .await?
+            .trim()
+        {
+            "0" => false,
+            "1" => true,
+            value => bail!("invalid qBittorrent speedLimitsMode response: {value:?}"),
+        };
         Ok(BackendTransferLimits {
             download_limit: qbit_nonnegative_i64(Some(info.dl_rate_limit), "dl_rate_limit")?,
             upload_limit: qbit_nonnegative_i64(Some(info.up_rate_limit), "up_rate_limit")?,
-            speed_limits_mode: info.use_alt_speed_limits,
+            speed_limits_mode,
         })
     }
 

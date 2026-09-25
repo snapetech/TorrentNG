@@ -18,7 +18,7 @@ ARG TNG_UID=1000
 ARG TNG_GID=1000
 
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates curl tini util-linux \
+    && apt-get install -y --no-install-recommends ca-certificates curl jq tini util-linux \
     && rm -rf /var/lib/apt/lists/* \
     && case "$TNG_UID" in ''|*[!0-9]*) echo "TNG_UID must be a nonzero numeric ID" >&2; exit 1;; *[1-9]*) :;; *) echo "TNG_UID must be a nonzero numeric ID" >&2; exit 1;; esac \
     && case "$TNG_GID" in ''|*[!0-9]*) echo "TNG_GID must be a nonzero numeric ID" >&2; exit 1;; *[1-9]*) :;; *) echo "TNG_GID must be a nonzero numeric ID" >&2; exit 1;; esac \
@@ -31,8 +31,9 @@ COPY --from=build /src/target/release/torrentngd /usr/local/bin/torrentngd
 COPY --from=webui-build /webui/dist /usr/share/torrentng/webui
 COPY deploy/native/config.toml /etc/torrentngd/config.toml
 COPY deploy/container/identity.sh /usr/local/lib/torrentng/identity.sh
+COPY deploy/native/vpn-port-sync.sh /usr/local/lib/torrentng/vpn-port-sync.sh
 COPY deploy/native/entrypoint.sh /entrypoint.sh
-RUN chmod +x /entrypoint.sh
+RUN chmod +x /entrypoint.sh /usr/local/lib/torrentng/vpn-port-sync.sh
 
 ENV TNG_STATIC_DIR=/usr/share/torrentng/webui
 ENV RUST_LOG=info

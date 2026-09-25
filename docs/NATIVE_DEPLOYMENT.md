@@ -108,6 +108,51 @@ The Prometheus and Grafana host ports bind to `127.0.0.1` by default. Use an
 authenticated reverse proxy or an explicit host-side access policy before
 making either monitoring UI remotely reachable.
 
+## Running behind a VPN
+
+Use the optional Gluetun Compose deployment when the VPN provider assigns a
+forwarded port dynamically:
+
+```sh
+cp deploy/native/.env.vpn.example deploy/native/.env.vpn
+# Replace the example credentials with private values before starting.
+docker compose --env-file deploy/native/.env.vpn \
+  -f deploy/native/compose.vpn.yml up -d
+```
+
+Create `deploy/native/.env.vpn` with a random `TORRENTNG_API_TOKEN`, a separate
+random `GLUETUN_CONTROL_API_KEY`, and the provider's WireGuard or OpenVPN
+credentials. The checked-in Compose example defaults to ProtonVPN/WireGuard;
+for ProtonVPN, generate the WireGuard profile with NAT-PMP port forwarding
+enabled. Gluetun currently supports provider-side port forwarding for
+ProtonVPN, Private Internet Access, Perfect Privacy, and PrivateVPN. Set
+`VPN_PORT_FORWARDING_PROVIDER` to the matching provider if you change the
+default. The Compose example keeps Gluetun's control API private to its shared
+network namespace and requires its API key; it publishes only TorrentNG's
+WebUI/API port on the host.
+
+TorrentNG, Gluetun, and a small port-sync process share Gluetun's network
+namespace. The sync process polls the authenticated `GET /v1/portforward`
+endpoint and patches `/api/v1/session/settings` when the assigned port changes.
+TorrentNG rebinds its TCP and enabled uTP listeners, persists the new port, and
+updates tracker and DHT peer-port announcements without restarting. Gluetun's
+firewall provides the VPN kill switch and handles the provider's forwarded
+port; do not publish a fixed Docker peer port in this deployment. Keep the
+state volume so TorrentNG restores the latest port after container restarts.
+Leave `dht.port = 0` for DHT to follow the runtime peer port; when incoming uTP
+is enabled, TorrentNG places DHT on the adjacent UDP port to avoid binding two
+independent UDP listeners to the forwarded peer port. If you set an explicit
+DHT port, keep it distinct from the dynamic peer port.
+
+For Unraid with an existing Gluetun container, use the native template with
+Docker Extra Parameters `--network=container:gluetun`, remove the native
+template's peer-port mappings, and publish WebUI/API port `8080` on the
+Gluetun container. The port-sync process can run from the same native image
+with `--network=container:gluetun`, entrypoint
+`/usr/local/lib/torrentng/vpn-port-sync.sh`, and the two API-key environment
+variables above. The Unraid guide has the full container command and port
+setup.
+
 Change storage paths and the public peer port before using the example outside
 local testing. For systemd or a direct binary deployment, use a root-owned
 token file and set `auth.api_tokens_file` to its path, or use inline

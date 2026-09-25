@@ -2779,7 +2779,10 @@ impl TorrentTask {
             uploaded,
             downloaded,
             left: self.picker.bytes_left(),
-            listen_port: self.listen_port,
+            listen_port: match self.network_budget.listen_port() {
+                0 => self.listen_port,
+                port => port,
+            },
             http_timeout: self.http_timeout,
             udp_timeout: self.udp_timeout,
             numwant: protocol_numwant(self.peer_capacity()),

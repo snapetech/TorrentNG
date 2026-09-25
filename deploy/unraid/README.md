@@ -30,6 +30,47 @@ maintained templates.
 Both are documented in depth in their own `<Overview>` text, which Unraid
 shows on the Add Container page.
 
+## Native torrentng behind Gluetun
+
+The native daemon can share an existing Gluetun network namespace and follow
+the provider-assigned port after every VPN reconnect. Use the
+[VPN Compose variant](../native/compose.vpn.yml) when managing the deployment
+with Compose. For the Community Applications template:
+
+1. Configure Gluetun with `VPN_PORT_FORWARDING=on` and its authenticated
+   control server, for example
+   `HTTP_CONTROL_SERVER_AUTH_DEFAULT_ROLE={"auth":"apikey","apikey":"..."}`.
+   Publish the TorrentNG WebUI/API port (`8080`) on the Gluetun container; do
+   not expose its control-server port to the host.
+2. In the `torrentng` template, set Docker Extra Parameters to
+   `--network=container:gluetun` and remove the WebUI and peer-port mappings
+   from the TorrentNG container. Its shared network is published through
+   Gluetun.
+3. Start a port-sync helper in the same network namespace. The native image
+   already contains the helper:
+
+   ```sh
+   docker run -d --name=torrentng-vpn-port-sync \
+     --restart=unless-stopped \
+     --network=container:gluetun \
+     --user=99:100 \
+     -e GLUETUN_CONTROL_API_KEY='same-key-configured-in-gluetun' \
+     -e TORRENTNGD_API_TOKEN='same-token-configured-in-torrentng' \
+     --entrypoint=/usr/local/lib/torrentng/vpn-port-sync.sh \
+     ghcr.io/snapetech/torrentng/native:latest
+   ```
+
+The helper polls Gluetun's authenticated `/v1/portforward` endpoint and
+updates TorrentNG's runtime API. The daemon rebinds TCP and enabled uTP, saves
+the assigned port, and refreshes its tracker/DHT peer-port announcements.
+Gluetun provides the WireGuard kill switch and provider NAT-PMP forwarding;
+for ProtonVPN, enable NAT-PMP when generating the WireGuard profile. Use the
+provider's supported port-forwarding setup and a separate key for Gluetun's
+control server. Keep `dht.port = 0` so DHT follows the runtime peer port; with
+incoming uTP enabled, TorrentNG uses the adjacent UDP port for DHT. See
+[NATIVE_DEPLOYMENT.md](../../docs/NATIVE_DEPLOYMENT.md) for the complete
+Compose example.
+
 ## Try it without submitting anywhere (works today)
 
 Unraid can install directly from a raw template XML URL, no CA submission

@@ -1,0 +1,89 @@
+services:
+  gluetun:
+    image: "${GLUETUN_IMAGE:-qmcgaw/gluetun:v3.41.3}"
+    restart: unless-stopped
+    cap_add:
+      - NET_ADMIN
+    devices:
+      - /dev/net/tun:/dev/net/tun
+    ports:
+      - "${TNG_WEBUI_BIND:-127.0.0.1}:${TNG_WEBUI_PORT:-28082}:8080/tcp"
+    environment:
+      VPN_SERVICE_PROVIDER: "${VPN_SERVICE_PROVIDER:-protonvpn}"
+      VPN_TYPE: "${VPN_TYPE:-wireguard}"
+      VPN_PORT_FORWARDING: "on"
+      VPN_PORT_FORWARDING_PROVIDER: "${VPN_PORT_FORWARDING_PROVIDER:-protonvpn}"
+      WIREGUARD_PRIVATE_KEY: "${WIREGUARD_PRIVATE_KEY:-}"
+      OPENVPN_USER: "${OPENVPN_USER:-}"
+      OPENVPN_PASSWORD: "${OPENVPN_PASSWORD:-}"
+      SERVER_COUNTRIES: "${SERVER_COUNTRIES:-}"
+      SERVER_REGIONS: "${SERVER_REGIONS:-}"
+      SERVER_CITIES: "${SERVER_CITIES:-}"
+      SERVER_NAMES: "${SERVER_NAMES:-}"
+      FIREWALL_INPUT_PORTS: "8080"
+      HTTP_CONTROL_SERVER_AUTH_DEFAULT_ROLE: >-
+        {"auth":"apikey","apikey":"${GLUETUN_CONTROL_API_KEY:?Set GLUETUN_CONTROL_API_KEY}"}
+
+  torrentngd:
+    image: "${TNG_NATIVE_IMAGE:-ghcr.io/snapetech/torrentng/native:latest}"
+    restart: unless-stopped
+    network_mode: service:gluetun
+    depends_on:
+      gluetun:
+        condition: service_started
+    cap_drop:
+      - ALL
+    cap_add:
+      - CHOWN
+      - DAC_OVERRIDE
+      - FOWNER
+      - SETGID
+      - SETUID
+    security_opt:
+      - no-new-privileges:true
+    volumes:
+      - ./config.toml:/etc/torrentngd/config.toml:ro
+      - torrentngd-state:/var/lib/torrentngd
+      - downloads:/data
+    environment:
+      PUID: "${PUID:-1000}"
+      PGID: "${PGID:-1000}"
+      TORRENTNGD_CONFIG: /etc/torrentngd/config.toml
+      TORRENTNGD_API_TOKEN: "${TORRENTNG_API_TOKEN:?Set TORRENTNG_API_TOKEN}"
+      RUST_LOG: "${RUST_LOG:-info}"
+    secrets:
+      - torrentngd_api_token
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8080/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+  vpn-port-sync:
+    image: "${TNG_NATIVE_IMAGE:-ghcr.io/snapetech/torrentng/native:latest}"
+    restart: unless-stopped
+    user: "${PUID:-1000}:${PGID:-1000}"
+    network_mode: service:gluetun
+    entrypoint: ["/usr/local/lib/torrentng/vpn-port-sync.sh"]
+    depends_on:
+      gluetun:
+        condition: service_started
+      torrentngd:
+        condition: service_healthy
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    environment:
+      GLUETUN_CONTROL_API_KEY: "${GLUETUN_CONTROL_API_KEY:?Set GLUETUN_CONTROL_API_KEY}"
+      TORRENTNGD_API_TOKEN: "${TORRENTNG_API_TOKEN:?Set TORRENTNG_API_TOKEN}"
+      VPN_PORT_SYNC_INTERVAL: "${VPN_PORT_SYNC_INTERVAL:-10}"
+
+volumes:
+  torrentngd-state:
+  downloads:
+
+secrets:
+  torrentngd_api_token:
+    environment: TORRENTNG_API_TOKEN

@@ -18,11 +18,11 @@ use tokio::net::TcpListener;
 use tokio::sync::{mpsc, watch, Notify, OwnedSemaphorePermit};
 use tokio::task::JoinSet;
 use tokio::time::{sleep, timeout};
-use tracing::warn;
+use tracing::{info, warn};
 
 use crate::command::EngineCmd;
 use crate::engine::ENGINE_COMMAND_SEND_TIMEOUT;
-use crate::network_budget::GlobalNetworkBudget;
+use crate::network_budget::{GlobalNetworkBudget, PeerListenerRebindRequest};
 use crate::peer_ingress::{PeerIngressBudget, PeerIngressPermit};
 use crate::torrent_task::TorrentCmd;
 
@@ -50,7 +50,7 @@ pub(crate) struct PeerListenerContext {
 
 /// Run the socket acceptors independently of the engine command actor.
 pub(crate) async fn run(
-    listener: TcpListener,
+    mut listener: TcpListener,
     mut utp_endpoint: Option<UtpEndpoint>,
     context: PeerListenerContext,
     stop: watch::Receiver<bool>,
@@ -60,6 +60,7 @@ pub(crate) async fn run(
         done: Arc::clone(&context.done),
     };
     let mut stop = stop;
+    let mut rebind_rx = context.network_budget.take_listener_rebind_receiver();
     let mut handshakes = JoinSet::new();
     loop {
         let has_handshakes = !handshakes.is_empty();
@@ -67,6 +68,47 @@ pub(crate) async fn run(
             stop_result = stop.changed() => {
                 if stop_result.is_err() || *stop.borrow() {
                     break;
+                }
+            }
+            request = receive_rebind_request(&mut rebind_rx) => {
+                if let Some(request) = request {
+                    let current_port = listener.local_addr().map(|addr| addr.port());
+                    let result = match current_port {
+                        Ok(port) if port == request.port => Ok(()),
+                        Ok(_) => {
+                            let incoming_utp = utp_endpoint.is_some();
+                            match bind_peer_sockets(request.port, incoming_utp).await {
+                                Ok((replacement_listener, replacement_utp)) => {
+                                    listener = replacement_listener;
+                                    if let Some(previous) =
+                                        std::mem::replace(&mut utp_endpoint, replacement_utp)
+                                    {
+                                        if let Err(error) = previous.shutdown().await {
+                                            warn!(
+                                                component = "peer_listener",
+                                                operation = "rebind_utp_shutdown",
+                                                result = "error",
+                                                error = %error,
+                                                "old uTP listener failed to shut down after rebind"
+                                            );
+                                        }
+                                    }
+                                    info!(
+                                        component = "peer_listener",
+                                        operation = "rebind",
+                                        port = request.port,
+                                        "peer listener rebound"
+                                    );
+                                    Ok(())
+                                }
+                                Err(error) => Err(error),
+                            }
+                        }
+                        Err(error) => Err(format!("read peer listener address: {error}")),
+                    };
+                    let _ = request.reply.send(result);
+                } else {
+                    rebind_rx = None;
                 }
             }
             accept_result = listener.accept() => {
@@ -261,6 +303,35 @@ pub(crate) async fn run(
             debug_handshake_join_error(error);
         }
     }
+}
+
+async fn receive_rebind_request(
+    receiver: &mut Option<mpsc::Receiver<PeerListenerRebindRequest>>,
+) -> Option<PeerListenerRebindRequest> {
+    match receiver {
+        Some(receiver) => receiver.recv().await,
+        None => std::future::pending().await,
+    }
+}
+
+async fn bind_peer_sockets(
+    port: u16,
+    incoming_utp: bool,
+) -> Result<(TcpListener, Option<UtpEndpoint>), String> {
+    let addr = SocketAddr::from(([0, 0, 0, 0], port));
+    let listener = TcpListener::bind(addr)
+        .await
+        .map_err(|error| format!("binding TCP peer listener to {addr}: {error}"))?;
+    let utp_endpoint = if incoming_utp {
+        Some(
+            UtpEndpoint::bind(addr)
+                .await
+                .map_err(|error| format!("binding uTP peer listener to {addr}: {error}"))?,
+        )
+    } else {
+        None
+    };
+    Ok((listener, utp_endpoint))
 }
 
 fn debug_handshake_join_error(error: tokio::task::JoinError) {

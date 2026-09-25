@@ -639,6 +639,23 @@ pub async fn app_preferences(State(state): State<AppState>) -> Response {
             };
             map.insert("dht".to_owned(), serde_json::Value::Bool(features.dht));
             map.insert("pex".to_owned(), serde_json::Value::Bool(features.pex));
+            match engine.listen_port().await {
+                Ok(port) => {
+                    map.insert("listen_port".to_owned(), serde_json::Value::from(port));
+                }
+                Err(_) => {
+                    return (
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        Json(serde_json::json!({
+                            "error": {
+                                "code": "SERVICE_UNAVAILABLE",
+                                "message": "TorrentNG client listen port is unavailable",
+                            }
+                        })),
+                    )
+                        .into_response()
+                }
+            }
         }
         let banned_ips = if let Some(engine) = &state.engine {
             match engine.banned_peers().await {
@@ -677,7 +694,9 @@ pub async fn app_preferences(State(state): State<AppState>) -> Response {
         for (key, value) in &stored_preferences {
             // DHT/PEX are read from the engine above. Do not let a stale
             // compatibility override mask the authoritative runtime value.
-            if matches!(key.as_str(), "dht" | "pex") {
+            if matches!(key.as_str(), "dht" | "pex")
+                || (state.engine.is_some() && key == "listen_port")
+            {
                 continue;
             }
             map.insert(key.clone(), value.clone());
@@ -694,6 +713,13 @@ pub async fn app_set_preferences(State(state): State<AppState>, body: String) ->
                 .filter(|(key, _)| matches!(key.as_str(), "dht" | "pex"))
                 .any(|(_, value)| !value.is_boolean())
             {
+                return StatusCode::BAD_REQUEST.into_response();
+            }
+            if updates.get("listen_port").is_some_and(|value| {
+                value
+                    .as_u64()
+                    .is_none_or(|port| !(1..=u16::MAX as u64).contains(&port))
+            }) {
                 return StatusCode::BAD_REQUEST.into_response();
             }
             let _write = state.preference_write.lock().await;
@@ -717,6 +743,15 @@ pub async fn app_set_preferences(State(state): State<AppState>, body: String) ->
                         return qbit_backend_error(error);
                     }
                 }
+                if let Some(port) = updates
+                    .get("listen_port")
+                    .and_then(serde_json::Value::as_u64)
+                    .and_then(|port| u16::try_from(port).ok())
+                {
+                    if let Err(error) = engine.update_listen_port(port).await {
+                        return qbit_backend_error(error);
+                    }
+                }
             }
             let mut stored_updates = updates;
             if state.engine.is_some() {
@@ -725,10 +760,13 @@ pub async fn app_set_preferences(State(state): State<AppState>, body: String) ->
                 // brain state after a restart or another control-plane write.
                 stored_updates.remove("dht");
                 stored_updates.remove("pex");
+                stored_updates.remove("listen_port");
             }
-            stored_preferences.extend(stored_updates);
-            if let Err(error) = save_qbit_preferences(&state, stored_preferences).await {
-                return qbit_backend_error(error);
+            if !stored_updates.is_empty() {
+                stored_preferences.extend(stored_updates);
+                if let Err(error) = save_qbit_preferences(&state, stored_preferences).await {
+                    return qbit_backend_error(error);
+                }
             }
             StatusCode::OK.into_response()
         }

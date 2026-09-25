@@ -1566,6 +1566,16 @@ pub struct UpdateNetworkFeaturesRequest {
     pub pex: Option<bool>,
 }
 
+#[derive(Debug, Serialize)]
+pub struct SessionSettingsResponse {
+    pub listen_port: u16,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct UpdateSessionSettingsRequest {
+    pub listen_port: Option<u16>,
+}
+
 /// `GET /api/v1/transfer/limits` — read global transfer limits.
 pub async fn transfer_limits(State(state): State<AppState>) -> impl IntoResponse {
     let Some(engine) = &state.engine else {
@@ -1811,6 +1821,64 @@ pub async fn update_session_features(
         Err(e) => (
             StatusCode::BAD_REQUEST,
             Json(serde_json::to_value(ApiError::bad_request(e)).unwrap()),
+        )
+            .into_response(),
+    }
+}
+
+/// `GET /api/v1/session/settings` — read runtime session settings.
+pub async fn session_settings(State(state): State<AppState>) -> Response {
+    let Some(engine) = &state.engine else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(
+                serde_json::to_value(ApiError::internal("TorrentNG client is not available"))
+                    .unwrap(),
+            ),
+        )
+            .into_response();
+    };
+    match engine.listen_port().await {
+        Ok(listen_port) => (
+            StatusCode::OK,
+            Json(SessionSettingsResponse { listen_port }),
+        )
+            .into_response(),
+        Err(error) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::to_value(ApiError::internal(error)).unwrap()),
+        )
+            .into_response(),
+    }
+}
+
+/// `PATCH /api/v1/session/settings` — apply supported runtime session settings.
+pub async fn update_session_settings(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(req): Json<UpdateSessionSettingsRequest>,
+) -> Response {
+    if let Some(response) = require_mutation_auth(&state, &headers) {
+        return response;
+    }
+    let Some(engine) = &state.engine else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(
+                serde_json::to_value(ApiError::internal("TorrentNG client is not available"))
+                    .unwrap(),
+            ),
+        )
+            .into_response();
+    };
+    let Some(port) = req.listen_port else {
+        return StatusCode::BAD_REQUEST.into_response();
+    };
+    match engine.update_listen_port(port).await {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(error) => (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::to_value(ApiError::bad_request(error)).unwrap()),
         )
             .into_response(),
     }
