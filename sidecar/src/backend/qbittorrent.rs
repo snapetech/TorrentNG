@@ -1,6 +1,6 @@
 use anyhow::{bail, Context, Result};
 use async_trait::async_trait;
-use reqwest::Url;
+use reqwest::{StatusCode, Url};
 use std::{collections::BTreeMap, net::SocketAddr};
 use tokio::sync::Mutex;
 
@@ -66,7 +66,7 @@ impl QbittorrentBackend {
             "qBittorrent login",
         )
         .await?;
-        if !status.is_success() || std::str::from_utf8(&body).ok().map(str::trim) != Some("Ok.") {
+        if !qbit_login_succeeded(status, &body) {
             bail!("qBittorrent login failed with status {status}");
         }
         Ok(())
@@ -173,6 +173,20 @@ impl QbittorrentBackend {
     }
 }
 
+fn qbit_login_succeeded(status: StatusCode, body: &[u8]) -> bool {
+    match status {
+        StatusCode::NO_CONTENT => body.is_empty(),
+        status if status.is_success() => {
+            std::str::from_utf8(body).ok().map(str::trim) == Some("Ok.")
+        }
+        _ => false,
+    }
+}
+
+fn qbit_version_is_usable(version: &str) -> bool {
+    !version.trim().is_empty()
+}
+
 #[derive(Debug, serde::Deserialize)]
 struct QbitTorrent {
     hash: String,
@@ -258,8 +272,8 @@ impl TorrentBackend for QbittorrentBackend {
     }
 
     async fn health(&self) -> BackendStatus {
-        match self.get_json::<String>("api/v2/app/version").await {
-            Ok(version) if !version.trim().is_empty() => BackendStatus::Connected,
+        match self.get_text("api/v2/app/version").await {
+            Ok(version) if qbit_version_is_usable(&version) => BackendStatus::Connected,
             Err(_) => BackendStatus::Unreachable,
             Ok(_) => BackendStatus::Unreachable,
         }
@@ -1011,6 +1025,21 @@ mod tests {
         assert!(validate_qbit_mutation_body(b"Ok.\n", "api/v2/torrents/pause").is_ok());
         assert!(validate_qbit_mutation_body(b"Fails.", "api/v2/torrents/pause").is_err());
         assert!(validate_qbit_mutation_body(b"unexpected", "api/v2/torrents/pause").is_err());
+    }
+
+    #[test]
+    fn qbit_login_accepts_successful_no_content_responses() {
+        assert!(qbit_login_succeeded(StatusCode::NO_CONTENT, b""));
+        assert!(qbit_login_succeeded(StatusCode::OK, b"Ok.\n"));
+        assert!(!qbit_login_succeeded(StatusCode::NO_CONTENT, b"unexpected"));
+        assert!(!qbit_login_succeeded(StatusCode::OK, b""));
+        assert!(!qbit_login_succeeded(StatusCode::UNAUTHORIZED, b"Ok."));
+    }
+
+    #[test]
+    fn qbit_health_accepts_plain_text_version_responses() {
+        assert!(qbit_version_is_usable("v5.2.3"));
+        assert!(!qbit_version_is_usable(" \n"));
     }
 
     #[tokio::test]
