@@ -55,6 +55,65 @@ jobs:
           fi
           echo "tag=$tag" >> "$GITHUB_OUTPUT"
 
+  release-notes:
+    name: Assemble release notes
+    needs: validate-release-tag
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      release_body: ${{ steps.release-body.outputs.release_body }}
+    env:
+      RELEASE_TAG: ${{ needs.validate-release-tag.outputs.tag }}
+    steps:
+      - name: Checkout release tag
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          ref: ${{ needs.validate-release-tag.outputs.tag }}
+          persist-credentials: false
+
+      - name: Find previous published release
+        id: previous
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          previous_tag="$(gh release list \
+            --repo "$GITHUB_REPOSITORY" \
+            --limit 1000 \
+            --json tagName,isDraft \
+            --jq '.[] | select(.isDraft == false) | .tagName' \
+            | awk -v current="$RELEASE_TAG" '$0 != current { print; exit }')"
+          echo "tag=$previous_tag" >> "$GITHUB_OUTPUT"
+
+      - name: Assemble curated release notes
+        env:
+          PREVIOUS_TAG: ${{ steps.previous.outputs.tag }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          args=(--head "$RELEASE_TAG" --output release-notes.md)
+          if [[ -n "$PREVIOUS_TAG" ]]; then
+            args+=(--base "$PREVIOUS_TAG")
+          fi
+          python3 scripts/release_notes.py assemble "${args[@]}"
+          test -s release-notes.md
+          cat release-notes.md
+
+      - name: Export release body
+        id: release-body
+        shell: bash
+        run: |
+          set -euo pipefail
+          delimiter="release_body_${GITHUB_RUN_ID}"
+          {
+            echo "release_body<<${delimiter}"
+            cat release-notes.md
+            echo "$delimiter"
+          } >> "$GITHUB_OUTPUT"
+
   native-quality:
     name: TorrentNG client and compatible-client service quality gate
     needs: validate-release-tag
@@ -437,6 +496,7 @@ jobs:
     runs-on: [self-hosted, Linux, X64]
     needs:
       - validate-release-tag
+      - release-notes
       - native-binaries
       - linux-release-assets
     env:
@@ -461,17 +521,21 @@ jobs:
       - name: Create GitHub release
         env:
           GH_TOKEN: ${{ github.token }}
+          RELEASE_BODY: ${{ needs.release-notes.outputs.release_body }}
         shell: bash
         run: |
           set -euo pipefail
           tag="$RELEASE_TAG"
-          if gh release view "$tag" >/dev/null 2>&1; then
-            gh release upload "$tag" dist/* --clobber
+          if gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release edit "$tag" --repo "$GITHUB_REPOSITORY" \
+              --title "TorrentNG $tag" \
+              --notes "$RELEASE_BODY"
+            gh release upload "$tag" dist/* --clobber --repo "$GITHUB_REPOSITORY"
           else
             gh release create "$tag" dist/* \
+              --repo "$GITHUB_REPOSITORY" \
               --title "TorrentNG $tag" \
-              --notes "The universal torrent client interface: one WebUI/API for the TorrentNG Engine and qBittorrent, rTorrent, Transmission, and Deluge." \
-              --generate-notes \
+              --notes "$RELEASE_BODY" \
               --verify-tag
           fi
 
@@ -506,20 +570,25 @@ jobs:
         env:
           DISCORD_RELEASE_WEBHOOK: ${{ secrets.DISCORD_RELEASE_WEBHOOK }}
           RELEASE_TAG: ${{ needs.validate-release-tag.outputs.tag }}
+          RELEASE_BODY: ${{ needs.release-notes.outputs.release_body }}
         shell: bash
         run: |
           set -euo pipefail
           release_url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/releases/tag/$RELEASE_TAG"
+          body="$RELEASE_BODY"
+          if (( ${#body} > 3800 )); then
+            body="${body:0:3797}…"
+          fi
           jq -n \
             --arg tag "$RELEASE_TAG" \
             --arg url "$release_url" \
-            --arg repo "$GITHUB_REPOSITORY" \
+            --arg description "$body" \
             '{
               username: "TorrentNG releases",
               embeds: [{
                 title: ("TorrentNG " + $tag + " released"),
                 url: $url,
-                description: ("The universal torrent client interface: a new TorrentNG release is available for " + $repo + "."),
+                description: $description,
                 color: 3447003,
                 fields: [
                   {name: "Tag", value: $tag, inline: true},
