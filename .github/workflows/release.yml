@@ -459,7 +459,7 @@ jobs:
             [[ "$(docker exec "$name" stat -c '%u:%g' /var/lib/torrentng/cache.db)" == "1000:1000" ]]
             [[ "$(docker exec "$name" stat -c '%u:%g' /var/lib/rtorrentng)" == "1000:1000" ]]
             [[ "$(docker exec "$name" stat -c '%u:%g' /var/lib/rtorrentng/cache.db)" == "1000:1000" ]]
-            docker rm "$name" >/dev/null
+            docker rm -f "$name" >/dev/null
           }
 
           run_smoke override /var/lib/rtorrentng
