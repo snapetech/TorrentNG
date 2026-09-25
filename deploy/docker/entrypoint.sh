@@ -2,8 +2,8 @@
 set -e
 
 TNG_INIT=/sbin/tini
-TNG_IDENTITY_PATHS="/data /session /var/lib/torrentng /var/log/rtorrent /run/rtorrent"
-TNG_IDENTITY_FILES="/var/log/rtorrent/rtorrent.log"
+TNG_IDENTITY_PATHS="/data /session /var/lib/torrentng /var/lib/rtorrentng /var/log/rtorrent /run/rtorrent"
+TNG_IDENTITY_FILES="/var/log/rtorrent/rtorrent.log /var/lib/rtorrentng/cache.db"
 . /usr/local/lib/torrentng/identity.sh
 tng_identity_enter "$@"
 if [ "${1:-}" = --tng-identity-dropped ]; then
