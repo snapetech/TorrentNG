@@ -1,3 +1,12 @@
+# Historical design brief — implementation checklist complete
+
+The rewrite implementation checklist is complete; see
+[`docs/ENGINE_REWRITE_BURNDOWN.md`](docs/ENGINE_REWRITE_BURNDOWN.md). This
+specification is retained as design history, not an open implementation
+backlog. Current compatibility and qualification boundaries are tracked in
+[`docs/CLIENT_COMPATIBILITY_MATRICES.md`](docs/CLIENT_COMPATIBILITY_MATRICES.md)
+and [`docs/BACKEND_AUDIT_BURN_DOWN.md`](docs/BACKEND_AUDIT_BURN_DOWN.md).
+
 Created the archive-ready implementation spec here:
 
 [Download the TorrentNG engine rewrite spec](sandbox:/mnt/data/torrentng_engine_rewrite_spec.md)
@@ -45,4 +54,3 @@ That keeps the project implementable without letting a weak model wander into �
 [4]: https://github.com/transmission/transmission/blob/main/docs/rpc-spec.md "transmission/docs/rpc-spec.md at main · transmission/transmission · GitHub"
 [5]: https://github.com/arvidn/libtorrent/issues/7551 "Why libtorrent 2.0's use of memory mapped files was a bad idea · Issue #7551 · arvidn/libtorrent · GitHub"
 [6]: https://github.com/ikatson/rqbit/blob/main/README.md "rqbit/README.md at main · ikatson/rqbit · GitHub"
-

@@ -2,17 +2,18 @@
 
 > Historical baseline: this document preserves the original May 2026 red-team
 > findings. The current disposition and verification record are maintained in
-> [`BACKEND_AUDIT_BURN_DOWN.md`](BACKEND_AUDIT_BURN_DOWN.md), updated 2026-09-21.
+> [`BACKEND_AUDIT_BURN_DOWN.md`](BACKEND_AUDIT_BURN_DOWN.md), updated 2026-09-25.
 
 This document records the red-team and engineering-hardening issues found during the May 2026 ruthless review pass. It is intentionally blunt: if a behavior is compatibility-shaped, inert, or safe only behind localhost assumptions, that needs to be visible in code, docs, and release gates.
 
-## Current disposition (2026-09-21 UTC)
+## Current disposition (2026-09-25 UTC)
 
-The historical checklist below is not an open work queue. Most repository-
-actionable findings have been implemented and regression-tested in the current
-tree. The historical compatible-client container privilege finding is fixed in
-the current images; deployment-specific ownership migration for existing
-volumes and host mounts remains open. The linked local security review reports
+The historical checklist below is not an open work queue. The
+repository-actionable hardening findings in the reviewed scope are implemented
+in the current tree. The historical compatible-client container privilege
+finding is fixed in the current images; deployment-specific ownership
+migration for existing volumes and host mounts remains an operator task. The
+linked local security review reports
 are 2026-09-04 snapshots; the
 newer egress coverage is recorded in the canonical backend audit. The local
 reports ([native](../certification/reports/security-review-native-current-20260904.md),
@@ -22,7 +23,7 @@ predate that additional coverage.
 | Finding | Current state | Honest boundary |
 |---|---|---|
 | Facade authentication | The TorrentNG client, qBittorrent, Transmission, Deluge, and the rTorrent library entry point enforce the configured token boundary; sidecar session cookies are signed, HttpOnly, and Secure by default. | Reverse-proxy header handling, TLS termination, and deployed secret rotation require operator review. |
-| Storage authority | Execute paths use configured/persisted server roots and descriptor-relative no-follow checks; caller roots are preview-only. Plans requiring publication rename fail closed when the target lacks atomic no-replace rename support. | Non-Linux runtime authority and a hostile live mount race still require target-host evidence. |
+| Storage authority | Unix execute paths use configured/persisted server roots and descriptor-relative no-follow checks; Windows storage-plan operations use configured-root capabilities and handle-relative traversal, copy/verification/deletion, pruning, reconciliation, and no-replace rename. Caller roots are preview-only, and plans requiring publication rename fail closed when the target lacks atomic no-replace support. | Native Windows runtime behavior and hostile live filesystem races still require target-host qualification. |
 | Metainfo integers and caps | Checked signed-to-unsigned conversions and parser limits reject negative, overflowing, and oversized torrent-controlled values. | Larger external corpus/fuzz runs remain qualification evidence. |
 | Outbound egress | The shared address policy covers tracker/webseed requests, DHT targets/results, metadata-pending magnets, and v1/hybrid/pure-v2 peer connections; global peer bans also apply before metadata acquisition. Private, loopback, and link-local destinations are denied by default. | Public-network hostile DNS/redirect behavior and interoperability remain unverified; private-network operation requires explicit config opt-in. |
 | Compatibility honesty | Unsupported queue/plugin behavior returns explicit unsupported results; pure-v2 metadata completion is implemented behind bounded BEP 9/BEP 52 validation, and projection-only state is documented. | Client-version breadth and public pure-v2 interoperability remain evidence questions. |
