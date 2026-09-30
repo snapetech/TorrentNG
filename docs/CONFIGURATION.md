@@ -270,7 +270,7 @@ Environment variables override file values where listed.
 |---|---|---|---|
 | `listen_addr` | `127.0.0.1:8080` | `TNG_LISTEN_ADDR` | TCP address the service listens on; non-loopback binds require strong API tokens and a session secret |
 | `debug` | `false` | `TNG_DEBUG=1` | Enable debug logging |
-| `sync_interval_secs` | `2` | `TNG_SYNC_INTERVAL_SECS` | Seconds between backend state polls |
+| `sync_interval_secs` | `5` | `TNG_SYNC_INTERVAL_SECS` | Seconds between backend state polls |
 | `data_dir` | `~/.local/share/torrentng` | - | Directory for SQLite cache |
 | `storage_roots` | `[]` | - | Paths shown in the storage dashboard; defaults to `/` when empty |
 | WebUI static dir | `static` | `TNG_STATIC_DIR` | Directory served for WebUI assets and SPA fallback |
@@ -618,7 +618,7 @@ remote WebUI/API access.
 ```toml
 listen_addr = "127.0.0.1:8080"
 debug = false
-sync_interval_secs = 2
+sync_interval_secs = 5
 data_dir = "/var/lib/torrentng"
 storage_roots = ["/data", "/mnt/archive"]
 

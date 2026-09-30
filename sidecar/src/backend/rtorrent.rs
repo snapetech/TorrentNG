@@ -205,8 +205,11 @@ impl TorrentBackend for RtorrentBackend {
         self.client.list_torrents_range(view, offset, limit).await
     }
 
-    async fn live_summary(&self, view: &str, limit: i64) -> Result<LiveSummary> {
-        self.client.live_summary(view, limit).await
+    async fn live_summary(&self, _view: &str, limit: i64) -> Result<LiveSummary> {
+        // A torrent with a nonzero transfer rate must be in rTorrent's
+        // `started` view. Avoid scanning the full `main` view, which can
+        // contain thousands of stopped torrents during each sync tick.
+        self.client.live_summary("started", limit).await
     }
 
     async fn feature_status(&self) -> (String, String) {
