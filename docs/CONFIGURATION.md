@@ -43,7 +43,7 @@ TORRENTNGD_CONFIG=/config/config.toml torrentngd
 
 | Key | Default | Description |
 |---|---|---|
-| `listen_port` | `6881` | Incoming peer TCP port |
+| `listen_port` | `6881` | Incoming peer TCP port; can be changed through the authenticated session-settings API or qBittorrent `setPreferences` at runtime, and the active value is persisted in session state |
 | `max_peers` | `200` | Maximum peer connections across all torrents |
 | `upload_rate_limit` | `0` | Upload limit in bytes/sec; `0` means unlimited |
 | `download_rate_limit` | `0` | Download limit in bytes/sec; `0` means unlimited |
@@ -62,6 +62,11 @@ UDP port when incoming uTP is enabled (and uses an ephemeral port if
 `listen_port = 65535`). An explicit `dht.port` equal to `listen_port` is
 rejected in that mode. `TNG_UTP_METADATA=prefer|only` enables uTP magnet
 metadata fetch explicitly.
+
+When `dht.port = 0`, DHT follows the runtime peer port (using the next UDP
+port while incoming uTP is enabled). A runtime listen-port change rebinds the
+peer sockets and restarts DHT on its corresponding port; an explicit
+`dht.port` remains fixed.
 
 ### `[storage]`
 
@@ -265,7 +270,7 @@ Environment variables override file values where listed.
 |---|---|---|---|
 | `listen_addr` | `127.0.0.1:8080` | `TNG_LISTEN_ADDR` | TCP address the service listens on; non-loopback binds require strong API tokens and a session secret |
 | `debug` | `false` | `TNG_DEBUG=1` | Enable debug logging |
-| `sync_interval_secs` | `2` | `TNG_SYNC_INTERVAL_SECS` | Seconds between backend state polls |
+| `sync_interval_secs` | `5` | `TNG_SYNC_INTERVAL_SECS` | Seconds between backend state polls |
 | `data_dir` | `~/.local/share/torrentng` | - | Directory for SQLite cache |
 | `storage_roots` | `[]` | - | Paths shown in the storage dashboard; defaults to `/` when empty |
 | WebUI static dir | `static` | `TNG_STATIC_DIR` | Directory served for WebUI assets and SPA fallback |
@@ -613,7 +618,7 @@ remote WebUI/API access.
 ```toml
 listen_addr = "127.0.0.1:8080"
 debug = false
-sync_interval_secs = 2
+sync_interval_secs = 5
 data_dir = "/var/lib/torrentng"
 storage_roots = ["/data", "/mnt/archive"]
 
