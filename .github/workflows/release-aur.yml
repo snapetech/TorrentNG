@@ -20,18 +20,26 @@ jobs:
       - name: Resolve tag
         id: tag
         shell: bash
+        env:
+          REQUESTED_TAG: ${{ inputs.tag || github.event.release.tag_name }}
         run: |
           set -euo pipefail
-          tag="${{ github.event.inputs.tag || github.event.release.tag_name }}"
-          if [[ "$tag" != main-* ]]; then
-            echo "Release tags must start with main-; got $tag." >&2
+          if [[ "$GITHUB_EVENT_NAME" == "workflow_dispatch" && "$GITHUB_REF" != "refs/heads/main" ]]; then
+            echo "Manual package publishes must be dispatched from the default main branch." >&2
+            exit 1
+          fi
+          tag="$REQUESTED_TAG"
+          if [[ ! "$tag" =~ ^main-[A-Za-z0-9][A-Za-z0-9._-]*$ ]] ||
+            [[ "$tag" == *..* ]] || ! git check-ref-format "refs/tags/$tag"; then
+            echo "Invalid release tag: $tag" >&2
             exit 1
           fi
           echo "tag=$tag" >> "$GITHUB_OUTPUT"
 
       - uses: actions/checkout@v7
         with:
-          ref: ${{ steps.tag.outputs.tag }}
+          ref: main
+          persist-credentials: false
 
       - name: Configure AUR SSH
         env:
@@ -58,6 +66,7 @@ jobs:
       - name: Publish torrentngd-git
         env:
           AUR_SSH_KEY: ${{ secrets.AUR_SSH_KEY }}
+          RELEASE_TAG: ${{ steps.tag.outputs.tag }}
         shell: bash
         run: |
           set -euo pipefail
@@ -84,5 +93,5 @@ jobs:
           git -C "$workdir/torrentngd-git" config user.name "snapetech release bot"
           git -C "$workdir/torrentngd-git" config user.email "release@snapetech.local"
           git -C "$workdir/torrentngd-git" add PKGBUILD .SRCINFO torrentngd.service torrentngd.sysusers torrentngd.tmpfiles
-          git -C "$workdir/torrentngd-git" commit -m "Update to ${{ steps.tag.outputs.tag }}" || exit 0
+          git -C "$workdir/torrentngd-git" commit -m "Update to $RELEASE_TAG" || exit 0
           git -C "$workdir/torrentngd-git" push

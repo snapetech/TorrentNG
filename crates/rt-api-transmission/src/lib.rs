@@ -2,6 +2,7 @@
 
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap, HashSet},
+    convert::Infallible,
     sync::Arc,
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -17,16 +18,16 @@ use axum::{
 };
 use base64::{engine::general_purpose, Engine as _};
 use rt_api_model::{
-    api_token_allowed, csrf_request_allowed, request_fingerprint, session_cookie_value,
-    valid_idempotency_key, CachedResponse, IdempotencyClaim, IdempotencyStore,
-    MAX_IDEMPOTENCY_BODY_BYTES,
+    api_token_allowed, bearer_token, csrf_request_allowed, request_fingerprint,
+    session_cookie_value, valid_idempotency_key, CachedResponse, IdempotencyClaim,
+    IdempotencyStore, MAX_IDEMPOTENCY_BODY_BYTES,
 };
 use rt_engine::{
     EngineGlobalLimits, EngineHandle, EngineJob, EngineNetworkFeatures, EnginePeerSnapshot,
     EnginePieceState, EngineTorrentLimits, EngineTorrentMetadata, EngineTrackerSnapshot,
     EngineWebseedSnapshot, QueueMove,
 };
-use rt_metainfo::parse_magnet;
+use rt_metainfo::{parse_magnet, MAX_TORRENT_BYTES};
 use rt_metrics::{MemoryClass, MemoryLease};
 use rt_session::SessionRegistry;
 use serde::{Deserialize, Serialize};
@@ -35,6 +36,7 @@ use tokio::{
     sync::{Mutex, Notify, RwLock},
     task::JoinSet,
 };
+use tower::limit::GlobalConcurrencyLimitLayer;
 
 const SESSION_ID: &str = "TorrentNG";
 const MAX_TRANSMISSION_BATCH_REQUESTS: usize = 128;
@@ -42,6 +44,20 @@ const MAX_TRANSMISSION_BATCH_REQUESTS: usize = 128;
 const MAX_TRANSMISSION_MUTATION_ITEMS: usize = 16_384;
 const SETTING_TRANSMISSION_SESSION: &str = "compat.transmission.session";
 const MAX_TRANSMISSION_SESSION_BYTES: usize = 64 * 1024;
+const MAX_TRANSMISSION_SESSION_TEXT_BYTES: usize = 16 * 1024;
+const MAX_TRANSMISSION_PATH_BYTES: usize = 16 * 1024;
+const MAX_TRANSMISSION_URL_BYTES: usize = 8 * 1024;
+const MAX_TRANSMISSION_LABEL_BYTES: usize = 256;
+const MAX_TRANSMISSION_GROUP_NAME_BYTES: usize = 256;
+const MAX_TRANSMISSION_GROUPS: usize = 1_024;
+const MAX_TRANSMISSION_SUBSCRIPTION_BYTES: usize = 256;
+const MAX_TRANSMISSION_SUBSCRIPTIONS: usize = 1_024;
+const MAX_TRANSMISSION_TRACKER_BYTES: usize = 4 * 1024 * 1024;
+const MAX_TRANSMISSION_METAINFO_ENCODED_BYTES: usize = (MAX_TORRENT_BYTES / 3 + 1) * 4 + 4;
+const MAX_TRANSMISSION_LARGE_BODY_REQUESTS: usize = 4;
+const MAX_TRANSMISSION_DEFAULT_BODY_BYTES: usize = 8 * 1024 * 1024;
+const MAX_TRANSMISSION_TORRENT_REQUEST_BODY_BYTES: usize =
+    MAX_TRANSMISSION_METAINFO_ENCODED_BYTES + 1024 * 1024;
 // Transmission's torrent-get contract has no page/cursor parameter. Bound
 // the compatibility fallback so one request cannot allocate and enrich an
 // arbitrarily large full-list response.
@@ -282,6 +298,7 @@ impl AppState {
             serde_json::from_str::<TransmissionPersistedState>(&raw).map_err(|error| {
                 format!("invalid persisted Transmission compatibility state: {error}")
             })?;
+        validate_transmission_persisted_state(&restored)?;
         // The engine starts before this facade is constructed.  Reapply the
         // two session flags that have a real engine equivalent before
         // publishing the compatibility projection; otherwise session-get
@@ -407,8 +424,9 @@ async fn load_transmission_runtime_projections(
             });
         }
         while let Some(result) = tasks.join_next().await {
-            let projection = result
-                .map_err(|error| format!("Transmission projection task failed: {error}"))??;
+            let projection = result.map_err(|error| {
+                rt_engine::task_join_error_summary("Transmission projection task", &error)
+            })??;
             projections.push(projection);
         }
     }
@@ -429,8 +447,9 @@ async fn load_transmission_tracker_snapshot_size(
             tasks.spawn(async move { engine.torrent_tracker_snapshot_size(info_hash).await });
         }
         while let Some(result) = tasks.join_next().await {
-            let (count, bytes) = result
-                .map_err(|error| format!("Transmission tracker size task failed: {error}"))??;
+            let (count, bytes) = result.map_err(|error| {
+                rt_engine::task_join_error_summary("Transmission tracker size task", &error)
+            })??;
             total_count = total_count.saturating_add(count);
             total_bytes = total_bytes.saturating_add(bytes);
         }
@@ -471,9 +490,27 @@ fn merge_transmission_runtime_projections(
 }
 
 pub fn build_transmission_router(state: AppState) -> Router {
+    let large_body_limit = GlobalConcurrencyLimitLayer::new(MAX_TRANSMISSION_LARGE_BODY_REQUESTS);
     Router::new()
-        .route("/transmission/rpc", post(rpc))
-        .route("/api/transmission/rpc", post(rpc))
+        // Transmission carries base64 metainfo inside the single JSON-RPC
+        // endpoint; keep the 64 MiB decoded torrent ceiling reachable while
+        // admitting only a small number of these memory-heavy requests.
+        .route(
+            "/transmission/rpc",
+            post(rpc)
+                .layer::<_, Infallible>(DefaultBodyLimit::max(
+                    MAX_TRANSMISSION_TORRENT_REQUEST_BODY_BYTES,
+                ))
+                .layer::<_, Infallible>(large_body_limit.clone()),
+        )
+        .route(
+            "/api/transmission/rpc",
+            post(rpc)
+                .layer::<_, Infallible>(DefaultBodyLimit::max(
+                    MAX_TRANSMISSION_TORRENT_REQUEST_BODY_BYTES,
+                ))
+                .layer::<_, Infallible>(large_body_limit),
+        )
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
             transmission_idempotency_guard,
@@ -482,7 +519,7 @@ pub fn build_transmission_router(state: AppState) -> Router {
             state.clone(),
             transmission_auth_guard,
         ))
-        .layer(DefaultBodyLimit::max(8 * 1024 * 1024))
+        .layer(DefaultBodyLimit::max(MAX_TRANSMISSION_DEFAULT_BODY_BYTES))
         .with_state(state)
 }
 
@@ -623,11 +660,7 @@ async fn transmission_auth_guard(
 }
 
 fn transmission_bearer_token(headers: &HeaderMap) -> Option<String> {
-    headers
-        .get(header::AUTHORIZATION)
-        .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.strip_prefix("Bearer "))
-        .map(str::to_owned)
+    bearer_token(headers)
 }
 
 fn transmission_is_mutating(req: &Request<Body>) -> bool {
@@ -758,6 +791,16 @@ async fn transmission_rpc_payload(state: &AppState, body: Value) -> Value {
                     id,
                     json_rpc,
                     Err("Transmission location cannot be empty".to_owned()),
+                );
+            }
+            if location.len() > MAX_TRANSMISSION_PATH_BYTES {
+                return transmission_response(
+                    tag.clone(),
+                    id,
+                    json_rpc,
+                    Err(format!(
+                        "Transmission location exceeds {MAX_TRANSMISSION_PATH_BYTES} bytes"
+                    )),
                 );
             }
             let hashes = match mutation_ids(state, &args).await {
@@ -981,12 +1024,16 @@ async fn torrent_set(state: &AppState, args: &Value) -> Result<Value, String> {
             }
         }
         if let Some(group) = &group {
-            state
-                .groups
-                .write()
-                .await
+            let mut groups = state.groups.write().await;
+            if !groups.contains_key(group) && groups.len() >= MAX_TRANSMISSION_GROUPS {
+                return Err(format!(
+                    "Transmission group count exceeds {MAX_TRANSMISSION_GROUPS}"
+                ));
+            }
+            groups
                 .entry(group.clone())
                 .or_insert_with(|| TransmissionGroup::new(group.clone()));
+            drop(groups);
             let group_state = state.groups.read().await.get(group).cloned();
             if let Some(group_state) = group_state {
                 apply_transmission_group_limits(state, &hash, &group_state).await?;
@@ -1072,6 +1119,11 @@ async fn group_set(state: &AppState, args: &Value) -> Result<Value, String> {
         .ok_or_else(|| "missing group".to_owned())?;
     let group = {
         let mut groups = state.groups.write().await;
+        if !groups.contains_key(name) && groups.len() >= MAX_TRANSMISSION_GROUPS {
+            return Err(format!(
+                "Transmission group count exceeds {MAX_TRANSMISSION_GROUPS}"
+            ));
+        }
         let group = groups
             .entry(name.to_owned())
             .or_insert_with(|| TransmissionGroup::new(name.to_owned()));
@@ -1145,6 +1197,15 @@ async fn session_subscribe(state: &AppState, args: &Value) -> Result<Value, Stri
     let requested = transmission_subscription_fields(args);
     let subscriptions = {
         let mut subscriptions = state.notification_subscriptions.write().await;
+        let new_count = requested
+            .iter()
+            .filter(|field| !subscriptions.contains(*field))
+            .count();
+        if subscriptions.len().saturating_add(new_count) > MAX_TRANSMISSION_SUBSCRIPTIONS {
+            return Err(format!(
+                "Transmission subscription count exceeds {MAX_TRANSMISSION_SUBSCRIPTIONS}"
+            ));
+        }
         for field in requested {
             subscriptions.insert(field);
         }
@@ -1479,6 +1540,11 @@ async fn transmission_free_space(state: &AppState, args: &Value) -> Result<Value
         return Err("Transmission free-space path must be a string".to_owned());
     }
     let requested_path = args.get("path").and_then(Value::as_str).unwrap_or_default();
+    if requested_path.len() > MAX_TRANSMISSION_PATH_BYTES {
+        return Err(format!(
+            "Transmission free-space path exceeds {MAX_TRANSMISSION_PATH_BYTES} bytes"
+        ));
+    }
     let roots = transmission_engine(state)?.list_storage_roots().await?;
     let root = roots
         .iter()
@@ -1502,11 +1568,21 @@ async fn torrent_rename_path(state: &AppState, args: &Value) -> Result<Value, St
     if path.trim().is_empty() {
         return Err("Transmission rename path cannot be empty".to_owned());
     }
+    if path.len() > MAX_TRANSMISSION_PATH_BYTES {
+        return Err(format!(
+            "Transmission rename path exceeds {MAX_TRANSMISSION_PATH_BYTES} bytes"
+        ));
+    }
     let Some(name) = args.get("name").and_then(Value::as_str) else {
         return Err("missing name".to_owned());
     };
     if name.trim().is_empty() {
         return Err("Transmission rename name cannot be empty".to_owned());
+    }
+    if name.len() > MAX_TRANSMISSION_PATH_BYTES {
+        return Err(format!(
+            "Transmission rename name exceeds {MAX_TRANSMISSION_PATH_BYTES} bytes"
+        ));
     }
     let hashes = mutation_ids(state, args).await?;
     if hashes.is_empty() {
@@ -2837,6 +2913,11 @@ async fn torrent_add(state: &AppState, args: &Value) -> Result<Value, String> {
         let raw = general_purpose::STANDARD
             .decode(metainfo)
             .map_err(|e| e.to_string())?;
+        if raw.len() > MAX_TORRENT_BYTES {
+            return Err(format!(
+                "Transmission torrent payload exceeds the {MAX_TORRENT_BYTES} byte limit"
+            ));
+        }
         engine
             .add_torrent_raw_with_labels(raw, download_dir, paused, None, labels)
             .await?
@@ -3406,6 +3487,119 @@ fn validate_transmission_session_args(args: &Value) -> Result<(), String> {
             return Err(format!("Transmission session field {key} must be a string"));
         }
     }
+    for key in [
+        "download-dir",
+        "incomplete-dir",
+        "script-torrent-added-filename",
+        "script-torrent-done-filename",
+        "script-torrent-done-seeding-filename",
+    ] {
+        validate_transmission_string_bytes(args, key, MAX_TRANSMISSION_PATH_BYTES, "path")?;
+    }
+    validate_transmission_string_bytes(args, "blocklist-url", MAX_TRANSMISSION_URL_BYTES, "URL")?;
+    for key in ["preferred-transport", "rpc-username", "rpc-bind-address"] {
+        validate_transmission_string_bytes(
+            args,
+            key,
+            MAX_TRANSMISSION_SESSION_TEXT_BYTES,
+            "value",
+        )?;
+    }
+    Ok(())
+}
+
+fn validate_transmission_string_bytes(
+    args: &Value,
+    key: &str,
+    maximum: usize,
+    kind: &str,
+) -> Result<(), String> {
+    let Some(value) = args.get(key).and_then(Value::as_str) else {
+        return Ok(());
+    };
+    if value.len() > maximum {
+        return Err(format!(
+            "Transmission {kind} field {key} exceeds {maximum} bytes"
+        ));
+    }
+    Ok(())
+}
+
+fn validate_transmission_persisted_state(state: &TransmissionPersistedState) -> Result<(), String> {
+    let path_fields = [
+        ("download-dir", state.session.download_dir.as_deref()),
+        (
+            "incomplete-dir",
+            Some(state.session.incomplete_dir.as_str()),
+        ),
+        (
+            "script-torrent-added-filename",
+            Some(state.session.script_torrent_added_filename.as_str()),
+        ),
+        (
+            "script-torrent-done-filename",
+            Some(state.session.script_torrent_done_filename.as_str()),
+        ),
+        (
+            "script-torrent-done-seeding-filename",
+            Some(state.session.script_torrent_done_seeding_filename.as_str()),
+        ),
+    ];
+    for (field, value) in path_fields
+        .into_iter()
+        .filter_map(|(field, value)| value.map(|value| (field, value)))
+    {
+        if value.len() > MAX_TRANSMISSION_PATH_BYTES {
+            return Err(format!(
+                "persisted Transmission path field {field} exceeds {MAX_TRANSMISSION_PATH_BYTES} bytes"
+            ));
+        }
+    }
+    if state.session.blocklist_url.len() > MAX_TRANSMISSION_URL_BYTES {
+        return Err(format!(
+            "persisted Transmission blocklist URL exceeds {MAX_TRANSMISSION_URL_BYTES} bytes"
+        ));
+    }
+    for (field, value) in [
+        (
+            "preferred-transport",
+            state.session.preferred_transport.as_str(),
+        ),
+        ("rpc-username", state.session.rpc_username.as_str()),
+        ("rpc-bind-address", state.session.rpc_bind_address.as_str()),
+    ] {
+        if value.len() > MAX_TRANSMISSION_SESSION_TEXT_BYTES {
+            return Err(format!(
+                "persisted Transmission field {field} exceeds {MAX_TRANSMISSION_SESSION_TEXT_BYTES} bytes"
+            ));
+        }
+    }
+    if state.groups.len() > MAX_TRANSMISSION_GROUPS {
+        return Err(format!(
+            "persisted Transmission group count exceeds {MAX_TRANSMISSION_GROUPS}"
+        ));
+    }
+    for group in state.groups.values() {
+        if group.name.len() > MAX_TRANSMISSION_GROUP_NAME_BYTES {
+            return Err(format!(
+                "persisted Transmission group name exceeds {MAX_TRANSMISSION_GROUP_NAME_BYTES} bytes"
+            ));
+        }
+    }
+    if state.notification_subscriptions.len() > MAX_TRANSMISSION_SUBSCRIPTIONS {
+        return Err(format!(
+            "persisted Transmission subscription count exceeds {MAX_TRANSMISSION_SUBSCRIPTIONS}"
+        ));
+    }
+    if state
+        .notification_subscriptions
+        .iter()
+        .any(|field| field.len() > MAX_TRANSMISSION_SUBSCRIPTION_BYTES)
+    {
+        return Err(format!(
+            "persisted Transmission subscription exceeds {MAX_TRANSMISSION_SUBSCRIPTION_BYTES} bytes"
+        ));
+    }
     Ok(())
 }
 
@@ -3437,12 +3631,23 @@ fn validate_transmission_torrent_set_args(args: &Value) -> Result<(), String> {
         if labels.iter().any(|label| !label.is_string()) {
             return Err("Transmission torrent field labels must contain only strings".to_owned());
         }
+        if labels.iter().any(|label| {
+            label
+                .as_str()
+                .is_some_and(|label| label.len() > MAX_TRANSMISSION_LABEL_BYTES)
+        }) {
+            return Err(format!(
+                "Transmission torrent labels exceed {MAX_TRANSMISSION_LABEL_BYTES} bytes"
+            ));
+        }
     }
     for key in ["download-dir", "group"] {
         if args.get(key).is_some_and(|value| !value.is_string()) {
             return Err(format!("Transmission torrent field {key} must be a string"));
         }
     }
+    validate_transmission_string_bytes(args, "download-dir", MAX_TRANSMISSION_PATH_BYTES, "path")?;
+    validate_transmission_string_bytes(args, "group", MAX_TRANSMISSION_GROUP_NAME_BYTES, "group")?;
     for key in [
         "download-limited",
         "downloadLimited",
@@ -3542,6 +3747,7 @@ fn validate_transmission_group_set_args(args: &Value) -> Result<(), String> {
         if args.get(key).is_some_and(|value| !value.is_string()) {
             return Err(format!("Transmission group field {key} must be a string"));
         }
+        validate_transmission_string_bytes(args, key, MAX_TRANSMISSION_GROUP_NAME_BYTES, "group")?;
     }
     Ok(())
 }
@@ -3565,6 +3771,15 @@ fn validate_transmission_subscription_args(args: &Value) -> Result<(), String> {
                 "Transmission subscription field {key} must contain only strings"
             ));
         }
+        if values.iter().any(|value| {
+            value
+                .as_str()
+                .is_some_and(|value| value.len() > MAX_TRANSMISSION_SUBSCRIPTION_BYTES)
+        }) {
+            return Err(format!(
+                "Transmission subscription field {key} exceeds {MAX_TRANSMISSION_SUBSCRIPTION_BYTES} bytes"
+            ));
+        }
     }
     Ok(())
 }
@@ -3577,10 +3792,16 @@ fn validate_transmission_tracker_list_args(args: &Value) -> Result<(), String> {
         };
         found = true;
         let mut count = 0;
-        if !transmission_tracker_value_is_valid(value, &mut count) {
+        let mut bytes = 0;
+        if !transmission_tracker_value_is_valid(value, &mut count, &mut bytes) {
             if count > MAX_TRANSMISSION_MUTATION_ITEMS {
                 return Err(format!(
                     "Transmission torrent field {key} contains too many tracker entries; maximum is {MAX_TRANSMISSION_MUTATION_ITEMS}"
+                ));
+            }
+            if bytes > MAX_TRANSMISSION_TRACKER_BYTES {
+                return Err(format!(
+                    "Transmission torrent field {key} exceeds {MAX_TRANSMISSION_TRACKER_BYTES} bytes"
                 ));
             }
             return Err(format!(
@@ -3594,27 +3815,41 @@ fn validate_transmission_tracker_list_args(args: &Value) -> Result<(), String> {
     Ok(())
 }
 
-fn transmission_tracker_value_is_valid(value: &Value, count: &mut usize) -> bool {
+fn transmission_tracker_value_is_valid(
+    value: &Value,
+    count: &mut usize,
+    bytes: &mut usize,
+) -> bool {
     match value {
         Value::String(value) => {
-            if value.trim().is_empty() {
+            if value.trim().is_empty() || value.len() > MAX_TRANSMISSION_URL_BYTES {
                 return false;
             }
             *count = count.saturating_add(1);
-            *count <= MAX_TRANSMISSION_MUTATION_ITEMS
+            *bytes = bytes.saturating_add(value.len());
+            *count <= MAX_TRANSMISSION_MUTATION_ITEMS && *bytes <= MAX_TRANSMISSION_TRACKER_BYTES
         }
         Value::Array(values) => values
             .iter()
-            .all(|value| transmission_tracker_value_is_valid(value, count)),
+            .all(|value| transmission_tracker_value_is_valid(value, count, bytes)),
         Value::Object(object) => {
             let valid = object
                 .get("announce")
                 .and_then(Value::as_str)
-                .is_some_and(|announce| !announce.trim().is_empty());
+                .is_some_and(|announce| {
+                    !announce.trim().is_empty() && announce.len() <= MAX_TRANSMISSION_URL_BYTES
+                });
+            if let Some(announce) = object.get("announce").and_then(Value::as_str) {
+                if valid {
+                    *bytes = bytes.saturating_add(announce.len());
+                }
+            }
             if valid {
                 *count = count.saturating_add(1);
             }
-            valid && *count <= MAX_TRANSMISSION_MUTATION_ITEMS
+            valid
+                && *count <= MAX_TRANSMISSION_MUTATION_ITEMS
+                && *bytes <= MAX_TRANSMISSION_TRACKER_BYTES
         }
         _ => false,
     }
@@ -3646,6 +3881,15 @@ fn validate_transmission_torrent_add_args(args: &Value) -> Result<(), String> {
     if args.get("metainfo").is_some_and(|value| !value.is_string()) {
         return Err("Transmission torrent-add metainfo must be a string".to_owned());
     }
+    if args
+        .get("metainfo")
+        .and_then(Value::as_str)
+        .is_some_and(|value| value.len() > MAX_TRANSMISSION_METAINFO_ENCODED_BYTES)
+    {
+        return Err(format!(
+            "Transmission torrent-add metainfo exceeds the {MAX_TORRENT_BYTES} byte decoded limit"
+        ));
+    }
     if args.get("paused").is_some() && transmission_bool_arg(args, "paused").is_none() {
         return Err("Transmission torrent-add paused must be boolean".to_owned());
     }
@@ -3655,6 +3899,8 @@ fn validate_transmission_torrent_add_args(args: &Value) -> Result<(), String> {
     {
         return Err("Transmission torrent-add download-dir must be a string or null".to_owned());
     }
+    validate_transmission_string_bytes(args, "filename", MAX_TRANSMISSION_PATH_BYTES, "path")?;
+    validate_transmission_string_bytes(args, "download-dir", MAX_TRANSMISSION_PATH_BYTES, "path")?;
     if let Some(labels) = args.get("labels") {
         let Some(labels) = labels.as_array() else {
             return Err("Transmission torrent-add labels must be an array".to_owned());
@@ -3662,6 +3908,15 @@ fn validate_transmission_torrent_add_args(args: &Value) -> Result<(), String> {
         ensure_transmission_input_bound(labels.len(), "Transmission torrent-add labels")?;
         if labels.iter().any(|label| !label.is_string()) {
             return Err("Transmission torrent-add labels must contain only strings".to_owned());
+        }
+        if labels.iter().any(|label| {
+            label
+                .as_str()
+                .is_some_and(|label| label.len() > MAX_TRANSMISSION_LABEL_BYTES)
+        }) {
+            return Err(format!(
+                "Transmission torrent-add labels exceed {MAX_TRANSMISSION_LABEL_BYTES} bytes"
+            ));
         }
     }
     if args.get("filename").is_none() && args.get("metainfo").is_none() {
@@ -3792,6 +4047,33 @@ mod tests {
         // independent checks, and auth must run first (see the 401 case
         // above) without masking or short-circuiting the second one.
         assert_eq!(allowed.status(), StatusCode::CONFLICT);
+    }
+
+    #[tokio::test]
+    async fn transmission_rpc_route_reaches_the_decoded_torrent_size_boundary() {
+        let padding = "x".repeat(MAX_TRANSMISSION_DEFAULT_BODY_BYTES + 1024);
+        let body = serde_json::to_vec(&serde_json::json!({
+            "id": 1,
+            "method": "session-get",
+            "arguments": {},
+            "padding": padding,
+        }))
+        .unwrap();
+        let app =
+            build_transmission_router(AppState::new(Arc::new(RwLock::new(SessionRegistry::new()))));
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/transmission/rpc")
+                    .header("content-type", "application/json")
+                    .header("x-transmission-session-id", SESSION_ID)
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
     }
 
     #[tokio::test]
@@ -5341,6 +5623,69 @@ mod tests {
             ),
         });
         assert!(validate_transmission_file_id_arg(&oversized_ids, "files-wanted").is_err());
+    }
+
+    #[test]
+    fn transmission_compatibility_text_inputs_are_bounded() {
+        let oversized_path = "x".repeat(MAX_TRANSMISSION_PATH_BYTES + 1);
+        assert!(validate_transmission_session_args(&json!({
+            "download-dir": oversized_path,
+        }))
+        .is_err());
+        assert!(validate_transmission_torrent_set_args(&json!({
+            "download-dir": "x".repeat(MAX_TRANSMISSION_PATH_BYTES + 1),
+        }))
+        .is_err());
+        assert!(validate_transmission_torrent_add_args(&json!({
+            "filename": "x".repeat(MAX_TRANSMISSION_PATH_BYTES + 1),
+        }))
+        .is_err());
+        assert!(validate_transmission_group_set_args(&json!({
+            "group": "x".repeat(MAX_TRANSMISSION_GROUP_NAME_BYTES + 1),
+        }))
+        .is_err());
+        assert!(validate_transmission_subscription_args(&json!({
+            "fields": ["x".repeat(MAX_TRANSMISSION_SUBSCRIPTION_BYTES + 1)],
+        }))
+        .is_err());
+        assert!(validate_transmission_tracker_list_args(&json!({
+            "trackerList": ["https://example.invalid/{}".replace(
+                "{}",
+                &"x".repeat(MAX_TRANSMISSION_URL_BYTES)
+            )],
+        }))
+        .is_err());
+    }
+
+    #[tokio::test]
+    async fn transmission_group_count_is_bounded_without_engine() {
+        let state = AppState::new(Arc::new(RwLock::new(SessionRegistry::new())));
+        {
+            let mut groups = state.groups.write().await;
+            for index in 0..MAX_TRANSMISSION_GROUPS {
+                let name = format!("group-{index}");
+                groups.insert(name.clone(), TransmissionGroup::new(name));
+            }
+        }
+        let error = group_set(&state, &json!({ "group": "overflow" }))
+            .await
+            .expect_err("group capacity must be enforced");
+        assert!(error.contains("group count"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn transmission_subscription_count_is_bounded_without_engine() {
+        let state = AppState::new(Arc::new(RwLock::new(SessionRegistry::new())));
+        {
+            let mut subscriptions = state.notification_subscriptions.write().await;
+            for index in 0..MAX_TRANSMISSION_SUBSCRIPTIONS {
+                subscriptions.insert(format!("event-{index}"));
+            }
+        }
+        let error = session_subscribe(&state, &json!({ "fields": ["overflow"] }))
+            .await
+            .expect_err("subscription capacity must be enforced");
+        assert!(error.contains("subscription count"), "{error}");
     }
 
     #[tokio::test]

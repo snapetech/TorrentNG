@@ -238,6 +238,11 @@ impl<'a> PieceVerifier<'a> {
         file_offset: u64,
         len: u64,
     ) -> Result<bytes::Bytes, StorageError> {
+        if region.pad {
+            // BEP 47 padding participates in v1 piece hashes as zero bytes,
+            // but compliant clients need not create a corresponding file.
+            return Ok(bytes::Bytes::from(vec![0; len as usize]));
+        }
         let file_path = region.path.resolve(self.storage_root);
         read_sparse_range(self.scheduler, &file_path, file_offset, len).await
     }
@@ -535,6 +540,36 @@ mod tests {
         let verifier = PieceVerifier::new(dir.path(), &sched, &pm, &hashes);
 
         assert_eq!(verifier.verify_piece(0).await, VerifyResult::Valid);
+    }
+
+    #[tokio::test]
+    async fn verify_piece_treats_missing_bep47_padding_as_zeroes() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("payload.bin"), b"abc").unwrap();
+        let files = vec![
+            FileSpan {
+                file_index: 0,
+                path: SafeRelPath::from_name("payload.bin", false).unwrap(),
+                content_offset: 0,
+                length: 3,
+            },
+            FileSpan {
+                file_index: 1,
+                path: SafeRelPath::from_components(&[".pad", "13"], false).unwrap(),
+                content_offset: 3,
+                length: 13,
+            },
+        ];
+        let map = PieceMap::new_with_padding(16, files, [1]).unwrap();
+        let mut expected = b"abc".to_vec();
+        expected.resize(16, 0);
+        let hash = piece_hash(&expected);
+        let hashes = [hash];
+        let scheduler = ssd_scheduler();
+        let verifier = PieceVerifier::new(dir.path(), &scheduler, &map, &hashes);
+
+        assert_eq!(verifier.verify_piece(0).await, VerifyResult::Valid);
+        assert!(!dir.path().join(".pad/13").exists());
     }
 
     #[tokio::test]

@@ -216,12 +216,14 @@ impl Client {
             let mut page = self
                 .list_torrents_range(view, offset, MULTICALL_RANGE_PAGE_SIZE)
                 .await?;
-            let page_len = page.len() as i64;
+            let page_len = i64::try_from(page.len()).context("rTorrent page length exceeds i64")?;
             torrents.append(&mut page);
             if page_len < MULTICALL_RANGE_PAGE_SIZE {
                 break;
             }
-            offset += page_len;
+            offset = offset
+                .checked_add(page_len)
+                .ok_or_else(|| anyhow!("rTorrent torrent page offset overflowed"))?;
         }
         Ok(torrents)
     }
@@ -485,11 +487,14 @@ impl Client {
                 .with_context(|| {
                     format!("set rTorrent download local_id values at offset {offset}")
                 })?;
-            let count = result.try_into_array()?.len() as i64;
+            let count = i64::try_from(result.try_into_array()?.len())
+                .context("rTorrent identity page length exceeds i64")?;
             if count == 0 {
                 break;
             }
-            offset += count;
+            offset = offset
+                .checked_add(count)
+                .ok_or_else(|| anyhow!("rTorrent identity page offset overflowed"))?;
             if count < 1000 {
                 break;
             }
@@ -522,11 +527,14 @@ impl Client {
                 .with_context(|| {
                     format!("resume rTorrent downloads after identity gate at offset {offset}")
                 })?;
-            let count = result.try_into_array()?.len() as i64;
+            let count = i64::try_from(result.try_into_array()?.len())
+                .context("rTorrent resume page length exceeds i64")?;
             if count == 0 {
                 break;
             }
-            offset += count;
+            offset = offset
+                .checked_add(count)
+                .ok_or_else(|| anyhow!("rTorrent resume page offset overflowed"))?;
             if count < 1000 {
                 break;
             }
@@ -613,7 +621,11 @@ fn parse_torrent_rows(rows: Vec<XmlValue>) -> Result<Vec<RawTorrent>> {
             tracker_focus: required_i64_field(&fields, 19, "d.tracker_focus")?,
             peers_connected: required_i64_field(&fields, 20, "d.peers_connected")?,
             peers_complete: required_i64_field(&fields, 21, "d.peers_complete")?,
-            message: required_string_field(&fields, 22, "d.message")?,
+            message: crate::url_redaction::redact_sensitive_text(&required_string_field(
+                &fields,
+                22,
+                "d.message",
+            )?),
             tracker_url: String::new(),
             tags: String::new(),
         });
@@ -728,7 +740,8 @@ fn base64_encode(data: &[u8]) -> String {
 mod tests {
     use super::{
         bounded_range_args, decode_legacy_category, live_summary_args, nonzero_rate_args,
-        normalize_rtorrent_save_path, rtorrent_patch_manifest_enables_bounded_live,
+        normalize_rtorrent_save_path, parse_torrent_rows,
+        rtorrent_patch_manifest_enables_bounded_live,
     };
     use crate::rtorrent::XmlValue;
 
@@ -765,6 +778,47 @@ mod tests {
         assert!(!rtorrent_patch_manifest_enables_bounded_live(
             "rtorrent-0.16.11-user-agent-command"
         ));
+    }
+
+    #[test]
+    fn torrent_status_messages_redact_tracker_credentials() {
+        let row = XmlValue::Array(vec![
+            "hash".into(),
+            "torrent".into(),
+            100_i64.into(),
+            50_i64.into(),
+            0_i64.into(),
+            0_i64.into(),
+            0_i64.into(),
+            0_i64.into(),
+            0_i64.into(),
+            false.into(),
+            false.into(),
+            false.into(),
+            0_i64.into(),
+            0_i64.into(),
+            "category".into(),
+            "/downloads".into(),
+            "/downloads".into(),
+            0_i64.into(),
+            0_i64.into(),
+            0_i64.into(),
+            0_i64.into(),
+            0_i64.into(),
+            "Tracker rejected https://user:password@tracker.example/short-passkey?signature=query-secret \u{1b}"
+                .into(),
+        ]);
+
+        let parsed = parse_torrent_rows(vec![row]).unwrap();
+
+        assert_eq!(
+            parsed[0].message,
+            "Tracker rejected https://tracker.example/ \\u{1b}"
+        );
+        for secret in ["user", "password", "short-passkey", "query-secret"] {
+            assert!(!parsed[0].message.contains(secret), "{}", parsed[0].message);
+        }
+        assert!(!parsed[0].message.chars().any(char::is_control));
     }
 
     #[test]

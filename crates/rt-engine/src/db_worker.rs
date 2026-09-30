@@ -10,15 +10,17 @@
 use std::any::Any;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread::JoinHandle;
-use std::time::Duration;
+use std::time::{Duration, Instant as StdInstant};
 
 use rusqlite::Connection;
 use tokio::sync::oneshot;
 use tokio::time::{sleep, timeout, Instant};
 use tracing::{debug, warn};
+
+use crate::command::EngineDatabaseWorkerStats;
 
 const DB_QUEUE_CAPACITY: usize = 128;
 const DB_SEND_TIMEOUT: Duration = Duration::from_millis(500);
@@ -51,6 +53,7 @@ enum DbReply {
 enum DbRequest {
     Execute {
         operation: &'static str,
+        enqueued_at: StdInstant,
         job: DbOperation,
         cancelled: Arc<AtomicBool>,
         reply: DbReply,
@@ -63,6 +66,7 @@ enum DbRequest {
     /// ceiling at high torrent counts.
     ExecuteBatched {
         operation: &'static str,
+        enqueued_at: StdInstant,
         job: DbTxOperation,
         cancelled: Arc<AtomicBool>,
         reply: DbReply,
@@ -70,6 +74,140 @@ enum DbRequest {
     Shutdown {
         reply: oneshot::Sender<()>,
     },
+}
+
+impl DbRequest {
+    fn is_command(&self) -> bool {
+        matches!(self, Self::Execute { .. } | Self::ExecuteBatched { .. })
+    }
+
+    fn enqueued_at(&self) -> Option<StdInstant> {
+        match self {
+            Self::Execute { enqueued_at, .. } | Self::ExecuteBatched { enqueued_at, .. } => {
+                Some(*enqueued_at)
+            }
+            Self::Shutdown { .. } => None,
+        }
+    }
+
+    fn set_enqueued_at(&mut self, instant: StdInstant) {
+        match self {
+            Self::Execute { enqueued_at, .. } | Self::ExecuteBatched { enqueued_at, .. } => {
+                *enqueued_at = instant;
+            }
+            Self::Shutdown { .. } => {}
+        }
+    }
+}
+
+#[derive(Default)]
+pub(crate) struct DbWorkerMetrics {
+    queue_depth: AtomicU64,
+    commands_enqueued_total: AtomicU64,
+    commands_completed_total: AtomicU64,
+    command_failures_total: AtomicU64,
+    commands_cancelled_total: AtomicU64,
+    enqueue_timeouts_total: AtomicU64,
+    queue_wait_nanoseconds_total: AtomicU64,
+    command_latency_nanoseconds_total: AtomicU64,
+    batch_transactions_total: AtomicU64,
+    batch_transaction_failures_total: AtomicU64,
+    batch_transaction_nanoseconds_total: AtomicU64,
+}
+
+impl DbWorkerMetrics {
+    pub(crate) fn snapshot(&self) -> EngineDatabaseWorkerStats {
+        EngineDatabaseWorkerStats {
+            queue_depth: self.queue_depth.load(Ordering::Relaxed),
+            queue_capacity: DB_QUEUE_CAPACITY as u64,
+            commands_enqueued_total: self.commands_enqueued_total.load(Ordering::Relaxed),
+            commands_completed_total: self.commands_completed_total.load(Ordering::Relaxed),
+            command_failures_total: self.command_failures_total.load(Ordering::Relaxed),
+            commands_cancelled_total: self.commands_cancelled_total.load(Ordering::Relaxed),
+            enqueue_timeouts_total: self.enqueue_timeouts_total.load(Ordering::Relaxed),
+            queue_wait_nanoseconds_total: self.queue_wait_nanoseconds_total.load(Ordering::Relaxed),
+            command_latency_nanoseconds_total: self
+                .command_latency_nanoseconds_total
+                .load(Ordering::Relaxed),
+            batch_transactions_total: self.batch_transactions_total.load(Ordering::Relaxed),
+            batch_transaction_failures_total: self
+                .batch_transaction_failures_total
+                .load(Ordering::Relaxed),
+            batch_transaction_nanoseconds_total: self
+                .batch_transaction_nanoseconds_total
+                .load(Ordering::Relaxed),
+        }
+    }
+
+    fn request_dequeued(&self, request: &DbRequest) {
+        atomic_saturating_sub(&self.queue_depth, 1);
+        if let Some(enqueued_at) = request.enqueued_at() {
+            atomic_saturating_add(
+                &self.queue_wait_nanoseconds_total,
+                duration_nanoseconds(enqueued_at.elapsed()),
+            );
+        }
+    }
+
+    fn command_completed(&self, failed: bool, latency: Duration) {
+        atomic_saturating_add(&self.commands_completed_total, 1);
+        if failed {
+            atomic_saturating_add(&self.command_failures_total, 1);
+        }
+        atomic_saturating_add(
+            &self.command_latency_nanoseconds_total,
+            duration_nanoseconds(latency),
+        );
+    }
+
+    fn command_cancelled(&self) {
+        atomic_saturating_add(&self.commands_cancelled_total, 1);
+    }
+
+    fn batch_transaction_completed(&self, failed: bool, duration: Duration) {
+        atomic_saturating_add(&self.batch_transactions_total, 1);
+        if failed {
+            atomic_saturating_add(&self.batch_transaction_failures_total, 1);
+        }
+        atomic_saturating_add(
+            &self.batch_transaction_nanoseconds_total,
+            duration_nanoseconds(duration),
+        );
+    }
+}
+
+fn duration_nanoseconds(duration: Duration) -> u64 {
+    u64::try_from(duration.as_nanos()).unwrap_or(u64::MAX)
+}
+
+fn atomic_saturating_add(counter: &AtomicU64, value: u64) {
+    let mut current = counter.load(Ordering::Relaxed);
+    loop {
+        match counter.compare_exchange_weak(
+            current,
+            current.saturating_add(value),
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        ) {
+            Ok(_) => return,
+            Err(actual) => current = actual,
+        }
+    }
+}
+
+fn atomic_saturating_sub(counter: &AtomicU64, value: u64) {
+    let mut current = counter.load(Ordering::Relaxed);
+    loop {
+        match counter.compare_exchange_weak(
+            current,
+            current.saturating_sub(value),
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        ) {
+            Ok(_) => return,
+            Err(actual) => current = actual,
+        }
+    }
 }
 
 struct CancellationGuard(Arc<AtomicBool>);
@@ -86,6 +224,7 @@ pub(crate) struct DbWorker {
     tx: mpsc::SyncSender<DbRequest>,
     healthy: Arc<AtomicBool>,
     force_stop: Arc<AtomicBool>,
+    metrics: Arc<DbWorkerMetrics>,
     thread: Arc<Mutex<Option<JoinHandle<()>>>>,
 }
 
@@ -193,6 +332,8 @@ impl DbWorker {
         let worker_healthy = Arc::clone(&healthy);
         let force_stop = Arc::new(AtomicBool::new(false));
         let worker_force_stop = Arc::clone(&force_stop);
+        let metrics = Arc::new(DbWorkerMetrics::default());
+        let worker_metrics = Arc::clone(&metrics);
         let (ready_tx, ready_rx) = mpsc::sync_channel(1);
         let thread = thread_builder().spawn(move || {
             let mut db = match Connection::open(&db_path) {
@@ -263,11 +404,15 @@ impl DbWorker {
             // hold-for-next-turn shape used for interrupted lifecycle
             // commands elsewhere in this actor's task loop.
             let mut pending_request: Option<DbRequest> = None;
+            let mut savepoint_sequence = 0_u64;
             loop {
                 let request = match pending_request.take() {
                     Some(request) => request,
                     None => match rx.recv_timeout(Duration::from_millis(50)) {
-                        Ok(request) => request,
+                        Ok(request) => {
+                            worker_metrics.request_dequeued(&request);
+                            request
+                        }
                         Err(mpsc::RecvTimeoutError::Timeout) => {
                             if worker_force_stop.load(Ordering::Acquire) {
                                 break;
@@ -283,6 +428,7 @@ impl DbWorker {
                 match request {
                     DbRequest::Execute {
                         operation,
+                        enqueued_at,
                         job,
                         cancelled,
                         reply,
@@ -294,6 +440,7 @@ impl DbWorker {
                         if cancelled.load(Ordering::Acquire)
                             || matches!(&reply, DbReply::Async(reply) if reply.is_closed())
                         {
+                            worker_metrics.command_cancelled();
                             continue;
                         }
                         let result = catch_unwind(AssertUnwindSafe(|| job(&mut db)))
@@ -307,6 +454,7 @@ impl DbWorker {
                                 "database operation failed"
                             );
                         }
+                        worker_metrics.command_completed(result.is_err(), enqueued_at.elapsed());
                         match reply {
                             DbReply::Async(reply) => {
                                 let _ = reply.send(result);
@@ -322,26 +470,40 @@ impl DbWorker {
                     }
                     DbRequest::ExecuteBatched {
                         operation,
+                        enqueued_at,
                         job,
                         cancelled,
                         reply,
                     } => {
-                        let mut batch = vec![(operation, job, cancelled, reply)];
+                        let mut batch = vec![(operation, job, cancelled, reply, enqueued_at)];
                         while batch.len() < DB_BATCH_MAX {
                             match rx.try_recv() {
-                                Ok(DbRequest::ExecuteBatched {
-                                    operation,
-                                    job,
-                                    cancelled,
-                                    reply,
-                                }) => batch.push((operation, job, cancelled, reply)),
-                                Ok(other) => {
-                                    pending_request = Some(other);
-                                    break;
+                                Ok(request) => {
+                                    worker_metrics.request_dequeued(&request);
+                                    match request {
+                                        DbRequest::ExecuteBatched {
+                                            operation,
+                                            enqueued_at,
+                                            job,
+                                            cancelled,
+                                            reply,
+                                        } => batch.push((
+                                            operation,
+                                            job,
+                                            cancelled,
+                                            reply,
+                                            enqueued_at,
+                                        )),
+                                        other => {
+                                            pending_request = Some(other);
+                                            break;
+                                        }
+                                    }
                                 }
                                 Err(_) => break,
                             }
                         }
+                        let transaction_started_at = StdInstant::now();
                         match db.transaction() {
                             Ok(tx) => {
                                 // Run every job first, but hold each reply
@@ -350,19 +512,64 @@ impl DbWorker {
                                 // it succeeded before its data is actually
                                 // durable, even though other jobs in the
                                 // same batch already ran against `tx`.
-                                let mut outcomes: Vec<(DbReply, DbResult)> =
+                                let mut outcomes: Vec<(DbReply, DbResult, StdInstant)> =
                                     Vec::with_capacity(batch.len());
-                                for (operation, job, cancelled, reply) in batch {
+                                let mut requests = batch.into_iter();
+                                let mut abort_message = None;
+                                while let Some((operation, job, cancelled, reply, enqueued_at)) =
+                                    requests.next()
+                                {
                                     if cancelled.load(Ordering::Acquire)
                                         || matches!(&reply, DbReply::Async(r) if r.is_closed())
                                     {
+                                        worker_metrics.command_cancelled();
                                         continue;
                                     }
-                                    let result = catch_unwind(AssertUnwindSafe(|| job(&tx)))
-                                        .map_err(|_| {
-                                            format!("database operation panicked: {operation}")
-                                        })
-                                        .and_then(|result| result);
+                                    savepoint_sequence = savepoint_sequence.wrapping_add(1);
+                                    let result = execute_batched_operation(
+                                        &tx,
+                                        operation,
+                                        savepoint_sequence,
+                                        job,
+                                    );
+                                    let result = match result {
+                                        Ok(result) => result,
+                                        Err(error) => {
+                                            let message = format!(
+                                                "batched transaction aborted: {error}"
+                                            );
+                                            warn!(
+                                                component = "db",
+                                                operation,
+                                                result = "error",
+                                                error = %error,
+                                                "engine database worker could not isolate a batched operation"
+                                            );
+                                            outcomes.push((
+                                                reply,
+                                                Err(message.clone()),
+                                                enqueued_at,
+                                            ));
+                                            for (_, _, cancelled, reply, enqueued_at) in requests {
+                                                if !cancelled.load(Ordering::Acquire)
+                                                    && !matches!(
+                                                        &reply,
+                                                        DbReply::Async(r) if r.is_closed()
+                                                    )
+                                                {
+                                                    outcomes.push((
+                                                        reply,
+                                                        Err(message.clone()),
+                                                        enqueued_at,
+                                                    ));
+                                                } else {
+                                                    worker_metrics.command_cancelled();
+                                                }
+                                            }
+                                            abort_message = Some(message);
+                                            break;
+                                        }
+                                    };
                                     if result.is_err() {
                                         debug!(
                                             component = "db",
@@ -371,25 +578,39 @@ impl DbWorker {
                                             "database operation failed"
                                         );
                                     }
-                                    outcomes.push((reply, result));
+                                    outcomes.push((reply, result, enqueued_at));
                                 }
-                                let commit_result = tx.commit();
+                                let commit_result = match abort_message {
+                                    Some(message) => match tx.rollback() {
+                                        Ok(()) => Err(message),
+                                        Err(error) => Err(format!(
+                                            "{message}; database worker could not roll back batch: {error}"
+                                        )),
+                                    },
+                                    None => tx.commit().map_err(|error| {
+                                        format!("batched transaction failed to commit: {error}")
+                                    }),
+                                };
+                                worker_metrics.batch_transaction_completed(
+                                    commit_result.is_err(),
+                                    transaction_started_at.elapsed(),
+                                );
                                 if let Err(error) = &commit_result {
                                     warn!(
                                         component = "db",
-                                        operation = "batch_commit",
+                                        operation = "batch_finalize",
                                         result = "error",
                                         error = %error,
-                                        "engine database worker failed to commit a batched transaction"
+                                        "engine database worker failed to finalize a batched transaction"
                                     );
                                 }
-                                for (reply, result) in outcomes {
+                                for (reply, result, enqueued_at) in outcomes {
                                     let result = match &commit_result {
                                         Ok(()) => result,
-                                        Err(error) => Err(format!(
-                                            "batched transaction failed to commit: {error}"
-                                        )),
+                                        Err(error) => Err(error.clone()),
                                     };
+                                    worker_metrics
+                                        .command_completed(result.is_err(), enqueued_at.elapsed());
                                     match reply {
                                         DbReply::Async(reply) => {
                                             let _ = reply.send(result);
@@ -402,10 +623,21 @@ impl DbWorker {
                                 }
                             }
                             Err(error) => {
+                                worker_metrics.batch_transaction_completed(
+                                    true,
+                                    transaction_started_at.elapsed(),
+                                );
                                 let message = format!(
                                     "database worker could not open a transaction: {error}"
                                 );
-                                for (_, _, _, reply) in batch {
+                                for (_, _, cancelled, reply, enqueued_at) in batch {
+                                    if cancelled.load(Ordering::Acquire)
+                                        || matches!(&reply, DbReply::Async(r) if r.is_closed())
+                                    {
+                                        worker_metrics.command_cancelled();
+                                        continue;
+                                    }
+                                    worker_metrics.command_completed(true, enqueued_at.elapsed());
                                     match reply {
                                         DbReply::Async(reply) => {
                                             let _ = reply.send(Err(message.clone()));
@@ -428,7 +660,12 @@ impl DbWorker {
                     }
                 }
             }
+            // Drop the receiver before publishing the terminal queue gauge so
+            // a racing sender cannot successfully enqueue into a dead worker
+            // after the gauge has been reset.
+            drop(rx);
             worker_healthy.store(false, Ordering::Release);
+            worker_metrics.queue_depth.store(0, Ordering::Release);
             warn!(
                 component = "db",
                 operation = "worker",
@@ -470,12 +707,55 @@ impl DbWorker {
             tx,
             healthy,
             force_stop,
+            metrics,
             thread: Arc::new(Mutex::new(thread)),
         }
     }
 
     pub(crate) fn is_healthy(&self) -> bool {
         self.healthy.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn metrics_handle(&self) -> Arc<DbWorkerMetrics> {
+        Arc::clone(&self.metrics)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn stats(&self) -> EngineDatabaseWorkerStats {
+        self.metrics.snapshot()
+    }
+
+    fn try_send(&self, mut request: DbRequest) -> Result<(), mpsc::TrySendError<DbRequest>> {
+        request.set_enqueued_at(StdInstant::now());
+        let count_as_command = request.is_command();
+        let capacity = DB_QUEUE_CAPACITY as u64;
+        let mut depth = self.metrics.queue_depth.load(Ordering::Relaxed);
+        loop {
+            if depth >= capacity {
+                return Err(mpsc::TrySendError::Full(request));
+            }
+            match self.metrics.queue_depth.compare_exchange_weak(
+                depth,
+                depth + 1,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => break,
+                Err(current) => depth = current,
+            }
+        }
+        match self.tx.try_send(request) {
+            Ok(()) => {
+                if count_as_command {
+                    atomic_saturating_add(&self.metrics.commands_enqueued_total, 1);
+                }
+                Ok(())
+            }
+            Err(error) => {
+                atomic_saturating_sub(&self.metrics.queue_depth, 1);
+                Err(error)
+            }
+        }
     }
 
     /// Request an out-of-band stop for drop/abort cleanup. A normal shutdown
@@ -495,11 +775,12 @@ impl DbWorker {
     async fn enqueue(&self, mut request: DbRequest, operation: &'static str) -> Result<(), String> {
         let deadline = Instant::now() + DB_SEND_TIMEOUT;
         loop {
-            match self.tx.try_send(request) {
+            match self.try_send(request) {
                 Ok(()) => return Ok(()),
                 Err(mpsc::TrySendError::Full(returned)) => {
                     request = returned;
                     if Instant::now() >= deadline {
+                        atomic_saturating_add(&self.metrics.enqueue_timeouts_total, 1);
                         return Err(format!("database worker queue timed out for {operation}"));
                     }
                     sleep(DB_SEND_RETRY).await;
@@ -521,11 +802,12 @@ impl DbWorker {
     ) -> Result<(), String> {
         let deadline = std::time::Instant::now() + DB_SEND_TIMEOUT;
         loop {
-            match self.tx.try_send(request) {
+            match self.try_send(request) {
                 Ok(()) => return Ok(()),
                 Err(mpsc::TrySendError::Full(returned)) => {
                     request = returned;
                     if std::time::Instant::now() >= deadline {
+                        atomic_saturating_add(&self.metrics.enqueue_timeouts_total, 1);
                         return Err(format!("database worker queue timed out for {operation}"));
                     }
                     std::thread::sleep(DB_SEND_RETRY);
@@ -572,6 +854,7 @@ impl DbWorker {
         let (reply, response) = oneshot::channel();
         let request = DbRequest::ExecuteBatched {
             operation,
+            enqueued_at: StdInstant::now(),
             job: Box::new(move |tx| job(tx).map(|value| Box::new(value) as ErasedValue)),
             cancelled,
             reply: DbReply::Async(reply),
@@ -613,6 +896,7 @@ impl DbWorker {
         let (reply, response) = oneshot::channel();
         let request = DbRequest::Execute {
             operation,
+            enqueued_at: StdInstant::now(),
             job: Box::new(move |db| job(db).map(|value| Box::new(value) as ErasedValue)),
             cancelled,
             reply: DbReply::Async(reply),
@@ -654,6 +938,7 @@ impl DbWorker {
         self.enqueue_blocking(
             DbRequest::Execute {
                 operation,
+                enqueued_at: StdInstant::now(),
                 job: Box::new(move |db| job(db).map(|value| Box::new(value) as ErasedValue)),
                 cancelled,
                 reply: DbReply::Blocking(reply),
@@ -773,22 +1058,87 @@ impl DbWorker {
     }
 
     async fn join_thread(&self, budget: Duration) {
-        let thread = self.thread.lock().ok().and_then(|mut thread| thread.take());
+        let thread = match self.thread.lock() {
+            Ok(mut thread) => thread.take(),
+            Err(poisoned) => poisoned.into_inner().take(),
+        };
         let Some(thread) = thread else {
             return;
         };
-        if timeout(budget, tokio::task::spawn_blocking(move || thread.join()))
-            .await
-            .is_err()
-        {
-            self.healthy.store(false, Ordering::Release);
-            self.force_stop();
-            warn!(
-                component = "db",
-                operation = "join_worker_thread",
-                result = "timeout",
-                "database worker thread did not join before shutdown deadline"
-            );
+        match timeout(budget, tokio::task::spawn_blocking(move || thread.join())).await {
+            Err(_) => {
+                self.healthy.store(false, Ordering::Release);
+                self.force_stop();
+                warn!(
+                    component = "db",
+                    operation = "join_worker_thread",
+                    result = "timeout",
+                    "database worker thread did not join before shutdown deadline"
+                );
+            }
+            Ok(result) => {
+                if let Some(error) = worker_thread_join_failure(result) {
+                    self.healthy.store(false, Ordering::Release);
+                    self.force_stop();
+                    warn!(
+                        component = "db",
+                        operation = "join_worker_thread",
+                        result = "join_error",
+                        error,
+                        "database worker thread failed while joining"
+                    );
+                }
+            }
+        }
+    }
+}
+
+fn worker_thread_join_failure(
+    result: Result<std::thread::Result<()>, tokio::task::JoinError>,
+) -> Option<&'static str> {
+    match result {
+        Ok(Ok(())) => None,
+        Ok(Err(_)) => Some("database worker thread panicked"),
+        Err(error) if error.is_panic() => Some("database worker join task panicked"),
+        Err(_) => Some("database worker join task was cancelled"),
+    }
+}
+
+/// Run one member of a shared transaction inside its own savepoint. A job
+/// that returns an error or panics must not leave partial writes to be
+/// committed alongside successful sibling jobs.
+fn execute_batched_operation(
+    tx: &rusqlite::Transaction<'_>,
+    operation: &'static str,
+    savepoint_sequence: u64,
+    job: DbTxOperation,
+) -> Result<DbResult, String> {
+    // Keep the identifier numeric and generated on the worker thread. The
+    // closure receives the outer transaction for compatibility, but cannot
+    // accidentally collide with this per-command rollback boundary.
+    let savepoint = format!("tng_db_batch_job_{savepoint_sequence}");
+    tx.execute_batch(&format!("SAVEPOINT {savepoint}"))
+        .map_err(|error| {
+            format!("database worker could not isolate batched operation {operation}: {error}")
+        })?;
+    let result = catch_unwind(AssertUnwindSafe(|| job(tx)))
+        .map_err(|_| format!("database operation panicked: {operation}"))
+        .and_then(|result| result);
+
+    match result {
+        Ok(value) => {
+            tx.execute_batch(&format!("RELEASE SAVEPOINT {savepoint}"))
+                .map_err(|error| {
+                    format!("database worker could not release savepoint for {operation}: {error}")
+                })?;
+            Ok(Ok(value))
+        }
+        Err(operation_error) => {
+            tx.execute_batch(&format!(
+                "ROLLBACK TO SAVEPOINT {savepoint}; RELEASE SAVEPOINT {savepoint};"
+            ))
+            .map_err(|error| format!("database worker could not roll back {operation}: {error}"))?;
+            Ok(Err(operation_error))
         }
     }
 }
@@ -929,6 +1279,82 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn worker_stats_track_queue_and_command_outcomes() {
+        let worker = worker();
+        worker
+            .run("successful_stats_probe", |_| Ok::<_, String>(()))
+            .await
+            .expect("successful command");
+        worker
+            .run::<(), _>(
+                "failed_stats_probe",
+                |_| Err("synthetic failure".to_owned()),
+            )
+            .await
+            .expect_err("failed command");
+        worker
+            .run_batched("batched_stats_probe", |_| Ok::<_, String>(()))
+            .await
+            .expect("successful batched command");
+
+        let stats = worker.stats();
+        assert_eq!(stats.queue_depth, 0);
+        assert_eq!(stats.queue_capacity, DB_QUEUE_CAPACITY as u64);
+        assert_eq!(stats.commands_enqueued_total, 3);
+        assert_eq!(stats.commands_completed_total, 3);
+        assert_eq!(stats.command_failures_total, 1);
+        assert_eq!(stats.commands_cancelled_total, 0);
+        assert!(stats.command_latency_nanoseconds_total >= stats.queue_wait_nanoseconds_total);
+        assert_eq!(stats.batch_transactions_total, 1);
+        assert_eq!(stats.batch_transaction_failures_total, 0);
+        worker.shutdown(Duration::from_secs(1)).await;
+    }
+
+    #[tokio::test]
+    async fn deferred_constraint_failure_is_counted_as_a_batch_failure() {
+        let worker = worker();
+        worker
+            .run("create_deferred_fk_probe", |db| {
+                db.execute_batch(
+                    "CREATE TABLE batch_parent (id INTEGER PRIMARY KEY);
+                     CREATE TABLE batch_child (
+                         parent_id INTEGER NOT NULL REFERENCES batch_parent(id)
+                             DEFERRABLE INITIALLY DEFERRED
+                     );",
+                )
+                .map_err(|error| error.to_string())
+            })
+            .await
+            .expect("create deferred foreign-key probe");
+
+        let error = worker
+            .run_batched("deferred_fk_violation", |tx| {
+                tx.execute("INSERT INTO batch_child (parent_id) VALUES (99)", [])
+                    .map(|_| ())
+                    .map_err(|error| error.to_string())
+            })
+            .await
+            .expect_err("deferred foreign-key violation must fail at commit");
+        assert!(error.contains("FOREIGN KEY constraint failed"), "{error}");
+
+        let stats = worker.stats();
+        assert_eq!(stats.batch_transactions_total, 1);
+        assert_eq!(stats.batch_transaction_failures_total, 1);
+        assert_eq!(stats.command_failures_total, 1);
+        assert_eq!(stats.commands_completed_total, 2);
+
+        let children: i64 = worker
+            .run("count_after_deferred_fk_failure", |db| {
+                db.query_row("SELECT COUNT(*) FROM batch_child", [], |row| row.get(0))
+                    .map_err(|error| error.to_string())
+            })
+            .await
+            .expect("read deferred foreign-key probe");
+        assert_eq!(children, 0, "a failed batch transaction must roll back");
+        worker.shutdown(Duration::from_secs(1)).await;
+    }
+
+    #[tokio::test]
     async fn run_batched_persists_a_single_job_like_run_does() {
         let worker = worker();
         worker
@@ -969,13 +1395,34 @@ mod tests {
     #[tokio::test]
     async fn run_batched_panic_is_contained_and_worker_survives() {
         let worker = worker();
+        worker
+            .run("create_probe", |db| {
+                db.execute_batch("CREATE TABLE batched_panic_probe (value INTEGER NOT NULL);")
+                    .map_err(|error| error.to_string())
+            })
+            .await
+            .expect("create panic probe table");
+
         let panic = worker
-            .run_batched::<(), _>("expected_batched_panic", |_tx| {
+            .run_batched::<(), _>("expected_batched_panic", |tx| {
+                tx.execute("INSERT INTO batched_panic_probe (value) VALUES (1)", [])
+                    .map_err(|error| error.to_string())?;
                 panic!("synthetic batched panic")
             })
             .await
             .expect_err("panic should be contained by the worker");
         assert!(panic.contains("panicked"));
+
+        let count: i64 = worker
+            .run("count_after_panic", |db| {
+                db.query_row("SELECT COUNT(*) FROM batched_panic_probe", [], |row| {
+                    row.get(0)
+                })
+                .map_err(|error| error.to_string())
+            })
+            .await
+            .expect("read panic probe table");
+        assert_eq!(count, 0, "the panicking job's partial write must roll back");
 
         // The worker must still be usable after a panic inside a batch.
         let value = worker
@@ -1007,7 +1454,12 @@ mod tests {
         // the erroring job must not silently swallow or corrupt siblings'
         // results even if they land in the same transaction.
         let worker_ref = &worker;
-        let error_job = worker_ref.run_batched::<(), _>("erroring_sibling", |_tx| {
+        let error_job = worker_ref.run_batched::<(), _>("erroring_sibling", |tx| {
+            tx.execute(
+                "INSERT INTO concurrent_batch_probe (tag) VALUES (?1)",
+                [-1_i64],
+            )
+            .map_err(|error| error.to_string())?;
             Err("synthetic sibling failure".to_owned())
         });
         let writes = (0..8i64).map(|tag| {
@@ -1231,6 +1683,85 @@ mod tests {
         worker.shutdown(Duration::from_secs(1)).await;
     }
 
+    #[test]
+    fn worker_thread_join_reports_panics_without_formatting_payloads() {
+        let thread_result = std::thread::spawn(|| std::panic::panic_any(())).join();
+
+        assert_eq!(
+            worker_thread_join_failure(Ok(thread_result)),
+            Some("database worker thread panicked")
+        );
+    }
+
+    #[tokio::test]
+    async fn join_thread_marks_panicked_database_worker_unhealthy() {
+        let thread = std::thread::spawn(|| std::panic::panic_any(()));
+        let (tx, _rx) = mpsc::sync_channel(1);
+        let worker = DbWorker {
+            tx,
+            healthy: Arc::new(AtomicBool::new(true)),
+            force_stop: Arc::new(AtomicBool::new(false)),
+            metrics: Arc::new(DbWorkerMetrics::default()),
+            thread: Arc::new(Mutex::new(Some(thread))),
+        };
+
+        worker.join_thread(Duration::from_secs(1)).await;
+
+        assert!(!worker.is_healthy());
+        assert!(worker.force_stop.load(Ordering::Acquire));
+    }
+
+    #[tokio::test]
+    async fn join_thread_recovers_a_poisoned_handle_lock() {
+        let thread = std::thread::spawn(|| std::panic::panic_any(()));
+        let thread_slot = Arc::new(Mutex::new(Some(thread)));
+        let slot_to_poison = Arc::clone(&thread_slot);
+        let poison_result = std::panic::catch_unwind(AssertUnwindSafe(move || {
+            let _thread_slot = slot_to_poison.lock().expect("thread-handle lock");
+            std::panic::panic_any(());
+        }));
+        assert!(poison_result.is_err());
+
+        let (tx, _rx) = mpsc::sync_channel(1);
+        let worker = DbWorker {
+            tx,
+            healthy: Arc::new(AtomicBool::new(true)),
+            force_stop: Arc::new(AtomicBool::new(false)),
+            metrics: Arc::new(DbWorkerMetrics::default()),
+            thread: thread_slot,
+        };
+
+        worker.join_thread(Duration::from_secs(1)).await;
+
+        assert!(!worker.is_healthy());
+        assert!(worker.force_stop.load(Ordering::Acquire));
+    }
+
+    #[tokio::test]
+    async fn database_join_task_panic_is_reported_without_formatting_payloads() {
+        let error = tokio::spawn(async { std::panic::panic_any(()) })
+            .await
+            .unwrap_err();
+
+        assert_eq!(
+            worker_thread_join_failure(Err(error)),
+            Some("database worker join task panicked")
+        );
+    }
+
+    #[tokio::test]
+    async fn database_join_task_cancellation_is_reported() {
+        let task = tokio::spawn(std::future::pending::<()>());
+        task.abort();
+        let error = task.await.expect_err("aborted task must fail to join");
+
+        assert_eq!(
+            worker_thread_join_failure(Err(error)),
+            Some("database worker join task was cancelled")
+        );
+        assert_eq!(worker_thread_join_failure(Ok(Ok(()))), None);
+    }
+
     #[tokio::test]
     async fn zero_budget_shutdown_forces_stop_before_enqueue() {
         let worker = worker();
@@ -1277,9 +1808,9 @@ mod tests {
             let (reply, response) = oneshot::channel();
             let executed_for_job = Arc::clone(&executed);
             worker
-                .tx
                 .try_send(DbRequest::Execute {
                     operation: "queued_after_shutdown_timeout",
+                    enqueued_at: StdInstant::now(),
                     job: Box::new(move |_| {
                         executed_for_job.fetch_add(1, Ordering::SeqCst);
                         Ok::<ErasedValue, String>(Box::new(()))
@@ -1290,6 +1821,17 @@ mod tests {
                 .expect("worker queue should accept the test workload");
             queued_replies.push(response);
         }
+        let saturated = worker.stats();
+        assert_eq!(saturated.queue_depth, DB_QUEUE_CAPACITY as u64);
+        assert_eq!(saturated.queue_capacity, DB_QUEUE_CAPACITY as u64);
+
+        let (reply, _response) = oneshot::channel();
+        let error = worker
+            .enqueue(DbRequest::Shutdown { reply }, "queue_timeout_probe")
+            .await
+            .expect_err("full queue admission must time out");
+        assert!(error.contains("queue timed out"), "{error}");
+        assert_eq!(worker.stats().enqueue_timeouts_total, 1);
 
         worker.shutdown(Duration::from_millis(25)).await;
         assert!(!worker.is_healthy());
@@ -1300,6 +1842,7 @@ mod tests {
             .expect("blocking operation task")
             .expect("blocking operation");
         worker.shutdown(Duration::from_secs(1)).await;
+        assert_eq!(worker.stats().queue_depth, 0);
         assert_eq!(executed.load(Ordering::SeqCst), 0);
         drop(queued_replies);
     }

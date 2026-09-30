@@ -2,16 +2,15 @@ diff --git a/src/command_events.cc b/src/command_events.cc
 index 23e262c..ebb3674 100644
 --- a/src/command_events.cc
 +++ b/src/command_events.cc
-@@ -1,6 +1,8 @@
+@@ -1,6 +1,7 @@
  #include "config.h"
  
 +#include <algorithm>
  #include <functional>
-+#include <iterator>
  #include <cstdio>
  #include <torrent/rate.h>
  #include <torrent/hash_string.h>
-@@ -285,6 +287,181 @@ d_multicall_filtered(const torrent::Object::list_type& args) {
+@@ -285,6 +286,180 @@ d_multicall_filtered(const torrent::Object::list_type& args) {
    return resultRaw;
  }
  
@@ -52,21 +51,20 @@ index 23e262c..ebb3674 100644
 +
 +  const int64_t bounded_limit = std::min(limit, tng_multicall_max_limit);
 +
-+  auto view_begin = (*view_itr)->begin_visible();
-+  auto view_end   = (*view_itr)->end_visible();
-+  auto view_size  = std::distance(view_begin, view_end);
++  auto itr = (*view_itr)->begin_visible();
++  const auto view_end = (*view_itr)->end_visible();
++  int64_t skipped = 0;
++  while (itr != view_end && skipped < offset) {
++    ++itr;
++    ++skipped;
++  }
 +
-+  if (offset >= view_size)
++  if (itr == view_end)
 +    return resultRaw;
-+
-+  std::advance(view_begin, offset);
-+
-+  auto row_end = view_begin;
-+  std::advance(row_end, std::min<int64_t>(bounded_limit, std::distance(view_begin, view_end)));
 +
 +  ++arg; // skip to first command
 +
-+  for (auto itr = view_begin; itr != row_end; ++itr) {
++  for (int64_t emitted = 0; itr != view_end && emitted < bounded_limit; ++itr, ++emitted) {
 +    torrent::Object::list_type& row = result.insert(result.end(), torrent::Object::create_list())->as_list();
 +
 +    for (auto command = arg; command != args.end(); ++command) {
@@ -193,7 +191,7 @@ index 23e262c..ebb3674 100644
  static void
  call_watch_command(const std::string& command, const std::string& path) {
    rpc::commands.call_catch(command.c_str(), rpc::make_target(), path);
-@@ -342,6 +519,9 @@ initialize_command_events() {
+@@ -342,6 +517,9 @@ initialize_command_events() {
    CMD2_ANY_LIST    ("download_list",       std::bind(&apply_download_list, std::placeholders::_2));
    CMD2_ANY_LIST    ("d.multicall2",        std::bind(&d_multicall, std::placeholders::_2));
    CMD2_ANY_LIST    ("d.multicall.filtered", std::bind(&d_multicall_filtered, std::placeholders::_2));
@@ -203,7 +201,7 @@ index 23e262c..ebb3674 100644
  
    CMD2_ANY_LIST    ("directory.watch.added", std::bind(&directory_watch_added, std::placeholders::_2));
  
-@@ -355,4 +535,7 @@ initialize_command_events() {
+@@ -355,4 +533,7 @@ initialize_command_events() {
    rpc::rpc.mark_safe("download_list");
    rpc::rpc.mark_safe("d.multicall2");
    rpc::rpc.mark_safe("d.multicall.filtered");

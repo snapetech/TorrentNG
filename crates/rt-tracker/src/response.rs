@@ -8,6 +8,7 @@ use crate::{
         parse_compact_peers_v4_with_limit, parse_compact_peers_v6_with_limit, Peer,
         MAX_TRACKER_PEERS,
     },
+    redaction::sanitize_tracker_message,
 };
 
 // Tracker response bodies are byte-bounded by the engine, but a bencoded
@@ -41,7 +42,9 @@ fn bounded_tracker_text(
             "{field} exceeds {MAX_TRACKER_TEXT_BYTES} byte limit"
         )));
     }
-    Ok(std::str::from_utf8(bytes).ok().map(ToOwned::to_owned))
+    Ok(std::str::from_utf8(bytes)
+        .ok()
+        .map(sanitize_tracker_message))
 }
 
 fn bounded_tracker_failure_reason(value: Option<&BValue<'_>>) -> Result<String, TrackerError> {
@@ -53,9 +56,9 @@ fn bounded_tracker_failure_reason(value: Option<&BValue<'_>>) -> Result<String, 
             "failure reason exceeds {MAX_TRACKER_TEXT_BYTES} byte limit"
         )));
     }
-    Ok(std::str::from_utf8(bytes)
-        .unwrap_or("unknown failure")
-        .to_owned())
+    Ok(sanitize_tracker_message(
+        std::str::from_utf8(bytes).unwrap_or("unknown failure"),
+    ))
 }
 
 fn bounded_tracker_id(value: Option<&BValue<'_>>) -> Result<Option<Vec<u8>>, TrackerError> {
@@ -382,6 +385,26 @@ mod tests {
     }
 
     #[test]
+    fn parse_failure_reason_redacts_echoed_tracker_credentials() {
+        let failure = "denied https://user:auth-secret@tracker.example/private/passkey?signature=query-secret#fragment-secret";
+        let raw = make_response(0, None, Some(failure));
+        let error = AnnounceResponse::parse(&raw).unwrap_err();
+        let TrackerError::FailureReason(message) = error else {
+            panic!("expected tracker failure reason");
+        };
+
+        assert_eq!(message, "denied https://tracker.example/");
+        for secret in [
+            "auth-secret",
+            "private/passkey",
+            "query-secret",
+            "fragment-secret",
+        ] {
+            assert!(!message.contains(secret), "{message}");
+        }
+    }
+
+    #[test]
     fn parse_rejects_oversized_failure_reason() {
         let failure = vec![b'x'; MAX_TRACKER_TEXT_BYTES + 1];
         let raw = encode(&BValue::Dict(vec![(
@@ -595,6 +618,23 @@ mod tests {
         let raw = encode(&BValue::Dict(pairs));
         let resp = AnnounceResponse::parse(&raw).unwrap();
         assert_eq!(resp.warning_message.as_deref(), Some("low peers"));
+    }
+
+    #[test]
+    fn parse_warning_message_redacts_echoed_tracker_credentials() {
+        let warning =
+            b"limited https://user:password@tracker.example/short-key?sig=secret#fragment";
+        let raw = encode(&BValue::Dict(vec![
+            (b"interval".as_ref(), BValue::Int(1800)),
+            (b"peers".as_ref(), BValue::Bytes(b"")),
+            (b"warning message".as_ref(), BValue::Bytes(warning)),
+        ]));
+        let response = AnnounceResponse::parse(&raw).unwrap();
+
+        assert_eq!(
+            response.warning_message.as_deref(),
+            Some("limited https://tracker.example/")
+        );
     }
 
     #[test]

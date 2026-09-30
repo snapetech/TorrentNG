@@ -2,6 +2,8 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+# shellcheck source=scripts/curl_policy.sh
+source "$ROOT/scripts/curl_policy.sh"
 ENV_FILE="${CERT_ENV_FILE:-$ROOT/deploy/certification/.env}"
 COMPOSE_FILE="${CERT_COMPOSE_FILE:-$ROOT/deploy/certification/compose.yml}"
 
@@ -108,7 +110,9 @@ case "$cmd" in
   restart-cert)
     out="$(write_env "$mapping")"
     set -a
+    # shellcheck disable=SC1090
     [[ -f "$ENV_FILE" ]] && source "$ENV_FILE"
+    # shellcheck disable=SC1090
     source "$out"
     set +a
     TNG_HOST_PORT="${TNG_HOST_PORT:-28080}" \

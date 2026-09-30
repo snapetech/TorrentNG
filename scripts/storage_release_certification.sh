@@ -79,7 +79,8 @@ mark() {
 run_gate() {
   local name="$1"
   shift
-  local log="$tmpdir/$(printf '%s' "$name" | tr -c 'A-Za-z0-9_.-' '_').log"
+  local log
+  log="$tmpdir/$(printf '%s' "$name" | tr -c 'A-Za-z0-9_.-' '_').log"
   if "$@" >"$log" 2>&1; then
     mark "$name" PASS "$(tail -1 "$log")"
   else

@@ -19,11 +19,18 @@ jobs:
       - name: Resolve version
         id: version
         shell: bash
+        env:
+          REQUESTED_TAG: ${{ inputs.tag || github.event.release.tag_name }}
         run: |
           set -euo pipefail
-          tag="${{ github.event.inputs.tag || github.event.release.tag_name }}"
-          if [[ "$tag" != main-* ]]; then
-            echo "Release tags must start with main-; got $tag." >&2
+          if [[ "$GITHUB_EVENT_NAME" == "workflow_dispatch" && "$GITHUB_REF" != "refs/heads/main" ]]; then
+            echo "Manual package publishes must be dispatched from the default main branch." >&2
+            exit 1
+          fi
+          tag="$REQUESTED_TAG"
+          if [[ ! "$tag" =~ ^main-[A-Za-z0-9][A-Za-z0-9._-]*$ ]] ||
+            [[ "$tag" == *..* ]] || ! git check-ref-format "refs/tags/$tag"; then
+            echo "Invalid release tag: $tag" >&2
             exit 1
           fi
           rpm_version="${tag#main-}"
@@ -36,16 +43,18 @@ jobs:
       - uses: actions/checkout@v7
         with:
           ref: main
+          persist-credentials: false
 
       - name: Download native release asset
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_TAG: ${{ steps.version.outputs.tag }}
         shell: bash
         run: |
           set -euo pipefail
-          tag="${{ steps.version.outputs.tag }}"
+          tag="$RELEASE_TAG"
           asset="torrentngd-native-${tag}-linux-x86_64.tar.gz"
-          for attempt in {1..80}; do
+          for _ in {1..80}; do
             if gh release download "$tag" -R "$GITHUB_REPOSITORY" --pattern "$asset" --clobber; then
               exit 0
             fi
@@ -84,10 +93,13 @@ jobs:
           copr-cli whoami >/dev/null
 
       - name: Build SRPM
+        env:
+          RELEASE_TAG: ${{ steps.version.outputs.tag }}
+          RPM_VERSION: ${{ steps.version.outputs.rpm_version }}
         run: |
           set -euo pipefail
-          tag="${{ steps.version.outputs.tag }}"
-          rpm_version="${{ steps.version.outputs.rpm_version }}"
+          tag="$RELEASE_TAG"
+          rpm_version="$RPM_VERSION"
           asset="torrentngd-native-${tag}-linux-x86_64.tar.gz"
           rpm_top="$(mktemp -d "/tmp/torrentng-rpmbuild-${rpm_version}.XXXXXX")"
           mkdir -p "$rpm_top"/{SOURCES,SPECS,SRPMS}
