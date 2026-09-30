@@ -19,10 +19,10 @@ use std::ptr;
 use cap_std::fs::{Dir, File, Metadata, MetadataExt, OpenOptions, OpenOptionsExt};
 use windows_sys::Win32::Foundation::HANDLE;
 use windows_sys::Win32::Storage::FileSystem::{
-    FileRenameInfo, SetFileInformationByHandle, DELETE, FILE_ADD_FILE, FILE_ADD_SUBDIRECTORY,
-    FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS,
-    FILE_FLAG_OPEN_REPARSE_POINT, FILE_INFO_BY_HANDLE_CLASS, FILE_READ_ATTRIBUTES,
-    FILE_RENAME_INFO, FILE_RENAME_INFO_0, FILE_SHARE_READ, FILE_SHARE_WRITE, SYNCHRONIZE,
+    FileRenameInfo, SetFileInformationByHandle, DELETE, FILE_ATTRIBUTE_DIRECTORY,
+    FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
+    FILE_INFO_BY_HANDLE_CLASS, FILE_READ_ATTRIBUTES, FILE_RENAME_INFO, FILE_RENAME_INFO_0,
+    FILE_SHARE_READ, FILE_SHARE_WRITE, SYNCHRONIZE,
 };
 
 use crate::plan::{
@@ -34,6 +34,7 @@ use crate::StorageError;
 
 struct Entry {
     parent: Dir,
+    _ancestor_directories: Vec<Dir>,
     name: OsString,
     path: PathBuf,
 }
@@ -280,15 +281,16 @@ fn path_entry(
             })?;
     let root_dir = crate::open::open_windows_directory_capability(root)
         .map_err(|error| StorageError::io(root.display().to_string(), error))?;
-    let Some(parent) =
+    let Some((parent, ancestor_directories)) =
         open_relative_directory(&root_dir, relative_parent, create_parents, path, step)?
     else {
         return Ok(None);
     };
     Ok(Some(Entry {
         parent,
+        _ancestor_directories: ancestor_directories,
         name,
-        path: path.to_path_buf(),
+        path: resolved_parent.join(path.file_name().expect("checked above")),
     }))
 }
 
@@ -298,9 +300,10 @@ fn open_relative_directory(
     create_missing: bool,
     display_path: &Path,
     step: &'static str,
-) -> Result<Option<Dir>, StorageError> {
+) -> Result<Option<(Dir, Vec<Dir>)>, StorageError> {
     let mut current = crate::open::reopen_windows_directory(root)
         .map_err(|error| StorageError::io(display_path.display().to_string(), error))?;
+    let mut ancestor_directories = Vec::new();
     for component in relative.components() {
         let Component::Normal(name) = component else {
             return Err(plan_error(
@@ -339,9 +342,11 @@ fn open_relative_directory(
             Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
             Err(error) => return Err(StorageError::io(display_path.display().to_string(), error)),
         }
-        current = open_child_directory(&current, name, display_path, step)?;
+        let child = open_child_directory(&current, name, display_path, step)?;
+        ancestor_directories.push(current);
+        current = child;
     }
-    Ok(Some(current))
+    Ok(Some((current, ancestor_directories)))
 }
 
 fn open_child_directory(
@@ -587,12 +592,14 @@ fn copy_directory_contents(
         let source_child = Entry {
             parent: crate::open::reopen_windows_directory(source)
                 .map_err(|error| StorageError::io(source_path.display().to_string(), error))?,
+            _ancestor_directories: Vec::new(),
             name: name.clone(),
             path: source_child_path,
         };
         let destination_child = Entry {
             parent: crate::open::reopen_windows_directory(destination)
                 .map_err(|error| StorageError::io(destination_path.display().to_string(), error))?,
+            _ancestor_directories: Vec::new(),
             name,
             path: destination_child_path,
         };
@@ -681,6 +688,7 @@ fn content_len_directory(
         let child = Entry {
             parent: crate::open::reopen_windows_directory(directory)
                 .map_err(|error| StorageError::io(path.display().to_string(), error))?,
+            _ancestor_directories: Vec::new(),
             name,
             path: child_path.clone(),
         };
@@ -828,12 +836,14 @@ fn verify_directory_contents(
         let source_child = Entry {
             parent: crate::open::reopen_windows_directory(source)
                 .map_err(|error| StorageError::io(source_path.display().to_string(), error))?,
+            _ancestor_directories: Vec::new(),
             name: name.clone(),
             path: source_path.join(&name),
         };
         let destination_child = Entry {
             parent: crate::open::reopen_windows_directory(destination)
                 .map_err(|error| StorageError::io(destination_path.display().to_string(), error))?,
+            _ancestor_directories: Vec::new(),
             name: name.clone(),
             path: destination_path.join(&name),
         };
@@ -936,16 +946,19 @@ fn safe_delete(
             Err(error) => Err(StorageError::io(path.display().to_string(), error)),
         }
     } else if root_is_dir {
-        let directory = open_child_directory(&entry.parent, &entry.name, path, "delete-source")?;
-        remove_directory_contents(&directory, path, 0, check_control, &mut removed)?;
-        drop(directory);
-        check_control()?;
-        entry
-            .parent
-            .remove_dir(Path::new(&entry.name))
-            .map_err(|error| StorageError::io(path.display().to_string(), error))?;
-        removed = true;
-        Ok(())
+        (|| {
+            let directory =
+                open_child_directory(&entry.parent, &entry.name, path, "delete-source")?;
+            remove_directory_contents(&directory, path, 0, check_control, &mut removed)?;
+            drop(directory);
+            check_control()?;
+            entry
+                .parent
+                .remove_dir(Path::new(&entry.name))
+                .map_err(|error| StorageError::io(path.display().to_string(), error))?;
+            removed = true;
+            Ok(())
+        })()
     } else if metadata.is_file() {
         check_control()?;
         entry
@@ -999,6 +1012,7 @@ fn remove_directory_contents(
         if is_reparse(&metadata) {
             let entry = Entry {
                 parent,
+                _ancestor_directories: Vec::new(),
                 name,
                 path: child_path,
             };
@@ -1140,13 +1154,12 @@ fn rename_entry_no_replace(source: &Entry, destination: &Entry) -> Result<(), St
         .metadata()
         .map_err(|error| StorageError::io(source.path.display().to_string(), error))?;
     ensure_supported_entry(&metadata, &source.path, "rename-source")?;
-    let destination_parent = open_rename_destination_directory(
-        &destination.parent,
-        &destination.path,
-        metadata.is_dir(),
-    )?;
-    let mut wide = destination.name.encode_wide().collect::<Vec<_>>();
-    if wide.is_empty() || wide.iter().any(|value| *value == 0) {
+    let mut wide = destination
+        .path
+        .as_os_str()
+        .encode_wide()
+        .collect::<Vec<_>>();
+    if wide.is_empty() || wide.contains(&0) {
         return Err(plan_error("rename-destination", "invalid Windows filename"));
     }
     let name_bytes = wide
@@ -1154,8 +1167,14 @@ fn rename_entry_no_replace(source: &Entry, destination: &Entry) -> Result<(), St
         .checked_mul(size_of::<u16>())
         .ok_or_else(|| plan_error("rename-destination", "filename is too long"))?;
     let offset = offset_of!(FILE_RENAME_INFO, FileName);
+    // FILE_RENAME_INFO.FileName is documented as NUL-terminated. Keep the
+    // terminator in the buffer passed to SetFileInformationByHandle while
+    // FileNameLength continues to report only the path bytes. All destination
+    // ancestors stay open without FILE_SHARE_DELETE in `destination`, so the
+    // absolute path cannot be redirected while the rename is applied.
     let byte_len = offset
         .checked_add(name_bytes)
+        .and_then(|length| length.checked_add(size_of::<u16>()))
         .ok_or_else(|| plan_error("rename-destination", "filename is too long"))?;
     let word_count = byte_len
         .checked_add(size_of::<usize>() - 1)
@@ -1166,7 +1185,7 @@ fn rename_entry_no_replace(source: &Entry, destination: &Entry) -> Result<(), St
         Anonymous: FILE_RENAME_INFO_0 {
             ReplaceIfExists: false,
         },
-        RootDirectory: destination_parent.as_raw_handle() as HANDLE,
+        RootDirectory: ptr::null_mut(),
         FileNameLength: u32::try_from(name_bytes)
             .map_err(|_| plan_error("rename-destination", "filename is too long"))?,
         FileName: [0],
@@ -1193,43 +1212,6 @@ fn rename_entry_no_replace(source: &Entry, destination: &Entry) -> Result<(), St
         }
     }
     Ok(())
-}
-
-fn open_rename_destination_directory(
-    parent: &Dir,
-    path: &Path,
-    source_is_directory: bool,
-) -> Result<Dir, StorageError> {
-    // FILE_RENAME_INFO resolves FileName relative to RootDirectory. Windows
-    // requires FILE_ADD_FILE or FILE_ADD_SUBDIRECTORY on that directory handle
-    // according to the source type; the ordinary traversal handles are
-    // intentionally opened with read-only access.
-    let add_right = if source_is_directory {
-        FILE_ADD_SUBDIRECTORY
-    } else {
-        FILE_ADD_FILE
-    };
-    let mut options = OpenOptions::new();
-    options
-        .access_mode(add_right | FILE_READ_ATTRIBUTES | SYNCHRONIZE)
-        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
-        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT);
-    let file = parent
-        .open_with(Path::new("."), &options)
-        .map_err(|error| StorageError::io(path.display().to_string(), error))?;
-    let metadata = file
-        .metadata()
-        .map_err(|error| StorageError::io(path.display().to_string(), error))?;
-    if is_reparse(&metadata) {
-        return Err(unsafe_symlink_error(path, "rename-destination"));
-    }
-    if !metadata.is_dir() {
-        return Err(StorageError::StagedMoveFailed {
-            step: "rename-destination",
-            reason: format!("destination parent is not a directory: {}", path.display()),
-        });
-    }
-    Ok(Dir::from_std_file(file.into_std()))
 }
 
 fn reconcile_content_matches(
@@ -1378,6 +1360,24 @@ mod tests {
 
         assert_eq!(std::fs::read(&source).unwrap(), b"source");
         assert_eq!(std::fs::read(&destination).unwrap(), b"keep");
+    }
+
+    #[test]
+    fn rooted_entry_keeps_destination_ancestors_pinned() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("root");
+        let parent = root.join("parent");
+        let nested = parent.join("nested");
+        std::fs::create_dir_all(&nested).unwrap();
+        let destination = nested.join("destination.bin");
+        let roots = vec![configured_root(&root)];
+
+        let entry = required_entry(&destination, &roots, false, "rename-destination").unwrap();
+        let moved_parent = root.join("parent-renamed");
+        assert!(std::fs::rename(&parent, &moved_parent).is_err());
+
+        drop(entry);
+        std::fs::rename(parent, moved_parent).unwrap();
     }
 
     #[test]
