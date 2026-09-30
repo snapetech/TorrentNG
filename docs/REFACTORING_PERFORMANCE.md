@@ -40,7 +40,7 @@ The peer-wire release microbenchmark encoded 10,000 16 KiB Piece frames in
 (14.7% faster in that isolated loop). This is not an end-to-end transfer
 throughput claim.
 
-Current release artifacts built from this worktree are:
+Release artifact sizes captured during the 2026-09-21 pass were:
 
 - native daemon: 26,831,584 bytes
 - sidecar binary: 16,008,272 bytes
@@ -49,13 +49,12 @@ The root release profile already uses `opt-level = 3`, thin LTO, one codegen
 unit, and stripped debuginfo. The sidecar uses full LTO and symbol stripping.
 No compiler-profile change was made without a before/after product benchmark.
 
-## Dependency audit
+## Dependency audit baseline (2026-09-21)
 
-The root graph still carries duplicate versions of `base64`, `tower`,
-`tower-http`, and several crypto/random support crates. Some duplicates are
-required by the axum/reqwest generations or are dev-only/transitive. They
-should not be unified blindly; a future dependency cleanup should measure the
-release daemon and sidecar artifacts independently.
+The initial audit found duplicate versions of `base64`, `tower`, `tower-http`,
+and crypto/random support crates. The scoped follow-up below consolidated the
+compatible direct dependencies and records the framework-constrained versions
+that remain.
 
 ## Verification
 
@@ -69,3 +68,44 @@ The affected slices passed:
 
 The remaining production-scale memory and real-device storage claims stay
 with the existing soak and hardware evidence gates.
+
+
+## Engine module and dependency cleanup (2026-09-25)
+
+The engine source split is complete. `Engine` remains the ordering authority
+for its state transitions and `TorrentTask` remains the authority for
+per-torrent state. No actor mailbox, protocol ordering, or public API changed.
+The extracted private modules are:
+
+- `crates/rt-engine/src/engine/handle.rs` for the cloneable command facade.
+- `crates/rt-engine/src/engine/lifecycle.rs` and
+  `crates/rt-engine/src/engine/restore.rs` for torrent task lifecycle and
+  startup/job recovery.
+- `crates/rt-engine/src/engine/storage.rs` for move/delete/storage-plan
+  choreography.
+- `crates/rt-engine/src/engine/read_model.rs` for statistics, health, and
+  diagnostics.
+- `rt-engine/src/torrent_task/peer_connections.rs`, `peer_session.rs`, and
+  `peer_transfer.rs` for peer selection, session transport, and block transfer.
+
+The root workspace now uses `base64 0.22`, matching its Axum 0.7 and Reqwest
+0.12 graph, instead of retaining a direct 0.23 copy. Root `sha1` is updated to
+0.10.7, matching the sidecar lockfile patch version.
+
+The remaining duplicate versions are dependency-generation boundaries visible
+in `cargo tree --workspace -d` and `sidecar/cargo tree -d`:
+
+- Root `tower 0.4` / `0.5` and `tower-http 0.5` / `0.6` come from the Axum 0.7
+  and Reqwest 0.12 dependency generations.
+- Root `rand 0.8` / `0.9` / `0.10` comes from Tungstenite, Proptest, and
+  TorrentNG's direct use, respectively. Root `digest` and `crypto-common`
+  0.10 / 0.11 follow the separate SHA-1 0.10 and SHA-2 0.11 APIs; `hashbrown`
+  0.14 / 0.17 follows rusqlite and the TOML/indexmap stack.
+- The separately locked sidecar uses Axum 0.8 and Reqwest 0.13, which require
+  both `base64 0.22` and `0.23`; Reqwest's `tower-http 0.6` also coexists with
+  the sidecar's direct `0.7` integration.
+
+Unifying those remaining entries requires framework or test-tool version
+changes, not a safe manifest alignment. The root `cargo tree` now has one
+`base64` version. Locked offline checks and debug/release builds passed for the
+root workspace; the locked offline release build passed for the sidecar.

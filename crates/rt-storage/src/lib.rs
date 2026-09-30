@@ -15,6 +15,8 @@ pub mod verify;
 
 #[cfg(unix)]
 mod secure_fs;
+#[cfg(windows)]
+mod windows_secure_fs;
 
 pub use backend::{
     BackendKind, BackendRequest, BackendSelection, DiskBackend, FixedBufferStrategy, PreadBackend,

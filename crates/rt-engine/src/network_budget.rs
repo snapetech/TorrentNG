@@ -1,8 +1,8 @@
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU16, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
-use tokio::sync::{Notify, Semaphore};
+use tokio::sync::{mpsc, oneshot, Notify, Semaphore};
 // tokio's Instant, not std's: it respects the paused/mockable clock that
 // `#[tokio::test(start_paused = true)]` and `tokio::time::advance()` use.
 // Using std::time::Instant here would make the refill calculation below see
@@ -22,6 +22,14 @@ pub(crate) struct GlobalNetworkBudget {
     peer_slots: Arc<Semaphore>,
     download: Arc<SharedRateLimiter>,
     upload: Arc<SharedRateLimiter>,
+    listen_port: Arc<AtomicU16>,
+    listener_rebind_tx: mpsc::Sender<PeerListenerRebindRequest>,
+    listener_rebind_rx: Arc<Mutex<Option<mpsc::Receiver<PeerListenerRebindRequest>>>>,
+}
+
+pub(crate) struct PeerListenerRebindRequest {
+    pub(crate) port: u16,
+    pub(crate) reply: oneshot::Sender<Result<(), String>>,
 }
 
 impl GlobalNetworkBudget {
@@ -30,11 +38,55 @@ impl GlobalNetworkBudget {
         download_limit_bytes_per_sec: Option<u64>,
         upload_limit_bytes_per_sec: Option<u64>,
     ) -> Self {
+        let (listener_rebind_tx, listener_rebind_rx) = mpsc::channel(4);
         Self {
             peer_slots: Arc::new(Semaphore::new(max_peers.max(1))),
             download: Arc::new(SharedRateLimiter::new(download_limit_bytes_per_sec)),
             upload: Arc::new(SharedRateLimiter::new(upload_limit_bytes_per_sec)),
+            listen_port: Arc::new(AtomicU16::new(0)),
+            listener_rebind_tx,
+            listener_rebind_rx: Arc::new(Mutex::new(Some(listener_rebind_rx))),
         }
+    }
+
+    pub(crate) fn listen_port(&self) -> u16 {
+        self.listen_port.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn set_listen_port(&self, port: u16) {
+        self.listen_port.store(port, Ordering::Release);
+    }
+
+    pub(crate) fn listen_port_shared(&self) -> Arc<AtomicU16> {
+        Arc::clone(&self.listen_port)
+    }
+
+    pub(crate) fn take_listener_rebind_receiver(
+        &self,
+    ) -> Option<mpsc::Receiver<PeerListenerRebindRequest>> {
+        self.listener_rebind_rx
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take()
+    }
+
+    pub(crate) async fn rebind_peer_listener(&self, port: u16) -> Result<(), String> {
+        if port == 0 {
+            return Err("listen_port must be between 1 and 65535".to_owned());
+        }
+        let (reply, response) = oneshot::channel();
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            self.listener_rebind_tx
+                .send(PeerListenerRebindRequest { port, reply }),
+        )
+        .await
+        .map_err(|_| "peer listener rebind queue timed out".to_owned())?
+        .map_err(|_| "peer listener is not running".to_owned())?;
+        tokio::time::timeout(Duration::from_secs(10), response)
+            .await
+            .map_err(|_| "peer listener rebind timed out".to_owned())?
+            .map_err(|_| "peer listener dropped rebind reply".to_owned())?
     }
 
     #[allow(dead_code)]

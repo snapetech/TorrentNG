@@ -350,7 +350,7 @@ fn default_listen_addr() -> String {
     "127.0.0.1:8080".into()
 }
 fn default_sync_interval_secs() -> u64 {
-    2
+    5
 }
 fn default_timeout_secs() -> u64 {
     10

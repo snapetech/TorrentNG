@@ -303,6 +303,13 @@ fn parse_metadata_transport_policy(value: &str) -> MetadataTransportPolicy {
     }
 }
 
+fn current_listen_port(network_budget: &GlobalNetworkBudget, fallback: u16) -> u16 {
+    match network_budget.listen_port() {
+        0 => fallback,
+        port => port,
+    }
+}
+
 // Metadata acquisition currently has separate transport, persistence, and
 // admission dependencies. Keep those boundaries explicit until the task
 // context object is introduced as part of the engine seam refactor.
@@ -534,7 +541,7 @@ pub async fn run_metadata_task(
                                 info_hash,
                                 &info_hash_hex,
                                 &trackers,
-                                listen_port,
+                                current_listen_port(&network_budget, listen_port),
                                 max_peers,
                                 http_timeout,
                                 udp_timeout,
@@ -570,7 +577,7 @@ pub async fn run_metadata_task(
                                 info_hash,
                                 &info_hash_hex,
                                 &trackers,
-                                listen_port,
+                                current_listen_port(&network_budget, listen_port),
                                 max_peers,
                                 http_timeout,
                                 udp_timeout,
@@ -718,7 +725,7 @@ pub async fn run_metadata_task(
                         info_hash,
                         &info_hash_hex,
                         &trackers,
-                        listen_port,
+                        current_listen_port(&network_budget, listen_port),
                         max_peers,
                         http_timeout,
                         udp_timeout,
@@ -765,7 +772,7 @@ pub async fn run_metadata_task(
                         info_hash,
                         &info_hash_hex,
                         &trackers,
-                        listen_port,
+                        current_listen_port(&network_budget, listen_port),
                         max_peers,
                         http_timeout,
                         udp_timeout,

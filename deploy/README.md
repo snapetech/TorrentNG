@@ -61,7 +61,7 @@ stacks consume.
 |---|---|
 | `../templates/torrentng-webui.xml` | Community Applications template: WebUI/API replacement for an rTorrent/qBittorrent/Transmission/Deluge install you already run |
 | `../templates/torrentng.xml` | Community Applications template: full `torrentngd` stack, no external client |
-| `unraid/README.md` | How to install directly from these template URLs today, and the Community Applications submission layout |
+| `unraid/README.md` | Unraid template selection, installation, storage permissions, and backend setup |
 
 ## Shared / cross-cutting
 
