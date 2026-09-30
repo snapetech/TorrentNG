@@ -80,7 +80,9 @@ where
     deserialize_bounded_vec(deserializer, MAX_FASTRESUME_PIECES, "fastresume pieces")
 }
 
-fn deserialize_partial_pieces<'de, D>(deserializer: D) -> Result<Vec<PartialPieceState>, D::Error>
+pub(crate) fn deserialize_partial_pieces<'de, D>(
+    deserializer: D,
+) -> Result<Vec<PartialPieceState>, D::Error>
 where
     D: Deserializer<'de>,
 {
@@ -91,7 +93,7 @@ where
     )
 }
 
-fn deserialize_file_hints<'de, D>(deserializer: D) -> Result<Vec<FileHint>, D::Error>
+pub(crate) fn deserialize_file_hints<'de, D>(deserializer: D) -> Result<Vec<FileHint>, D::Error>
 where
     D: Deserializer<'de>,
 {
@@ -417,11 +419,10 @@ impl FastresumeState {
             }
         }
         self.partial_pieces.retain(|partial| {
-            !self
-                .durability
+            self.durability
                 .dirty_pieces_since_barrier
                 .binary_search(&partial.piece)
-                .is_ok()
+                .is_err()
         });
         self.clean_shutdown = true;
         self.durability.dirty_pieces_since_barrier.clear();

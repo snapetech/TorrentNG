@@ -33,6 +33,17 @@ pub fn has_session_cookie(headers: &HeaderMap, names: &[&str]) -> bool {
     session_cookie_value(headers, names).is_some()
 }
 
+/// Return whether a request carries metadata that identifies it as a browser
+/// request.  Keep this separate from [`csrf_request_allowed`]: clients that
+/// do not send browser metadata remain compatible, while browser requests
+/// must provide positive same-origin evidence before a public auth endpoint
+/// sets or clears a session cookie.
+pub fn has_browser_request_headers(headers: &HeaderMap) -> bool {
+    headers.contains_key(header::ORIGIN)
+        || headers.contains_key(header::REFERER)
+        || headers.contains_key("sec-fetch-site")
+}
+
 /// Decode one of the percent-encoded session-cookie values used by the
 /// compatibility facades.
 pub fn session_cookie_value(headers: &HeaderMap, names: &[&str]) -> Option<String> {

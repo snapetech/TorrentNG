@@ -104,17 +104,42 @@ fn tracker_tiers_from_meta_v2(meta: &TorrentMetaV2) -> Vec<Vec<TrackerState>> {
     tiers
 }
 
-/// Estimate the v2 piece-index allocation retained by the live task.
-pub(crate) fn v2_piece_index_memory_bytes(piece_count: usize) -> usize {
+/// Estimate one packed v2 bitmap allocation.
+pub(crate) fn v2_bitmap_memory_bytes(piece_count: usize) -> usize {
     piece_count
         .div_ceil(64)
         .saturating_mul(std::mem::size_of::<u64>())
 }
 
+/// Estimate the two torrent-wide v2 availability bitmaps that can overlap
+/// during a recheck or copy-on-write update: the current map and the map
+/// visible to peers while the replacement is built.
+pub(crate) fn v2_piece_index_memory_bytes(piece_count: usize) -> usize {
+    v2_bitmap_memory_bytes(piece_count).saturating_mul(2)
+}
+
 /// Estimate the immutable v2 graph retained by a live task. The exact parser
 /// allocation is deliberately charged before the actor is constructed, just
 /// as it is for the v1 actor; this covers paths, file descriptors' metadata,
-/// piece-layer vectors, and the retained raw info dictionary.
+/// piece-layer vectors, and the retained raw info dictionary. The actor also
+/// keeps an original-file clone for policy rebuilds and path-bearing spans in
+/// V2PieceMap, so include those two additional file graphs.
+fn v2_file_graph_memory_bytes(files: &[TorrentFileV2], capacity: usize) -> usize {
+    let mut total = capacity.saturating_mul(std::mem::size_of::<TorrentFileV2>());
+    for file in files {
+        total = total.saturating_add(
+            file.path
+                .components()
+                .len()
+                .saturating_mul(std::mem::size_of::<String>()),
+        );
+        for component in file.path.components() {
+            total = total.saturating_add(component.capacity());
+        }
+    }
+    total
+}
+
 pub(crate) fn persistent_torrent_metadata_memory_bytes_v2(meta: &TorrentMetaV2) -> usize {
     let mut total = 64 * 1024usize;
     total = total.saturating_add(meta.name.capacity());
@@ -145,21 +170,8 @@ pub(crate) fn persistent_torrent_metadata_memory_bytes_v2(meta: &TorrentMetaV2) 
         total = total.saturating_add(webseed.capacity());
     }
     total = total.saturating_add(
-        meta.files
-            .capacity()
-            .saturating_mul(std::mem::size_of::<TorrentFileV2>()),
+        v2_file_graph_memory_bytes(&meta.files, meta.files.capacity()).saturating_mul(3),
     );
-    for file in &meta.files {
-        total = total.saturating_add(
-            file.path
-                .components()
-                .len()
-                .saturating_mul(std::mem::size_of::<String>()),
-        );
-        for component in file.path.components() {
-            total = total.saturating_add(component.capacity());
-        }
-    }
     total = total.saturating_add(
         meta.piece_layers
             .capacity()
@@ -184,7 +196,7 @@ struct V2Bitmap {
 
 impl V2Bitmap {
     fn memory_bytes_for_len(len: usize) -> u64 {
-        v2_piece_index_memory_bytes(len) as u64
+        v2_bitmap_memory_bytes(len) as u64
     }
 
     fn new(len: usize) -> Self {
@@ -194,20 +206,8 @@ impl V2Bitmap {
         }
     }
 
-    fn all_true(len: usize) -> Self {
-        let mut bitmap = Self {
-            len,
-            words: vec![u64::MAX; len.div_ceil(64)],
-        };
-        if let Some(last) = bitmap.words.last_mut() {
-            if !len.is_multiple_of(64) {
-                *last = (1_u64 << (len % 64)) - 1;
-            }
-        }
-        bitmap
-    }
-
-    fn from_bitfield(bits: &[u8], piece_count: usize) -> Result<Self, String> {
+    fn copy_from_bitfield(&mut self, bits: &[u8]) -> Result<(), String> {
+        let piece_count = self.len;
         if bits.len() != piece_count.div_ceil(8) {
             return Err(format!(
                 "v2 bitfield has {} bytes, expected {}",
@@ -221,7 +221,7 @@ impl V2Bitmap {
                 return Err("v2 bitfield sets bits beyond the piece count".to_owned());
             }
         }
-        let mut bitmap = Self::new(piece_count);
+        self.fill(false);
         for (byte_index, byte) in bits.iter().copied().enumerate() {
             for bit in 0..8 {
                 let piece = byte_index * 8 + bit;
@@ -229,11 +229,22 @@ impl V2Bitmap {
                     break;
                 }
                 if byte & (0x80 >> bit) != 0 {
-                    bitmap.set(piece, true);
+                    self.set(piece, true);
                 }
             }
         }
-        Ok(bitmap)
+        Ok(())
+    }
+
+    fn fill(&mut self, value: bool) {
+        self.words.fill(if value { u64::MAX } else { 0 });
+        if value {
+            if let Some(last) = self.words.last_mut() {
+                if !self.len.is_multiple_of(64) {
+                    *last = (1_u64 << (self.len % 64)) - 1;
+                }
+            }
+        }
     }
 
     fn len(&self) -> usize {
@@ -285,7 +296,7 @@ impl V2Bitmap {
 
 #[derive(Debug)]
 struct V2PeerState {
-    remote_have: V2Bitmap,
+    remote_have: Arc<V2Bitmap>,
     choked: bool,
     upload_choked: bool,
     interested: bool,
@@ -304,7 +315,7 @@ struct V2PeerState {
 impl V2PeerState {
     fn new(piece_count: usize) -> Self {
         Self {
-            remote_have: V2Bitmap::new(piece_count),
+            remote_have: Arc::new(V2Bitmap::new(piece_count)),
             choked: true,
             upload_choked: true,
             interested: false,
@@ -386,7 +397,7 @@ struct V2PeerContext {
     storage: MountScheduler,
     resources: ResourceGovernor,
     network_budget: GlobalNetworkBudget,
-    local_have: Arc<RwLock<V2Bitmap>>,
+    local_have: Arc<RwLock<Arc<V2Bitmap>>>,
     have_updates: watch::Sender<()>,
     file_policy: Arc<HashMap<u32, (bool, i64)>>,
     assembly_cap_bytes: usize,
@@ -539,7 +550,7 @@ pub struct V2TorrentTask {
     cmd_rx: mpsc::Receiver<TorrentCmd>,
     events_tx: mpsc::Sender<V2PeerEvent>,
     events_rx: mpsc::Receiver<V2PeerEvent>,
-    local_have: Arc<RwLock<V2Bitmap>>,
+    local_have: Arc<RwLock<Arc<V2Bitmap>>>,
     have_updates: watch::Sender<()>,
     peers: HashMap<SocketAddr, V2PeerHandle>,
     paused: bool,
@@ -675,7 +686,9 @@ impl V2TorrentTask {
         );
         let peer_event_capacity = max_peers.clamp(64, 512);
         let (events_tx, events_rx) = mpsc::channel(peer_event_capacity);
-        let local_have = Arc::new(RwLock::new(V2Bitmap::new(piece_map.piece_count as usize)));
+        let local_have = Arc::new(RwLock::new(Arc::new(V2Bitmap::new(
+            piece_map.piece_count as usize,
+        ))));
         let (have_updates, _) = watch::channel(());
         let storage = MountScheduler::new_for_path(
             StorageRootId::new(),
@@ -751,7 +764,7 @@ impl V2TorrentTask {
 
     pub async fn run(mut self) {
         let new_have = self.recheck_files().await;
-        *self.local_have.write().await = new_have;
+        *self.local_have.write().await = Arc::new(new_have);
         self.notify_local_have_changed();
 
         let startup_state = if self.paused {
@@ -1071,6 +1084,22 @@ impl V2TorrentTask {
             .ok_or_else(|| format!("pure-v2 file policy allocation of {bytes} bytes denied"))
     }
 
+    fn reserve_v2_file_policy_workspace_memory(&self) -> Result<Option<MemoryLease>, String> {
+        let bytes = v2_file_graph_memory_bytes(&self.metainfo_files, self.metainfo_files.len());
+        if bytes == 0 {
+            return Ok(None);
+        }
+        let bytes = u64::try_from(bytes).map_err(|_| {
+            "pure-v2 file-policy workspace memory estimate overflows u64".to_owned()
+        })?;
+        self.resources
+            .try_acquire(MemoryClass::Metadata, bytes)
+            .map(Some)
+            .ok_or_else(|| {
+                format!("pure-v2 file-policy workspace allocation of {bytes} bytes denied")
+            })
+    }
+
     async fn apply_file_policy_from_db(&mut self) -> Result<(), String> {
         let info_hash = self.info_hash_hex.clone();
         let rows = self
@@ -1080,6 +1109,10 @@ impl V2TorrentTask {
                     .map_err(|error| format!("loading pure-v2 file policy: {error}"))
             })
             .await?;
+        // Admit the temporary graph before cloning it and constructing the
+        // replacement V2PieceMap. The retained-policy lease below covers the
+        // post-swap lifetime; this lease covers the reload workspace peak.
+        let _file_policy_workspace_memory_lease = self.reserve_v2_file_policy_workspace_memory()?;
         let mut effective_files = self.metainfo_files.clone();
         let mut policy = HashMap::with_capacity(rows.len());
         for row in rows {
@@ -1173,6 +1206,7 @@ impl V2TorrentTask {
             self.shutdown_peers().await;
             {
                 let mut have = self.local_have.write().await;
+                let have = Arc::make_mut(&mut *have);
                 for (first, last) in changed_piece_ranges {
                     for piece in first..last {
                         have.set(piece as usize, false);
@@ -1337,7 +1371,7 @@ impl V2TorrentTask {
                 .expect("v2 info hash truncation is 20 bytes"),
             uploaded,
             downloaded,
-            left: self.bytes_left(&have),
+            left: self.bytes_left(have.as_ref()),
             listen_port: self.listen_port,
             http_timeout: self.http_timeout,
             udp_timeout: self.udp_timeout,
@@ -1572,7 +1606,7 @@ impl V2TorrentTask {
                 .unwrap_or((0, 0))
         };
         let have = self.local_have.read().await.clone();
-        let left = v2_db_i64(self.bytes_left(&have));
+        let left = v2_db_i64(self.bytes_left(have.as_ref()));
         let now = Instant::now();
         let mut rows = Vec::new();
         let mut tracker_index = 0i64;
@@ -1660,7 +1694,7 @@ impl V2TorrentTask {
         // clean peer set so no connection can use stale availability.
         self.shutdown_peers().await;
         let new_have = self.recheck_files().await;
-        *self.local_have.write().await = new_have;
+        *self.local_have.write().await = Arc::new(new_have);
         self.notify_local_have_changed();
         let target = if self.paused {
             TorrentState::Paused
@@ -1739,7 +1773,7 @@ impl V2TorrentTask {
 
     async fn is_complete(&self) -> bool {
         let have = self.local_have.read().await;
-        self.bytes_left(&have) == 0
+        self.bytes_left(have.as_ref()) == 0
     }
 
     fn bytes_left(&self, have: &V2Bitmap) -> u64 {
@@ -1756,7 +1790,7 @@ impl V2TorrentTask {
         transfer: Option<(bool, u64)>,
     ) -> Result<(), String> {
         let have = self.local_have.read().await.clone();
-        let amount_left = self.bytes_left(&have);
+        let amount_left = self.bytes_left(have.as_ref());
         let (previous, row) = {
             let mut registry = self.registry.write().await;
             let mut entry = registry.get_mut(&self.info_hash_hex).ok_or_else(|| {
@@ -1901,7 +1935,10 @@ impl V2TorrentTask {
             let Ok(peer_permit) = self.network_budget.try_acquire_peer() else {
                 break;
             };
-            let bitmap_bytes = V2Bitmap::memory_bytes_for_len(self.piece_map.piece_count as usize);
+            // V2PeerState retains remote_have and the protocol loop retains
+            // announced_have, so charge both packed maps before spawning it.
+            let bitmap_bytes = V2Bitmap::memory_bytes_for_len(self.piece_map.piece_count as usize)
+                .saturating_mul(2);
             let Some(bitmap_memory_lease) = self
                 .resources
                 .try_acquire(MemoryClass::PeerBuffer, bitmap_bytes)
@@ -2033,7 +2070,10 @@ impl V2TorrentTask {
             drop(peer_permit);
             return;
         }
-        let bitmap_bytes = V2Bitmap::memory_bytes_for_len(self.piece_map.piece_count as usize);
+        // V2PeerState retains remote_have and the protocol loop retains
+        // announced_have, so charge both packed maps before spawning it.
+        let bitmap_bytes =
+            V2Bitmap::memory_bytes_for_len(self.piece_map.piece_count as usize).saturating_mul(2);
         let Some(bitmap_memory_lease) = self
             .resources
             .try_acquire(MemoryClass::PeerBuffer, bitmap_bytes)
@@ -2095,7 +2135,10 @@ impl V2TorrentTask {
             drop(peer_permit);
             return;
         }
-        let bitmap_bytes = V2Bitmap::memory_bytes_for_len(self.piece_map.piece_count as usize);
+        // V2PeerState retains remote_have and the protocol loop retains
+        // announced_have, so charge both packed maps before spawning it.
+        let bitmap_bytes =
+            V2Bitmap::memory_bytes_for_len(self.piece_map.piece_count as usize).saturating_mul(2);
         let Some(bitmap_memory_lease) = self
             .resources
             .try_acquire(MemoryClass::PeerBuffer, bitmap_bytes)
@@ -2579,9 +2622,21 @@ async fn run_v2_peer_protocol(
             .await?;
     }
     let mut have_updates = context.have_updates.subscribe();
-    let initial_have = context.local_have.read().await.clone();
-    send_v2_have_bitmap(&mut framed, &initial_have, remote_supports_fast).await?;
-    let mut announced_have = initial_have;
+    // Keep the initial snapshot alive only until the first announcement has
+    // been materialized. Retaining it for the whole peer lifetime would make
+    // every later local-have replacement preserve an obsolete bitmap through
+    // this peer's Arc reference.
+    let mut announced_have = {
+        let initial_have = context.local_have.read().await.clone();
+        send_v2_have_bitmap(
+            &mut framed,
+            &initial_have,
+            &context.resources,
+            remote_supports_fast,
+        )
+        .await?;
+        (*initial_have).clone()
+    };
 
     let mut outstanding = HashMap::<(u32, u32), u32>::new();
     let mut assemblies = HashMap::<u32, V2PieceAssembly>::new();
@@ -2622,13 +2677,10 @@ async fn run_v2_peer_protocol(
                 last_activity = Instant::now();
                 match message {
                     Message::Bitfield(bits) => {
-                        let remote_have = V2Bitmap::from_bitfield(
-                            &bits,
-                            context.piece_map.piece_count as usize,
-                        )
-                        .map_err(anyhow::Error::msg)?;
                         if let Ok(mut peer) = state.lock() {
-                            peer.remote_have = remote_have;
+                            Arc::make_mut(&mut peer.remote_have)
+                                .copy_from_bitfield(&bits)
+                                .map_err(anyhow::Error::msg)?;
                         }
                         remote_availability_known = true;
                         update_v2_interest(
@@ -2645,7 +2697,7 @@ async fn run_v2_peer_protocol(
                             continue;
                         }
                         if let Ok(mut peer) = state.lock() {
-                            peer.remote_have.set(piece as usize, true);
+                            Arc::make_mut(&mut peer.remote_have).set(piece as usize, true);
                         }
                         remote_availability_known = true;
                         update_v2_interest(
@@ -2659,7 +2711,7 @@ async fn run_v2_peer_protocol(
                     }
                     Message::HaveAll => {
                         if let Ok(mut peer) = state.lock() {
-                            peer.remote_have = V2Bitmap::all_true(context.piece_map.piece_count as usize);
+                            Arc::make_mut(&mut peer.remote_have).fill(true);
                         }
                         remote_availability_known = true;
                         update_v2_interest(
@@ -2673,7 +2725,7 @@ async fn run_v2_peer_protocol(
                     }
                     Message::HaveNone => {
                         if let Ok(mut peer) = state.lock() {
-                            peer.remote_have = V2Bitmap::new(context.piece_map.piece_count as usize);
+                            Arc::make_mut(&mut peer.remote_have).fill(false);
                         }
                         remote_availability_known = true;
                         update_v2_interest(
@@ -2784,6 +2836,7 @@ async fn run_v2_peer_protocol(
 async fn send_v2_have_bitmap(
     framed: &mut PeerIo,
     have: &V2Bitmap,
+    resources: &ResourceGovernor,
     remote_supports_fast: bool,
 ) -> anyhow::Result<()> {
     let count = have.count_ones();
@@ -2792,6 +2845,17 @@ async fn send_v2_have_bitmap(
     } else if remote_supports_fast && count == 0 {
         framed.send(Message::HaveNone).await?;
     } else if count > 0 {
+        let bitfield_bytes = u64::try_from(have.len().div_ceil(8))
+            .map_err(|_| anyhow::anyhow!("v2 peer bitfield length does not fit in u64"))?;
+        // The bitfield is materialized as a Vec, then copied into the framed
+        // writer. Reserve the wire peak before creating that peer-controlled
+        // allocation; the steady-state bitmap lease does not cover it.
+        let _wire_memory_lease = resources
+            .try_acquire(
+                MemoryClass::PeerBuffer,
+                bitfield_bytes.saturating_mul(3).saturating_add(5),
+            )
+            .ok_or_else(|| anyhow::anyhow!("v2 peer bitfield allocation denied"))?;
         framed.send(Message::Bitfield(have.to_bitfield())).await?;
     }
     Ok(())
@@ -2813,8 +2877,8 @@ async fn update_v2_interest(
         .any(|piece| context.piece_is_wanted(piece) && !local_have.get(piece as usize));
     let remote_have = state
         .lock()
-        .map(|peer| peer.remote_have.clone())
-        .unwrap_or_else(|_| V2Bitmap::new(context.piece_map.piece_count as usize));
+        .map(|peer| Arc::clone(&peer.remote_have))
+        .map_err(|_| anyhow::anyhow!("v2 peer state lock poisoned"))?;
     let should_be_interested = has_missing_wanted
         && (!remote_availability_known
             || (0..context.piece_map.piece_count).any(|piece| {
@@ -2849,8 +2913,8 @@ async fn fill_v2_requests(
     }
     let remote_have = state
         .lock()
-        .map(|peer| peer.remote_have.clone())
-        .unwrap_or_else(|_| V2Bitmap::new(context.piece_map.piece_count as usize));
+        .map(|peer| Arc::clone(&peer.remote_have))
+        .map_err(|_| anyhow::anyhow!("v2 peer state lock poisoned"))?;
     let local_have = context.local_have.read().await.clone();
     while outstanding.len() < V2_REQUEST_WINDOW {
         let mut selected = None;
@@ -3042,12 +3106,14 @@ async fn handle_v2_piece(
             .await?;
         }
     }
-    let mut local_have = context.local_have.write().await;
-    if local_have.get(piece as usize) {
-        return Ok(());
+    {
+        let mut local_have = context.local_have.write().await;
+        let local_have = Arc::make_mut(&mut *local_have);
+        if local_have.get(piece as usize) {
+            return Ok(());
+        }
+        local_have.set(piece as usize, true);
     }
-    local_have.set(piece as usize, true);
-    drop(local_have);
     let _ = context.have_updates.send(());
     let _ = context
         .events
@@ -3103,6 +3169,17 @@ async fn serve_v2_request(
         // BEP 47 permits an implementation to omit padding files locally,
         // but it still has to answer a legacy peer that requests their
         // synthetic zero bytes.
+        let Some(_upload_memory_lease) = reserve_v2_upload_bytes(&context.resources, region.length)
+        else {
+            framed
+                .send(Message::Reject {
+                    piece,
+                    begin,
+                    length,
+                })
+                .await?;
+            return Ok(());
+        };
         let data = Bytes::from(vec![0u8; region.length as usize]);
         context
             .network_budget
@@ -3122,6 +3199,17 @@ async fn serve_v2_request(
             .await?;
         return Ok(());
     }
+    let Some(_upload_memory_lease) = reserve_v2_upload_bytes(&context.resources, region.length)
+    else {
+        framed
+            .send(Message::Reject {
+                piece,
+                begin,
+                length,
+            })
+            .await?;
+        return Ok(());
+    };
     let path = region.path.resolve(&context.save_root);
     let data = match scheduled_read_owned(
         &context.storage,
@@ -3178,6 +3266,10 @@ async fn serve_v2_request(
         })
         .await;
     Ok(())
+}
+
+fn reserve_v2_upload_bytes(resources: &ResourceGovernor, bytes: u32) -> Option<MemoryLease> {
+    resources.try_acquire(MemoryClass::PeerBuffer, u64::from(bytes))
 }
 
 async fn serve_v2_hash_request(
@@ -3496,10 +3588,16 @@ mod tests {
         bitmap.set(0, true);
         bitmap.set(9, true);
         let encoded = bitmap.to_bitfield();
-        assert_eq!(
-            V2Bitmap::from_bitfield(&encoded, 10).unwrap().count_ones(),
-            2
-        );
+        let mut decoded = V2Bitmap::new(10);
+        decoded.copy_from_bitfield(&encoded).unwrap();
+        assert_eq!(decoded.count_ones(), 2);
+    }
+
+    #[test]
+    fn v2_piece_index_accounting_covers_overlapping_bitmap_replacement() {
+        let one_bitmap = v2_bitmap_memory_bytes(65);
+        assert_eq!(V2Bitmap::memory_bytes_for_len(65), one_bitmap as u64);
+        assert_eq!(v2_piece_index_memory_bytes(65), one_bitmap * 2);
     }
 
     #[test]
@@ -3633,6 +3731,24 @@ mod tests {
         .unwrap();
         let assembly = V2PieceAssembly::new(0, region_len, 0, &resources).unwrap();
         assert_eq!(assembly.received.len(), block_count);
+    }
+
+    #[test]
+    fn v2_upload_payload_reservation_is_bounded() {
+        let mut class_caps = [0; rt_metrics::MEMORY_CLASS_COUNT];
+        class_caps[MemoryClass::PeerBuffer as usize] = 16;
+        let resources = ResourceGovernor::new(rt_metrics::ResourceGovernorConfig {
+            total_cap_bytes: 16,
+            class_caps_bytes: class_caps,
+            pressure_constrained_pct: 75,
+            pressure_critical_pct: 90,
+        });
+
+        let lease = reserve_v2_upload_bytes(&resources, 16).expect("payload fits");
+        assert_eq!(lease.bytes(), 16);
+        assert!(reserve_v2_upload_bytes(&resources, 1).is_none());
+        drop(lease);
+        assert_eq!(resources.snapshot().total_used_bytes, 0);
     }
 
     #[test]

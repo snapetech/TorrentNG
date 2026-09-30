@@ -21,7 +21,7 @@ use std::ffi::OsString;
 use std::os::fd::{AsRawFd, FromRawFd};
 #[cfg(unix)]
 use std::os::unix::ffi::OsStrExt;
-#[cfg(windows)]
+#[cfg(all(windows, test))]
 use std::os::windows::ffi::OsStrExt;
 #[cfg(windows)]
 use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
@@ -31,11 +31,12 @@ use std::os::windows::io::AsRawHandle;
 use std::path::{Component, PathBuf};
 #[cfg(windows)]
 use windows_sys::Win32::Foundation::HANDLE;
+#[cfg(all(windows, test))]
+use windows_sys::Win32::Storage::FileSystem::MoveFileW;
 #[cfg(windows)]
 use windows_sys::Win32::Storage::FileSystem::{
-    GetFileInformationByHandle, MoveFileW, BY_HANDLE_FILE_INFORMATION,
-    FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
-    FILE_SHARE_READ, FILE_SHARE_WRITE,
+    GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION, FILE_ATTRIBUTE_REPARSE_POINT,
+    FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_READ, FILE_SHARE_WRITE,
 };
 
 pub(crate) fn open_path_no_follow(path: &Path, write: bool, create: bool) -> io::Result<File> {
@@ -63,7 +64,7 @@ pub(crate) fn open_path_no_follow(path: &Path, write: bool, create: bool) -> io:
 /// Create a new runtime file without following the final component or an
 /// ancestor reparse point/symlink. Existing destinations are never opened or
 /// truncated.
-#[cfg(any(not(unix), test))]
+#[cfg(any(all(not(unix), not(windows)), test))]
 pub(crate) fn create_new_file_no_follow(path: &Path) -> io::Result<File> {
     #[cfg(unix)]
     {
@@ -388,12 +389,11 @@ pub fn rename_no_follow(source: &Path, destination: &Path) -> io::Result<()> {
 
 /// Rename a file without replacing an existing destination.
 ///
-/// The Windows storage-plan executor uses this after checking that the
-/// destination is absent. `MoveFileW` makes that condition atomic with the
-/// rename: if another process creates the destination after the check, the
-/// move fails and leaves both files intact. The held parent handles also
-/// prevent an ancestor directory from being replaced during path resolution.
-#[cfg(windows)]
+/// `MoveFileW` makes the no-replace condition atomic: if another process
+/// creates the destination after the check, the move fails and leaves both
+/// files intact. Held parent handles also prevent ancestor replacement while
+/// the paths are resolved. Storage plans use their root-relative executor.
+#[cfg(all(windows, test))]
 pub(crate) fn rename_no_replace(source: &Path, destination: &Path) -> io::Result<()> {
     let _source_parents = open_windows_parent_dirs(source)?;
     let _destination_parents = open_windows_parent_dirs(destination)?;
@@ -407,7 +407,7 @@ pub(crate) fn rename_no_replace(source: &Path, destination: &Path) -> io::Result
     }
 }
 
-#[cfg(windows)]
+#[cfg(all(windows, test))]
 fn windows_move_path(path: &Path) -> io::Result<Vec<u16>> {
     let file_name = path.file_name().ok_or_else(|| {
         io::Error::new(
@@ -544,11 +544,13 @@ fn open_windows_directory_chain(path: &Path) -> io::Result<Vec<File>> {
     Ok(opened)
 }
 
+#[cfg(any(all(not(unix), not(windows)), test))]
 pub(crate) struct ParentDirsGuard {
     #[cfg(windows)]
     _handles: Vec<File>,
 }
 
+#[cfg(any(all(not(unix), not(windows)), test))]
 pub(crate) fn hold_parent_dirs_no_follow(path: &Path) -> io::Result<ParentDirsGuard> {
     #[cfg(windows)]
     {
@@ -563,11 +565,13 @@ pub(crate) fn hold_parent_dirs_no_follow(path: &Path) -> io::Result<ParentDirsGu
     }
 }
 
+#[cfg(any(all(not(unix), not(windows)), test))]
 pub(crate) struct DirectoryGuard {
     #[cfg(windows)]
     _handle: File,
 }
 
+#[cfg(any(all(not(unix), not(windows)), test))]
 pub(crate) fn hold_directory_no_follow(path: &Path) -> io::Result<DirectoryGuard> {
     #[cfg(windows)]
     {
@@ -608,6 +612,29 @@ fn open_windows_directory(path: &Path) -> io::Result<File> {
         ));
     }
     Ok(directory)
+}
+
+/// Open a Windows directory as a capability root after walking every path
+/// component without following reparse points. The returned handle omits
+/// `FILE_SHARE_DELETE`, so the directory cannot be renamed out from under
+/// handle-relative storage-plan operations.
+#[cfg(windows)]
+pub(crate) fn open_windows_directory_capability(path: &Path) -> io::Result<cap_std::fs::Dir> {
+    let mut handles = open_windows_directory_chain(path)?;
+    let directory = handles.pop().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "runtime storage directory has no rooted components",
+        )
+    })?;
+    Ok(cap_std::fs::Dir::from_std_file(directory))
+}
+
+#[cfg(windows)]
+pub(crate) fn reopen_windows_directory(
+    directory: &cap_std::fs::Dir,
+) -> io::Result<cap_std::fs::Dir> {
+    cap_std::fs::Dir::reopen_dir(directory)
 }
 
 #[cfg(windows)]

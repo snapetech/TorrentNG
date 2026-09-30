@@ -55,6 +55,65 @@ jobs:
           fi
           echo "tag=$tag" >> "$GITHUB_OUTPUT"
 
+  release-notes:
+    name: Assemble release notes
+    needs: validate-release-tag
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      release_body: ${{ steps.release-body.outputs.release_body }}
+    env:
+      RELEASE_TAG: ${{ needs.validate-release-tag.outputs.tag }}
+    steps:
+      - name: Checkout release tag
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          ref: ${{ needs.validate-release-tag.outputs.tag }}
+          persist-credentials: false
+
+      - name: Find previous published release
+        id: previous
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          previous_tag="$(gh release list \
+            --repo "$GITHUB_REPOSITORY" \
+            --limit 1000 \
+            --json tagName,isDraft \
+            --jq '.[] | select(.isDraft == false) | .tagName' \
+            | awk -v current="$RELEASE_TAG" '$0 != current { print; exit }')"
+          echo "tag=$previous_tag" >> "$GITHUB_OUTPUT"
+
+      - name: Assemble curated release notes
+        env:
+          PREVIOUS_TAG: ${{ steps.previous.outputs.tag }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          args=(--head "$RELEASE_TAG" --output release-notes.md)
+          if [[ -n "$PREVIOUS_TAG" ]]; then
+            args+=(--base "$PREVIOUS_TAG")
+          fi
+          python3 scripts/release_notes.py assemble "${args[@]}"
+          test -s release-notes.md
+          cat release-notes.md
+
+      - name: Export release body
+        id: release-body
+        shell: bash
+        run: |
+          set -euo pipefail
+          delimiter="release_body_${GITHUB_RUN_ID}"
+          {
+            echo "release_body<<${delimiter}"
+            cat release-notes.md
+            echo "$delimiter"
+          } >> "$GITHUB_OUTPUT"
+
   native-quality:
     name: TorrentNG client and compatible-client service quality gate
     needs: validate-release-tag
@@ -112,7 +171,7 @@ jobs:
         run: cargo build --workspace --all-targets --locked
 
       - name: Test TorrentNG client workspace at declared MSRV
-        run: cargo test --workspace --all-targets --locked
+        run: cargo test --workspace --all-targets --locked -- --test-threads=1
 
   msrv-check-sidecar:
     name: Compatible-client service MSRV gate
@@ -306,7 +365,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v7
         with:
-          fetch-depth: 0
+          fetch-depth: 1
           ref: ${{ needs.validate-release-tag.outputs.tag }}
           persist-credentials: false
 
@@ -337,6 +396,74 @@ jobs:
           docker build --network host -f deploy/native/Dockerfile -t "torrentng-native:${RELEASE_TAG}" .
           docker build --network host -f deploy/docker/Dockerfile -t "torrentng:${RELEASE_TAG}" .
           docker build --network host -f deploy/docker/Dockerfile.phase1 -t "torrentng-phase1:${RELEASE_TAG}" .
+
+      - name: Smoke compatible-client image with root-owned persistent files
+        env:
+          RELEASE_TAG: ${{ needs.validate-release-tag.outputs.tag }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          suffix="${GITHUB_RUN_ID}"
+          containers=()
+          volumes=()
+          cleanup() {
+            docker rm -f "${containers[@]}" >/dev/null 2>&1 || true
+            docker volume rm "${volumes[@]}" >/dev/null 2>&1 || true
+          }
+          trap cleanup EXIT
+
+          run_smoke() {
+            local name="torrentng-identity-smoke-${suffix}-$1"
+            local data_dir="$2"
+            local log_volume="${name}-log"
+            local default_volume="${name}-default-data"
+            local override_volume="${name}-override-data"
+            containers+=("$name")
+            volumes+=("$log_volume" "$default_volume" "$override_volume")
+            docker volume create "$log_volume" >/dev/null
+            docker volume create "$default_volume" >/dev/null
+            docker volume create "$override_volume" >/dev/null
+            docker run --rm --entrypoint /bin/sh \
+              -v "$log_volume:/var/log/rtorrent" \
+              -v "$default_volume:/var/lib/torrentng" \
+              -v "$override_volume:/var/lib/rtorrentng" alpine:3.20 \
+              -c 'touch /var/log/rtorrent/rtorrent.log /var/lib/torrentng/cache.db /var/lib/rtorrentng/cache.db && chmod 0664 /var/log/rtorrent/rtorrent.log /var/lib/torrentng/cache.db /var/lib/rtorrentng/cache.db'
+            docker run -d --name "$name" --network none --read-only \
+              --tmpfs /tmp:rw,nosuid,nodev,size=1g \
+              --tmpfs /run:rw,nosuid,nodev,size=128m \
+              -v "$log_volume:/var/log/rtorrent" \
+              -v "$default_volume:/var/lib/torrentng" \
+              -v "$override_volume:/var/lib/rtorrentng" \
+              -e "TNG_DATA_DIR=$data_dir" \
+              -e RTORRENT_STARTUP_GRACE_SECS=0 \
+              -e TNG_SECRET_KEY=release-smoke-only-session-secret \
+              -e TNG_API_TOKENS=release-smoke-only-token \
+              "torrentng:${RELEASE_TAG}" >/dev/null
+
+            local healthy=0
+            for _ in $(seq 1 60); do
+              if docker exec "$name" wget -qO- http://127.0.0.1:8080/health >/dev/null 2>&1; then
+                healthy=1
+                break
+              fi
+              sleep 1
+            done
+            if [[ "$healthy" != 1 ]]; then
+              docker logs "$name"
+              return 1
+            fi
+            docker exec "$name" test -S /run/rtorrent/rpc.sock
+            docker exec --user 1000:1000 "$name" sh -c 'test -w /var/log/rtorrent/rtorrent.log && test -w /var/lib/torrentng && test -w /var/lib/torrentng/cache.db && test -w /var/lib/rtorrentng && test -w /var/lib/rtorrentng/cache.db'
+            [[ "$(docker exec "$name" stat -c '%u:%g' /var/log/rtorrent/rtorrent.log)" == "1000:1000" ]]
+            [[ "$(docker exec "$name" stat -c '%u:%g' /var/lib/torrentng)" == "1000:1000" ]]
+            [[ "$(docker exec "$name" stat -c '%u:%g' /var/lib/torrentng/cache.db)" == "1000:1000" ]]
+            [[ "$(docker exec "$name" stat -c '%u:%g' /var/lib/rtorrentng)" == "1000:1000" ]]
+            [[ "$(docker exec "$name" stat -c '%u:%g' /var/lib/rtorrentng/cache.db)" == "1000:1000" ]]
+            docker rm -f "$name" >/dev/null
+          }
+
+          run_smoke override /var/lib/rtorrentng
+          run_smoke default /var/lib/torrentng
 
       - name: Publish Docker images
         env:
@@ -394,6 +521,7 @@ jobs:
     runs-on: [self-hosted, Linux, X64]
     needs:
       - validate-release-tag
+      - release-notes
       - native-binaries
       - linux-release-assets
     env:
@@ -418,17 +546,21 @@ jobs:
       - name: Create GitHub release
         env:
           GH_TOKEN: ${{ github.token }}
+          RELEASE_BODY: ${{ needs.release-notes.outputs.release_body }}
         shell: bash
         run: |
           set -euo pipefail
           tag="$RELEASE_TAG"
-          if gh release view "$tag" >/dev/null 2>&1; then
-            gh release upload "$tag" dist/* --clobber
+          if gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release edit "$tag" --repo "$GITHUB_REPOSITORY" \
+              --title "TorrentNG $tag" \
+              --notes "$RELEASE_BODY"
+            gh release upload "$tag" dist/* --clobber --repo "$GITHUB_REPOSITORY"
           else
             gh release create "$tag" dist/* \
+              --repo "$GITHUB_REPOSITORY" \
               --title "TorrentNG $tag" \
-              --notes "The universal torrent client interface: one WebUI/API for the TorrentNG Engine and qBittorrent, rTorrent, Transmission, and Deluge." \
-              --generate-notes \
+              --notes "$RELEASE_BODY" \
               --verify-tag
           fi
 
@@ -463,20 +595,25 @@ jobs:
         env:
           DISCORD_RELEASE_WEBHOOK: ${{ secrets.DISCORD_RELEASE_WEBHOOK }}
           RELEASE_TAG: ${{ needs.validate-release-tag.outputs.tag }}
+          RELEASE_BODY: ${{ needs.release-notes.outputs.release_body }}
         shell: bash
         run: |
           set -euo pipefail
           release_url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/releases/tag/$RELEASE_TAG"
+          body="$RELEASE_BODY"
+          if (( ${#body} > 3800 )); then
+            body="${body:0:3797}…"
+          fi
           jq -n \
             --arg tag "$RELEASE_TAG" \
             --arg url "$release_url" \
-            --arg repo "$GITHUB_REPOSITORY" \
+            --arg description "$body" \
             '{
               username: "TorrentNG releases",
               embeds: [{
                 title: ("TorrentNG " + $tag + " released"),
                 url: $url,
-                description: ("The universal torrent client interface: a new TorrentNG release is available for " + $repo + "."),
+                description: $description,
                 color: 3447003,
                 fields: [
                   {name: "Tag", value: $tag, inline: true},

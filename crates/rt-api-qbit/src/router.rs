@@ -12,14 +12,16 @@ use axum::{
 
 use crate::{handlers::*, state::AppState};
 use rt_api_model::{
-    api_token_allowed, bearer_token, csrf_request_allowed, has_session_cookie, request_fingerprint,
-    valid_idempotency_key, CachedResponse, IdempotencyClaim, MAX_IDEMPOTENCY_BODY_BYTES,
+    api_token_allowed, bearer_token, csrf_request_allowed, has_browser_request_headers,
+    has_session_cookie, request_fingerprint, valid_idempotency_key, CachedResponse,
+    IdempotencyClaim, MAX_IDEMPOTENCY_BODY_BYTES,
 };
 use tower::limit::GlobalConcurrencyLimitLayer;
 
 const MAX_QBIT_LARGE_BODY_REQUESTS: usize = 4;
 const MAX_QBIT_DEFAULT_BODY_BYTES: usize = 8 * 1024 * 1024;
 const MAX_QBIT_TORRENT_BODY_BYTES: usize = 64 * 1024 * 1024;
+const MAX_QBIT_AUTH_BODY_BYTES: usize = 16 * 1024;
 
 pub fn build_qbit_router(state: AppState) -> Router {
     let large_body_limit = GlobalConcurrencyLimitLayer::new(MAX_QBIT_LARGE_BODY_REQUESTS);
@@ -172,12 +174,36 @@ async fn qbit_auth_guard(
     req: Request<Body>,
     next: Next,
 ) -> Response {
-    if qbit_public_path(req.uri().path()) || state.api_tokens.is_empty() {
+    if bearer_token(req.headers()).is_some_and(|token| api_token_allowed(&state.api_tokens, &token))
+    {
         return next.run(req).await;
     }
 
-    if bearer_token(req.headers()).is_some_and(|token| api_token_allowed(&state.api_tokens, &token))
-    {
+    if qbit_public_path(req.uri().path()) {
+        if is_mutating_request(&req)
+            && has_browser_request_headers(req.headers())
+            && !csrf_request_allowed(req.headers())
+        {
+            return (
+                StatusCode::FORBIDDEN,
+                "cross-origin browser authentication request rejected",
+            )
+                .into_response();
+        }
+        return next.run(req).await;
+    }
+
+    if state.api_tokens.is_empty() {
+        if is_mutating_request(&req)
+            && has_browser_request_headers(req.headers())
+            && !csrf_request_allowed(req.headers())
+        {
+            return (
+                StatusCode::FORBIDDEN,
+                "cross-origin browser request rejected",
+            )
+                .into_response();
+        }
         return next.run(req).await;
     }
     if qbit_presented_token(req.headers())
@@ -273,7 +299,10 @@ fn hex_value(byte: u8) -> Option<u8> {
 
 fn qbit_routes(large_body_limit: GlobalConcurrencyLimitLayer) -> Router<AppState> {
     Router::new()
-        .route("/auth/login", post(auth_login))
+        .route(
+            "/auth/login",
+            post(auth_login).layer(DefaultBodyLimit::max(MAX_QBIT_AUTH_BODY_BYTES)),
+        )
         .route("/auth/logout", post(auth_logout))
         .route("/app/version", get(app_version))
         .route("/app/webapiVersion", get(app_webapi_version))
@@ -415,7 +444,11 @@ fn qbit_routes(large_body_limit: GlobalConcurrencyLimitLayer) -> Router<AppState
 
 #[cfg(test)]
 mod tests {
-    use super::qbit_public_path;
+    use super::{build_qbit_router, qbit_public_path};
+    use crate::state::AppState;
+    use axum::{body::Body, http::Request};
+    use std::sync::Arc;
+    use tower::ServiceExt;
 
     #[test]
     fn qbit_public_auth_paths_are_exact() {
@@ -436,5 +469,26 @@ mod tests {
         ] {
             assert!(!qbit_public_path(path), "{path} should remain protected");
         }
+    }
+
+    #[tokio::test]
+    async fn qbit_browser_login_rejects_cross_origin_cookie_seeding() {
+        let mut state = AppState::new();
+        state.api_tokens = Arc::new(vec!["secret".to_owned()]);
+        let app = build_qbit_router(state);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/qb/v2/auth/login")
+                    .header("host", "torrentng.example")
+                    .header("origin", "https://attacker.example")
+                    .header("content-type", "application/x-www-form-urlencoded")
+                    .body(Body::from("username=operator&password=secret"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), axum::http::StatusCode::FORBIDDEN);
     }
 }

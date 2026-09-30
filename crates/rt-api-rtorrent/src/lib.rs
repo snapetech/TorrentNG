@@ -20,6 +20,19 @@ use tokio::{sync::RwLock, task::JoinSet};
 // force an unbounded response and serial per-torrent actor queries.
 const MAX_LEGACY_FULL_LIST_ENTRIES: usize = 10_000;
 const RTORRENT_RUNTIME_PROJECTION_CONCURRENCY: usize = 64;
+// The library entry point is intentionally usable without an HTTP server, so
+// it needs its own framing limits rather than relying on an outer body limit.
+const MAX_XMLRPC_REQUEST_BYTES: usize = 32 * 1024 * 1024;
+const MAX_XMLRPC_PARAMS: usize = 1_024;
+const MAX_XMLRPC_COLLECTION_ITEMS: usize = 16_384;
+const MAX_XMLRPC_VALUE_DEPTH: usize = 64;
+const MAX_RT_MULTICALL_COMMANDS: usize = 256;
+const MAX_RT_MULTICALL_COMMAND_BYTES: usize = 256;
+const MAX_RT_VIEW_NAME_BYTES: usize = 256;
+const MAX_RT_CUSTOM_KEY_BYTES: usize = 256;
+const MAX_RT_CUSTOM_VALUE_BYTES: usize = 64 * 1024;
+const MAX_RT_CUSTOM_FIELDS_PER_TORRENT: usize = 256;
+const MAX_RT_CUSTOM_VIEWS: usize = 256;
 
 #[derive(Clone)]
 pub struct AppState {
@@ -113,6 +126,21 @@ impl RtValue {
             RtValue::String(value) => Some(value),
             _ => None,
         }
+    }
+}
+
+fn rt_value_size_bytes(value: &RtValue) -> usize {
+    match value {
+        RtValue::Int(_) | RtValue::Bool(_) | RtValue::Nil => 8,
+        RtValue::String(value) => value.len(),
+        RtValue::Array(values) => values.iter().fold(0usize, |total, value| {
+            total.saturating_add(rt_value_size_bytes(value))
+        }),
+        RtValue::Struct(values) => values.iter().fold(0usize, |total, (key, value)| {
+            total
+                .saturating_add(key.len())
+                .saturating_add(rt_value_size_bytes(value))
+        }),
     }
 }
 
@@ -227,6 +255,9 @@ pub async fn execute_xml_with_token(
     {
         return fault_response(401, "unauthorized");
     }
+    if request.len() > MAX_XMLRPC_REQUEST_BYTES {
+        return fault_response(413, "XMLRPC request exceeds the configured size limit");
+    }
     match parse_method_call(request) {
         Ok((method, params)) => match execute(state, &method, &params).await {
             Ok(value) => method_response(&value),
@@ -257,16 +288,27 @@ async fn d_read_or_write(
             .get(2)
             .cloned()
             .ok_or_else(|| "d.custom.set requires a value".to_owned())?;
+        if key.len() > MAX_RT_CUSTOM_KEY_BYTES {
+            return Err(format!(
+                "d.custom.set field name exceeds {MAX_RT_CUSTOM_KEY_BYTES} bytes"
+            ));
+        }
+        if rt_value_size_bytes(&value) > MAX_RT_CUSTOM_VALUE_BYTES {
+            return Err(format!(
+                "d.custom.set value exceeds {MAX_RT_CUSTOM_VALUE_BYTES} bytes"
+            ));
+        }
         if state.registry.read().await.get(hash).is_none() {
             return Err(format!("torrent not found: {hash}"));
         }
-        state
-            .custom
-            .write()
-            .await
-            .entry(hash_key.clone())
-            .or_default()
-            .insert(key.to_owned(), value);
+        let mut custom = state.custom.write().await;
+        let fields = custom.entry(hash_key.clone()).or_default();
+        if !fields.contains_key(key) && fields.len() >= MAX_RT_CUSTOM_FIELDS_PER_TORRENT {
+            return Err(format!(
+                "d.custom.set exceeds {MAX_RT_CUSTOM_FIELDS_PER_TORRENT} fields per torrent"
+            ));
+        }
+        fields.insert(key.to_owned(), value);
         return Ok(RtValue::Int(0));
     }
     if method == "d.down.max_rate.set" || method == "d.up.max_rate.set" {
@@ -704,7 +746,17 @@ async fn rtorrent_view_add(state: &AppState, params: &[RtValue]) -> Result<RtVal
     if view.is_empty() {
         return Err("view name required".to_owned());
     }
-    state.views.write().await.insert(view.to_owned());
+    if view.len() > MAX_RT_VIEW_NAME_BYTES {
+        return Err(format!("view name exceeds {MAX_RT_VIEW_NAME_BYTES} bytes"));
+    }
+    let mut views = state.views.write().await;
+    if !views.contains(view) && views.len() >= rtorrent_builtin_views().len() + MAX_RT_CUSTOM_VIEWS
+    {
+        return Err(format!(
+            "view count exceeds {MAX_RT_CUSTOM_VIEWS} custom views"
+        ));
+    }
+    views.insert(view.to_owned());
     Ok(RtValue::Int(0))
 }
 
@@ -737,6 +789,11 @@ fn d_multicall_commands(params: &[RtValue]) -> Result<Vec<String>, String> {
     if params.len() < 2 {
         return Err("d.multicall requires a view and at least one command".to_owned());
     }
+    if params.len() - 1 > MAX_RT_MULTICALL_COMMANDS {
+        return Err(format!(
+            "d.multicall exceeds {MAX_RT_MULTICALL_COMMANDS} commands"
+        ));
+    }
     let mut commands = Vec::with_capacity(params.len() - 1);
     for (index, value) in params.iter().enumerate().skip(1) {
         let command = value
@@ -748,6 +805,11 @@ fn d_multicall_commands(params: &[RtValue]) -> Result<Vec<String>, String> {
             .trim();
         if command.is_empty() || command.contains('=') {
             return Err(format!("d.multicall command {index} is invalid"));
+        }
+        if command.len() > MAX_RT_MULTICALL_COMMAND_BYTES {
+            return Err(format!(
+                "d.multicall command {index} exceeds {MAX_RT_MULTICALL_COMMAND_BYTES} bytes"
+            ));
         }
         commands.push(command.to_owned());
     }
@@ -774,6 +836,16 @@ fn multicall_commands(params: &[RtValue]) -> Result<Vec<String>, String> {
             let command = command.trim();
             if command.is_empty() || command.contains('=') {
                 return Err(format!("multicall command {index} is invalid"));
+            }
+            if commands.len() >= MAX_RT_MULTICALL_COMMANDS {
+                return Err(format!(
+                    "multicall exceeds {MAX_RT_MULTICALL_COMMANDS} commands"
+                ));
+            }
+            if command.len() > MAX_RT_MULTICALL_COMMAND_BYTES {
+                return Err(format!(
+                    "multicall command {index} exceeds {MAX_RT_MULTICALL_COMMAND_BYTES} bytes"
+                ));
             }
             command_section = true;
             commands.push(command.to_owned());
@@ -1163,57 +1235,82 @@ fn parse_method_call(xml: &str) -> Result<(String, Vec<RtValue>), String> {
     let mut params = Vec::new();
     let mut rest = xml;
     while let Some(start) = rest.find("<param>") {
+        if params.len() >= MAX_XMLRPC_PARAMS {
+            return Err(format!(
+                "XMLRPC request exceeds {MAX_XMLRPC_PARAMS} parameters"
+            ));
+        }
         rest = &rest[start + "<param>".len()..];
         let Some(end) = rest.find("</param>") else {
             return Err("XMLRPC request contains an unterminated param".to_owned());
         };
-        params.push(parse_value(&rest[..end]));
+        params.push(parse_value_checked(&rest[..end], 0)?);
         rest = &rest[end + "</param>".len()..];
     }
     Ok((xml_unescape(method), params))
 }
 
+#[cfg(test)]
 fn parse_value(xml: &str) -> RtValue {
+    parse_value_checked(xml, 0).unwrap_or(RtValue::Nil)
+}
+
+fn parse_value_checked(xml: &str, depth: usize) -> Result<RtValue, String> {
+    if depth > MAX_XMLRPC_VALUE_DEPTH {
+        return Err(format!(
+            "XMLRPC value nesting exceeds {MAX_XMLRPC_VALUE_DEPTH} levels"
+        ));
+    }
     let xml = xml.trim();
     if xml.starts_with("<value>") && xml.ends_with("</value>") {
-        return parse_value(&xml["<value>".len()..xml.len() - "</value>".len()]);
+        return parse_value_checked(
+            &xml["<value>".len()..xml.len() - "</value>".len()],
+            depth + 1,
+        );
     }
     if let Some(value) = between(xml, "<array>", "</array>") {
         let data = between(value, "<data>", "</data>").unwrap_or(value);
-        return RtValue::Array(parse_value_nodes(data));
+        return Ok(RtValue::Array(parse_value_nodes(data, depth + 1)?));
     }
     if let Some(value) = between(xml, "<struct>", "</struct>") {
-        return RtValue::Struct(parse_struct_members(value));
+        return Ok(RtValue::Struct(parse_struct_members(value, depth + 1)?));
     }
     if let Some(value) = between(xml, "<string>", "</string>") {
-        return RtValue::String(xml_unescape(value));
+        return Ok(RtValue::String(xml_unescape(value)));
     }
     if let Some(value) = between(xml, "<base64>", "</base64>") {
-        return RtValue::String(value.trim().to_owned());
+        return Ok(RtValue::String(value.trim().to_owned()));
     }
     if let Some(value) = between(xml, "<i4>", "</i4>").or_else(|| between(xml, "<int>", "</int>")) {
-        return value
+        return Ok(value
             .trim()
             .parse()
             .map(RtValue::Int)
-            .unwrap_or_else(|_| RtValue::String(xml_unescape(value.trim())));
+            .unwrap_or_else(|_| RtValue::String(xml_unescape(value.trim()))));
     }
     if let Some(value) = between(xml, "<boolean>", "</boolean>") {
-        return RtValue::Bool(value.trim() == "1" || value.trim().eq_ignore_ascii_case("true"));
+        return Ok(RtValue::Bool(
+            value.trim() == "1" || value.trim().eq_ignore_ascii_case("true"),
+        ));
     }
     if xml.contains("<nil/>") {
-        return RtValue::Nil;
+        return Ok(RtValue::Nil);
     }
-    RtValue::String(xml_unescape(xml))
+    Ok(RtValue::String(xml_unescape(xml)))
 }
 
-fn parse_value_nodes(mut xml: &str) -> Vec<RtValue> {
+fn parse_value_nodes(mut xml: &str, depth: usize) -> Result<Vec<RtValue>, String> {
     let mut values = Vec::new();
     while let Some((value, rest)) = next_value_node(xml) {
-        values.push(parse_value(value));
+        if values.len() >= MAX_XMLRPC_COLLECTION_ITEMS {
+            return Err(format!(
+                "XMLRPC array exceeds {MAX_XMLRPC_COLLECTION_ITEMS} items"
+            ));
+        }
+        values.push(parse_value_checked(value, depth)?);
         xml = rest;
     }
-    values
+    Ok(values)
 }
 
 fn next_value_node(xml: &str) -> Option<(&str, &str)> {
@@ -1242,23 +1339,29 @@ fn next_value_node(xml: &str) -> Option<(&str, &str)> {
     None
 }
 
-fn parse_struct_members(mut xml: &str) -> BTreeMap<String, RtValue> {
+fn parse_struct_members(mut xml: &str, depth: usize) -> Result<BTreeMap<String, RtValue>, String> {
     let mut values = BTreeMap::new();
     while let Some(start) = xml.find("<member>") {
+        if values.len() >= MAX_XMLRPC_COLLECTION_ITEMS {
+            return Err(format!(
+                "XMLRPC struct exceeds {MAX_XMLRPC_COLLECTION_ITEMS} members"
+            ));
+        }
         xml = &xml[start + "<member>".len()..];
         let Some(end) = xml.find("</member>") else {
             break;
         };
         let member = &xml[..end];
         if let Some(name) = between(member, "<name>", "</name>") {
-            let value = between(member, "<value>", "</value>")
-                .map(parse_value)
-                .unwrap_or(RtValue::Nil);
+            let value = match between(member, "<value>", "</value>") {
+                Some(value) => parse_value_checked(value, depth)?,
+                None => RtValue::Nil,
+            };
             values.insert(xml_unescape(name), value);
         }
         xml = &xml[end + "</member>".len()..];
     }
-    values
+    Ok(values)
 }
 
 fn between<'a>(text: &'a str, open: &str, close: &str) -> Option<&'a str> {
@@ -1584,6 +1687,63 @@ mod tests {
             .unwrap(),
             RtValue::String("movies".to_owned())
         );
+    }
+
+    #[tokio::test]
+    async fn custom_fields_bound_key_value_and_field_count() {
+        let state = state_with_torrent().await;
+        let hash = RtValue::String("a".repeat(40));
+        let oversized_key = execute(
+            &state,
+            "d.custom.set",
+            &[
+                hash.clone(),
+                RtValue::String("k".repeat(MAX_RT_CUSTOM_KEY_BYTES + 1)),
+                RtValue::String("value".to_owned()),
+            ],
+        )
+        .await
+        .expect_err("oversized custom keys must be rejected");
+        assert!(oversized_key.contains("field name"));
+
+        let oversized_value = execute(
+            &state,
+            "d.custom.set",
+            &[
+                hash.clone(),
+                RtValue::String("large".to_owned()),
+                RtValue::String("x".repeat(MAX_RT_CUSTOM_VALUE_BYTES + 1)),
+            ],
+        )
+        .await
+        .expect_err("oversized custom values must be rejected");
+        assert!(oversized_value.contains("value"));
+
+        for index in 0..MAX_RT_CUSTOM_FIELDS_PER_TORRENT {
+            execute(
+                &state,
+                "d.custom.set",
+                &[
+                    hash.clone(),
+                    RtValue::String(format!("field-{index}")),
+                    RtValue::String("value".to_owned()),
+                ],
+            )
+            .await
+            .expect("custom field within the bound should be accepted");
+        }
+        let too_many = execute(
+            &state,
+            "d.custom.set",
+            &[
+                hash,
+                RtValue::String("field-overflow".to_owned()),
+                RtValue::String("value".to_owned()),
+            ],
+        )
+        .await
+        .expect_err("custom field count must be bounded");
+        assert!(too_many.contains("fields per torrent"));
     }
 
     #[tokio::test]
@@ -2197,6 +2357,70 @@ mod tests {
                 )])),
             ])
         );
+    }
+
+    #[test]
+    fn xmlrpc_parser_rejects_excessive_value_nesting() {
+        let layers = MAX_XMLRPC_VALUE_DEPTH + 2;
+        let nested = format!(
+            "{}<string>x</string>{}",
+            "<value>".repeat(layers),
+            "</value>".repeat(layers)
+        );
+        let request = format!(
+            "<methodCall><methodName>system.time</methodName><params><param>{nested}</param></params></methodCall>"
+        );
+        assert!(parse_method_call(&request)
+            .expect_err("excessive XMLRPC nesting must be rejected")
+            .contains("nesting"));
+    }
+
+    #[tokio::test]
+    async fn xmlrpc_library_entry_point_bounds_request_and_parameter_sizes() {
+        let state = AppState::new(Arc::new(RwLock::new(SessionRegistry::new())));
+        let oversized = "x".repeat(MAX_XMLRPC_REQUEST_BYTES + 1);
+        assert!(execute_xml(&state, &oversized).await.contains("413"));
+
+        let params = (0..=MAX_XMLRPC_PARAMS)
+            .map(|_| "<param><value><int>1</int></value></param>")
+            .collect::<String>();
+        let request = format!(
+            "<methodCall><methodName>system.time</methodName><params>{params}</params></methodCall>"
+        );
+        assert!(parse_method_call(&request)
+            .expect_err("excessive XMLRPC parameters must be rejected")
+            .contains("parameters"));
+
+        let values = (0..=MAX_XMLRPC_COLLECTION_ITEMS)
+            .map(|_| "<value><int>1</int></value>")
+            .collect::<String>();
+        let request = format!(
+            "<methodCall><methodName>system.time</methodName><params><param><value><array><data>{values}</data></array></value></param></params></methodCall>"
+        );
+        assert!(parse_method_call(&request)
+            .expect_err("excessive XMLRPC arrays must be rejected")
+            .contains("items"));
+    }
+
+    #[test]
+    fn rtorrent_multicall_command_count_and_size_are_bounded() {
+        let too_many = std::iter::once(RtValue::String("main".to_owned()))
+            .chain((0..=MAX_RT_MULTICALL_COMMANDS).map(|_| RtValue::String("d.name=".to_owned())))
+            .collect::<Vec<_>>();
+        assert!(d_multicall_commands(&too_many)
+            .expect_err("too many d.multicall commands must be rejected")
+            .contains("exceeds"));
+
+        let too_long = vec![
+            RtValue::String("main".to_owned()),
+            RtValue::String(format!(
+                "{}=",
+                "x".repeat(MAX_RT_MULTICALL_COMMAND_BYTES + 1)
+            )),
+        ];
+        assert!(d_multicall_commands(&too_long)
+            .expect_err("oversized d.multicall command must be rejected")
+            .contains("bytes"));
     }
 
     #[tokio::test]

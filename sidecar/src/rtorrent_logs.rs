@@ -145,8 +145,19 @@ fn offset_key(path: &Path) -> String {
 }
 
 fn error_key(path: &Path) -> String {
-    let stable_path = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
-    format!("rtorrent_log_error:{}", stable_path.to_string_lossy())
+    // Keep this key lexical: an rTorrent log may be missing when the failure
+    // is recorded and canonicalize successfully after the file appears. On
+    // Windows those two representations differ, so recovery would otherwise
+    // miss the durable failure state.
+    format!("rtorrent_log_error:{}", path.to_string_lossy())
+}
+
+fn legacy_error_key(path: &Path) -> Option<String> {
+    let stable_path = std::fs::canonicalize(path).ok()?;
+    Some(format!(
+        "rtorrent_log_error:{}",
+        stable_path.to_string_lossy()
+    ))
 }
 
 fn log_source(path: &Path) -> &str {
@@ -191,10 +202,23 @@ fn record_ingest_failure(
 
 fn record_ingest_recovery(db: &Db, path: &Path, retention: usize) -> Result<()> {
     let key = error_key(path);
-    if db.get_kv(&key)?.is_none() {
+    let current_error = db.get_kv(&key)?.is_some();
+    let old_key = legacy_error_key(path).filter(|old_key| old_key != &key);
+    let legacy_error = match &old_key {
+        Some(old_key) => db.get_kv(old_key)?.is_some(),
+        None => false,
+    };
+    if !current_error && !legacy_error {
         return Ok(());
     }
-    db.delete_kv(&key)?;
+    if current_error {
+        db.delete_kv(&key)?;
+    }
+    if legacy_error {
+        if let Some(old_key) = old_key {
+            db.delete_kv(&old_key)?;
+        }
+    }
     let source = log_source(path);
     db.append_app_event(
         &AppEventRow {
@@ -450,6 +474,39 @@ mod tests {
 
         let events = db.list_app_events(10).unwrap();
         assert_eq!(events.len(), 2);
+        assert_eq!(events[0].kind, "rtorrent_log_ingest_recovered");
+    }
+
+    #[test]
+    fn error_key_is_stable_when_a_missing_log_file_appears() {
+        let dir = tempfile::tempdir().unwrap();
+        let log_path = dir.path().join("missing").join("rtorrent.log");
+        let before = error_key(&log_path);
+
+        std::fs::create_dir_all(log_path.parent().unwrap()).unwrap();
+        std::fs::write(&log_path, "ready\n").unwrap();
+
+        assert_eq!(error_key(&log_path), before);
+    }
+
+    #[test]
+    fn recovery_clears_a_legacy_canonical_error_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let file_dir = dir.path().join("logs");
+        std::fs::create_dir_all(&file_dir).unwrap();
+        let log_path = file_dir.join("..").join("logs").join("rtorrent.log");
+        std::fs::write(&log_path, "ready\n").unwrap();
+
+        let legacy_key = legacy_error_key(&log_path).unwrap();
+        assert_ne!(legacy_key, error_key(&log_path));
+        let db = Db::open(&dir.path().join("cache.db")).unwrap();
+        db.set_kv(&legacy_key, "previous error").unwrap();
+
+        record_ingest_recovery(&db, &log_path, 10).unwrap();
+
+        assert!(db.get_kv(&legacy_key).unwrap().is_none());
+        let events = db.list_app_events(10).unwrap();
+        assert_eq!(events.len(), 1);
         assert_eq!(events[0].kind, "rtorrent_log_ingest_recovered");
     }
 }

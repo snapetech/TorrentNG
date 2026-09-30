@@ -59,6 +59,8 @@ const QBIT_LIVE_TORRENT_INFO_EXTRA_BYTES: u64 = 64 * 1024;
 // parser from retaining an attacker-controlled number of distinct fields even
 // when the request body is otherwise within the multipart/body byte limit.
 const MAX_QBIT_FORM_FIELDS: usize = 1_024;
+const MAX_QBIT_SEARCH_JOBS: usize = 256;
+const MAX_QBIT_SEARCH_FIELD_BYTES: usize = 16 * 1024;
 
 // These compatibility settings are deliberately separate from the engine's
 // runtime settings.  They are qBittorrent WebUI state, not TorrentNG-client transport
@@ -637,6 +639,23 @@ pub async fn app_preferences(State(state): State<AppState>) -> Response {
             };
             map.insert("dht".to_owned(), serde_json::Value::Bool(features.dht));
             map.insert("pex".to_owned(), serde_json::Value::Bool(features.pex));
+            match engine.listen_port().await {
+                Ok(port) => {
+                    map.insert("listen_port".to_owned(), serde_json::Value::from(port));
+                }
+                Err(_) => {
+                    return (
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        Json(serde_json::json!({
+                            "error": {
+                                "code": "SERVICE_UNAVAILABLE",
+                                "message": "TorrentNG client listen port is unavailable",
+                            }
+                        })),
+                    )
+                        .into_response()
+                }
+            }
         }
         let banned_ips = if let Some(engine) = &state.engine {
             match engine.banned_peers().await {
@@ -675,7 +694,9 @@ pub async fn app_preferences(State(state): State<AppState>) -> Response {
         for (key, value) in &stored_preferences {
             // DHT/PEX are read from the engine above. Do not let a stale
             // compatibility override mask the authoritative runtime value.
-            if matches!(key.as_str(), "dht" | "pex") {
+            if matches!(key.as_str(), "dht" | "pex")
+                || (state.engine.is_some() && key == "listen_port")
+            {
                 continue;
             }
             map.insert(key.clone(), value.clone());
@@ -692,6 +713,13 @@ pub async fn app_set_preferences(State(state): State<AppState>, body: String) ->
                 .filter(|(key, _)| matches!(key.as_str(), "dht" | "pex"))
                 .any(|(_, value)| !value.is_boolean())
             {
+                return StatusCode::BAD_REQUEST.into_response();
+            }
+            if updates.get("listen_port").is_some_and(|value| {
+                value
+                    .as_u64()
+                    .is_none_or(|port| !(1..=u16::MAX as u64).contains(&port))
+            }) {
                 return StatusCode::BAD_REQUEST.into_response();
             }
             let _write = state.preference_write.lock().await;
@@ -715,6 +743,15 @@ pub async fn app_set_preferences(State(state): State<AppState>, body: String) ->
                         return qbit_backend_error(error);
                     }
                 }
+                if let Some(port) = updates
+                    .get("listen_port")
+                    .and_then(serde_json::Value::as_u64)
+                    .and_then(|port| u16::try_from(port).ok())
+                {
+                    if let Err(error) = engine.update_listen_port(port).await {
+                        return qbit_backend_error(error);
+                    }
+                }
             }
             let mut stored_updates = updates;
             if state.engine.is_some() {
@@ -723,10 +760,13 @@ pub async fn app_set_preferences(State(state): State<AppState>, body: String) ->
                 // brain state after a restart or another control-plane write.
                 stored_updates.remove("dht");
                 stored_updates.remove("pex");
+                stored_updates.remove("listen_port");
             }
-            stored_preferences.extend(stored_updates);
-            if let Err(error) = save_qbit_preferences(&state, stored_preferences).await {
-                return qbit_backend_error(error);
+            if !stored_updates.is_empty() {
+                stored_preferences.extend(stored_updates);
+                if let Err(error) = save_qbit_preferences(&state, stored_preferences).await {
+                    return qbit_backend_error(error);
+                }
             }
             StatusCode::OK.into_response()
         }
@@ -4018,24 +4058,49 @@ pub async fn search_update_plugins() -> impl IntoResponse {
     StatusCode::OK
 }
 
-pub async fn search_start(State(state): State<AppState>, body: String) -> impl IntoResponse {
+pub async fn search_start(State(state): State<AppState>, body: String) -> Response {
     let params = parse_form_body(&body);
+    if params.overflowed {
+        return StatusCode::PAYLOAD_TOO_LARGE.into_response();
+    }
+    let pattern = params.get("pattern").cloned().unwrap_or_default();
+    let plugins = params
+        .get("plugins")
+        .cloned()
+        .unwrap_or_else(|| "all".to_owned());
+    let category = params
+        .get("category")
+        .cloned()
+        .unwrap_or_else(|| "all".to_owned());
+    if [pattern.as_str(), plugins.as_str(), category.as_str()]
+        .iter()
+        .any(|value| value.len() > MAX_QBIT_SEARCH_FIELD_BYTES)
+    {
+        return StatusCode::PAYLOAD_TOO_LARGE.into_response();
+    }
+
+    let mut jobs = state.search_jobs.write().await;
+    if jobs.len() >= MAX_QBIT_SEARCH_JOBS {
+        return StatusCode::TOO_MANY_REQUESTS.into_response();
+    }
     let mut next_id = state.next_search_id.write().await;
     let id = *next_id;
-    *next_id += 1;
-    drop(next_id);
+    let Some(next_value) = next_id.checked_add(1) else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    *next_id = next_value;
 
     let job = serde_json::json!({
         "id": id,
-        "pattern": params.get("pattern").cloned().unwrap_or_default(),
-        "plugins": params.get("plugins").cloned().unwrap_or_else(|| "all".to_owned()),
-        "category": params.get("category").cloned().unwrap_or_else(|| "all".to_owned()),
+        "pattern": pattern,
+        "plugins": plugins,
+        "category": category,
         "status": "Stopped",
         "total": 0,
         "results": [],
     });
-    state.search_jobs.write().await.insert(id.to_string(), job);
-    (StatusCode::OK, Json(serde_json::json!({ "id": id })))
+    jobs.insert(id.to_string(), job);
+    (StatusCode::OK, Json(serde_json::json!({ "id": id }))).into_response()
 }
 
 pub async fn search_stop(State(state): State<AppState>, body: String) -> impl IntoResponse {
@@ -6009,6 +6074,30 @@ mod tests {
             validate_qbit_filter(Some("stalled")).unwrap_err().0,
             StatusCode::NOT_IMPLEMENTED
         );
+    }
+
+    #[tokio::test]
+    async fn qbit_search_jobs_bound_retained_input_and_job_count() {
+        let state = AppState::new();
+        let oversized = search_start(
+            State(state.clone()),
+            format!("pattern={}", "x".repeat(MAX_QBIT_SEARCH_FIELD_BYTES + 1)),
+        )
+        .await
+        .into_response();
+        assert_eq!(oversized.status(), StatusCode::PAYLOAD_TOO_LARGE);
+
+        for _ in 0..MAX_QBIT_SEARCH_JOBS {
+            let response = search_start(State(state.clone()), "pattern=ok".to_owned())
+                .await
+                .into_response();
+            assert_eq!(response.status(), StatusCode::OK);
+        }
+        let response = search_start(State(state.clone()), "pattern=overflow".to_owned())
+            .await
+            .into_response();
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(state.search_jobs.read().await.len(), MAX_QBIT_SEARCH_JOBS);
     }
 
     #[test]

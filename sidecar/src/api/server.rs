@@ -53,7 +53,12 @@ pub fn build_router(state: AppState) -> Router {
 
     Router::new()
         // TorrentNG API.
-        .route("/api/v1/auth/login", post(crate::qbcompat::auth_login))
+        .route(
+            "/api/v1/auth/login",
+            post(crate::qbcompat::auth_login).layer(DefaultBodyLimit::max(
+                crate::multipart::MAX_AUTH_REQUEST_BODY_BYTES,
+            )),
+        )
         .route("/api/v1/auth/logout", post(crate::qbcompat::auth_logout))
         .route(
             "/api/v1/torrents",
@@ -186,6 +191,9 @@ pub fn build_router(state: AppState) -> Router {
         )
         .layer(RequestBodyLimitLayer::new(
             crate::multipart::MAX_MULTIPART_REQUEST_BODY_BYTES,
+        ))
+        .layer(DefaultBodyLimit::max(
+            crate::multipart::MAX_DEFAULT_REQUEST_BODY_BYTES,
         ))
         .layer(middleware::from_fn(request_log))
         .layer(middleware::from_fn_with_state(state.clone(), require_auth))

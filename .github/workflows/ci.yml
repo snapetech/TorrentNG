@@ -318,7 +318,18 @@ jobs:
 
       - name: Run webui browser certification
         working-directory: webui
+        env:
+          DBUS_SESSION_BUS_ADDRESS: unix:path=/dev/null
         run: npm run test:e2e -- --reporter=line
+
+      - name: Upload WebUI browser failure evidence
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: webui-browser-failure-${{ github.run_id }}
+          path: webui/test-results/
+          if-no-files-found: ignore
+          retention-days: 7
 
   backup-restore:
     name: Backup and restore drill

@@ -167,7 +167,12 @@ fn hash_resolution_status(error: &anyhow::Error) -> StatusCode {
 pub fn build_router(_state: AppState) -> Router<AppState> {
     Router::new()
         // Auth
-        .route("/auth/login", post(auth_login))
+        .route(
+            "/auth/login",
+            post(auth_login).layer(DefaultBodyLimit::max(
+                crate::multipart::MAX_AUTH_REQUEST_BODY_BYTES,
+            )),
+        )
         .route("/auth/logout", post(auth_logout))
         // App
         .route("/app/version", get(app_version).post(app_version))
@@ -1647,7 +1652,10 @@ async fn app_set_preferences(
     let user_agent = match prefs.get("network_http_user_agent") {
         None => None,
         Some(value) => match value.as_str() {
-            Some(value) => Some(value),
+            Some(value) => match crate::config::normalize_runtime_user_agent(value) {
+                Ok(value) => Some(value),
+                Err(_) => return StatusCode::BAD_REQUEST,
+            },
             None => return StatusCode::BAD_REQUEST,
         },
     };
@@ -1708,7 +1716,7 @@ async fn app_set_preferences(
                 "qBit user-agent preference ignored because backend does not support runtime user-agent updates"
             );
         } else {
-            match s.backend.set_user_agent(ua).await {
+            match s.backend.set_user_agent(&ua).await {
                 Ok(_) => {
                     record_operator_event(
                         &s,
@@ -3758,6 +3766,9 @@ async fn torrents_rename_file(
     let Some(id) = f.id else {
         return StatusCode::BAD_REQUEST;
     };
+    if crate::backend::checked_backend_file_index(id, "qBittorrent").is_err() {
+        return StatusCode::BAD_REQUEST;
+    }
     let Some(name) = f.name else {
         return StatusCode::BAD_REQUEST;
     };

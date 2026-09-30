@@ -20,30 +20,36 @@ use crate::{
         list_workflow_runs, live_torrent_stats, logs, metrics, patch_torrent_files,
         patch_torrent_trackers, pause_job, pause_torrent, reannounce_torrent, recheck_torrent,
         remove_torrent_tags, restart_engine, resume_job, resume_torrent, rtorrent_settings,
-        run_json_workflow, save_rtorrent_settings, session_features, set_torrent_category,
-        set_user_agent, sidebar_facets, storage, storage_execute_plan, storage_preview_plan,
-        stream_events, tags, test_rss_rules, torrent_limits, tracker_health, transfer_info,
-        transfer_limits, update_session_features, update_torrent, update_torrent_limits,
-        update_torrent_queue, update_transfer_limits, upsert_category, upsert_json_map,
+        run_json_workflow, save_rtorrent_settings, session_features, session_settings,
+        set_torrent_category, set_user_agent, sidebar_facets, storage, storage_execute_plan,
+        storage_preview_plan, stream_events, tags, test_rss_rules, torrent_limits, tracker_health,
+        transfer_info, transfer_limits, update_session_features, update_session_settings,
+        update_torrent, update_torrent_limits, update_torrent_queue, update_transfer_limits,
+        upsert_category, upsert_json_map,
     },
     state::AppState,
 };
 use rt_api_model::{
-    api_token_allowed, bearer_token, csrf_request_allowed, has_session_cookie, request_fingerprint,
-    valid_idempotency_key, CachedResponse, IdempotencyClaim, MAX_IDEMPOTENCY_BODY_BYTES,
+    api_token_allowed, bearer_token, csrf_request_allowed, has_browser_request_headers,
+    has_session_cookie, request_fingerprint, valid_idempotency_key, CachedResponse,
+    IdempotencyClaim, MAX_IDEMPOTENCY_BODY_BYTES,
 };
 use tower::limit::GlobalConcurrencyLimitLayer;
 
 const MAX_NATIVE_LARGE_BODY_REQUESTS: usize = 4;
 const MAX_NATIVE_DEFAULT_BODY_BYTES: usize = 8 * 1024 * 1024;
 const MAX_NATIVE_TORRENT_BODY_BYTES: usize = 96 * 1024 * 1024;
+const MAX_NATIVE_AUTH_BODY_BYTES: usize = 16 * 1024;
 
 pub fn build_router(state: AppState) -> Router {
     let large_body_limit = GlobalConcurrencyLimitLayer::new(MAX_NATIVE_LARGE_BODY_REQUESTS);
     Router::new()
         .route("/health", get(health))
         .route("/metrics", get(metrics))
-        .route("/api/v1/auth/login", post(auth_login))
+        .route(
+            "/api/v1/auth/login",
+            post(auth_login).layer(DefaultBodyLimit::max(MAX_NATIVE_AUTH_BODY_BYTES)),
+        )
         .route("/api/v1/auth/logout", post(auth_logout))
         .route(
             "/api/v1/torrents",
@@ -96,6 +102,10 @@ pub fn build_router(state: AppState) -> Router {
         .route(
             "/api/v1/session/features",
             get(session_features).put(update_session_features),
+        )
+        .route(
+            "/api/v1/session/settings",
+            get(session_settings).patch(update_session_settings),
         )
         .route(
             "/api/v1/torrents/:hash/tags",
@@ -330,14 +340,40 @@ async fn torrentng_auth_guard(
     next: Next,
 ) -> Response {
     let path = req.uri().path();
-    if torrentng_public_path(path) || state.api_tokens.is_empty() {
-        return next.run(req).await;
-    }
-
     if bearer_token(req.headers()).is_some_and(|token| api_token_allowed(&state.api_tokens, &token))
     {
         return next.run(req).await;
     }
+
+    if torrentng_public_path(path) {
+        if torrentng_auth_path(path)
+            && is_mutating_request(&req)
+            && has_browser_request_headers(req.headers())
+            && !csrf_request_allowed(req.headers())
+        {
+            return (
+                StatusCode::FORBIDDEN,
+                "cross-origin browser authentication request rejected",
+            )
+                .into_response();
+        }
+        return next.run(req).await;
+    }
+
+    if state.api_tokens.is_empty() {
+        if is_mutating_request(&req)
+            && has_browser_request_headers(req.headers())
+            && !csrf_request_allowed(req.headers())
+        {
+            return (
+                StatusCode::FORBIDDEN,
+                "cross-origin browser request rejected",
+            )
+                .into_response();
+        }
+        return next.run(req).await;
+    }
+
     if torrentng_presented_token(req.headers())
         .is_some_and(|token| api_token_allowed(&state.api_tokens, &token))
     {
@@ -428,7 +464,11 @@ fn hex_value(byte: u8) -> Option<u8> {
 
 #[cfg(test)]
 mod tests {
-    use super::torrentng_auth_path;
+    use super::{build_router, torrentng_auth_path, torrentng_public_path};
+    use crate::state::AppState;
+    use axum::{body::Body, http::Request};
+    use std::sync::Arc;
+    use tower::ServiceExt;
 
     #[test]
     fn native_auth_paths_are_exact() {
@@ -436,5 +476,35 @@ mod tests {
         assert!(torrentng_auth_path("/api/v1/auth/logout"));
         assert!(!torrentng_auth_path("/api/v1/nested/auth/login"));
         assert!(!torrentng_auth_path("/api/v1/auth/logout/extra"));
+    }
+
+    #[test]
+    fn native_public_paths_do_not_include_future_auth_routes() {
+        assert!(torrentng_public_path("/health"));
+        assert!(torrentng_public_path("/api/v1/auth/login"));
+        assert!(torrentng_public_path("/api/v1/auth/logout"));
+        assert!(!torrentng_public_path("/api/v1/auth/refresh"));
+        assert!(!torrentng_public_path("/api/v1/torrents"));
+    }
+
+    #[tokio::test]
+    async fn native_browser_login_rejects_cross_origin_cookie_seeding() {
+        let mut state = AppState::new();
+        state.api_tokens = Arc::new(vec!["secret".to_owned()]);
+        let app = build_router(state);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/auth/login")
+                    .header("host", "torrentng.example")
+                    .header("origin", "https://attacker.example")
+                    .header("content-type", "application/x-www-form-urlencoded")
+                    .body(Body::from("token=secret"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), axum::http::StatusCode::FORBIDDEN);
     }
 }

@@ -1288,7 +1288,7 @@ fn read_exact_at(file: &File, mut buf: &mut [u8], mut offset: u64) -> io::Result
         match file.read_at(buf, offset) {
             Ok(0) => return Err(io::ErrorKind::UnexpectedEof.into()),
             Ok(n) => {
-                offset += n as u64;
+                offset = checked_io_offset(offset, n)?;
                 let (_, rest) = buf.split_at_mut(n);
                 buf = rest;
             }
@@ -1305,7 +1305,7 @@ fn read_exact_at(file: &File, mut buf: &mut [u8], mut offset: u64) -> io::Result
         match file.seek_read(buf, offset) {
             Ok(0) => return Err(io::ErrorKind::UnexpectedEof.into()),
             Ok(n) => {
-                offset += n as u64;
+                offset = checked_io_offset(offset, n)?;
                 let (_, rest) = buf.split_at_mut(n);
                 buf = rest;
             }
@@ -1322,7 +1322,7 @@ fn write_all_at(file: &File, mut buf: &[u8], mut offset: u64) -> io::Result<()> 
         match file.write_at(buf, offset) {
             Ok(0) => return Err(io::ErrorKind::WriteZero.into()),
             Ok(n) => {
-                offset += n as u64;
+                offset = checked_io_offset(offset, n)?;
                 buf = &buf[n..];
             }
             Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
@@ -1338,7 +1338,7 @@ fn write_all_at(file: &File, mut buf: &[u8], mut offset: u64) -> io::Result<()> 
         match file.seek_write(buf, offset) {
             Ok(0) => return Err(io::ErrorKind::WriteZero.into()),
             Ok(n) => {
-                offset += n as u64;
+                offset = checked_io_offset(offset, n)?;
                 buf = &buf[n..];
             }
             Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
@@ -1346,6 +1346,17 @@ fn write_all_at(file: &File, mut buf: &[u8], mut offset: u64) -> io::Result<()> 
         }
     }
     Ok(())
+}
+
+fn checked_io_offset(offset: u64, bytes: usize) -> io::Result<u64> {
+    offset
+        .checked_add(u64::try_from(bytes).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "I/O byte count does not fit in u64",
+            )
+        })?)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "I/O offset overflow"))
 }
 
 /// `pread`/`pwrite` backend backed by a fixed pool of dedicated OS
@@ -1730,6 +1741,13 @@ mod tests {
         let frame = pool.try_acquire(16).unwrap();
         let res = backend.pread(file, frame, 0).await.unwrap();
         assert!(res.is_err()); // read_exact_at past EOF
+    }
+
+    #[test]
+    fn checked_io_offset_rejects_u64_overflow() {
+        assert_eq!(checked_io_offset(u64::MAX - 1, 1).unwrap(), u64::MAX);
+        let error = checked_io_offset(u64::MAX, 1).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
     }
 
     #[tokio::test]

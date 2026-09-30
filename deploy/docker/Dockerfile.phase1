@@ -41,7 +41,7 @@ ARG TNG_GID=1000
 
 RUN apk add --no-cache \
     php83 php83-fpm php83-json php83-session php83-curl php83-posix \
-    nginx curl ca-certificates tini tzdata \
+    nginx curl ca-certificates tini tzdata util-linux \
     libcurl ncurses tinyxml2 openssl zlib \
     && case "$TNG_UID" in ''|*[!0-9]*) echo "TNG_UID must be a nonzero numeric ID" >&2; exit 1;; *[1-9]*) :;; *) echo "TNG_UID must be a nonzero numeric ID" >&2; exit 1;; esac \
     && case "$TNG_GID" in ''|*[!0-9]*) echo "TNG_GID must be a nonzero numeric ID" >&2; exit 1;; *[1-9]*) :;; *) echo "TNG_GID must be a nonzero numeric ID" >&2; exit 1;; esac
@@ -65,6 +65,7 @@ RUN mkdir -p /var/www/rutorrent && \
 COPY deploy/docker/rtorrent.rc      /etc/rtorrent/rtorrent.rc
 COPY engine-profile/rtorrent.rc     /etc/rtorrent/profile.rc
 COPY deploy/nginx/nginx.phase1.conf /etc/nginx/http.d/default.conf
+COPY deploy/container/identity.sh /usr/local/lib/torrentng/identity.sh
 COPY deploy/docker/entrypoint.phase1.sh /entrypoint.sh
 RUN chmod +x /entrypoint.sh \
     && sed -i '/^[[:space:]]*user[[:space:]]/d; s#^[[:space:]]*pid[[:space:]].*;#pid /run/nginx/nginx.pid;#' /etc/nginx/nginx.conf \
@@ -85,5 +86,11 @@ RUN chmod +x /entrypoint.sh \
 VOLUME ["/data", "/session", "/config"]
 EXPOSE 8080 50000 50000/udp
 
-USER 1000:1000
-ENTRYPOINT ["/sbin/tini", "-g", "--", "/entrypoint.sh"]
+ENV TNG_DEFAULT_UID="${TNG_UID}"
+ENV TNG_DEFAULT_GID="${TNG_GID}"
+
+# Root is used only for the entrypoint's PUID/PGID directory setup; it drops
+# to the configured non-root identity before starting Tini and the services.
+# trivy:ignore:DS-0002
+USER root
+ENTRYPOINT ["/entrypoint.sh"]

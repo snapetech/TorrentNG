@@ -188,6 +188,34 @@ class WorkflowSecurityTests(unittest.TestCase):
                 source = (ROOT / relative_path).read_text(encoding="utf-8")
                 self.assertIn(f'- "{binding}"', source)
 
+    def test_native_deployments_pin_non_root_privileges(self) -> None:
+        dockerfile = (ROOT / "deploy/native/Dockerfile").read_text(encoding="utf-8")
+        identity = (ROOT / "deploy/container/identity.sh").read_text(encoding="utf-8")
+        compose = (ROOT / "deploy/native/compose.yml").read_text(encoding="utf-8")
+        interop = (ROOT / "deploy/interop/compose.yml").read_text(encoding="utf-8")
+        statefulset = (ROOT / "deploy/native/kubernetes/statefulset.yaml").read_text(
+            encoding="utf-8"
+        )
+
+        self.assertIn('TNG_UID must be a nonzero numeric ID', dockerfile)
+        self.assertIn('TNG_GID must be a nonzero numeric ID', dockerfile)
+        self.assertIn('USER root', dockerfile)
+        self.assertIn('tng_identity_enter', identity)
+        self.assertIn('--bounding-set=-all', identity)
+        self.assertIn('PUID', identity)
+        self.assertIn('PGID', identity)
+        for source in (compose, interop):
+            self.assertIn("cap_drop:\n      - ALL", source)
+            self.assertIn("no-new-privileges:true", source)
+            for capability in ("CHOWN", "DAC_OVERRIDE", "FOWNER", "SETGID", "SETUID"):
+                self.assertIn(capability, source)
+        self.assertIn("runAsNonRoot: true", statefulset)
+        self.assertIn("runAsUser: 1000", statefulset)
+        self.assertIn("runAsGroup: 1000", statefulset)
+        self.assertIn("allowPrivilegeEscalation: false", statefulset)
+        self.assertIn("type: RuntimeDefault", statefulset)
+        self.assertIn("automountServiceAccountToken: false", statefulset)
+
     def test_default_rtorrent_settings_overlay_uses_persistent_writable_state(self) -> None:
         compose = (ROOT / "deploy/docker/compose.yml").read_text(encoding="utf-8")
         entrypoint = (ROOT / "deploy/docker/entrypoint.sh").read_text(encoding="utf-8")
@@ -199,6 +227,15 @@ class WorkflowSecurityTests(unittest.TestCase):
         self.assertIn('set -C; : > "$RTORRENT_UI_OVERLAY"', entrypoint)
         self.assertIn('grep -Fqx "import = $RTORRENT_UI_OVERLAY"', entrypoint)
         self.assertIn('printf \'\\nimport = %s\\n\'', entrypoint)
+
+    def test_unmanaged_rtorrent_mode_does_not_remove_managed_socket_or_lock(self) -> None:
+        entrypoint = (ROOT / "deploy/docker/entrypoint.sh").read_text(encoding="utf-8")
+        self.assertIn(
+            'if [ "$MANAGE_RTORRENT" = "1" ]; then\n'
+            '  rm -f "$RTORRENT_SOCKET" /session/rtorrent.lock\n'
+            "fi",
+            entrypoint,
+        )
 
     def test_arr_fixture_never_deletes_a_fixed_download_directory(self) -> None:
         source = (ROOT / "scripts" / "arr_app_certification.sh").read_text(encoding="utf-8")

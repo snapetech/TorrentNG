@@ -146,7 +146,7 @@ else
   mark "SCGI socket" "FAIL" "missing or inaccessible /run/rtorrent/rpc.sock"
 fi
 
-runtime_uid="$(container_exec 'id -u')"
+runtime_uid="$(container_exec "awk '/^Uid:/ {print \$2}' /proc/1/status")"
 if [[ "$runtime_uid" =~ ^[1-9][0-9]*$ ]]; then
   mark "non-root runtime" "PASS" "UID $runtime_uid"
 else

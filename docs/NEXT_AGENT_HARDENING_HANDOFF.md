@@ -4,9 +4,9 @@
 > wiring items below were the starting checklist, not the current state. The
 > current source disposition is maintained in
 > [`docs/BACKEND_AUDIT_BURN_DOWN.md`](BACKEND_AUDIT_BURN_DOWN.md), updated
-> 2026-09-21. Check that ledger before reapplying any item.
+> 2026-09-25. Check that ledger before reapplying any item.
 
-## Current disposition (2026-09-21)
+## Current disposition (2026-09-25)
 
 This handoff is retained as historical context, not as an active checklist.
 The storage-root authority, egress policy, shared HTTP transport, peer ingress,
@@ -24,7 +24,11 @@ lifecycle-tied active-descriptor admission to each path-backed scheduler
 `FilePool`; TNG-136 applies a local lease cap to
 `StorageRuntime::HandleCache`. TNG-138 makes those caches share one
 process-level managed-storage budget; unrelated process descriptors remain
-outside that quota.
+outside that quota. The Windows storage-plan executor now also opens configured
+roots as capability directories and performs recursive operations and
+no-replace rename relative to opened directory handles. Its library and test
+targets cross-check for `x86_64-pc-windows-msvc`; native Windows runtime
+qualification remains external.
 Fresh evidence for those fixes is recorded in
 [`BACKEND_AUDIT_BURN_DOWN.md`](BACKEND_AUDIT_BURN_DOWN.md).
 

@@ -6,7 +6,8 @@ pub mod snapshot;
 pub mod torrent;
 
 pub use auth::{
-    api_token_allowed, bearer_token, csrf_request_allowed, has_session_cookie, session_cookie_value,
+    api_token_allowed, bearer_token, csrf_request_allowed, has_browser_request_headers,
+    has_session_cookie, session_cookie_value,
 };
 pub use error::ApiError;
 pub use idempotency::{

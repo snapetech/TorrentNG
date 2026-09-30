@@ -55,6 +55,14 @@ See [docs/DEPLOYMENT.md](../docs/DEPLOYMENT.md) and
 [engine-profile/](../engine-profile/) for the pinned rTorrent build these
 stacks consume.
 
+## Unraid
+
+| Path | What it is |
+|---|---|
+| `../templates/torrentng-webui.xml` | Community Applications template: WebUI/API replacement for an rTorrent/qBittorrent/Transmission/Deluge install you already run |
+| `../templates/torrentng.xml` | Community Applications template: full `torrentngd` stack, no external client |
+| `unraid/README.md` | Unraid template selection, installation, storage permissions, and backend setup |
+
 ## Shared / cross-cutting
 
 | Path | What it is |

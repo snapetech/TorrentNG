@@ -6,12 +6,17 @@ services:
       args:
         TNG_UID: "${PUID:-1000}"
         TNG_GID: "${PGID:-1000}"
-    user: "${PUID:-1000}:${PGID:-1000}"
     image: torrentng-phase1:latest
     container_name: torrentng-phase1
     restart: unless-stopped
     cap_drop:
       - ALL
+    cap_add:
+      - CHOWN
+      - DAC_OVERRIDE
+      - FOWNER
+      - SETGID
+      - SETUID
     security_opt:
       - no-new-privileges:true
     ports:

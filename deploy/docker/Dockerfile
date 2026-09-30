@@ -56,11 +56,13 @@ COPY deploy/docker/patches/rtorrent-0.16.11-user-agent-command.patch /tmp/rtorre
 COPY deploy/docker/patches/rtorrent-0.16.11-local-id-command.patch /tmp/rtorrent-local-id-command.patch
 COPY deploy/docker/patches/rtorrent-0.16.11-multicall-range.patch /tmp/rtorrent-multicall-range.patch
 COPY deploy/docker/patches/rtorrent-0.16.11-tracker-identity-gate.patch /tmp/rtorrent-tracker-identity-gate.patch
+COPY deploy/docker/patches/rtorrent-0.16.11-unlimited-queue-refill.patch /tmp/rtorrent-unlimited-queue-refill.patch
 RUN cd rtorrent && \
     git apply /tmp/rtorrent-user-agent-command.patch && \
     git apply /tmp/rtorrent-local-id-command.patch && \
     git apply /tmp/rtorrent-multicall-range.patch && \
-    git apply /tmp/rtorrent-tracker-identity-gate.patch
+    git apply /tmp/rtorrent-tracker-identity-gate.patch && \
+    git apply /tmp/rtorrent-unlimited-queue-refill.patch
 RUN cd libtorrent && autoreconf -fi && \
     ./configure --prefix=/usr/local && \
     make -j"$(nproc)" && make install
@@ -72,7 +74,7 @@ RUN cd rtorrent && autoreconf -fi && \
 FROM alpine:3.20
 ARG TNG_UID=1000
 ARG TNG_GID=1000
-RUN apk add --no-cache ca-certificates curl libcurl ncurses openssl socat tinyxml2 tini tzdata zlib \
+RUN apk add --no-cache ca-certificates curl libcurl ncurses openssl socat tinyxml2 tini tzdata util-linux zlib \
     && case "$TNG_UID" in ''|*[!0-9]*) echo "TNG_UID must be a nonzero numeric ID" >&2; exit 1;; *[1-9]*) :;; *) echo "TNG_UID must be a nonzero numeric ID" >&2; exit 1;; esac \
     && case "$TNG_GID" in ''|*[!0-9]*) echo "TNG_GID must be a nonzero numeric ID" >&2; exit 1;; *[1-9]*) :;; *) echo "TNG_GID must be a nonzero numeric ID" >&2; exit 1;; esac
 
@@ -84,6 +86,7 @@ COPY --from=rtorrent-build /usr/local/lib/libtorrent* /usr/local/lib/
 COPY deploy/docker/rtorrent.rc    /etc/rtorrent/rtorrent.rc
 COPY engine-profile/rtorrent.rc   /etc/rtorrent/profile.rc
 COPY deploy/docker/sidecar.config.toml /etc/torrentng/config.toml
+COPY deploy/container/identity.sh /usr/local/lib/torrentng/identity.sh
 COPY deploy/docker/entrypoint.sh  /entrypoint.sh
 RUN chmod +x /entrypoint.sh \
     && mkdir -p /data /session /config /var/lib/torrentng /var/log/rtorrent /run/rtorrent \
@@ -92,9 +95,11 @@ RUN chmod +x /entrypoint.sh \
 
 ENV TNG_STATIC_DIR=/usr/share/torrentng/webui
 ENV LD_LIBRARY_PATH=/usr/local/lib
+ENV TNG_DEFAULT_UID="${TNG_UID}"
+ENV TNG_DEFAULT_GID="${TNG_GID}"
 ENV TNG_PACKAGED_RTORRENT_VERSION=0.16.11
 ENV TNG_PACKAGED_LIBTORRENT_VERSION=0.16.11
-ENV TNG_RTORRENT_PATCHES=rtorrent-0.16.11-user-agent-command,rtorrent-0.16.11-local-id-command,rtorrent-0.16.11-multicall-range,rtorrent-0.16.11-tracker-identity-gate
+ENV TNG_RTORRENT_PATCHES=rtorrent-0.16.11-user-agent-command,rtorrent-0.16.11-local-id-command,rtorrent-0.16.11-multicall-range,rtorrent-0.16.11-tracker-identity-gate,rtorrent-0.16.11-unlimited-queue-refill
 
 LABEL org.opencontainers.image.title="TorrentNG Compatible-Client Service" \
       org.opencontainers.image.description="TorrentNG compatible-client WebUI/API service for existing qBittorrent, rTorrent, Transmission, and Deluge deployments."
@@ -102,5 +107,8 @@ LABEL org.opencontainers.image.title="TorrentNG Compatible-Client Service" \
 VOLUME ["/data", "/session", "/config", "/var/lib/torrentng"]
 EXPOSE 8080 50000 50000/udp
 
-USER 1000:1000
-ENTRYPOINT ["/sbin/tini", "-g", "--", "/entrypoint.sh"]
+# Root is used only for the entrypoint's PUID/PGID directory setup; it drops
+# to the configured non-root identity before starting Tini and the service.
+# trivy:ignore:DS-0002
+USER root
+ENTRYPOINT ["/entrypoint.sh"]
