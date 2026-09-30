@@ -148,6 +148,8 @@ required for the TorrentNG client.
 | `PUT` | `/api/v1/transfer/limits` | Merge global transfer limits (`download_limit`, `upload_limit`, `speed_limits_mode`) |
 | `GET` | `/api/v1/session/features` | Read runtime network feature switches (`dht`, `pex`) |
 | `PUT` | `/api/v1/session/features` | Merge runtime network feature switches; `torrentngd` returns empty `204`, while the compatible-client sidecar returns the updated fields as JSON (`200`); DHT starts/stops at runtime and PEX affects future peer extension handshakes |
+| `GET` | `/api/v1/session/settings` | Read the active peer `listen_port` |
+| `PATCH` | `/api/v1/session/settings` | Change and persist `listen_port` at runtime; binds TCP and enabled uTP listeners before committing, then updates tracker and DHT announcements |
 
 For `torrentngd`, torrent-add JSON accepts `save_path`, exactly one of
 `torrent_b64` or `magnet`, and optional `category`, `tags`, and `start` fields.
@@ -506,9 +508,9 @@ Implements the qBittorrent Web API v2. By default it advertises qBittorrent `5.0
 | `GET` | `/api/qb/v2/app/version` |
 | `GET` | `/api/qb/v2/app/webapiVersion` |
 | `GET` | `/api/qb/v2/app/buildInfo` |
-| `GET` | `/api/qb/v2/app/preferences` | Includes queue defaults plus backend-derived `dht`/`pex` status when known and `network_http_user_agent` when supported; TorrentNG-client preferences, cookies, and API-key state are durable |
+| `GET` | `/api/qb/v2/app/preferences` | Includes queue defaults plus runtime `listen_port`, backend-derived `dht`/`pex` status when known, and `network_http_user_agent` when supported; TorrentNG-client preferences, cookies, and API-key state are durable |
 | `GET` | `/api/qb/v2/app/defaultSavePath` |
-| `POST` | `/api/qb/v2/app/setPreferences` | Form: `json` preference object; TorrentNG-client mode applies `dht`, `pex`, and the supported user-agent setting; other accepted keys are compatibility-only facade overrides and are not runtime enforcement unless the capability manifest says so |
+| `POST` | `/api/qb/v2/app/setPreferences` | Form: `json` preference object; TorrentNG-client mode applies `listen_port`, `dht`, `pex`, and the supported user-agent setting; other accepted keys are compatibility-only facade overrides and are not runtime enforcement unless the capability manifest says so |
 | `GET` | `/api/qb/v2/app/getCookies` | Returns durable facade-stored cookie objects sorted by host/name when a TorrentNG client is attached; no-client instances are process-local |
 | `POST` | `/api/qb/v2/app/setCookies` | Accepts JSON array, `{ "cookies": [...] }`, or form `cookies=<json array>`; bounded and durable when the engine is attached |
 | `POST` | `/api/qb/v2/app/rotateAPIKey` | Stores and returns a generated facade API key as `{ "apiKey": "..." }`; this is compatibility state, not an authentication credential |

@@ -192,7 +192,7 @@ impl Client {
         };
         if priority == RpcPriority::Background {
             if let Err(error) = &result {
-                if is_timeout_error(error) {
+                if is_transient_transport_error(error) {
                     *self.low_priority_pause_until.lock().await =
                         Some(Instant::now() + std::time::Duration::from_secs(15));
                 }
@@ -508,6 +508,31 @@ fn contains_base64(value: &XmlValue) -> bool {
 fn is_timeout_error(error: &anyhow::Error) -> bool {
     let text = format!("{error:#}");
     text.contains("timed out") || text.contains("deadline has elapsed")
+}
+
+fn is_transient_transport_error(error: &anyhow::Error) -> bool {
+    if is_timeout_error(error) {
+        return true;
+    }
+
+    error.chain().any(|cause| {
+        cause
+            .downcast_ref::<std::io::Error>()
+            .is_some_and(|io_error| {
+                matches!(
+                    io_error.kind(),
+                    std::io::ErrorKind::BrokenPipe
+                        | std::io::ErrorKind::ConnectionAborted
+                        | std::io::ErrorKind::ConnectionRefused
+                        | std::io::ErrorKind::ConnectionReset
+                        | std::io::ErrorKind::NotConnected
+                        | std::io::ErrorKind::NotFound
+                        | std::io::ErrorKind::TimedOut
+                        | std::io::ErrorKind::UnexpectedEof
+                        | std::io::ErrorKind::WouldBlock
+                )
+            })
+    })
 }
 
 // --- XMLRPC builder ---

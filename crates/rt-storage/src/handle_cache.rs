@@ -324,7 +324,9 @@ impl HandleCache {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    #[cfg(target_os = "linux")]
+    use std::sync::atomic::AtomicUsize;
+    use std::sync::atomic::Ordering;
 
     fn tmp_file(dir: &Path, name: &str, content: &[u8]) -> PathBuf {
         let p = dir.join(name);
