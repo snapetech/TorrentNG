@@ -320,6 +320,7 @@ jobs:
         working-directory: webui
         env:
           DBUS_SESSION_BUS_ADDRESS: unix:path=/dev/null
+          TNG_WEBUI_SNAPSHOT_PROFILE: ${{ github.event_name == 'pull_request' && 'hosted' || 'self-hosted' }}
         run: npm run test:e2e -- --reporter=line
 
       - name: Upload WebUI browser failure evidence
