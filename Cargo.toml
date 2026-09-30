@@ -58,7 +58,7 @@ toml = "0.8"
 
 # error handling
 anyhow = "1"
-thiserror = "1"
+thiserror = "2"
 
 # tracing
 tracing = "0.1"
