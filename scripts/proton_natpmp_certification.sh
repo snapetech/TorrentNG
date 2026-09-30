@@ -2,6 +2,8 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# shellcheck source=scripts/curl_policy.sh
+source "$ROOT/scripts/curl_policy.sh"
 SLSKR_ROOT="${SLSKR_ROOT:-/home/keith/Documents/code/slskR}"
 POOL_FILE="${SLSKR_PROTON_CREDENTIAL_POOL_FILE:-$SLSKR_ROOT/.secrets/proton-credential-pool.env}"
 LABEL="${TNG_PROTON_LABEL:-p1}"

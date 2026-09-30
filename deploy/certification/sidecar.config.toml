@@ -16,6 +16,7 @@ user_agent = "rtorrent/0.16.11/0.16.11"
 secret_key = "local-cert-session-secret-20260904-0123456789abcdef"
 api_tokens = ["local-cert-api-token-20260904"]
 trust_proxy_header = false
+secure_cookies = true
 
 [workflows]
 allow_scripts = false

@@ -8,7 +8,10 @@ use serde::{
     de::{self, Deserializer, SeqAccess, Visitor},
     Deserialize, Serialize,
 };
-use std::{collections::BTreeSet, fmt, io};
+use std::{
+    collections::{BTreeSet, HashMap},
+    fmt, io,
+};
 
 use crate::error::DbError;
 
@@ -32,7 +35,7 @@ const MAX_TORRENT_STATE_BYTES: usize = 64;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct TorrentRow {
-    /// Hex-encoded 40-char SHA-1 infohash.
+    /// Hex-encoded v1 SHA-1 or full v2 SHA-256 infohash. Hybrid rows use v1.
     pub info_hash: String,
     pub name: String,
     pub total_length: i64,
@@ -75,6 +78,7 @@ pub struct TorrentLabelsRow {
 #[derive(Debug, Clone, PartialEq)]
 pub struct TorrentMetadataProjection {
     pub info_hash: String,
+    pub expected_v2_hash: Option<[u8; 32]>,
     pub total_length: i64,
     pub piece_count: i64,
     pub is_private: bool,
@@ -949,9 +953,11 @@ pub fn torrent_metadata_projection(
     info_hash: &str,
 ) -> Result<Option<TorrentMetadataProjection>, DbError> {
     conn.query_row(
-        "SELECT info_hash, total_length, piece_count, is_private, state,
-                completed_at, amount_left, trackers
-         FROM torrents WHERE info_hash = ?1",
+        "SELECT t.info_hash, t.total_length, t.piece_count, t.is_private, t.state,
+                t.completed_at, t.amount_left, t.trackers, h.expected_v2_hash
+         FROM torrents t
+         LEFT JOIN torrent_metadata_v2_hashes h ON h.info_hash = t.info_hash
+         WHERE t.info_hash = ?1",
         params![info_hash],
         |row| {
             Ok(TorrentMetadataProjection {
@@ -961,6 +967,7 @@ pub fn torrent_metadata_projection(
                     "torrent info hash",
                     MAX_TORRENT_INFO_HASH_BYTES,
                 )?,
+                expected_v2_hash: metadata_v2_hash_column(row, 8)?,
                 total_length: row.get(1)?,
                 piece_count: row.get(2)?,
                 is_private: row.get::<_, i64>(3)? != 0,
@@ -1034,6 +1041,103 @@ pub fn delete_in_tx(tx: &rusqlite::Transaction<'_>, info_hash: &str) -> Result<b
         params![info_hash],
     )?;
     Ok(n > 0)
+}
+
+/// Persist the secondary v2 identity for a hybrid magnet while it is still
+/// waiting for metadata. The main torrent row remains keyed by its v1 hash.
+pub fn upsert_torrent_metadata_v2_hash_in_tx(
+    tx: &rusqlite::Transaction<'_>,
+    info_hash: &str,
+    expected_v2_hash: &[u8; 32],
+) -> Result<(), DbError> {
+    tx.execute(
+        "INSERT INTO torrent_metadata_v2_hashes (info_hash, expected_v2_hash)
+         VALUES (?1, ?2)
+         ON CONFLICT(info_hash) DO UPDATE SET expected_v2_hash = excluded.expected_v2_hash",
+        params![info_hash, expected_v2_hash.as_slice()],
+    )?;
+    Ok(())
+}
+
+/// Remove a magnet's secondary identity after metadata has been verified.
+pub fn delete_torrent_metadata_v2_hash_in_tx(
+    tx: &rusqlite::Transaction<'_>,
+    info_hash: &str,
+) -> Result<bool, DbError> {
+    let changed = tx.execute(
+        "DELETE FROM torrent_metadata_v2_hashes WHERE info_hash = ?1",
+        params![info_hash],
+    )?;
+    Ok(changed > 0)
+}
+
+/// Load the compact secondary-identity projection needed when restoring
+/// metadata-pending magnets at startup.
+pub fn list_torrent_metadata_v2_hashes(
+    conn: &Connection,
+) -> Result<HashMap<String, [u8; 32]>, DbError> {
+    let mut stmt = conn.prepare(
+        "SELECT info_hash, expected_v2_hash
+         FROM torrent_metadata_v2_hashes ORDER BY info_hash",
+    )?;
+    let mut rows = stmt.query([])?;
+    let mut result = HashMap::new();
+    let mut result_bytes = 0usize;
+    while let Some(row) = rows.next()? {
+        if result.len() >= MAX_TORRENT_RESULT_ITEMS {
+            return Err(DbError::ValueTooLarge {
+                field: "torrent metadata v2 hash result items",
+                len: (result.len() + 1) as u64,
+                max: MAX_TORRENT_RESULT_ITEMS as u64,
+            });
+        }
+        let info_hash = bounded_text_column(
+            row,
+            0,
+            "torrent metadata v2 hash owner",
+            MAX_TORRENT_INFO_HASH_BYTES,
+        )?;
+        result_bytes = result_bytes.saturating_add(info_hash.len().saturating_add(32));
+        if result_bytes > MAX_TORRENT_RESULT_BYTES {
+            return Err(DbError::ValueTooLarge {
+                field: "torrent metadata v2 hash result bytes",
+                len: result_bytes as u64,
+                max: MAX_TORRENT_RESULT_BYTES as u64,
+            });
+        }
+        let expected_v2_hash = metadata_v2_hash_column(row, 1)?.ok_or_else(|| {
+            rusqlite::Error::InvalidColumnType(1, "expected_v2_hash".to_owned(), Type::Null)
+        })?;
+        result.insert(info_hash, expected_v2_hash);
+    }
+    Ok(result)
+}
+
+fn metadata_v2_hash_column(row: &Row<'_>, column: usize) -> rusqlite::Result<Option<[u8; 32]>> {
+    match row.get_ref(column)? {
+        ValueRef::Null => Ok(None),
+        ValueRef::Blob(bytes) if bytes.len() == 32 => {
+            let mut hash = [0; 32];
+            hash.copy_from_slice(bytes);
+            Ok(Some(hash))
+        }
+        ValueRef::Blob(bytes) => Err(rusqlite::Error::FromSqlConversionFailure(
+            column,
+            Type::Blob,
+            Box::new(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "torrent metadata v2 hash is {} bytes; expected 32",
+                    bytes.len()
+                ),
+            )),
+        )),
+        other => Err(rusqlite::Error::InvalidColumnType(
+            column,
+            "expected_v2_hash".to_owned(),
+            other.data_type(),
+        )),
+    }
 }
 
 pub fn list_all(conn: &Connection) -> Result<Vec<TorrentRow>, DbError> {
@@ -1439,6 +1543,7 @@ mod tests {
                 .unwrap(),
             TorrentMetadataProjection {
                 info_hash: row.info_hash.clone(),
+                expected_v2_hash: None,
                 total_length: row.total_length,
                 piece_count: row.piece_count,
                 is_private: row.is_private,
@@ -1454,6 +1559,67 @@ mod tests {
                 .save_path,
             row.save_path
         );
+    }
+
+    #[test]
+    fn hybrid_metadata_v2_identity_round_trips_and_cascades() {
+        let mut conn = setup();
+        let row = sample();
+        let expected_v2_hash = [0x5a; 32];
+        upsert(&conn, &row).unwrap();
+
+        let tx = conn.transaction().unwrap();
+        upsert_torrent_metadata_v2_hash_in_tx(&tx, &row.info_hash, &expected_v2_hash).unwrap();
+        tx.commit().unwrap();
+
+        assert_eq!(
+            list_torrent_metadata_v2_hashes(&conn)
+                .unwrap()
+                .get(&row.info_hash),
+            Some(&expected_v2_hash)
+        );
+        assert_eq!(
+            torrent_metadata_projection(&conn, &row.info_hash)
+                .unwrap()
+                .unwrap()
+                .expected_v2_hash,
+            Some(expected_v2_hash)
+        );
+
+        let tx = conn.transaction().unwrap();
+        assert!(delete_torrent_metadata_v2_hash_in_tx(&tx, &row.info_hash).unwrap());
+        tx.commit().unwrap();
+        assert!(list_torrent_metadata_v2_hashes(&conn).unwrap().is_empty());
+
+        let tx = conn.transaction().unwrap();
+        upsert_torrent_metadata_v2_hash_in_tx(&tx, &row.info_hash, &expected_v2_hash).unwrap();
+        tx.commit().unwrap();
+        assert!(delete(&conn, &row.info_hash).unwrap());
+        assert!(list_torrent_metadata_v2_hashes(&conn).unwrap().is_empty());
+    }
+
+    #[test]
+    fn malformed_hybrid_v2_hash_blob_is_rejected_before_copying() {
+        let conn = setup();
+        let row = sample();
+        upsert(&conn, &row).unwrap();
+        conn.execute_batch("PRAGMA ignore_check_constraints = ON;")
+            .unwrap();
+        conn.execute(
+            "INSERT INTO torrent_metadata_v2_hashes (info_hash, expected_v2_hash)
+             VALUES (?1, ?2)",
+            params![row.info_hash, vec![0x5a_u8; 1024 * 1024]],
+        )
+        .unwrap();
+
+        assert!(list_torrent_metadata_v2_hashes(&conn)
+            .unwrap_err()
+            .to_string()
+            .contains("expected 32"));
+        assert!(torrent_metadata_projection(&conn, &row.info_hash)
+            .unwrap_err()
+            .to_string()
+            .contains("expected 32"));
     }
 
     #[test]

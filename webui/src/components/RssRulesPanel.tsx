@@ -1,6 +1,7 @@
 import { useState } from 'react'
 import { useQuery, useQueryClient } from '@tanstack/react-query'
 import { api } from '../api/client'
+import { redactUrlForDisplay } from '../lib/maskUrl'
 import type { RssRule, RssRuleMatch } from '../api/client'
 
 const EMPTY: RssRule = {
@@ -90,7 +91,13 @@ export function RssRulesPanel() {
     setApplyResult(null)
     try {
       const result = await api.rssRules.apply(sampleTitle.trim(), sampleLink.trim(), dryRun)
-      setApplyResult(`${result.dry_run ? 'Preview' : 'Apply'}: ${result.applied.length} matched, ${result.errors.length} error(s)`)
+      const matchedCount = result.matched_total ?? result.applied_total ?? result.applied.length
+      const appliedCount = result.applied_total ?? result.applied.length
+      const errorCount = result.errors_total ?? result.errors.length
+      const summary = result.dry_run
+        ? `${matchedCount} matched`
+        : `${matchedCount} matched, ${appliedCount} applied`
+      setApplyResult(`${result.dry_run ? 'Preview' : 'Apply'}: ${summary}, ${errorCount} error(s)`)
     } catch (e) {
       setError(String(e))
     } finally {
@@ -162,7 +169,7 @@ export function RssRulesPanel() {
               }} />
               {rule.name}
             </strong>
-            <span style={{ color: 'var(--faint)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{rule.feed_url}</span>
+            <span style={{ color: 'var(--faint)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{redactUrlForDisplay(rule.feed_url)}</span>
             <span style={{ color: 'var(--muted)' }}>{rule.include}</span>
             <span style={{ color: 'var(--faint)' }}>{rule.category || 'no category'}</span>
             <Pill tone={rule.enabled ? 'ok' : 'idle'}>{rule.enabled ? 'enabled' : 'disabled'}</Pill>

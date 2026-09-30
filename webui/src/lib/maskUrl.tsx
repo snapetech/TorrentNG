@@ -1,77 +1,29 @@
 import { useState } from 'react'
 
-const CREDENTIAL_QUERY_KEYS = new Set([
-  'passkey', 'pass', 'pid', 'auth', 'authkey', 'token', 'key', 'secret', 'uk', 'rsskey', 'apikey',
-  'password', 'passwd', 'cookie', 'session', 'torrentpass', 'trackerpass', 'privatekey',
-])
-
-function isCredentialQueryKey(key: string): boolean {
-  // Treat underscore- and hyphen-separated spellings alike (`api_key`,
-  // `api-key`, `torrent_pass`, etc.). A suffix match covers namespaced token
-  // keys such as `access_token` without masking ordinary query parameters.
-  const normalized = decodedLower(key).replace(/[-_]/g, '')
-  return CREDENTIAL_QUERY_KEYS.has(normalized)
-    || normalized.endsWith('token')
-    || normalized.endsWith('passkey')
-}
-
-const MASK = '•'.repeat(8)
-
-function decodedLower(value: string): string {
-  try {
-    return decodeURIComponent(value).toLowerCase()
-  } catch {
-    // A malformed percent escape must not make a render fail. It also cannot
-    // safely be treated as a credential key, so compare the raw spelling.
-    return value.toLowerCase()
-  }
-}
-
 /**
- * Masks credential-shaped parts of a tracker announce URL so it can be shown
- * on screen (and screen-shared/screenshotted) without leaking a private
- * tracker passkey. Two shapes are handled: known credential query params
- * (?passkey=...) and long opaque path segments some trackers use instead
- * (e.g. myanonamouse's /tracker.php/<passkey>/announce).
- *
- * The host is always left visible - masking exists to hide the credential,
- * not to hide which tracker this is.
+ * Shows a tracker origin without any URL components that may contain a
+ * credential. The TrackerUrl control has an explicit reveal/copy path for
+ * users who need the complete announce URL.
  */
 export function maskAnnounceUrl(url: string): string {
-  if (!url) return url
-
-  // Work on the raw string (not URL/URLSearchParams.toString(), which would
-  // percent-encode the bullet placeholder into "%E2%80%A2..." garbage) so
-  // the masked query value renders as readable text.
-  let masked = url.replace(
-    /^([a-z][a-z\d+.-]*:\/\/)([^/?#@]+)@/i,
-    `$1${MASK}@`,
-  ).replace(
-    /([?&])([^=&#]+)=([^&#]*)/g,
-    (match, sep: string, key: string, value: string) =>
-      isCredentialQueryKey(key) && value
-        ? `${sep}${key}=${MASK}`
-        : match,
-  )
-
-  const hashIndex = masked.indexOf('#')
-  const pathAndQuery = hashIndex === -1 ? masked : masked.slice(0, hashIndex)
-  const fragment = hashIndex === -1 ? '' : masked.slice(hashIndex)
-  const queryIndex = pathAndQuery.indexOf('?')
-  const pathPart = queryIndex === -1 ? pathAndQuery : pathAndQuery.slice(0, queryIndex)
-  const queryPart = queryIndex === -1 ? '' : pathAndQuery.slice(queryIndex)
-  masked = maskOpaquePathSegments(pathPart) + queryPart + fragment
-
-  return masked
+  return redactUrlOrigin(url, ['http:', 'https:', 'udp:'])
 }
 
-/** A path segment of 16+ alphanumeric characters is almost certainly an opaque token, not a real path. */
-function maskOpaquePathSegments(pathOrUrl: string): string {
-  return pathOrUrl.replace(/([/])([A-Za-z0-9]{16,})(?=[/?#]|$)/g, (_match, sep: string, segment: string) => {
-    const looksOpaque = /[0-9]/.test(segment) && /[A-Za-z]/.test(segment)
-    if (!looksOpaque) return `${sep}${segment}`
-    return `${sep}${'•'.repeat(8)}`
-  })
+/** Hides every URL component except the HTTP(S) origin for configuration labels. */
+export function redactUrlForDisplay(url: string): string {
+  return redactUrlOrigin(url, ['http:', 'https:'])
+}
+
+function redactUrlOrigin(url: string, allowedProtocols: readonly string[]): string {
+  if (!url) return url
+
+  try {
+    const parsed = new URL(url)
+    if (!allowedProtocols.includes(parsed.protocol) || !parsed.host) return '[redacted URL]'
+    return `${parsed.protocol}//${parsed.host}/…`
+  } catch {
+    return '[redacted URL]'
+  }
 }
 
 const BTN: React.CSSProperties = {

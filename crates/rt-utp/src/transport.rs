@@ -3,7 +3,7 @@ use std::{
     net::SocketAddr,
     sync::{
         atomic::{AtomicU64, Ordering},
-        Arc, Mutex as StdMutex,
+        Arc, Mutex as StdMutex, MutexGuard as StdMutexGuard,
     },
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -11,7 +11,7 @@ use std::{
 use rand::RngExt;
 use tokio::{
     net::UdpSocket,
-    sync::{mpsc, watch, Mutex},
+    sync::{mpsc, watch, Mutex as TokioMutex},
     task::JoinHandle,
     time::timeout,
 };
@@ -25,6 +25,10 @@ use crate::{
 };
 
 const MAX_RECEIVE_BUFFER_BYTES: usize = DEFAULT_INITIAL_WINDOW_BYTES as usize;
+/// Maximum UDP payload accepted by an IPv4/IPv6 socket. Keeping the public
+/// configuration below this bound also prevents a malformed setting from
+/// turning every listener or stream into an unbounded allocation.
+pub const MAX_UDP_DATAGRAM_LEN: usize = 65_507;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct UtpTransportConfig {
@@ -54,7 +58,7 @@ pub struct UtpListener {
 pub struct UtpEndpoint {
     socket: Arc<UdpSocket>,
     config: UtpTransportConfig,
-    accepted_rx: Arc<Mutex<mpsc::Receiver<Result<UtpStream, UtpError>>>>,
+    accepted_rx: Arc<TokioMutex<mpsc::Receiver<Result<UtpStream, UtpError>>>>,
     stop: watch::Sender<bool>,
     recv_task: Arc<StdMutex<Option<JoinHandle<()>>>>,
 }
@@ -170,6 +174,20 @@ fn record_nonzero_min(target: &AtomicU64, value: u64) {
     }
 }
 
+fn validate_config(config: UtpTransportConfig) -> Result<(), UtpError> {
+    if config.max_datagram_len < crate::HEADER_SIZE {
+        return Err(UtpError::InvalidConfig(
+            "max_datagram_len must include the uTP header",
+        ));
+    }
+    if config.max_datagram_len > MAX_UDP_DATAGRAM_LEN {
+        return Err(UtpError::InvalidConfig(
+            "max_datagram_len exceeds the maximum UDP payload",
+        ));
+    }
+    Ok(())
+}
+
 impl std::fmt::Debug for UtpStream {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("UtpStream")
@@ -193,23 +211,31 @@ struct UtpRoute {
     handshake_state: UtpPacket,
 }
 
-struct UtpRouteCleanup {
-    key: UtpRouteKey,
-    token: Arc<()>,
-}
-
 struct UtpRouteRegistration {
     key: UtpRouteKey,
     token: Arc<()>,
-    cleanup_tx: mpsc::UnboundedSender<UtpRouteCleanup>,
+    streams: Arc<StdMutex<HashMap<UtpRouteKey, UtpRoute>>>,
 }
 
 impl Drop for UtpRouteRegistration {
     fn drop(&mut self) {
-        let _ = self.cleanup_tx.send(UtpRouteCleanup {
-            key: self.key,
-            token: Arc::clone(&self.token),
-        });
+        let mut streams = lock_routes(&self.streams);
+        let remove = streams
+            .get(&self.key)
+            .map(|route| Arc::ptr_eq(&route.token, &self.token))
+            .unwrap_or(false);
+        if remove {
+            streams.remove(&self.key);
+        }
+    }
+}
+
+fn lock_routes(
+    streams: &StdMutex<HashMap<UtpRouteKey, UtpRoute>>,
+) -> StdMutexGuard<'_, HashMap<UtpRouteKey, UtpRoute>> {
+    match streams.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
     }
 }
 
@@ -222,6 +248,7 @@ impl UtpListener {
         addr: SocketAddr,
         config: UtpTransportConfig,
     ) -> Result<Self, UtpError> {
+        validate_config(config)?;
         let socket = UdpSocket::bind(addr)
             .await
             .map_err(|err| UtpError::Io(err.to_string()))?;
@@ -295,27 +322,25 @@ impl UtpEndpoint {
         addr: SocketAddr,
         config: UtpTransportConfig,
     ) -> Result<Self, UtpError> {
+        validate_config(config)?;
         let socket = UdpSocket::bind(addr)
             .await
             .map_err(|err| UtpError::Io(err.to_string()))?;
         let socket = Arc::new(socket);
-        let streams = Arc::new(Mutex::new(HashMap::new()));
+        let streams = Arc::new(StdMutex::new(HashMap::new()));
         let (accepted_tx, accepted_rx) = mpsc::channel(256);
         let (stop, stop_rx) = watch::channel(false);
-        let (route_cleanup_tx, route_cleanup_rx) = mpsc::unbounded_channel();
         let recv_task = tokio::spawn(run_endpoint_recv(
             socket.clone(),
             config,
             streams.clone(),
             accepted_tx,
             stop_rx,
-            route_cleanup_tx,
-            route_cleanup_rx,
         ));
         Ok(Self {
             socket,
             config,
-            accepted_rx: Arc::new(Mutex::new(accepted_rx)),
+            accepted_rx: Arc::new(TokioMutex::new(accepted_rx)),
             stop,
             recv_task: Arc::new(StdMutex::new(Some(recv_task))),
         })
@@ -345,12 +370,22 @@ impl UtpEndpoint {
     /// The endpoint owns a shared UDP socket, so merely dropping the task
     /// handle is insufficient: the receive task would otherwise keep the
     /// socket bound until the runtime happens to tear it down.
-    pub async fn shutdown(&self) {
+    pub async fn shutdown(&self) -> Result<(), UtpError> {
         let _ = self.stop.send(true);
-        let recv_task = self.recv_task.lock().ok().and_then(|mut task| task.take());
+        let recv_task = match self.recv_task.lock() {
+            Ok(mut task) => task.take(),
+            Err(poisoned) => poisoned.into_inner().take(),
+        };
         if let Some(recv_task) = recv_task {
-            let _ = recv_task.await;
+            recv_task.await.map_err(|error| {
+                if error.is_panic() {
+                    UtpError::ReceiveTaskPanicked
+                } else {
+                    UtpError::ReceiveTaskCancelled
+                }
+            })?;
         }
+        Ok(())
     }
 }
 
@@ -363,10 +398,12 @@ impl Drop for UtpEndpoint {
             return;
         }
         let _ = self.stop.send(true);
-        if let Ok(mut task) = self.recv_task.lock() {
-            if let Some(task) = task.take() {
-                task.abort();
-            }
+        let mut recv_task = match self.recv_task.lock() {
+            Ok(task) => task,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if let Some(task) = recv_task.take() {
+            task.abort();
         }
     }
 }
@@ -374,11 +411,9 @@ impl Drop for UtpEndpoint {
 async fn run_endpoint_recv(
     socket: Arc<UdpSocket>,
     config: UtpTransportConfig,
-    streams: Arc<Mutex<HashMap<UtpRouteKey, UtpRoute>>>,
+    streams: Arc<StdMutex<HashMap<UtpRouteKey, UtpRoute>>>,
     accepted_tx: mpsc::Sender<Result<UtpStream, UtpError>>,
     mut stop: watch::Receiver<bool>,
-    route_cleanup_tx: mpsc::UnboundedSender<UtpRouteCleanup>,
-    mut route_cleanup_rx: mpsc::UnboundedReceiver<UtpRouteCleanup>,
 ) {
     let mut buf = vec![0u8; config.max_datagram_len.saturating_add(1)];
     loop {
@@ -386,20 +421,6 @@ async fn run_endpoint_recv(
             stop_result = stop.changed() => {
                 if stop_result.is_err() || *stop.borrow() {
                     break;
-                }
-                continue;
-            }
-            cleanup = route_cleanup_rx.recv() => {
-                let Some(cleanup) = cleanup else {
-                    break;
-                };
-                let mut streams = streams.lock().await;
-                let remove = streams
-                    .get(&cleanup.key)
-                    .map(|route| Arc::ptr_eq(&route.token, &cleanup.token))
-                    .unwrap_or(false);
-                if remove {
-                    streams.remove(&cleanup.key);
                 }
                 continue;
             }
@@ -434,7 +455,7 @@ async fn run_endpoint_recv(
         };
         if packet.header.packet_type != PacketType::Syn {
             let tx = {
-                let streams = streams.lock().await;
+                let streams = lock_routes(&streams);
                 streams.get(&key).map(|route| route.tx.clone())
             };
             if let Some(tx) = tx {
@@ -451,7 +472,7 @@ async fn run_endpoint_recv(
         // the route already exists, resend the original STATE instead of
         // replacing the live stream and orphaning its receive queue.
         if let Some(state) = {
-            let streams = streams.lock().await;
+            let streams = lock_routes(&streams);
             streams.get(&key).map(|route| route.handshake_state.clone())
         } {
             if send_packet_to(&socket, peer, &state).await.is_err() {
@@ -483,7 +504,7 @@ async fn run_endpoint_recv(
             recv_connection_id: conn.ids().recv,
         };
         let token = Arc::new(());
-        streams.lock().await.insert(
+        lock_routes(&streams).insert(
             key,
             UtpRoute {
                 tx,
@@ -503,7 +524,7 @@ async fn run_endpoint_recv(
             route: Some(UtpRouteRegistration {
                 key,
                 token,
-                cleanup_tx: route_cleanup_tx.clone(),
+                streams: Arc::clone(&streams),
             }),
         };
         observe_connection(&stream.conn);
@@ -534,6 +555,7 @@ impl UtpStream {
         peer: SocketAddr,
         config: UtpTransportConfig,
     ) -> Result<Self, UtpError> {
+        validate_config(config)?;
         let bind_addr = if peer.is_ipv4() {
             "0.0.0.0:0"
         } else {
@@ -968,9 +990,8 @@ impl Drop for ReadBufferReleaseGuard<'_> {
 
 impl Drop for UtpStream {
     fn drop(&mut self) {
-        // Endpoint routes are removed asynchronously by the receive loop.
-        // The token prevents a late cleanup from deleting a newer stream if
-        // the same peer/connection-id pair is ever reused.
+        // The token prevents an old stream from deleting a newer route if the
+        // same peer/connection-id pair is ever reused.
         drop(self.route.take());
     }
 }
@@ -1053,6 +1074,66 @@ mod tests {
             max_datagram_len: 2048,
             max_retransmits: 1,
         }
+    }
+
+    #[tokio::test]
+    async fn rejects_invalid_datagram_configuration_before_binding() {
+        let mut config = test_config();
+        config.max_datagram_len = crate::HEADER_SIZE - 1;
+        assert!(matches!(
+            UtpEndpoint::bind_with_config("127.0.0.1:0".parse().unwrap(), config).await,
+            Err(UtpError::InvalidConfig(_))
+        ));
+
+        config.max_datagram_len = MAX_UDP_DATAGRAM_LEN + 1;
+        assert!(matches!(
+            UtpListener::bind_with_config("127.0.0.1:0".parse().unwrap(), config).await,
+            Err(UtpError::InvalidConfig(_))
+        ));
+    }
+
+    #[test]
+    fn dropped_route_registration_cannot_remove_a_replacement_route() {
+        let streams = Arc::new(StdMutex::new(HashMap::new()));
+        let key = UtpRouteKey {
+            peer: "127.0.0.1:1".parse().unwrap(),
+            recv_connection_id: 7,
+        };
+        let old_token = Arc::new(());
+        let (old_tx, _old_rx) = mpsc::channel(1);
+        let mut old_conn = UtpConnection::connect(1, 1);
+        let old_state = old_conn.build_state(0, 0);
+        lock_routes(&streams).insert(
+            key,
+            UtpRoute {
+                tx: old_tx,
+                token: Arc::clone(&old_token),
+                handshake_state: old_state,
+            },
+        );
+        let old_registration = UtpRouteRegistration {
+            key,
+            token: old_token,
+            streams: Arc::clone(&streams),
+        };
+
+        let new_token = Arc::new(());
+        let (new_tx, _new_rx) = mpsc::channel(1);
+        let mut new_conn = UtpConnection::connect(2, 2);
+        let new_state = new_conn.build_state(0, 0);
+        lock_routes(&streams).insert(
+            key,
+            UtpRoute {
+                tx: new_tx,
+                token: Arc::clone(&new_token),
+                handshake_state: new_state,
+            },
+        );
+
+        drop(old_registration);
+        let streams = lock_routes(&streams);
+        let route = streams.get(&key).expect("replacement route remains");
+        assert!(Arc::ptr_eq(&route.token, &new_token));
     }
 
     #[tokio::test]
@@ -1274,13 +1355,58 @@ mod tests {
             .await
             .unwrap();
         let addr = endpoint.local_addr().unwrap();
-        endpoint.shutdown().await;
+        endpoint.shutdown().await.expect("endpoint shutdown");
         drop(endpoint);
 
         let rebound = UtpEndpoint::bind_with_config(addr, test_config())
             .await
             .expect("endpoint shutdown must release the UDP socket");
-        rebound.shutdown().await;
+        rebound.shutdown().await.expect("rebound endpoint shutdown");
+    }
+
+    #[tokio::test]
+    async fn utp_endpoint_shutdown_reports_receive_task_panic_without_payload() {
+        let endpoint = UtpEndpoint::bind_with_config("127.0.0.1:0".parse().unwrap(), test_config())
+            .await
+            .unwrap();
+        let original = endpoint
+            .recv_task
+            .lock()
+            .expect("receive-task lock")
+            .take()
+            .expect("receive task");
+        endpoint.stop.send(true).expect("receive task is listening");
+        original.await.expect("receive loop stops cleanly");
+
+        let panicked = tokio::spawn(async { std::panic::panic_any(()) });
+        *endpoint.recv_task.lock().expect("receive-task lock") = Some(panicked);
+
+        let error = endpoint
+            .shutdown()
+            .await
+            .expect_err("panicked receive task must be reported");
+        assert!(matches!(error, UtpError::ReceiveTaskPanicked));
+        assert_eq!(error.to_string(), "uTP receive task panicked");
+    }
+
+    #[tokio::test]
+    async fn utp_endpoint_shutdown_recovers_a_poisoned_task_handle_lock() {
+        let endpoint = UtpEndpoint::bind_with_config("127.0.0.1:0".parse().unwrap(), test_config())
+            .await
+            .unwrap();
+        endpoint.stop.send(true).expect("receive task is listening");
+
+        let task_slot = Arc::clone(&endpoint.recv_task);
+        let poison_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+            let _task_slot = task_slot.lock().expect("receive-task lock");
+            std::panic::panic_any(());
+        }));
+        assert!(poison_result.is_err());
+
+        endpoint
+            .shutdown()
+            .await
+            .expect("shutdown recovers and joins the receive task");
     }
 
     #[tokio::test]
@@ -1293,7 +1419,7 @@ mod tests {
             tokio::spawn(async move { endpoint.accept().await })
         };
 
-        endpoint.shutdown().await;
+        endpoint.shutdown().await.expect("endpoint shutdown");
         assert!(matches!(waiter.await.unwrap(), Err(UtpError::Closed)));
     }
 
@@ -1324,7 +1450,7 @@ mod tests {
 
         drop(client);
         drop(accepted);
-        endpoint.shutdown().await;
+        endpoint.shutdown().await.expect("endpoint shutdown");
     }
 
     #[tokio::test]

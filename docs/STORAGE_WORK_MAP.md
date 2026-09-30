@@ -41,6 +41,7 @@ release claims.
 | Storage plan UI workflow | Implemented in the Library storage panel | Operators can select move/import/delete, choose a writable storage root, preview root-confined steps and issues, then execute through the TorrentNG durable storage-plan API |
 | TorrentNG storage config | Implemented for scheduler `StorageIoConfig` knobs in `[storage]` TOML | `rt-config` storage defaults/parse tests; `storage_io_config_maps_torrentng_storage_toml` |
 | Root-confined move/import/delete | Implemented as a separate planned executor | `execute_storage_plan_under_roots`; move/import certification script |
+| Windows storage-plan path authority | Implemented with configured-root capability directories and handle-relative traversal, copy, verification, deletion, pruning, reconciliation, and no-replace rename | `crates/rt-storage/src/windows_secure_fs.rs`; Windows library and test-target cross-checks |
 
 ## Remaining Evidence Boundaries
 

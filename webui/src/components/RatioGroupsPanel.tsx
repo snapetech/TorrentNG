@@ -65,10 +65,12 @@ export function RatioGroupsPanel() {
     setPreview(null)
     try {
       const result = await api.ratioGroups.apply(name, dryRun)
+      const appliedCount = result.applied_total ?? result.applied.length
+      const errorCount = result.errors_total ?? result.errors.length
       if (dryRun) {
-        setPreview({ name, count: result.applied.length })
-      } else if (result.errors.length > 0) {
-        setError(`${result.errors.length} error(s) applying ${name}`)
+        setPreview({ name, count: appliedCount })
+      } else if (errorCount > 0) {
+        setError(`${errorCount} error(s) applying ${name}`)
       }
     } catch (e) {
       setError(String(e))

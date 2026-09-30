@@ -185,29 +185,29 @@ contains ops from every `Hot` torrent on that spindle at once.
 
 ### 3. Open-handle cache
 
-Path-keyed LRU of open file descriptors. Capacity is a fraction of
-`RLIMIT_NOFILE` (queried via `nix::sys::resource::getrlimit`, raised toward
-the hard limit at startup), minus a reserve for sockets. Eviction is LRU
-**plus a time-based idle sweep**: a handle unused for `idle_ttl` (default
-30 s) is closed even below capacity, so a torrent going Dormant releases its
-fds promptly. Handles are only ever created for `Hot` torrents.
+Path-keyed LRU of open file descriptors. Cache capacity is limited per cache
+to a fraction of `RLIMIT_NOFILE`; the soft limit is raised toward the hard
+limit on a best-effort basis. Path-backed schedulers with matching I/O
+configuration share their file pool. Eviction is LRU **plus a time-based idle
+sweep**: a handle unused for `idle_ttl` (default 30 s) is closed even below
+capacity, so a torrent going Dormant releases its fds promptly. Handles are
+only ever created for `Hot` torrents.
 
 All I/O is **positioned** (`pread`/`pwrite` via `FileExt::read_at` /
 io_uring), so a single cached fd is safely shared by concurrent ops with no
 `seek` and no per-op open/close. This is the property that makes the cache
 usable and is why the old `seek`-based `scheduled_read` path was replaced.
 
-```rust
-pub struct HandleCache {
-    map: Mutex<LruMap<FileKey, Arc<OpenFile>>>,
-    cap: usize,                 // ≈ rlimit_nofile * 0.8 - socket_reserve
-    idle_ttl: Duration,
-}
-pub struct OpenFile { fd: RawFd, last_used: AtomicInstant /* + fadvise state */ }
-```
-
-"Too many open files" — rTorrent's classic failure — becomes structurally
-impossible: fd count is bounded by `cap` regardless of torrent count.
+Both the scheduler `FilePool` and `StorageRuntime::HandleCache` keep a
+descriptor lease through cached, caller, and backend-job ownership. Their
+local limits are independent, but both draw from one managed-storage budget
+set to 60% of the raised soft `RLIMIT_NOFILE`. Unrelated process descriptors
+are outside that quota, so it is not a guarantee against all process-wide
+`EMFILE` failures. The scheduler stats distinguish cached entries
+(`FilePoolStats.open_files`) from active leases
+(`FilePoolStats.active_descriptors`); `/metrics` exports both counts for the
+scheduler pool and the runtime cache, plus aggregate lease use, capacity, and
+budget waits across all managed storage caches.
 
 ### 4. Disk backend trait
 

@@ -80,7 +80,9 @@ where
     deserialize_bounded_vec(deserializer, MAX_FASTRESUME_PIECES, "fastresume pieces")
 }
 
-fn deserialize_partial_pieces<'de, D>(deserializer: D) -> Result<Vec<PartialPieceState>, D::Error>
+pub(crate) fn deserialize_partial_pieces<'de, D>(
+    deserializer: D,
+) -> Result<Vec<PartialPieceState>, D::Error>
 where
     D: Deserializer<'de>,
 {
@@ -91,7 +93,7 @@ where
     )
 }
 
-fn deserialize_file_hints<'de, D>(deserializer: D) -> Result<Vec<FileHint>, D::Error>
+pub(crate) fn deserialize_file_hints<'de, D>(deserializer: D) -> Result<Vec<FileHint>, D::Error>
 where
     D: Deserializer<'de>,
 {
@@ -417,11 +419,10 @@ impl FastresumeState {
             }
         }
         self.partial_pieces.retain(|partial| {
-            !self
-                .durability
+            self.durability
                 .dirty_pieces_since_barrier
                 .binary_search(&partial.piece)
-                .is_ok()
+                .is_err()
         });
         self.clean_shutdown = true;
         self.durability.dirty_pieces_since_barrier.clear();
@@ -651,6 +652,38 @@ mod tests {
             .iter()
             .all(|state| *state == PieceState::Unknown));
         assert!(state.partial_pieces.is_empty());
+    }
+
+    #[test]
+    fn missing_synthetic_padding_hint_does_not_invalidate_verified_pieces() {
+        let files = vec![
+            FileSpan {
+                file_index: 0,
+                path: SafeRelPath::from_name("payload.bin", false).unwrap(),
+                content_offset: 0,
+                length: 3,
+            },
+            FileSpan {
+                file_index: 1,
+                path: SafeRelPath::from_components(&[".pad", "13"], false).unwrap(),
+                content_offset: 3,
+                length: 13,
+            },
+        ];
+        let piece_map = PieceMap::new_with_padding(16, files, [1]).unwrap();
+        let mut state = FastresumeState::new_empty(&test_hash(), 1, ImportPolicy::TrustHints);
+        state.pieces[0] = PieceState::Valid;
+        state.file_hints = vec![FileHint {
+            file_index: 1,
+            size: 13,
+            mtime_secs: 1,
+            inode: 1,
+        }];
+
+        let invalidated = state.apply_file_hints(Vec::new(), &piece_map);
+
+        assert_eq!(invalidated, 0);
+        assert!(state.is_complete());
     }
 
     #[test]

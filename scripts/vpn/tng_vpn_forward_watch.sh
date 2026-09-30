@@ -55,7 +55,7 @@ stop_cert() {
 
 apply_mapping() {
   local mapping="$1"
-  local current_fp previous_fp
+  local current_fp previous_fp incoming_port public_port public_ip
   current_fp="$(fingerprint <<<"$mapping")"
   previous_fp="$(cat "$STATE_FILE" 2>/dev/null || true)"
   if [[ "$current_fp" == "$previous_fp" ]]; then
@@ -69,11 +69,15 @@ apply_mapping() {
 
   if [[ "$RUN_DHT_CERT" == "1" ]]; then
     set -a
+    # shellcheck disable=SC1090
     [[ -f "$OUT_ENV" ]] && source "$OUT_ENV"
     set +a
-    TNG_INCOMING_PORT="${TNG_INCOMING_PORT:-${TNG_VPN_PUBLIC_PORT:-50000}}" \
-    TNG_VPN_PUBLIC_PORT="${TNG_VPN_PUBLIC_PORT:-}" \
-    TNG_VPN_PUBLIC_IP="${TNG_VPN_PUBLIC_IP:-}" \
+    incoming_port="${TNG_INCOMING_PORT:-${TNG_VPN_PUBLIC_PORT:-50000}}"
+    public_port="${TNG_VPN_PUBLIC_PORT:-}"
+    public_ip="${TNG_VPN_PUBLIC_IP:-}"
+    TNG_INCOMING_PORT="$incoming_port" \
+    TNG_VPN_PUBLIC_PORT="$public_port" \
+    TNG_VPN_PUBLIC_IP="$public_ip" \
       "$ROOT/scripts/dht_certification.sh" || log "DHT certification failed after forward change"
   fi
 }

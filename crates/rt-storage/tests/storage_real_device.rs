@@ -167,7 +167,7 @@ fn shuffled_offsets(blocks: u64, block_len: usize) -> Vec<u64> {
         .collect()
 }
 
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 fn drop_file_cache(path: &Path) {
     use std::os::fd::AsRawFd;
 
@@ -177,7 +177,7 @@ fn drop_file_cache(path: &Path) {
     let _ = unsafe { libc::posix_fadvise(file.as_raw_fd(), 0, 0, libc::POSIX_FADV_DONTNEED) };
 }
 
-#[cfg(not(unix))]
+#[cfg(not(target_os = "linux"))]
 fn drop_file_cache(_path: &Path) {}
 
 fn settle_file_for_read_benchmark(path: &Path) {

@@ -1,7 +1,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
@@ -15,6 +15,19 @@ struct IngressReservation {
 }
 
 type PerIpReservations = HashMap<IpAddr, VecDeque<IngressReservation>>;
+
+fn lock_reservations(reservations: &Mutex<PerIpReservations>) -> MutexGuard<'_, PerIpReservations> {
+    match reservations.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => {
+            // These reservations enforce the per-source admission window.
+            // Preserve them during recovery so a panic cannot reset the cap.
+            let guard = poisoned.into_inner();
+            reservations.clear_poison();
+            guard
+        }
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PeerIngressConfig {
@@ -35,11 +48,16 @@ impl Default for PeerIngressConfig {
     }
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct PeerIngressStats {
+    /// Handshake slots admitted before peer-wire validation completes.
     pub accepted: u64,
     pub rejected_global_budget: u64,
     pub rejected_ip_budget: u64,
+    pub rejected_peer_connection_budget: u64,
+    pub handshake_read_errors: u64,
+    pub handshake_timeouts: u64,
+    pub malformed_handshakes: u64,
 }
 
 #[derive(Debug)]
@@ -51,6 +69,10 @@ pub struct PeerIngressBudget {
     accepted: AtomicU64,
     rejected_global_budget: AtomicU64,
     rejected_ip_budget: AtomicU64,
+    rejected_peer_connection_budget: AtomicU64,
+    handshake_read_errors: AtomicU64,
+    handshake_timeouts: AtomicU64,
+    malformed_handshakes: AtomicU64,
 }
 
 #[derive(Debug)]
@@ -71,6 +93,10 @@ impl PeerIngressBudget {
             accepted: AtomicU64::new(0),
             rejected_global_budget: AtomicU64::new(0),
             rejected_ip_budget: AtomicU64::new(0),
+            rejected_peer_connection_budget: AtomicU64::new(0),
+            handshake_read_errors: AtomicU64::new(0),
+            handshake_timeouts: AtomicU64::new(0),
+            malformed_handshakes: AtomicU64::new(0),
         }
     }
 
@@ -116,14 +142,34 @@ impl PeerIngressBudget {
             accepted: self.accepted.load(Ordering::Relaxed),
             rejected_global_budget: self.rejected_global_budget.load(Ordering::Relaxed),
             rejected_ip_budget: self.rejected_ip_budget.load(Ordering::Relaxed),
+            rejected_peer_connection_budget: self
+                .rejected_peer_connection_budget
+                .load(Ordering::Relaxed),
+            handshake_read_errors: self.handshake_read_errors.load(Ordering::Relaxed),
+            handshake_timeouts: self.handshake_timeouts.load(Ordering::Relaxed),
+            malformed_handshakes: self.malformed_handshakes.load(Ordering::Relaxed),
         }
     }
 
+    pub(crate) fn record_peer_connection_budget_rejection(&self) {
+        self.rejected_peer_connection_budget
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn record_handshake_timeout(&self) {
+        self.handshake_timeouts.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn record_handshake_read_error(&self) {
+        self.handshake_read_errors.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn record_malformed_handshake(&self) {
+        self.malformed_handshakes.fetch_add(1, Ordering::Relaxed);
+    }
+
     fn reserve_ip_slot(&self, ip: IpAddr, now: Instant, reservation_id: u64) -> bool {
-        let mut per_ip = self
-            .per_ip
-            .lock()
-            .expect("peer ingress budget mutex poisoned");
+        let mut per_ip = lock_reservations(&self.per_ip);
 
         // Prune the requested IP while holding the same lock used for the
         // admission check. This avoids a second lock acquisition and keeps
@@ -188,7 +234,7 @@ impl PeerIngressPermit {
 }
 
 fn release_ip_slot(per_ip: &Arc<Mutex<PerIpReservations>>, ip: IpAddr, reservation_id: u64) {
-    let mut per_ip = per_ip.lock().expect("peer ingress budget mutex poisoned");
+    let mut per_ip = lock_reservations(per_ip);
     let Some(events) = per_ip.get_mut(&ip) else {
         return;
     };
@@ -317,10 +363,7 @@ mod tests {
         let second = budget.try_begin(addr(2), now).unwrap();
 
         first.cancel();
-        let per_ip = budget
-            .per_ip
-            .lock()
-            .expect("peer ingress budget mutex poisoned");
+        let per_ip = lock_reservations(&budget.per_ip);
         let reservations = per_ip.get(&addr(1).ip()).unwrap();
         assert_eq!(reservations.len(), 1);
         assert_eq!(reservations[0].id, second.reservation_id);
@@ -365,5 +408,51 @@ mod tests {
         assert!(budget
             .try_begin(SocketAddr::new(new_ip, 6881), now + Duration::from_secs(31))
             .is_ok());
+    }
+
+    #[test]
+    fn poisoned_per_ip_state_preserves_admission_reservations() {
+        let budget = PeerIngressBudget::new(PeerIngressConfig {
+            max_global_handshakes: 10,
+            max_handshakes_per_ip: 1,
+            per_ip_window: Duration::from_secs(30),
+            handshake_timeout: Duration::from_secs(5),
+        });
+        let now = Instant::now();
+        let first = budget.try_begin(addr(1), now).unwrap();
+
+        let poisoner = Arc::clone(&budget.per_ip);
+        assert!(std::thread::spawn(move || {
+            let _guard = poisoner.lock().unwrap();
+            panic!("poison the per-IP admission map");
+        })
+        .join()
+        .is_err());
+        assert!(budget.per_ip.is_poisoned());
+
+        assert!(matches!(
+            budget.try_begin(addr(2), now),
+            Err(PeerIngressReject::PerIpBudget)
+        ));
+        assert!(!budget.per_ip.is_poisoned());
+        drop(first);
+        assert!(budget
+            .try_begin(addr(3), now + Duration::from_secs(31))
+            .is_ok());
+    }
+
+    #[test]
+    fn handshake_rejection_counters_are_snapshotted() {
+        let budget = PeerIngressBudget::new(PeerIngressConfig::default());
+        budget.record_peer_connection_budget_rejection();
+        budget.record_handshake_read_error();
+        budget.record_handshake_timeout();
+        budget.record_malformed_handshake();
+
+        let stats = budget.stats();
+        assert_eq!(stats.rejected_peer_connection_budget, 1);
+        assert_eq!(stats.handshake_read_errors, 1);
+        assert_eq!(stats.handshake_timeouts, 1);
+        assert_eq!(stats.malformed_handshakes, 1);
     }
 }

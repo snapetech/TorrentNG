@@ -1,8 +1,16 @@
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
-use std::{fs::File, io::Read, net::SocketAddr, path::PathBuf, time::Duration};
+use std::{io::Read, net::SocketAddr, path::PathBuf, time::Duration};
+
+use crate::safe_file::open_regular_read;
 
 const MAX_CONFIG_BYTES: u64 = 1024 * 1024;
+
+/// Keep tracker-facing user-agent mutations bounded independently of the
+/// ordinary JSON request limit. A user-agent is carried through XML-RPC and
+/// HTTP headers, so accepting megabytes here only moves the allocation and
+/// failure point deeper into the backend boundary.
+pub(crate) const MAX_RUNTIME_USER_AGENT_BYTES: usize = 1024;
 
 /// Default user-agent announced to trackers via rTorrent.
 ///
@@ -173,12 +181,24 @@ pub struct RtorrentLogConfig {
     pub read_from_start: bool,
 }
 
-#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct AuthConfig {
     pub secret_key: Option<String>,
     pub api_tokens: Vec<String>,
     pub trust_proxy_header: bool,
+    pub secure_cookies: bool,
+}
+
+impl Default for AuthConfig {
+    fn default() -> Self {
+        Self {
+            secret_key: None,
+            api_tokens: Vec::new(),
+            trust_proxy_header: false,
+            secure_cookies: true,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -330,7 +350,7 @@ fn default_listen_addr() -> String {
     "127.0.0.1:8080".into()
 }
 fn default_sync_interval_secs() -> u64 {
-    2
+    5
 }
 fn default_timeout_secs() -> u64 {
     10
@@ -417,7 +437,7 @@ impl Config {
                     component = "config",
                     operation = "resolve_peer_id",
                     result = "error",
-                    data_dir = %dir.display(),
+                    data_dir = %crate::url_redaction::redact_display(&dir.display()),
                     %error,
                     "could not persist per-install peer id; using an unpersisted random one for this run"
                 );
@@ -605,6 +625,8 @@ impl Config {
                     bail!("rtorrent: only one of scgi_socket or scgi_addr may be set")
                 }
                 _ => {
+                    normalize_runtime_user_agent(&self.rtorrent.user_agent)
+                        .context("rtorrent: validate user_agent")?;
                     if self.rtorrent.peer_id.len() != 20 || !self.rtorrent.peer_id.is_ascii() {
                         bail!("rtorrent: peer_id must be exactly 20 ASCII bytes");
                     }
@@ -651,6 +673,9 @@ impl Config {
         }
         if self.auth.trust_proxy_header && !listen_addr.ip().is_loopback() {
             bail!("auth.trust_proxy_header requires a loopback listen_addr");
+        }
+        if !self.auth.secure_cookies && !listen_addr.ip().is_loopback() {
+            bail!("auth.secure_cookies must be enabled for a non-loopback listen_addr");
         }
         if !listen_addr.ip().is_loopback() {
             if self.auth.api_tokens.is_empty() {
@@ -701,6 +726,20 @@ impl Config {
     }
 }
 
+pub(crate) fn normalize_runtime_user_agent(value: &str) -> Result<String> {
+    let value = value.trim();
+    if value.is_empty() {
+        bail!("user_agent must not be empty");
+    }
+    if value.len() > MAX_RUNTIME_USER_AGENT_BYTES {
+        bail!("user_agent must be at most {MAX_RUNTIME_USER_AGENT_BYTES} UTF-8 bytes");
+    }
+    if value.chars().any(|character| character.is_control()) {
+        bail!("user_agent must not contain control characters");
+    }
+    Ok(value.to_owned())
+}
+
 fn is_placeholder_secret(value: &str) -> bool {
     let normalized = value.trim().to_ascii_lowercase();
     normalized.is_empty()
@@ -712,7 +751,7 @@ fn is_placeholder_secret(value: &str) -> bool {
 }
 
 fn read_bounded_text(path: &std::path::Path, max_bytes: u64) -> Result<String> {
-    let file = File::open(path)?;
+    let file = open_regular_read(path)?;
     let mut bytes = Vec::new();
     file.take(max_bytes.saturating_add(1))
         .read_to_end(&mut bytes)?;
@@ -860,6 +899,26 @@ mod tests {
 
         cfg.auth.secret_key = Some("sidecar-session-secret-20260904-0123456789abcdef".to_owned());
         cfg.validate().unwrap();
+
+        cfg.auth.secure_cookies = false;
+        assert!(cfg
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("auth.secure_cookies"));
+        cfg.auth.secure_cookies = true;
+        cfg.validate().unwrap();
+    }
+
+    #[test]
+    fn secure_session_cookies_default_on_and_can_be_disabled_explicitly() {
+        assert!(AuthConfig::default().secure_cookies);
+
+        let existing_config: AuthConfig = toml::from_str("api_tokens = []").unwrap();
+        assert!(existing_config.secure_cookies);
+
+        let local_http_config: AuthConfig = toml::from_str("secure_cookies = false").unwrap();
+        assert!(!local_http_config.secure_cookies);
     }
 
     #[test]
@@ -897,6 +956,27 @@ mod tests {
         let path = dir.path().join("config.toml");
         std::fs::write(&path, vec![b' '; (MAX_CONFIG_BYTES + 1) as usize]).unwrap();
         assert!(Config::load(Some(path.to_str().unwrap())).is_err());
+    }
+
+    #[test]
+    fn runtime_user_agent_is_trimmed_and_bounded() {
+        assert_eq!(
+            normalize_runtime_user_agent("  TorrentNG/test  ").unwrap(),
+            "TorrentNG/test"
+        );
+        assert!(normalize_runtime_user_agent(" \t ").is_err());
+        assert!(normalize_runtime_user_agent("line\nbreak").is_err());
+        assert!(
+            normalize_runtime_user_agent(&"x".repeat(MAX_RUNTIME_USER_AGENT_BYTES + 1)).is_err()
+        );
+
+        let mut cfg = Config::test_default();
+        cfg.rtorrent.user_agent = "x".repeat(MAX_RUNTIME_USER_AGENT_BYTES + 1);
+        assert!(cfg
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("user_agent"));
     }
 
     #[test]

@@ -1,0 +1,58 @@
+name: Release-note validation
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+    types: [opened, synchronize, reopened, edited, ready_for_review]
+
+permissions:
+  contents: read
+  pull-requests: read
+
+jobs:
+  release-note:
+    name: Validate release-note choice
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout pull request
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Fetch base branch
+        if: github.event_name == 'pull_request'
+        env:
+          BASE_REF: ${{ github.base_ref }}
+        run: git fetch --no-tags origin "$BASE_REF"
+
+      - name: Validate and preview release notes
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_BODY: ${{ github.event_name == 'pull_request' && github.event.pull_request.body || github.event.head_commit.message || '' }}
+          PR_BASE_REF: ${{ github.base_ref }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          PUSH_BEFORE_SHA: ${{ github.event.before }}
+        run: |
+          set -euo pipefail
+          if [[ "$GITHUB_EVENT_NAME" == "pull_request" ]]; then
+            base="origin/${PR_BASE_REF}"
+            head="$PR_HEAD_SHA"
+          else
+            base="$PUSH_BEFORE_SHA"
+            head="$GITHUB_SHA"
+            associated_pr_bodies="$(gh api \
+              "repos/$GITHUB_REPOSITORY/commits/$head/pulls" \
+              --jq '.[].body')"
+            PR_BODY+=$'\n'"$associated_pr_bodies"
+            export PR_BODY
+          fi
+          python3 scripts/release_notes.py check \
+            --base "$base" \
+            --head "$head"
+          python3 scripts/release_notes.py preview \
+            --base "$base" \
+            --head "$head"

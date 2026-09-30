@@ -13,6 +13,14 @@ use tokio::time::Instant;
 use crate::config::RtorrentConfig;
 
 const MAX_SCGI_RESPONSE_BYTES: usize = 64 * 1024 * 1024;
+// XML-RPC responses can be large for a raw metainfo load, but their decoded
+// shape must stay bounded independently of the wire size.  These limits also
+// protect the JSON-RPC compatibility path, which is converted into XmlValue
+// before callers inspect it.
+const MAX_XMLRPC_REQUEST_BYTES: usize = 128 * 1024 * 1024;
+const MAX_XMLRPC_COLLECTION_ITEMS: usize = 16_384;
+const MAX_XMLRPC_VALUE_DEPTH: usize = 64;
+const MAX_XMLRPC_TEXT_BYTES: usize = 16 * 1024 * 1024;
 
 #[derive(Debug, Clone)]
 pub enum Transport {
@@ -172,7 +180,7 @@ impl Client {
             .await
             .context("rTorrent RPC gate closed")?;
 
-        match self.call_json(method, args).await {
+        let result = match self.call_json(method, args).await {
             Ok(value) => Ok(value),
             Err(json_err) => {
                 if is_jsonrpc_unavailable(&json_err) {
@@ -181,20 +189,27 @@ impl Client {
                     Err(json_err)
                 }
             }
-        }
-        .inspect_err(|e| {
-            if priority == RpcPriority::Background && is_timeout_error(e) {
-                let pause = self.low_priority_pause_until.clone();
-                tokio::spawn(async move {
-                    *pause.lock().await = Some(Instant::now() + std::time::Duration::from_secs(15));
-                });
+        };
+        if priority == RpcPriority::Background {
+            if let Err(error) = &result {
+                if is_transient_transport_error(error) {
+                    *self.low_priority_pause_until.lock().await =
+                        Some(Instant::now() + std::time::Duration::from_secs(15));
+                }
             }
-        })
+        }
+        result
     }
 
     async fn call_json(&self, method: &str, args: &[XmlValue]) -> Result<XmlValue> {
         if args.iter().any(contains_base64) {
             bail!("JSON-RPC unavailable for XML-RPC base64 payload");
+        }
+        if method.len() > MAX_XMLRPC_TEXT_BYTES {
+            bail!("JSON-RPC method name exceeds {MAX_XMLRPC_TEXT_BYTES} byte limit");
+        }
+        if args.len() > MAX_XMLRPC_COLLECTION_ITEMS {
+            bail!("JSON-RPC parameter count exceeds {MAX_XMLRPC_COLLECTION_ITEMS} items");
         }
         let body = json!({
             "jsonrpc": "2.0",
@@ -203,6 +218,9 @@ impl Client {
             "params": args.iter().map(xml_to_json).collect::<Vec<_>>(),
         })
         .to_string();
+        if body.len() > MAX_XMLRPC_REQUEST_BYTES {
+            bail!("JSON-RPC request exceeds {MAX_XMLRPC_REQUEST_BYTES} byte limit");
+        }
         let response = self
             .scgi_roundtrip("application/json", body.as_bytes())
             .await
@@ -220,7 +238,7 @@ impl Client {
         args: &[XmlValue],
         timeout: std::time::Duration,
     ) -> Result<XmlValue> {
-        let body = build_xmlrpc_request(method, args);
+        let body = build_xmlrpc_request(method, args)?;
         let response = self
             .scgi_roundtrip_with_timeout("text/xml", body.as_bytes(), timeout)
             .await
@@ -397,6 +415,13 @@ fn xml_to_json(value: &XmlValue) -> Value {
 }
 
 fn json_to_xml(value: Value) -> Result<XmlValue> {
+    json_to_xml_at_depth(value, 0)
+}
+
+fn json_to_xml_at_depth(value: Value, depth: usize) -> Result<XmlValue> {
+    if depth > MAX_XMLRPC_VALUE_DEPTH {
+        bail!("JSON-RPC value nesting exceeds {MAX_XMLRPC_VALUE_DEPTH} levels");
+    }
     Ok(match value {
         Value::Null => XmlValue::Nil,
         Value::Bool(b) => XmlValue::Bool(b),
@@ -405,18 +430,38 @@ fn json_to_xml(value: Value) -> Result<XmlValue> {
                 .or_else(|| n.as_u64().and_then(|value| i64::try_from(value).ok()))
                 .ok_or_else(|| anyhow!("JSON-RPC number does not fit in signed 64 bits"))?,
         ),
-        Value::String(s) => XmlValue::String(s),
-        Value::Array(items) => XmlValue::Array(
-            items
-                .into_iter()
-                .map(json_to_xml)
-                .collect::<Result<Vec<_>>>()?,
-        ),
-        Value::Object(map) => XmlValue::Struct(
-            map.into_iter()
-                .map(|(key, value)| Ok((key, json_to_xml(value)?)))
-                .collect::<Result<Vec<_>>>()?,
-        ),
+        Value::String(s) => {
+            if s.len() > MAX_XMLRPC_TEXT_BYTES {
+                bail!("JSON-RPC text exceeds {MAX_XMLRPC_TEXT_BYTES} byte limit");
+            }
+            XmlValue::String(s)
+        }
+        Value::Array(items) => {
+            if items.len() > MAX_XMLRPC_COLLECTION_ITEMS {
+                bail!("JSON-RPC array exceeds {MAX_XMLRPC_COLLECTION_ITEMS} items");
+            }
+            XmlValue::Array(
+                items
+                    .into_iter()
+                    .map(|value| json_to_xml_at_depth(value, depth + 1))
+                    .collect::<Result<Vec<_>>>()?,
+            )
+        }
+        Value::Object(map) => {
+            if map.len() > MAX_XMLRPC_COLLECTION_ITEMS {
+                bail!("JSON-RPC object exceeds {MAX_XMLRPC_COLLECTION_ITEMS} members");
+            }
+            XmlValue::Struct(
+                map.into_iter()
+                    .map(|(key, value)| {
+                        if key.len() > MAX_XMLRPC_TEXT_BYTES {
+                            bail!("JSON-RPC object key exceeds {MAX_XMLRPC_TEXT_BYTES} byte limit");
+                        }
+                        Ok((key, json_to_xml_at_depth(value, depth + 1)?))
+                    })
+                    .collect::<Result<Vec<_>>>()?,
+            )
+        }
     })
 }
 
@@ -427,13 +472,14 @@ fn parse_jsonrpc_response(body: &[u8]) -> Result<XmlValue> {
         .as_object()
         .ok_or_else(|| anyhow!("JSON-RPC response is not an object"))?;
     if let Some(error) = response.get("error").filter(|error| !error.is_null()) {
-        bail!(
-            "JSON-RPC error: {}",
-            error
-                .get("message")
-                .and_then(Value::as_str)
-                .unwrap_or("unknown error")
-        );
+        let message = error
+            .get("message")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown error");
+        if message.len() > MAX_XMLRPC_TEXT_BYTES {
+            bail!("JSON-RPC error message exceeds {MAX_XMLRPC_TEXT_BYTES} byte limit");
+        }
+        bail!("JSON-RPC error: {}", message);
     }
     let result = response
         .get("result")
@@ -464,9 +510,40 @@ fn is_timeout_error(error: &anyhow::Error) -> bool {
     text.contains("timed out") || text.contains("deadline has elapsed")
 }
 
+fn is_transient_transport_error(error: &anyhow::Error) -> bool {
+    if is_timeout_error(error) {
+        return true;
+    }
+
+    error.chain().any(|cause| {
+        cause
+            .downcast_ref::<std::io::Error>()
+            .is_some_and(|io_error| {
+                matches!(
+                    io_error.kind(),
+                    std::io::ErrorKind::BrokenPipe
+                        | std::io::ErrorKind::ConnectionAborted
+                        | std::io::ErrorKind::ConnectionRefused
+                        | std::io::ErrorKind::ConnectionReset
+                        | std::io::ErrorKind::NotConnected
+                        | std::io::ErrorKind::NotFound
+                        | std::io::ErrorKind::TimedOut
+                        | std::io::ErrorKind::UnexpectedEof
+                        | std::io::ErrorKind::WouldBlock
+                )
+            })
+    })
+}
+
 // --- XMLRPC builder ---
 
-fn build_xmlrpc_request(method: &str, args: &[XmlValue]) -> String {
+fn build_xmlrpc_request(method: &str, args: &[XmlValue]) -> Result<String> {
+    if method.len() > MAX_XMLRPC_TEXT_BYTES {
+        bail!("XML-RPC method name exceeds {MAX_XMLRPC_TEXT_BYTES} byte limit");
+    }
+    if args.len() > MAX_XMLRPC_COLLECTION_ITEMS {
+        bail!("XML-RPC parameter count exceeds {MAX_XMLRPC_COLLECTION_ITEMS} items");
+    }
     let mut out = String::from("<?xml version=\"1.0\"?>\n<methodCall>\n");
     out.push_str(&format!(
         "  <methodName>{}</methodName>\n  <params>\n",
@@ -474,21 +551,33 @@ fn build_xmlrpc_request(method: &str, args: &[XmlValue]) -> String {
     ));
     for arg in args {
         out.push_str("    <param><value>");
-        write_xml_value(&mut out, arg);
+        write_xml_value(&mut out, arg, 0)?;
         out.push_str("</value></param>\n");
     }
     out.push_str("  </params>\n</methodCall>");
-    out
+    if out.len() > MAX_XMLRPC_REQUEST_BYTES {
+        bail!("XML-RPC request exceeds {MAX_XMLRPC_REQUEST_BYTES} byte limit");
+    }
+    Ok(out)
 }
 
-fn write_xml_value(out: &mut String, v: &XmlValue) {
+fn write_xml_value(out: &mut String, v: &XmlValue, depth: usize) -> Result<()> {
+    if depth > MAX_XMLRPC_VALUE_DEPTH {
+        bail!("XML-RPC value nesting exceeds {MAX_XMLRPC_VALUE_DEPTH} levels");
+    }
     match v {
         XmlValue::String(s) => {
+            if s.len() > MAX_XMLRPC_TEXT_BYTES {
+                bail!("XML-RPC text exceeds {MAX_XMLRPC_TEXT_BYTES} byte limit");
+            }
             out.push_str("<string>");
             out.push_str(&xml_escape(s));
             out.push_str("</string>");
         }
         XmlValue::Base64(s) => {
+            if s.len() > MAX_XMLRPC_REQUEST_BYTES {
+                bail!("XML-RPC base64 value exceeds {MAX_XMLRPC_REQUEST_BYTES} bytes");
+            }
             out.push_str("<base64>");
             out.push_str(s);
             out.push_str("</base64>");
@@ -500,19 +589,28 @@ fn write_xml_value(out: &mut String, v: &XmlValue) {
             out.push_str(&format!("<boolean>{}</boolean>", if *b { 1 } else { 0 }));
         }
         XmlValue::Array(items) => {
+            if items.len() > MAX_XMLRPC_COLLECTION_ITEMS {
+                bail!("XML-RPC array exceeds {MAX_XMLRPC_COLLECTION_ITEMS} items");
+            }
             out.push_str("<array><data>");
             for item in items {
                 out.push_str("<value>");
-                write_xml_value(out, item);
+                write_xml_value(out, item, depth + 1)?;
                 out.push_str("</value>");
             }
             out.push_str("</data></array>");
         }
         XmlValue::Struct(fields) => {
+            if fields.len() > MAX_XMLRPC_COLLECTION_ITEMS {
+                bail!("XML-RPC struct exceeds {MAX_XMLRPC_COLLECTION_ITEMS} members");
+            }
             out.push_str("<struct>");
             for (k, v) in fields {
+                if k.len() > MAX_XMLRPC_TEXT_BYTES {
+                    bail!("XML-RPC struct key exceeds {MAX_XMLRPC_TEXT_BYTES} byte limit");
+                }
                 out.push_str(&format!("<member><name>{}</name><value>", xml_escape(k)));
-                write_xml_value(out, v);
+                write_xml_value(out, v, depth + 1)?;
                 out.push_str("</value></member>");
             }
             out.push_str("</struct>");
@@ -521,6 +619,7 @@ fn write_xml_value(out: &mut String, v: &XmlValue) {
             out.push_str("<nil/>");
         }
     }
+    Ok(())
 }
 
 fn xml_escape(s: &str) -> String {
@@ -635,10 +734,13 @@ fn parse_value(reader: &mut Reader<&[u8]>) -> Result<XmlValue> {
             _ => {}
         }
     }
-    parse_value_content(reader)
+    parse_value_content(reader, 0)
 }
 
-fn parse_value_content(reader: &mut Reader<&[u8]>) -> Result<XmlValue> {
+fn parse_value_content(reader: &mut Reader<&[u8]>, depth: usize) -> Result<XmlValue> {
+    if depth > MAX_XMLRPC_VALUE_DEPTH {
+        bail!("XML-RPC value nesting exceeds {MAX_XMLRPC_VALUE_DEPTH} levels");
+    }
     loop {
         match reader.read_event()? {
             Event::Start(e) => {
@@ -661,10 +763,10 @@ fn parse_value_content(reader: &mut Reader<&[u8]>) -> Result<XmlValue> {
                             value => bail!("invalid XML-RPC boolean value {value:?}"),
                         })
                     }
-                    "array" => parse_array(reader)?,
-                    "struct" => parse_struct(reader)?,
+                    "array" => parse_array(reader, depth + 1)?,
+                    "struct" => parse_struct(reader, depth + 1)?,
                     "nil" => {
-                        let _ = reader.read_text(e.name());
+                        reader.read_text(e.name())?;
                         XmlValue::Nil
                     }
                     _ => {
@@ -675,7 +777,11 @@ fn parse_value_content(reader: &mut Reader<&[u8]>) -> Result<XmlValue> {
                 return Ok(val);
             }
             Event::Text(t) => {
-                let s = t.into_inner().trim().to_owned();
+                let text = t.into_inner();
+                if text.len() > MAX_XMLRPC_TEXT_BYTES {
+                    bail!("XML-RPC text exceeds {MAX_XMLRPC_TEXT_BYTES} byte limit");
+                }
+                let s = text.trim().to_owned();
                 if !s.is_empty() {
                     return Ok(XmlValue::String(s));
                 }
@@ -687,12 +793,18 @@ fn parse_value_content(reader: &mut Reader<&[u8]>) -> Result<XmlValue> {
     }
 }
 
-fn parse_array(reader: &mut Reader<&[u8]>) -> Result<XmlValue> {
+fn parse_array(reader: &mut Reader<&[u8]>, depth: usize) -> Result<XmlValue> {
+    if depth > MAX_XMLRPC_VALUE_DEPTH {
+        bail!("XML-RPC value nesting exceeds {MAX_XMLRPC_VALUE_DEPTH} levels");
+    }
     let mut items = Vec::new();
     loop {
         match reader.read_event()? {
             Event::Start(e) if e.name().into_inner() == "value" => {
-                items.push(parse_value_content(reader)?);
+                if items.len() >= MAX_XMLRPC_COLLECTION_ITEMS {
+                    bail!("XML-RPC array exceeds {MAX_XMLRPC_COLLECTION_ITEMS} items");
+                }
+                items.push(parse_value_content(reader, depth)?);
             }
             Event::End(e) if e.name().into_inner() == "array" => break,
             Event::Eof => return Err(anyhow!("unexpected EOF in XML-RPC array")),
@@ -702,7 +814,10 @@ fn parse_array(reader: &mut Reader<&[u8]>) -> Result<XmlValue> {
     Ok(XmlValue::Array(items))
 }
 
-fn parse_struct(reader: &mut Reader<&[u8]>) -> Result<XmlValue> {
+fn parse_struct(reader: &mut Reader<&[u8]>, depth: usize) -> Result<XmlValue> {
+    if depth > MAX_XMLRPC_VALUE_DEPTH {
+        bail!("XML-RPC value nesting exceeds {MAX_XMLRPC_VALUE_DEPTH} levels");
+    }
     let mut fields = Vec::new();
     let mut current_name = String::new();
     loop {
@@ -712,7 +827,10 @@ fn parse_struct(reader: &mut Reader<&[u8]>) -> Result<XmlValue> {
                     current_name = read_text_string(reader, e.name())?;
                 }
                 "value" => {
-                    let val = parse_value_content(reader)?;
+                    if fields.len() >= MAX_XMLRPC_COLLECTION_ITEMS {
+                        bail!("XML-RPC struct exceeds {MAX_XMLRPC_COLLECTION_ITEMS} members");
+                    }
+                    let val = parse_value_content(reader, depth)?;
                     fields.push((std::mem::take(&mut current_name), val));
                 }
                 _ => {}
@@ -726,7 +844,11 @@ fn parse_struct(reader: &mut Reader<&[u8]>) -> Result<XmlValue> {
 }
 
 fn read_text_string(reader: &mut Reader<&[u8]>, end: QName<'_>) -> Result<String> {
-    Ok(reader.read_text(end)?.into_inner().into_owned())
+    let text = reader.read_text(end)?.into_inner().into_owned();
+    if text.len() > MAX_XMLRPC_TEXT_BYTES {
+        bail!("XML-RPC text exceeds {MAX_XMLRPC_TEXT_BYTES} byte limit");
+    }
+    Ok(text)
 }
 
 #[cfg(test)]
@@ -789,5 +911,116 @@ mod multicall_tests {
         let response = XmlValue::Array(vec![]);
         let results = parse_multicall_response(response, 0, "d.stop").unwrap();
         assert!(results.is_empty());
+    }
+
+    fn xmlrpc_response(value: &str) -> String {
+        format!(
+            "<?xml version=\"1.0\"?><methodResponse><params><param><value>{value}</value></param></params></methodResponse>"
+        )
+    }
+
+    #[test]
+    fn xml_parser_rejects_oversized_arrays() {
+        let item = "<value><int>0</int></value>";
+        let items = item.repeat(MAX_XMLRPC_COLLECTION_ITEMS + 1);
+        let xml = xmlrpc_response(&format!("<array><data>{items}</data></array>"));
+
+        let error = parse_xmlrpc_response(xml.as_bytes()).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("XML-RPC array exceeds 16384 items"));
+    }
+
+    #[test]
+    fn xml_parser_rejects_excessive_nesting() {
+        let levels = MAX_XMLRPC_VALUE_DEPTH + 1;
+        let mut value = String::from("<array><data><value>");
+        for _ in 1..levels {
+            value.push_str("<array><data><value>");
+        }
+        value.push_str("<int>0</int>");
+        for _ in 0..levels {
+            value.push_str("</value></data></array>");
+        }
+        let xml = xmlrpc_response(&value);
+
+        let error = parse_xmlrpc_response(xml.as_bytes()).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("XML-RPC value nesting exceeds 64 levels"));
+    }
+
+    #[test]
+    fn json_rpc_conversion_rejects_oversized_collections_and_nesting() {
+        let items = Value::Array(
+            (0..=MAX_XMLRPC_COLLECTION_ITEMS)
+                .map(|_| Value::from(0))
+                .collect(),
+        );
+        let error = json_to_xml(items).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("JSON-RPC array exceeds 16384 items"));
+
+        let error = json_to_xml(Value::String("x".repeat(MAX_XMLRPC_TEXT_BYTES + 1))).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("JSON-RPC text exceeds 16777216 byte limit"));
+
+        let mut nested = Value::from(0);
+        for _ in 0..=MAX_XMLRPC_VALUE_DEPTH {
+            nested = Value::Array(vec![nested]);
+        }
+        let error = json_to_xml(nested).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("JSON-RPC value nesting exceeds 64 levels"));
+    }
+
+    #[test]
+    fn xml_builder_rejects_oversized_collections() {
+        let args = [XmlValue::Array(vec![
+            XmlValue::Int(0);
+            MAX_XMLRPC_COLLECTION_ITEMS + 1
+        ])];
+        let error = build_xmlrpc_request("d.multicall2", &args).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("XML-RPC array exceeds 16384 items"));
+    }
+}
+
+#[cfg(all(test, unix))]
+mod circuit_breaker_tests {
+    use super::*;
+    use tokio::io::AsyncReadExt;
+
+    #[tokio::test]
+    async fn background_timeout_opens_circuit_before_returning() {
+        let directory = tempfile::tempdir().unwrap();
+        let socket_path = directory.path().join("rpc.sock");
+        let listener = tokio::net::UnixListener::bind(&socket_path).unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = [0_u8; 1024];
+            let _ = stream.read(&mut request).await;
+            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+        });
+        let client = Client::new_unix(socket_path.to_str().unwrap(), 1);
+
+        let timeout = client
+            .call_with_priority("d.name", &[], RpcPriority::Background)
+            .await
+            .expect_err("silent SCGI server should time out");
+        assert!(is_timeout_error(&timeout));
+
+        let next = client
+            .call_with_priority("d.name", &[], RpcPriority::Background)
+            .await
+            .expect_err("circuit should be open before timeout returns");
+        assert_eq!(next.to_string(), "rTorrent RPC circuit breaker is open");
+
+        server.abort();
+        let _ = server.await;
     }
 }

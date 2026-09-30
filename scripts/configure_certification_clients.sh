@@ -2,6 +2,8 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# shellcheck source=scripts/curl_policy.sh
+source "$ROOT/scripts/curl_policy.sh"
 ENV_FILE="${CERT_ENV_FILE:-$ROOT/deploy/certification/.env}"
 OUT="${1:-$ROOT/certification/reports/client-config-$(date -u +%Y%m%dT%H%M%SZ).md}"
 
@@ -41,6 +43,11 @@ SONARR_HOST_URL="$(mapped_host_url "$SONARR_HOST_URL" "$SONARR_CONTAINER" 8989)"
 RADARR_HOST_URL="$(mapped_host_url "$RADARR_HOST_URL" "$RADARR_CONTAINER" 7878)"
 PROWLARR_HOST_URL="$(mapped_host_url "$PROWLARR_HOST_URL" "$PROWLARR_CONTAINER" 9696)"
 AUTOBRR_HOST_URL="$(mapped_host_url "$AUTOBRR_HOST_URL" "$AUTOBRR_CONTAINER" 7474)"
+
+for protected_url in "$SONARR_HOST_URL" "$RADARR_HOST_URL" \
+  "$PROWLARR_HOST_URL" "$AUTOBRR_HOST_URL"; do
+  python3 "$ROOT/scripts/protected_target.py" "$protected_url"
+done
 
 mkdir -p "$(dirname "$OUT")"
 
@@ -107,16 +114,16 @@ configure_arr_client() {
     payload="$(printf '%s' "$payload" | jq --argjson id "$existing_id" '.id=$id')"
   fi
 
-  code="$(curl -ksS -o /tmp/tng-arr-test-body.txt -w '%{http_code}' -H "X-Api-Key: $api_key" -H 'Content-Type: application/json' -X POST -d "$payload" "$base_url$api_path/downloadclient/test")"
+  code="$(curl -q -sS --noproxy "*" -o /tmp/tng-arr-test-body.txt -w '%{http_code}' -H "X-Api-Key: $api_key" -H 'Content-Type: application/json' -X POST -d "$payload" "$base_url$api_path/downloadclient/test")"
   if [[ "$code" != "200" ]]; then
     mark "$label qBit test" "FAIL" "HTTP $code $(tr '\n' ' ' </tmp/tng-arr-test-body.txt)"
     return
   fi
 
   if [[ -n "$existing_id" ]]; then
-    code="$(curl -ksS -o /tmp/tng-arr-save-body.txt -w '%{http_code}' -H "X-Api-Key: $api_key" -H 'Content-Type: application/json' -X PUT -d "$payload" "$base_url$api_path/downloadclient/$existing_id")"
+    code="$(curl -q -sS --noproxy "*" -o /tmp/tng-arr-save-body.txt -w '%{http_code}' -H "X-Api-Key: $api_key" -H 'Content-Type: application/json' -X PUT -d "$payload" "$base_url$api_path/downloadclient/$existing_id")"
   else
-    code="$(curl -ksS -o /tmp/tng-arr-save-body.txt -w '%{http_code}' -H "X-Api-Key: $api_key" -H 'Content-Type: application/json' -X POST -d "$payload" "$base_url$api_path/downloadclient")"
+    code="$(curl -q -sS --noproxy "*" -o /tmp/tng-arr-save-body.txt -w '%{http_code}' -H "X-Api-Key: $api_key" -H 'Content-Type: application/json' -X POST -d "$payload" "$base_url$api_path/downloadclient")"
   fi
 
   if [[ "$code" == "200" || "$code" == "201" || "$code" == "202" ]]; then
@@ -132,12 +139,12 @@ configure_autobrr_client() {
   local pass="${AUTOBRR_CERT_PASSWORD:-cert}"
   local payload code existing_id
 
-  code="$(curl -ksS -o /tmp/tng-autobrr-onboard.txt -w '%{http_code}' "$AUTOBRR_HOST_URL/api/auth/onboard")"
+  code="$(curl -q -sS --noproxy "*" -o /tmp/tng-autobrr-onboard.txt -w '%{http_code}' "$AUTOBRR_HOST_URL/api/auth/onboard")"
   if [[ "$code" == "204" ]]; then
-    curl -ksS -o /tmp/tng-autobrr-onboard.txt -H 'Content-Type: application/json' -X POST -d "{\"username\":\"$user\",\"password\":\"$pass\"}" "$AUTOBRR_HOST_URL/api/auth/onboard" >/dev/null
+    curl -q -sS --noproxy "*" -o /tmp/tng-autobrr-onboard.txt -H 'Content-Type: application/json' -X POST -d "{\"username\":\"$user\",\"password\":\"$pass\"}" "$AUTOBRR_HOST_URL/api/auth/onboard" >/dev/null
   fi
 
-  code="$(curl -ksS -c "$cookies" -o /tmp/tng-autobrr-login.txt -w '%{http_code}' -H 'Content-Type: application/json' -X POST -d "{\"username\":\"$user\",\"password\":\"$pass\",\"remember_me\":true}" "$AUTOBRR_HOST_URL/api/auth/login")"
+  code="$(curl -q -sS --noproxy "*" -c "$cookies" -o /tmp/tng-autobrr-login.txt -w '%{http_code}' -H 'Content-Type: application/json' -X POST -d "{\"username\":\"$user\",\"password\":\"$pass\",\"remember_me\":true}" "$AUTOBRR_HOST_URL/api/auth/login")"
   if [[ "$code" != "204" ]]; then
     mark "autobrr login" "FAIL" "HTTP $code $(tr '\n' ' ' </tmp/tng-autobrr-login.txt)"
     return
@@ -159,7 +166,7 @@ configure_autobrr_client() {
     }
   }')"
 
-  code="$(curl -ksS -b "$cookies" -o /tmp/tng-autobrr-test.txt -w '%{http_code}' -H 'Content-Type: application/json' -X POST -d "$payload" "$AUTOBRR_HOST_URL/api/download_clients/test")"
+  code="$(curl -q -sS --noproxy "*" -b "$cookies" -o /tmp/tng-autobrr-test.txt -w '%{http_code}' -H 'Content-Type: application/json' -X POST -d "$payload" "$AUTOBRR_HOST_URL/api/download_clients/test")"
   if [[ "$code" != "204" ]]; then
     mark "autobrr qBit test" "FAIL" "HTTP $code $(tr '\n' ' ' </tmp/tng-autobrr-test.txt)"
     return
@@ -168,9 +175,9 @@ configure_autobrr_client() {
   existing_id="$(curl -fsS -b "$cookies" "$AUTOBRR_HOST_URL/api/download_clients" | jq -r '.[] | select(.name=="TorrentNG-qBit") | .id' | head -1)"
   if [[ -n "$existing_id" ]]; then
     payload="$(printf '%s' "$payload" | jq --argjson id "$existing_id" '.id=$id')"
-    code="$(curl -ksS -b "$cookies" -o /tmp/tng-autobrr-save.txt -w '%{http_code}' -H 'Content-Type: application/json' -X PUT -d "$payload" "$AUTOBRR_HOST_URL/api/download_clients")"
+    code="$(curl -q -sS --noproxy "*" -b "$cookies" -o /tmp/tng-autobrr-save.txt -w '%{http_code}' -H 'Content-Type: application/json' -X PUT -d "$payload" "$AUTOBRR_HOST_URL/api/download_clients")"
   else
-    code="$(curl -ksS -b "$cookies" -o /tmp/tng-autobrr-save.txt -w '%{http_code}' -H 'Content-Type: application/json' -X POST -d "$payload" "$AUTOBRR_HOST_URL/api/download_clients")"
+    code="$(curl -q -sS --noproxy "*" -b "$cookies" -o /tmp/tng-autobrr-save.txt -w '%{http_code}' -H 'Content-Type: application/json' -X POST -d "$payload" "$AUTOBRR_HOST_URL/api/download_clients")"
   fi
 
   if [[ "$code" == "200" || "$code" == "201" ]]; then

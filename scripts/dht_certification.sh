@@ -2,6 +2,8 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# shellcheck source=scripts/curl_policy.sh
+source "$ROOT/scripts/curl_policy.sh"
 ENV_FILE="${CERT_ENV_FILE:-$ROOT/deploy/certification/.env}"
 OUT="${1:-$ROOT/certification/reports/dht-cert-$(date -u +%Y%m%dT%H%M%SZ).md}"
 
@@ -19,8 +21,12 @@ TNG_CONTAINER="${TNG_CONTAINER:-certification-torrentng-1}"
 PUBLIC_PORT="${TNG_VPN_PUBLIC_PORT:-${TNG_INCOMING_PORT:-50000}}"
 PRIVATE_PORT="${TNG_PRIVATE_INCOMING_PORT:-${TNG_INCOMING_PORT:-$PUBLIC_PORT}}"
 PUBLIC_IP="${TNG_VPN_PUBLIC_IP:-}"
-COMPOSE_FILE="${CERT_COMPOSE_FILE:-$ROOT/deploy/certification/compose.yml}"
-
+if [[ -n "${TNG_PROTECTED_LOCAL_HTTP_ORIGIN:-}" ]]; then
+  python3 "$ROOT/scripts/protected_target.py" \
+    --allow-private-http-origin "$TNG_PROTECTED_LOCAL_HTTP_ORIGIN" "$TNG_HOST_URL"
+else
+  python3 "$ROOT/scripts/protected_target.py" "$TNG_HOST_URL"
+fi
 mkdir -p "$(dirname "$OUT")"
 status="PASS"
 mark() {

@@ -29,7 +29,10 @@ See [docs/NATIVE_DEPLOYMENT.md](../docs/NATIVE_DEPLOYMENT.md).
 
 | Path | What it is |
 |---|---|
-| `docker/compose.yml` | rTorrent + `torrentng` compatible-client service stack |
+| `docker/compose.yml` | Default rTorrent + `torrentng` compatible-client service stack |
+| `docker/compose.qbittorrent.yml` | Optional qBittorrent + compatible-client profile; requires backend credentials |
+| `docker/compose.transmission.yml` | Optional Transmission + compatible-client profile; requires backend credentials |
+| `docker/compose.deluge.yml` | Optional Deluge + compatible-client profile; requires backend credentials |
 | `docker/compose.phase1.yml` | Lower-level Phase 1 rTorrent/ruTorrent bundle (profile testing only) |
 | `docker/Dockerfile*`, `docker/entrypoint*.sh` | Images and entrypoints for both of the above |
 | `docker/config/`, `docker/patches/` | rTorrent/ruTorrent packaging config and patches |
@@ -40,9 +43,25 @@ docker compose -f deploy/docker/compose.yml up --build          # rTorrent + com
 docker compose -f deploy/docker/compose.phase1.yml up --build   # Phase 1 rTorrent/ruTorrent only
 ```
 
+The optional external-client profiles use a separate Compose overlay so their
+required credentials do not block the default stack. Their management UIs are
+bound to loopback; the compatible-client HTTP/API ports and HTTP-only Nginx
+front door are also loopback-only by default. Use an authenticated TLS
+reverse proxy for remote UI/API access. Torrent peer ports remain published
+for inbound peers. See the profile setup instructions in
+[docs/DEPLOYMENT.md](../docs/DEPLOYMENT.md).
+
 See [docs/DEPLOYMENT.md](../docs/DEPLOYMENT.md) and
 [engine-profile/](../engine-profile/) for the pinned rTorrent build these
 stacks consume.
+
+## Unraid
+
+| Path | What it is |
+|---|---|
+| `../templates/torrentng-webui.xml` | Community Applications template: WebUI/API replacement for an rTorrent/qBittorrent/Transmission/Deluge install you already run |
+| `../templates/torrentng.xml` | Community Applications template: full `torrentngd` stack, no external client |
+| `unraid/README.md` | Unraid template selection, installation, storage permissions, and backend setup |
 
 ## Shared / cross-cutting
 

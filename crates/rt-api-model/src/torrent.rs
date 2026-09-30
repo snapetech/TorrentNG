@@ -4,6 +4,8 @@ use std::marker::PhantomData;
 use serde::{de, Deserialize, Deserializer, Serialize};
 
 const MAX_API_LIST_ITEMS: usize = 16_384;
+const MAX_API_TAG_ITEMS: usize = 1_024;
+const MAX_API_TAG_BYTES: usize = 256;
 
 /// Summary returned by `GET /api/v1/torrents`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -58,7 +60,7 @@ pub struct FileInfo {
     pub priority: u8,
 }
 
-/// Request body for `POST /api/v1/torrents/add`.
+/// JSON request body for `POST /api/v1/torrents`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AddTorrentRequest {
     /// Base64-encoded .torrent file content.
@@ -66,14 +68,15 @@ pub struct AddTorrentRequest {
     /// Magnet link (alternative to torrent_b64).
     pub magnet: Option<String>,
     pub save_path: String,
+    #[serde(default, deserialize_with = "deserialize_bounded_optional_label")]
     pub category: Option<String>,
-    #[serde(default, deserialize_with = "deserialize_bounded_optional_vec")]
+    #[serde(default, deserialize_with = "deserialize_bounded_optional_tags")]
     pub tags: Option<Vec<String>>,
     /// Start immediately after adding.
     pub start: Option<bool>,
 }
 
-/// Response from `POST /api/v1/torrents/add`.
+/// JSON response from `POST /api/v1/torrents`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AddTorrentResponse {
     pub info_hash: String,
@@ -128,21 +131,62 @@ where
     deserializer.deserialize_seq(BoundedVecVisitor(PhantomData))
 }
 
-fn deserialize_bounded_optional_vec<'de, D, T>(deserializer: D) -> Result<Option<Vec<T>>, D::Error>
+struct BoundedApiLabel(String);
+
+impl<'de> Deserialize<'de> for BoundedApiLabel {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct LabelVisitor;
+
+        impl de::Visitor<'_> for LabelVisitor {
+            type Value = BoundedApiLabel;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("a label with at most 256 UTF-8 bytes")
+            }
+
+            fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
+            where
+                E: de::Error,
+            {
+                if value.len() > MAX_API_TAG_BYTES {
+                    return Err(E::custom(format!(
+                        "label exceeds maximum of {MAX_API_TAG_BYTES} UTF-8 bytes"
+                    )));
+                }
+                Ok(BoundedApiLabel(value.to_owned()))
+            }
+
+            fn visit_string<E>(self, value: String) -> Result<Self::Value, E>
+            where
+                E: de::Error,
+            {
+                if value.len() > MAX_API_TAG_BYTES {
+                    return Err(E::custom(format!(
+                        "label exceeds maximum of {MAX_API_TAG_BYTES} UTF-8 bytes"
+                    )));
+                }
+                Ok(BoundedApiLabel(value))
+            }
+        }
+
+        deserializer.deserialize_string(LabelVisitor)
+    }
+}
+
+fn deserialize_bounded_optional_label<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
 where
     D: Deserializer<'de>,
-    T: Deserialize<'de>,
 {
-    struct BoundedOptionalVecVisitor<T>(PhantomData<T>);
+    struct OptionalLabelVisitor;
 
-    impl<'de, T> de::Visitor<'de> for BoundedOptionalVecVisitor<T>
-    where
-        T: Deserialize<'de>,
-    {
-        type Value = Option<Vec<T>>;
+    impl<'de> de::Visitor<'de> for OptionalLabelVisitor {
+        type Value = Option<String>;
 
         fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-            formatter.write_str("null or a bounded array")
+            formatter.write_str("null or a label with at most 256 UTF-8 bytes")
         }
 
         fn visit_none<E>(self) -> Result<Self::Value, E>
@@ -156,11 +200,82 @@ where
         where
             D2: Deserializer<'de>,
         {
-            deserialize_bounded_vec(deserializer).map(Some)
+            BoundedApiLabel::deserialize(deserializer).map(|label| Some(label.0))
         }
     }
 
-    deserializer.deserialize_option(BoundedOptionalVecVisitor(PhantomData))
+    deserializer.deserialize_option(OptionalLabelVisitor)
+}
+
+fn deserialize_bounded_tags<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    struct TagsVisitor;
+
+    impl<'de> de::Visitor<'de> for TagsVisitor {
+        type Value = Vec<String>;
+
+        fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter.write_str("an array of at most 1024 labels, each at most 256 UTF-8 bytes")
+        }
+
+        fn visit_seq<A>(self, mut sequence: A) -> Result<Self::Value, A::Error>
+        where
+            A: de::SeqAccess<'de>,
+        {
+            let mut tags = Vec::with_capacity(
+                sequence
+                    .size_hint()
+                    .unwrap_or_default()
+                    .min(MAX_API_TAG_ITEMS),
+            );
+            while let Some(tag) = sequence.next_element::<BoundedApiLabel>()? {
+                if tags.len() >= MAX_API_TAG_ITEMS {
+                    return Err(de::Error::custom(format!(
+                        "array exceeds maximum of {MAX_API_TAG_ITEMS} labels"
+                    )));
+                }
+                tags.push(tag.0);
+            }
+            Ok(tags)
+        }
+    }
+
+    deserializer.deserialize_seq(TagsVisitor)
+}
+
+fn deserialize_bounded_optional_tags<'de, D>(
+    deserializer: D,
+) -> Result<Option<Vec<String>>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    struct OptionalTagsVisitor;
+
+    impl<'de> de::Visitor<'de> for OptionalTagsVisitor {
+        type Value = Option<Vec<String>>;
+
+        fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter.write_str("null or a bounded label array")
+        }
+
+        fn visit_none<E>(self) -> Result<Self::Value, E>
+        where
+            E: de::Error,
+        {
+            Ok(None)
+        }
+
+        fn visit_some<D2>(self, deserializer: D2) -> Result<Self::Value, D2::Error>
+        where
+            D2: Deserializer<'de>,
+        {
+            deserialize_bounded_tags(deserializer).map(Some)
+        }
+    }
+
+    deserializer.deserialize_option(OptionalTagsVisitor)
 }
 
 #[cfg(test)]
@@ -205,9 +320,24 @@ mod tests {
     fn add_request_rejects_oversized_tag_lists_during_deserialization() {
         let json = serde_json::json!({
             "save_path": "/data",
-            "tags": vec!["tag"; MAX_API_LIST_ITEMS + 1],
+            "tags": vec!["tag"; MAX_API_TAG_ITEMS + 1],
         });
         assert!(serde_json::from_value::<AddTorrentRequest>(json).is_err());
+    }
+
+    #[test]
+    fn add_request_rejects_oversized_labels_during_deserialization() {
+        let category = serde_json::json!({
+            "save_path": "/data",
+            "category": "x".repeat(MAX_API_TAG_BYTES + 1),
+        });
+        assert!(serde_json::from_value::<AddTorrentRequest>(category).is_err());
+
+        let tag = serde_json::json!({
+            "save_path": "/data",
+            "tags": ["x".repeat(MAX_API_TAG_BYTES + 1)],
+        });
+        assert!(serde_json::from_value::<AddTorrentRequest>(tag).is_err());
     }
 
     #[test]
