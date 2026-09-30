@@ -3,6 +3,10 @@ use crate::error::BencodeError;
 const DEFAULT_MAX_DEPTH: usize = 64;
 const DEFAULT_MAX_STRING: usize = 16 * 1024 * 1024; // 16 MiB
 const DEFAULT_MAX_NODES: usize = 1_000_000;
+const MAX_INTEGER_TOKEN_BYTES: usize = 20; // i64::MIN is the longest decimal i64
+                                           // Any usize value needs fewer base-10 digits than its bit width. This is a
+                                           // cheap upper bound that works for every supported pointer width.
+const MAX_LENGTH_PREFIX_DIGITS: usize = usize::BITS as usize;
 
 /// A borrowed bencode value. String values borrow from the input slice.
 #[derive(Debug, PartialEq, Clone)]
@@ -83,8 +87,20 @@ impl<'a> Decoder<'a> {
         self
     }
 
-    pub fn decode(mut self) -> Result<BValue<'a>, BencodeError> {
-        let val = self.decode_value(0)?;
+    pub fn decode(self) -> Result<BValue<'a>, BencodeError> {
+        let mut reserve = |_| true;
+        self.decode_with_allocation_reservation(&mut reserve)
+    }
+
+    /// Decode while requesting memory admission before each collection growth.
+    /// `reserve` receives the target capacity bytes for every vector growth,
+    /// not only the capacity delta: the existing buffer can still be live while
+    /// the allocator moves its contents into the new buffer.
+    pub fn decode_with_allocation_reservation(
+        mut self,
+        reserve: &mut impl FnMut(usize) -> bool,
+    ) -> Result<BValue<'a>, BencodeError> {
+        let val = self.decode_value(0, reserve)?;
         if self.pos != self.input.len() {
             return Err(BencodeError::TrailingData);
         }
@@ -92,11 +108,17 @@ impl<'a> Decoder<'a> {
     }
 
     /// Decode a value and also return the byte span it occupied.
-    pub fn decode_with_span(
+    pub fn decode_with_span(self) -> Result<(BValue<'a>, std::ops::Range<usize>), BencodeError> {
+        let mut reserve = |_| true;
+        self.decode_with_span_and_allocation_reservation(&mut reserve)
+    }
+
+    pub fn decode_with_span_and_allocation_reservation(
         mut self,
+        reserve: &mut impl FnMut(usize) -> bool,
     ) -> Result<(BValue<'a>, std::ops::Range<usize>), BencodeError> {
         let start = self.pos;
-        let val = self.decode_value(0)?;
+        let val = self.decode_value(0, reserve)?;
         if self.pos != self.input.len() {
             return Err(BencodeError::TrailingData);
         }
@@ -125,7 +147,11 @@ impl<'a> Decoder<'a> {
         }
     }
 
-    fn decode_value(&mut self, depth: usize) -> Result<BValue<'a>, BencodeError> {
+    fn decode_value(
+        &mut self,
+        depth: usize,
+        reserve: &mut impl FnMut(usize) -> bool,
+    ) -> Result<BValue<'a>, BencodeError> {
         if depth > self.max_depth {
             return Err(BencodeError::DepthExceeded(self.max_depth));
         }
@@ -144,8 +170,8 @@ impl<'a> Decoder<'a> {
         }
         match self.peek()? {
             b'i' => self.decode_int(),
-            b'l' => self.decode_list(depth),
-            b'd' => self.decode_dict(depth),
+            b'l' => self.decode_list(depth, reserve),
+            b'd' => self.decode_dict(depth, reserve),
             b'0'..=b'9' => self.decode_bytes(),
             b => Err(BencodeError::UnexpectedByte(b, self.pos)),
         }
@@ -155,6 +181,11 @@ impl<'a> Decoder<'a> {
         self.expect(b'i')?;
         let start = self.pos;
         while self.peek()? != b'e' {
+            if self.pos - start >= MAX_INTEGER_TOKEN_BYTES {
+                return Err(BencodeError::InvalidInteger(
+                    "integer token exceeds i64 width".into(),
+                ));
+            }
             self.pos += 1;
             if self.pos >= self.input.len() {
                 return Err(BencodeError::UnexpectedEof);
@@ -164,22 +195,25 @@ impl<'a> Decoder<'a> {
         self.expect(b'e')?;
 
         let s = std::str::from_utf8(digits)
-            .map_err(|_| BencodeError::InvalidInteger(format!("{digits:?}")))?;
+            .map_err(|_| BencodeError::InvalidInteger("non-ASCII integer token".into()))?;
 
         // Reject -0 and leading zeros
         if s == "-0" {
             return Err(BencodeError::InvalidInteger("-0".into()));
         }
+        if s.starts_with('+') {
+            return Err(BencodeError::InvalidInteger("leading plus".into()));
+        }
         if s.len() > 1 && s.starts_with('0') {
-            return Err(BencodeError::InvalidInteger(s.into()));
+            return Err(BencodeError::InvalidInteger("leading zero".into()));
         }
         if s.len() > 2 && s.starts_with("-0") {
-            return Err(BencodeError::InvalidInteger(s.into()));
+            return Err(BencodeError::InvalidInteger("leading zero".into()));
         }
 
         let n = s
             .parse::<i64>()
-            .map_err(|_| BencodeError::InvalidInteger(s.into()))?;
+            .map_err(|_| BencodeError::InvalidInteger("integer outside i64 range".into()))?;
 
         Ok(BValue::Int(n))
     }
@@ -207,6 +241,11 @@ impl<'a> Decoder<'a> {
     fn decode_length(&mut self) -> Result<usize, BencodeError> {
         let start = self.pos;
         while self.peek()? != b':' {
+            if self.pos - start >= MAX_LENGTH_PREFIX_DIGITS {
+                return Err(BencodeError::InvalidStringLength(
+                    "length prefix exceeds usize width".into(),
+                ));
+            }
             let b = self.input[self.pos];
             if !b.is_ascii_digit() {
                 return Err(BencodeError::InvalidStringLength(format!(
@@ -222,9 +261,7 @@ impl<'a> Decoder<'a> {
         let s = std::str::from_utf8(&self.input[start..self.pos])
             .map_err(|_| BencodeError::InvalidStringLength("utf8".into()))?;
         if s.len() > 1 && s.starts_with('0') {
-            return Err(BencodeError::InvalidStringLength(format!(
-                "leading zero: {s}"
-            )));
+            return Err(BencodeError::InvalidStringLength("leading zero".into()));
         }
         let n = s
             .parse::<usize>()
@@ -233,17 +270,27 @@ impl<'a> Decoder<'a> {
         Ok(n)
     }
 
-    fn decode_list(&mut self, depth: usize) -> Result<BValue<'a>, BencodeError> {
+    fn decode_list(
+        &mut self,
+        depth: usize,
+        reserve: &mut impl FnMut(usize) -> bool,
+    ) -> Result<BValue<'a>, BencodeError> {
         self.expect(b'l')?;
         let mut items = Vec::new();
         while self.peek()? != b'e' {
-            items.push(self.decode_value(depth + 1)?);
+            reserve_vec_growth(&mut items, reserve)?;
+            let item = self.decode_value(depth + 1, reserve)?;
+            items.push(item);
         }
         self.expect(b'e')?;
         Ok(BValue::List(items))
     }
 
-    fn decode_dict(&mut self, depth: usize) -> Result<BValue<'a>, BencodeError> {
+    fn decode_dict(
+        &mut self,
+        depth: usize,
+        reserve: &mut impl FnMut(usize) -> bool,
+    ) -> Result<BValue<'a>, BencodeError> {
         self.expect(b'd')?;
         let mut pairs: Vec<(&'a [u8], BValue<'a>)> = Vec::new();
         let mut last_key: Option<&[u8]> = None;
@@ -260,7 +307,8 @@ impl<'a> Decoder<'a> {
                 }
             }
             last_key = Some(key);
-            let val = self.decode_value(depth + 1)?;
+            reserve_vec_growth(&mut pairs, reserve)?;
+            let val = self.decode_value(depth + 1, reserve)?;
             pairs.push((key, val));
         }
         self.expect(b'e')?;
@@ -268,9 +316,52 @@ impl<'a> Decoder<'a> {
     }
 }
 
+fn reserve_vec_growth<T>(
+    items: &mut Vec<T>,
+    reserve: &mut impl FnMut(usize) -> bool,
+) -> Result<(), BencodeError> {
+    if items.len() < items.capacity() {
+        return Ok(());
+    }
+    let min_capacity = items
+        .len()
+        .checked_add(1)
+        .ok_or(BencodeError::AllocationFailed)?;
+    let new_capacity = items.capacity().saturating_mul(2).max(min_capacity);
+    // Keep the prior capacity charged and reserve the full replacement
+    // capacity before `try_reserve_exact`. During a moving realloc, both
+    // buffers may be resident. The admission owner retains reservations until
+    // the whole parse ends, which also covers older generations of this Vec.
+    let target_bytes = new_capacity
+        .checked_mul(std::mem::size_of::<T>())
+        .ok_or(BencodeError::AllocationFailed)?;
+    if target_bytes > 0 && !reserve(target_bytes) {
+        return Err(BencodeError::AllocationBudgetExceeded {
+            bytes: target_bytes,
+        });
+    }
+    let additional = new_capacity
+        .checked_sub(items.len())
+        .ok_or(BencodeError::AllocationFailed)?;
+    items
+        .try_reserve_exact(additional)
+        .map_err(|_| BencodeError::AllocationFailed)?;
+    if items.capacity() < new_capacity {
+        return Err(BencodeError::AllocationFailed);
+    }
+    Ok(())
+}
+
 /// Decode a bencode value from a byte slice.
 pub fn decode(input: &[u8]) -> Result<BValue<'_>, BencodeError> {
     Decoder::new(input).decode()
+}
+
+pub fn decode_with_allocation_reservation<'a>(
+    input: &'a [u8],
+    reserve: &mut impl FnMut(usize) -> bool,
+) -> Result<BValue<'a>, BencodeError> {
+    Decoder::new(input).decode_with_allocation_reservation(reserve)
 }
 
 /// Decode and return the value along with the byte span of the `info` key's value,
@@ -278,11 +369,15 @@ pub fn decode(input: &[u8]) -> Result<BValue<'_>, BencodeError> {
 pub fn decode_torrent_info_span(
     input: &[u8],
 ) -> Result<(BValue<'_>, Option<std::ops::Range<usize>>), BencodeError> {
-    let mut dec = Decoder::new(input);
-    let val = dec.decode_value(0)?;
-    if dec.pos != input.len() {
-        return Err(BencodeError::TrailingData);
-    }
+    let mut reserve = |_| true;
+    decode_torrent_info_span_with_allocation_reservation(input, &mut reserve)
+}
+
+pub fn decode_torrent_info_span_with_allocation_reservation<'a>(
+    input: &'a [u8],
+    reserve: &mut impl FnMut(usize) -> bool,
+) -> Result<(BValue<'a>, Option<std::ops::Range<usize>>), BencodeError> {
+    let val = Decoder::new(input).decode_with_allocation_reservation(reserve)?;
 
     // Find the byte span of the `info` value in the top-level dict
     let info_span = find_info_span(input);
@@ -357,6 +452,47 @@ mod tests {
     use super::*;
 
     #[test]
+    fn collection_reallocation_overlap_is_reserved_before_growth() {
+        let mut requested = Vec::new();
+        let mut reserve = |bytes| {
+            requested.push(bytes);
+            true
+        };
+        let decoded = Decoder::new(b"li1ei2ei3ee")
+            .decode_with_allocation_reservation(&mut reserve)
+            .unwrap();
+        let BValue::List(items) = decoded else {
+            panic!("expected list");
+        };
+        let allocated = items.capacity() * std::mem::size_of::<BValue<'_>>();
+        assert!(requested.iter().sum::<usize>() >= allocated);
+        assert_eq!(
+            requested,
+            [
+                std::mem::size_of::<BValue<'_>>(),
+                2 * std::mem::size_of::<BValue<'_>>(),
+                4 * std::mem::size_of::<BValue<'_>>(),
+            ]
+        );
+    }
+
+    #[test]
+    fn collection_growth_is_denied_before_allocation() {
+        let mut calls = 0;
+        let mut reserve = |bytes| {
+            calls += 1;
+            assert_eq!(bytes, std::mem::size_of::<BValue<'_>>());
+            false
+        };
+        assert!(matches!(
+            Decoder::new(b"li1ee").decode_with_allocation_reservation(&mut reserve),
+            Err(BencodeError::AllocationBudgetExceeded { bytes })
+                if bytes == std::mem::size_of::<BValue<'_>>()
+        ));
+        assert_eq!(calls, 1);
+    }
+
+    #[test]
     fn decode_integer() {
         assert_eq!(decode(b"i42e").unwrap(), BValue::Int(42));
         assert_eq!(decode(b"i-1e").unwrap(), BValue::Int(-1));
@@ -366,6 +502,18 @@ mod tests {
     #[test]
     fn reject_negative_zero() {
         assert!(decode(b"i-0e").is_err());
+    }
+
+    #[test]
+    fn reject_leading_plus() {
+        assert!(matches!(
+            decode(b"i+1e"),
+            Err(BencodeError::InvalidInteger(_))
+        ));
+        assert!(matches!(
+            decode(b"i+01e"),
+            Err(BencodeError::InvalidInteger(_))
+        ));
     }
 
     #[test]
@@ -414,6 +562,29 @@ mod tests {
             Decoder::new(&input).with_max_nodes(3).decode(),
             Err(BencodeError::NodeLimitExceeded { max: 3, .. })
         ));
+    }
+
+    #[test]
+    fn oversized_integer_token_is_rejected_without_echoing_input() {
+        let mut input = Vec::with_capacity(1024 * 1024 + 2);
+        input.push(b'i');
+        input.extend(std::iter::repeat_n(b'9', 1024 * 1024));
+        input.push(b'e');
+
+        let error = decode(&input).unwrap_err();
+        assert!(matches!(error, BencodeError::InvalidInteger(_)));
+        assert!(error.to_string().len() < 128);
+    }
+
+    #[test]
+    fn oversized_length_prefix_is_rejected_without_echoing_input() {
+        let mut input = Vec::with_capacity(1024 * 1024 + 1);
+        input.extend(std::iter::repeat_n(b'0', 1024 * 1024));
+        input.push(b':');
+
+        let error = decode(&input).unwrap_err();
+        assert!(matches!(error, BencodeError::InvalidStringLength(_)));
+        assert!(error.to_string().len() < 128);
     }
 
     #[test]

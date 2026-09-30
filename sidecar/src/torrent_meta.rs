@@ -1,9 +1,10 @@
 use std::{
     collections::HashMap,
-    fs::{File, OpenOptions},
     io::{self, Read},
-    path::{Path, PathBuf},
+    path::PathBuf,
 };
+
+use crate::safe_file::open_regular_read_no_follow;
 
 const DEFAULT_SESSION_DIR: &str = "/session";
 const MAX_BENCODE_DEPTH: usize = 64;
@@ -54,7 +55,7 @@ fn normalize_hash(hash: &str) -> io::Result<String> {
 
 fn read_session_torrent(hash: &str) -> io::Result<Vec<u8>> {
     let path = session_dir().join(format!("{hash}.torrent"));
-    let file = open_read_no_follow(&path)?;
+    let file = open_regular_read_no_follow(&path)?;
     let file_len = file.metadata()?.len();
     if file_len > MAX_SESSION_TORRENT_BYTES as u64 {
         return Err(io::Error::new(
@@ -82,21 +83,6 @@ fn read_session_torrent(hash: &str) -> io::Result<Vec<u8>> {
         ));
     }
     Ok(raw)
-}
-
-#[cfg(unix)]
-fn open_read_no_follow(path: &Path) -> io::Result<File> {
-    use std::os::unix::fs::OpenOptionsExt;
-
-    OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NOFOLLOW)
-        .open(path)
-}
-
-#[cfg(not(unix))]
-fn open_read_no_follow(path: &Path) -> io::Result<File> {
-    File::open(path)
 }
 
 fn session_dir() -> PathBuf {
@@ -284,6 +270,41 @@ mod tests {
     use super::{
         first_tracker_url, session_torrent_blob, tracker_urls_from_torrent, MAX_TRACKER_URL_BYTES,
     };
+    use crate::safe_file::open_regular_read_no_follow;
+
+    #[cfg(unix)]
+    #[test]
+    fn rejects_session_torrent_symlinks() {
+        use std::{fs, os::unix::fs::symlink};
+
+        let directory = tempfile::tempdir().unwrap();
+        let target = directory.path().join("target.torrent");
+        let link = directory.path().join("link.torrent");
+        fs::write(&target, b"payload").unwrap();
+        symlink(&target, &link).unwrap();
+
+        assert!(open_regular_read_no_follow(&link).is_err());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn rejects_session_torrent_reparse_points() {
+        use std::{fs, os::windows::fs::symlink_file};
+
+        let directory = tempfile::tempdir().unwrap();
+        let target = directory.path().join("target.torrent");
+        let link = directory.path().join("link.torrent");
+        fs::write(&target, b"payload").unwrap();
+        if let Err(error) = symlink_file(&target, &link) {
+            if error.kind() == std::io::ErrorKind::PermissionDenied {
+                eprintln!("Windows runner does not permit creating a test symlink: {error}");
+                return;
+            }
+            panic!("failed to create test reparse point: {error}");
+        }
+
+        assert!(open_regular_read_no_follow(&link).is_err());
+    }
 
     #[test]
     fn reads_announce_first() {

@@ -54,6 +54,15 @@ pub enum UtpError {
     #[error("uTP stream closed")]
     Closed,
 
+    #[error("uTP receive task panicked")]
+    ReceiveTaskPanicked,
+
+    #[error("uTP receive task was cancelled")]
+    ReceiveTaskCancelled,
+
     #[error("uTP receive buffer exceeded {max} bytes (attempted {actual})")]
     ReceiveBufferFull { max: usize, actual: usize },
+
+    #[error("invalid uTP transport configuration: {0}")]
+    InvalidConfig(&'static str),
 }

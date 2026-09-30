@@ -11,8 +11,14 @@ permissions: {}
 
 jobs:
   disabled:
-    if: false
+    # Kept dormant intentionally; no workflow with this fixed name can match.
+    if: github.workflow == '__disabled_package_smoke__'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-      - run: packaging/smoke/package-smoke torrentng github-binary "${{ inputs.tag }}" --arch amd64
+        with:
+          persist-credentials: false
+      - name: Run disabled package smoke
+        env:
+          RELEASE_TAG: ${{ inputs.tag }}
+        run: packaging/smoke/package-smoke torrentng github-binary "$RELEASE_TAG" --arch amd64

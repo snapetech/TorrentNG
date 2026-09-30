@@ -27,7 +27,7 @@ pub struct TorrentngBackend {
 
 impl TorrentngBackend {
     pub fn new(cfg: &TorrentngConfig) -> Result<Self> {
-        let client = reqwest::Client::builder()
+        let client = super::backend_client_builder()
             .timeout(std::time::Duration::from_secs(cfg.timeout_secs.max(1)))
             .danger_accept_invalid_certs(cfg.accept_invalid_certs)
             .build()
@@ -47,6 +47,17 @@ impl TorrentngBackend {
 
     fn torrent_path(hash: &str, suffix: &str) -> String {
         let hash = urlencoding::encode(hash);
+        // `urlencoding` correctly escapes path separators but leaves dots
+        // unescaped. A hash equal to `.` or `..` would therefore become a
+        // URL dot-segment when `Url::join` resolves this relative path,
+        // silently changing the authenticated backend endpoint. Double-
+        // encode those exact segments so they remain data until the server
+        // decodes the hash parameter (which will still be an invalid hash).
+        let hash = match hash.as_ref() {
+            "." => "%25.",
+            ".." => "%25..",
+            _ => hash.as_ref(),
+        };
         if suffix.is_empty() {
             format!("api/v1/torrents/{hash}")
         } else {
@@ -67,6 +78,7 @@ impl TorrentngBackend {
             self.request(reqwest::Method::GET, path)?
                 .send()
                 .await
+                .map_err(reqwest::Error::without_url)
                 .with_context(|| format!("TorrentNG GET {path}"))?,
             MAX_BACKEND_JSON_BYTES,
             &format!("TorrentNG GET {path}"),
@@ -88,6 +100,7 @@ impl TorrentngBackend {
                 .json(&body)
                 .send()
                 .await
+                .map_err(reqwest::Error::without_url)
                 .with_context(|| format!("TorrentNG {method} {path}"))?,
             MAX_BACKEND_JSON_BYTES,
             &format!("TorrentNG {method} {path}"),
@@ -343,6 +356,7 @@ impl TorrentBackend for TorrentngBackend {
             )?
             .send()
             .await
+            .map_err(reqwest::Error::without_url)
             .with_context(|| format!("TorrentNG GET torrent export {hash}"))?,
             MAX_BACKEND_JSON_BYTES,
             &format!("TorrentNG GET torrent export {hash}"),
@@ -356,12 +370,13 @@ impl TorrentBackend for TorrentngBackend {
         } else {
             Self::torrent_path(hash, "")
         };
-        self.request(reqwest::Method::DELETE, &path)?
+        let response = self
+            .request(reqwest::Method::DELETE, &path)?
             .send()
             .await
-            .with_context(|| format!("TorrentNG DELETE torrent {hash}"))?
-            .error_for_status()
+            .map_err(reqwest::Error::without_url)
             .with_context(|| format!("TorrentNG DELETE torrent {hash}"))?;
+        super::require_success_status(response, &format!("TorrentNG DELETE torrent {hash}"))?;
         Ok(())
     }
 
@@ -525,35 +540,38 @@ impl TorrentBackend for TorrentngBackend {
     }
 
     async fn set_category(&self, hash: &str, category: &str) -> Result<()> {
-        self.request(reqwest::Method::PUT, &Self::torrent_path(hash, "category"))?
+        let response = self
+            .request(reqwest::Method::PUT, &Self::torrent_path(hash, "category"))?
             .json(&json!({ "category": empty_to_null(category) }))
             .send()
             .await
-            .with_context(|| format!("TorrentNG PUT torrent {hash} category"))?
-            .error_for_status()
+            .map_err(reqwest::Error::without_url)
             .with_context(|| format!("TorrentNG PUT torrent {hash} category"))?;
+        super::require_success_status(response, &format!("TorrentNG PUT torrent {hash} category"))?;
         Ok(())
     }
 
     async fn set_location(&self, hash: &str, location: &str) -> Result<()> {
-        self.request(reqwest::Method::PUT, &Self::torrent_path(hash, ""))?
+        let response = self
+            .request(reqwest::Method::PUT, &Self::torrent_path(hash, ""))?
             .json(&json!({ "save_path": location }))
             .send()
             .await
-            .with_context(|| format!("TorrentNG PUT torrent {hash} location"))?
-            .error_for_status()
+            .map_err(reqwest::Error::without_url)
             .with_context(|| format!("TorrentNG PUT torrent {hash} location"))?;
+        super::require_success_status(response, &format!("TorrentNG PUT torrent {hash} location"))?;
         Ok(())
     }
 
     async fn rename_torrent(&self, hash: &str, name: &str) -> Result<()> {
-        self.request(reqwest::Method::PUT, &Self::torrent_path(hash, ""))?
+        let response = self
+            .request(reqwest::Method::PUT, &Self::torrent_path(hash, ""))?
             .json(&json!({ "name": name }))
             .send()
             .await
-            .with_context(|| format!("TorrentNG PUT torrent {hash} name"))?
-            .error_for_status()
+            .map_err(reqwest::Error::without_url)
             .with_context(|| format!("TorrentNG PUT torrent {hash} name"))?;
+        super::require_success_status(response, &format!("TorrentNG PUT torrent {hash} name"))?;
         Ok(())
     }
 
@@ -758,6 +776,7 @@ impl TorrentBackend for TorrentngBackend {
             .form(&[("peers", peers)])
             .send()
             .await
+            .map_err(reqwest::Error::without_url)
             .context("TorrentNG POST qBit banPeers")?;
         let body =
             response_bytes_bounded(response, 16 * 1024, "TorrentNG POST qBit banPeers").await?;
@@ -834,24 +853,26 @@ impl TorrentBackend for TorrentngBackend {
 
 impl TorrentngBackend {
     async fn put_limits(&self, hash: &str, body: Value) -> Result<()> {
-        self.request(reqwest::Method::PUT, &Self::torrent_path(hash, "limits"))?
+        let response = self
+            .request(reqwest::Method::PUT, &Self::torrent_path(hash, "limits"))?
             .json(&body)
             .send()
             .await
-            .with_context(|| format!("TorrentNG PUT torrent {hash} limits"))?
-            .error_for_status()
+            .map_err(reqwest::Error::without_url)
             .with_context(|| format!("TorrentNG PUT torrent {hash} limits"))?;
+        super::require_success_status(response, &format!("TorrentNG PUT torrent {hash} limits"))?;
         Ok(())
     }
 
     async fn put_transfer_limits(&self, body: Value) -> Result<()> {
-        self.request(reqwest::Method::PUT, "api/v1/transfer/limits")?
+        let response = self
+            .request(reqwest::Method::PUT, "api/v1/transfer/limits")?
             .json(&body)
             .send()
             .await
-            .context("TorrentNG PUT transfer limits")?
-            .error_for_status()
+            .map_err(reqwest::Error::without_url)
             .context("TorrentNG PUT transfer limits")?;
+        super::require_success_status(response, "TorrentNG PUT transfer limits")?;
         Ok(())
     }
 
@@ -890,9 +911,7 @@ fn map_summary(t: &Value) -> Result<RawTorrent> {
     };
     if let Some(amount_left) = amount_left {
         if amount_left > size {
-            bail!(
-                "TorrentNG torrent reports {amount_left} bytes left for size {size}"
-            );
+            bail!("TorrentNG torrent reports {amount_left} bytes left for size {size}");
         }
     }
     let bytes_done = if state == "seeding" {
@@ -939,10 +958,11 @@ fn map_summary(t: &Value) -> Result<RawTorrent> {
     };
     let message = match t.get("tracker_message") {
         None | Some(Value::Null) => String::new(),
-        Some(value) => value
-            .as_str()
-            .ok_or_else(|| anyhow::anyhow!("TorrentNG response contains invalid tracker_message"))?
-            .to_owned(),
+        Some(value) => {
+            crate::url_redaction::redact_sensitive_text(value.as_str().ok_or_else(|| {
+                anyhow::anyhow!("TorrentNG response contains invalid tracker_message")
+            })?)
+        }
     };
     let hash = required_string(t, "info_hash")?;
     let name = required_string(t, "name")?;
@@ -1100,7 +1120,8 @@ mod tests {
             "added_at": 10,
             "completed_at": 20,
             "num_peers": 3,
-            "num_seeds": 4
+            "num_seeds": 4,
+            "tracker_message": "tracker rejected https://user:password@tracker.example/short-passkey?signature=query-secret"
         });
 
         let mapped = map_summary(&raw).unwrap();
@@ -1118,6 +1139,20 @@ mod tests {
         assert_eq!(mapped.category, "linux");
         assert_eq!(mapped.peers_connected, 3);
         assert_eq!(mapped.peers_complete, 4);
+        assert_eq!(mapped.message, "tracker rejected https://tracker.example/");
+    }
+
+    #[tokio::test]
+    async fn torrentng_mutation_redirects_are_rejected_without_following() {
+        super::super::assert_backend_redirect_rejected(|base_url| async move {
+            let config = TorrentngConfig {
+                url: base_url,
+                ..TorrentngConfig::default()
+            };
+            let backend = TorrentngBackend::new(&config)?;
+            backend.remove("deadbeef", false).await
+        })
+        .await;
     }
 
     #[test]
@@ -1238,6 +1273,17 @@ mod tests {
             TorrentngBackend::torrent_path("../private/file", "start"),
             "api/v1/torrents/..%2Fprivate%2Ffile/start"
         );
+    }
+
+    #[test]
+    fn torrent_paths_do_not_normalize_dot_hashes_into_other_endpoints() {
+        let base = Url::parse("http://torrentng.invalid/").unwrap();
+        for hash in [".", ".."] {
+            let path = TorrentngBackend::torrent_path(hash, "start");
+            let joined = base.join(&path).unwrap();
+            assert_eq!(joined.path().split('/').nth(3), Some("torrents"));
+            assert!(joined.path().ends_with("/start"), "{}", joined.path());
+        }
     }
 
     #[test]

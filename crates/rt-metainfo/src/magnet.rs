@@ -122,11 +122,23 @@ fn parse_exact_topic(
     info_hash_v2: &mut Option<[u8; 32]>,
 ) -> Result<(), MetainfoError> {
     if let Some(hash) = value.strip_prefix("urn:btih:") {
-        *info_hash_v1 = Some(parse_btih(hash)?);
+        let hash = parse_btih(hash)?;
+        if info_hash_v1.is_some_and(|previous| previous != hash) {
+            return Err(MetainfoError::InvalidMagnet(
+                "conflicting btih exact topics".to_owned(),
+            ));
+        }
+        *info_hash_v1 = Some(hash);
         return Ok(());
     }
     if let Some(multihash) = value.strip_prefix("urn:btmh:") {
-        *info_hash_v2 = Some(parse_btmh(multihash)?);
+        let hash = parse_btmh(multihash)?;
+        if info_hash_v2.is_some_and(|previous| previous != hash) {
+            return Err(MetainfoError::InvalidMagnet(
+                "conflicting btmh exact topics".to_owned(),
+            ));
+        }
+        *info_hash_v2 = Some(hash);
     }
     Ok(())
 }
@@ -224,6 +236,35 @@ mod tests {
         .unwrap();
 
         assert_eq!(magnet.info_hash_v2.unwrap(), [0xaa; 32]);
+    }
+
+    #[test]
+    fn parses_hybrid_magnet_topics_together() {
+        let magnet = parse_magnet(
+            "magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567&xt=urn:btmh:1220aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        )
+        .unwrap();
+
+        assert_eq!(
+            magnet.info_hash_v1,
+            Some([
+                0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef, 0x01, 0x23, 0x45, 0x67, 0x89, 0xab,
+                0xcd, 0xef, 0x01, 0x23, 0x45, 0x67
+            ])
+        );
+        assert_eq!(magnet.info_hash_v2, Some([0xaa; 32]));
+    }
+
+    #[test]
+    fn rejects_conflicting_repeated_exact_topics() {
+        assert!(parse_magnet(
+            "magnet:?xt=urn:btih:0000000000000000000000000000000000000000&xt=urn:btih:1111111111111111111111111111111111111111"
+        )
+        .is_err());
+        assert!(parse_magnet(
+            "magnet:?xt=urn:btmh:12200000000000000000000000000000000000000000000000000000000000000000&xt=urn:btmh:12201111111111111111111111111111111111111111111111111111111111111111"
+        )
+        .is_err());
     }
 
     #[test]

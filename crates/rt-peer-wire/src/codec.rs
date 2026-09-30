@@ -1,5 +1,5 @@
 /// tokio-util `Codec` impl for BEP 3 length-prefixed peer messages.
-use bytes::{Buf, BufMut, BytesMut};
+use bytes::{Buf, BytesMut};
 use rt_metrics::{MemoryClass, MemoryLease, ResourceGovernor};
 use tokio_util::codec::{Decoder, Encoder};
 
@@ -87,17 +87,6 @@ impl PeerCodec {
         }
         Ok(())
     }
-
-    fn reserve_encode_temporary(&self, bytes: usize) -> Result<Option<MemoryLease>, WireError> {
-        let Some(resources) = self.resources.clone() else {
-            return Ok(None);
-        };
-        let bytes = u64::try_from(bytes).map_err(|_| WireError::PeerBufferLengthOverflow)?;
-        resources
-            .try_acquire(MemoryClass::PeerBuffer, bytes)
-            .map(Some)
-            .ok_or(WireError::PeerBufferAllocationDenied(bytes))
-    }
 }
 
 impl Decoder for PeerCodec {
@@ -132,35 +121,12 @@ impl Encoder<Message> for PeerCodec {
         let encoded_len = item
             .encoded_len()
             .ok_or(WireError::MessageTooLarge(u32::MAX))?;
-        // `Piece` carries the seeding hot-path block payload as `Bytes`.
-        // Write the frame directly into `dst` instead of routing through
-        // `Message::encode`'s `Vec<u8>` return value: that would force an
-        // extra copy of the block (into the temporary `Vec`) on top of the
-        // copy already required to land the bytes in the socket write
-        // buffer. Building the frame here collapses that down to the one
-        // copy that is unavoidable for a length-prefixed contiguous frame,
-        // moving `data` straight in rather than cloning it.
-        match item {
-            Message::Piece { piece, begin, data } => {
-                self.reserve_write_capacity(dst, encoded_len)?;
-                let len = (encoded_len - 4) as u32;
-                dst.put_u32(len);
-                dst.put_u8(7);
-                dst.put_u32(piece);
-                dst.put_u32(begin);
-                dst.put(data);
-            }
-            other => {
-                // `Message::encode` returns a temporary Vec while the
-                // framed write buffer retains its own copy. Reserve the
-                // temporary before constructing it, then release that
-                // short-lived lease after the copy is queued.
-                let _temporary = self.reserve_encode_temporary(encoded_len)?;
-                self.reserve_write_capacity(dst, encoded_len)?;
-                let encoded = other.encode();
-                dst.put_slice(&encoded);
-            }
-        }
+        // Encode every message directly into the retained framed write
+        // buffer. This removes the temporary Vec previously used for all
+        // non-Piece messages and keeps Piece on the same zero-intermediate
+        // path.
+        self.reserve_write_capacity(dst, encoded_len)?;
+        item.encode_into(dst)?;
         Ok(())
     }
 }
@@ -168,6 +134,7 @@ impl Encoder<Message> for PeerCodec {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bytes::BufMut;
     use bytes::BytesMut;
     use tokio_util::codec::{Decoder, Encoder};
 
@@ -244,9 +211,8 @@ mod tests {
 
     #[test]
     fn codec_piece_frame_matches_generic_encode() {
-        // The Encoder specializes `Piece` to build the frame directly in
-        // `dst` instead of going through `Message::encode`'s `Vec<u8>`
-        // path. Confirm the two produce byte-identical frames.
+        // The Encoder builds the frame directly in `dst` instead of going
+        // through `Message::encode`'s owned Vec path. Confirm byte identity.
         let data = bytes::Bytes::from(vec![0xAAu8; 1024]);
         let msg = Message::Piece {
             piece: 1,
@@ -256,6 +222,43 @@ mod tests {
         let via_codec = encode_msg(msg.clone());
         let via_generic = msg.encode();
         assert_eq!(via_codec.as_ref(), via_generic.as_slice());
+    }
+
+    #[test]
+    #[ignore = "local hot-path measurement; run explicitly in release mode"]
+    fn benchmark_direct_encode_against_owned_encode() {
+        use std::hint::black_box;
+        use std::time::Instant;
+
+        let message = Message::Piece {
+            piece: 7,
+            begin: 16_384,
+            data: bytes::Bytes::from(vec![0x42; 16_384]),
+        };
+        let iterations = 10_000;
+
+        let started = Instant::now();
+        let mut owned_bytes = 0usize;
+        for _ in 0..iterations {
+            let encoded = message.encode();
+            owned_bytes = owned_bytes.saturating_add(black_box(encoded.len()));
+        }
+        let owned_elapsed = started.elapsed();
+
+        let started = Instant::now();
+        let mut direct = BytesMut::with_capacity(message.encoded_len().unwrap());
+        let mut direct_bytes = 0usize;
+        for _ in 0..iterations {
+            direct.clear();
+            message.encode_into(&mut direct).unwrap();
+            direct_bytes = direct_bytes.saturating_add(black_box(direct.len()));
+        }
+        let direct_elapsed = started.elapsed();
+
+        assert_eq!(owned_bytes, direct_bytes);
+        println!(
+            "peer-wire encode {iterations} piece frames: owned={owned_elapsed:?}, direct_reused={direct_elapsed:?}, bytes={direct_bytes}"
+        );
     }
 
     #[test]

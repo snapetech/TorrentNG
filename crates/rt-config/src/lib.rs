@@ -171,10 +171,15 @@ pub struct TrackerConfig {
     pub allow_udp_trackers: bool,
     pub allow_http_webseeds: bool,
     pub allow_https_webseeds: bool,
+    /// Permit outbound tracker, webseed, DHT, and peer traffic to loopback IPs.
     pub allow_loopback_egress: bool,
+    /// Permit outbound tracker, webseed, DHT, and peer traffic to private IPs.
     pub allow_private_egress: bool,
+    /// Permit outbound tracker, webseed, DHT, and peer traffic to link-local IPs.
     pub allow_link_local_egress: bool,
+    /// Permit outbound tracker, webseed, DHT, and peer traffic to multicast IPs.
     pub allow_multicast_egress: bool,
+    /// Permit outbound tracker, webseed, DHT, and peer traffic to unspecified IPs.
     pub allow_unspecified_egress: bool,
 }
 
@@ -591,8 +596,10 @@ impl Config {
     pub fn db_path(&self) -> PathBuf {
         if self.db.path == PathBuf::new() {
             self.daemon.session_dir.join("state.db")
-        } else {
+        } else if self.db.path.is_absolute() {
             self.db.path.clone()
+        } else {
+            self.daemon.session_dir.join(&self.db.path)
         }
     }
 
@@ -766,6 +773,28 @@ mod tests {
         let c = Config::default();
         let p = c.db_path();
         assert!(p.ends_with("state.db"));
+    }
+
+    #[test]
+    fn relative_db_path_resolves_under_session_directory() {
+        let mut config = Config::default();
+        config.daemon.session_dir = PathBuf::from("/tmp/torrentng-session");
+        config.db.path = PathBuf::from("custom/state.db");
+        assert_eq!(
+            config.db_path(),
+            PathBuf::from("/tmp/torrentng-session/custom/state.db")
+        );
+    }
+
+    #[test]
+    fn absolute_db_path_remains_absolute() {
+        let mut config = Config::default();
+        config.daemon.session_dir = PathBuf::from("/tmp/torrentng-session");
+        config.db.path = PathBuf::from("/var/lib/torrentng/state.db");
+        assert_eq!(
+            config.db_path(),
+            PathBuf::from("/var/lib/torrentng/state.db")
+        );
     }
 
     #[test]
