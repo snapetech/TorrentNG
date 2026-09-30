@@ -19,6 +19,23 @@ const TORRENT_SNAPSHOT_CACHE_SIZE: usize = 4;
 const TORRENT_SNAPSHOT_MAX_AGE: Duration = Duration::from_millis(750);
 type TorrentOrderCache = StdMutex<HashMap<&'static str, Arc<Vec<usize>>>>;
 
+fn lock_order_cache(
+    cache: &TorrentOrderCache,
+) -> std::sync::MutexGuard<'_, HashMap<&'static str, Arc<Vec<usize>>>> {
+    match cache.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => {
+            // Sort orders are derived from the immutable snapshot. If a
+            // previous panic interrupted a cache update, discard the partial
+            // projection and let the next request rebuild it.
+            let mut guard = poisoned.into_inner();
+            guard.clear();
+            cache.clear_poison();
+            guard
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct TorrentSnapshot {
     pub revision: u64,
@@ -907,13 +924,7 @@ impl TorrentSnapshot {
             "hash" => "hash",
             _ => "added",
         };
-        if let Some(indices) = self
-            .orders
-            .lock()
-            .expect("torrent snapshot order mutex poisoned")
-            .get(sort)
-            .cloned()
-        {
+        if let Some(indices) = lock_order_cache(&self.orders).get(sort).cloned() {
             return indices;
         }
 
@@ -936,10 +947,7 @@ impl TorrentSnapshot {
             ordering.then_with(|| left.summary.info_hash.cmp(&right.summary.info_hash))
         });
         let indices = Arc::new(indices);
-        self.orders
-            .lock()
-            .expect("torrent snapshot order mutex poisoned")
-            .insert(sort, Arc::clone(&indices));
+        lock_order_cache(&self.orders).insert(sort, Arc::clone(&indices));
         indices
     }
 }
@@ -1189,6 +1197,63 @@ mod tests {
             snapshot.candidate_indices(&[], None, None, Some("   "), None),
             None
         );
+    }
+
+    #[test]
+    fn poisoned_sort_cache_is_discarded_and_rebuilt_from_snapshot() {
+        let summary = |info_hash: &str, name: &str| TorrentSummary {
+            info_hash: info_hash.to_owned(),
+            name: name.to_owned(),
+            state: "stopped".to_owned(),
+            total_length: 0,
+            downloaded: 0,
+            amount_left: 0,
+            uploaded: 0,
+            ratio: 0.0,
+            save_path: "/data".to_owned(),
+            category: None,
+            tags: Vec::new(),
+            added_at: 0,
+            completed_at: None,
+            num_peers: 0,
+            num_seeds: 0,
+            tracker_message: None,
+        };
+        let items = ChunkedVec::from_vec(vec![
+            TorrentSnapshotItem {
+                summary: summary("b", "Zulu"),
+                amount_left: 0,
+                name_sort_key: "zulu".to_owned(),
+            },
+            TorrentSnapshotItem {
+                summary: summary("a", "Alpha"),
+                amount_left: 0,
+                name_sort_key: "alpha".to_owned(),
+            },
+        ]);
+        let snapshot = TorrentSnapshot {
+            revision: 1,
+            torrents: Arc::new(items.clone()),
+            orders: Arc::new(StdMutex::new(HashMap::new())),
+            filters: Arc::new(build_filter_index(&items)),
+        };
+
+        let cache = Arc::clone(&snapshot.orders);
+        assert!(std::thread::spawn(move || {
+            let _guard = cache.lock().unwrap();
+            panic!("poison the derived sort cache");
+        })
+        .join()
+        .is_err());
+        assert!(snapshot.orders.is_poisoned());
+
+        let ordered = snapshot.ordered_indices(Some("name"));
+        assert_eq!(ordered.as_slice(), &[1, 0]);
+        assert!(Arc::ptr_eq(
+            &ordered,
+            &snapshot.ordered_indices(Some("name"))
+        ));
+        assert!(!snapshot.orders.is_poisoned());
     }
 
     #[test]

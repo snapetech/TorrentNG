@@ -1,9 +1,9 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use sha1::{Digest as Sha1Digest, Sha1};
 use sha2::{Digest as Sha2Digest, Sha256};
 
-use rt_bencode::{decode_torrent_info_span, BValue};
+use rt_bencode::BValue;
 use rt_hash::merkle_root;
 use rt_path::SafeRelPath;
 
@@ -16,8 +16,17 @@ use crate::{
 };
 
 pub const MAX_TORRENT_BYTES: usize = 64 * 1024 * 1024;
+/// Per-call allocation ceiling for convenience parsers that do not receive an
+/// external memory-governor reservation callback.
+pub const MAX_CONVENIENCE_METAINFO_ALLOCATION_BYTES: usize = 512 * 1024 * 1024;
 const MAX_FILES: usize = 100_000;
-const MAX_PATH_COMPONENTS: usize = 256;
+// Keep accepted torrent paths within rt-storage's recursive tree-walk bound
+// so a torrent cannot pass parsing and later fail only during move/delete.
+const MAX_PATH_COMPONENTS: usize = 64;
+// BEP 52 stores shared directory prefixes once but the runtime owns one path
+// per file. Bound that expansion independently of the encoded metainfo size.
+const MAX_TOTAL_FILE_PATH_COMPONENTS: usize = 500_000;
+const MAX_TOTAL_FILE_PATH_BYTES: usize = 16 * 1024 * 1024;
 const MAX_TRACKER_URLS: usize = 4096;
 const MAX_TRACKER_TIERS: usize = 256;
 const MAX_TRACKER_URL_BYTES: usize = 8192;
@@ -33,8 +42,518 @@ const MAX_PATH_COMPONENT_BYTES: usize = 4096;
 // across concurrent engine preparations.
 const MAX_METADATA_TEXT_BYTES: usize = 256 * 1024;
 
+#[derive(Default)]
+struct FilePathBudget {
+    total_components: usize,
+    total_bytes: usize,
+}
+
+impl FilePathBudget {
+    fn reserve(&mut self, components: &[&str]) -> Result<(), MetainfoError> {
+        let total_components = self.total_components.saturating_add(components.len());
+        if total_components > MAX_TOTAL_FILE_PATH_COMPONENTS {
+            return Err(MetainfoError::LimitExceeded {
+                field: "total file path components",
+                limit: MAX_TOTAL_FILE_PATH_COMPONENTS,
+            });
+        }
+
+        let path_bytes = components
+            .iter()
+            .map(|component| component.len())
+            .fold(components.len().saturating_sub(1), usize::saturating_add);
+        let total_bytes = self.total_bytes.saturating_add(path_bytes);
+        if total_bytes > MAX_TOTAL_FILE_PATH_BYTES {
+            return Err(MetainfoError::LimitExceeded {
+                field: "aggregate file path bytes",
+                limit: MAX_TOTAL_FILE_PATH_BYTES,
+            });
+        }
+
+        self.total_components = total_components;
+        self.total_bytes = total_bytes;
+        Ok(())
+    }
+}
+
+#[derive(Default, Clone, Copy)]
+struct FileProjectionEstimate {
+    files: usize,
+    paths: usize,
+    path_components: usize,
+    path_component_bytes: usize,
+    layered_files: usize,
+}
+
+impl FileProjectionEstimate {
+    fn add_path(&mut self, components: usize, component_bytes: usize, piece_layered: bool) {
+        self.paths = self.paths.saturating_add(1).min(MAX_FILES);
+        self.path_components = self
+            .path_components
+            .saturating_add(components)
+            .min(MAX_TOTAL_FILE_PATH_COMPONENTS);
+        self.path_component_bytes = self
+            .path_component_bytes
+            .saturating_add(component_bytes)
+            .min(MAX_TOTAL_FILE_PATH_BYTES);
+        if piece_layered {
+            self.layered_files = self.layered_files.saturating_add(1).min(MAX_FILES);
+        }
+    }
+}
+
+fn estimate_v1_file_projection(info: &BValue<'_>, name: &[u8]) -> FileProjectionEstimate {
+    let mut estimate = FileProjectionEstimate::default();
+    match info.get(b"files") {
+        Some(BValue::List(file_list)) => {
+            if file_list.len() > MAX_FILES {
+                return estimate;
+            }
+            // The v1 parser allocates its exact file vector before validating
+            // each entry, so even a later malformed path retains this capacity
+            // until parsing returns.
+            estimate.files = file_list.len();
+            for entry in file_list {
+                let Some(BValue::List(path)) = entry.get(b"path") else {
+                    continue;
+                };
+                if path.len().saturating_add(1) > MAX_PATH_COMPONENTS {
+                    continue;
+                }
+                let mut components = 1usize; // The torrent name is the v1 root.
+                let mut bytes = name.len();
+                let mut valid = true;
+                for part in path {
+                    let Some(value) = part.as_bytes() else {
+                        valid = false;
+                        break;
+                    };
+                    if value.len() > MAX_PATH_COMPONENT_BYTES || std::str::from_utf8(value).is_err()
+                    {
+                        valid = false;
+                        break;
+                    }
+                    if !value.is_empty() {
+                        components = components.saturating_add(1);
+                        bytes = bytes.saturating_add(value.len());
+                    }
+                }
+                if valid {
+                    estimate.add_path(components, bytes, false);
+                }
+            }
+        }
+        Some(_) => {}
+        None => {
+            if info
+                .get(b"length")
+                .and_then(BValue::as_int)
+                .is_some_and(|length| length >= 0)
+            {
+                estimate.files = 1;
+                estimate.add_path(1, name.len(), false);
+            }
+        }
+    }
+    estimate
+}
+
+fn estimate_v2_file_projection(info: &BValue<'_>, piece_length: u64) -> FileProjectionEstimate {
+    let mut estimate = FileProjectionEstimate::default();
+    if let Some(file_tree) = info.get(b"file tree") {
+        estimate_v2_file_tree_node(file_tree, 0, 0, piece_length, &mut estimate);
+    }
+    estimate
+}
+
+fn estimate_v2_file_tree_node(
+    node: &BValue<'_>,
+    depth: usize,
+    path_component_bytes: usize,
+    piece_length: u64,
+    estimate: &mut FileProjectionEstimate,
+) {
+    if estimate.files >= MAX_FILES || depth > MAX_PATH_COMPONENTS {
+        return;
+    }
+    let BValue::Dict(entries) = node else {
+        return;
+    };
+
+    if let Some(leaf) = node.get(b"") {
+        if depth == 0 || entries.len() != 1 {
+            return;
+        }
+        let Some(length) = leaf
+            .get(b"length")
+            .and_then(BValue::as_int)
+            .and_then(|value| u64::try_from(value).ok())
+        else {
+            return;
+        };
+        let has_valid_root = match leaf.get(b"pieces root") {
+            Some(value) => value.as_bytes().is_some_and(|bytes| bytes.len() == 32),
+            None => length == 0,
+        };
+        if !has_valid_root {
+            return;
+        }
+        let layered = length > piece_length;
+        estimate.files = estimate.files.saturating_add(1).min(MAX_FILES);
+        estimate.add_path(depth, path_component_bytes, layered);
+        return;
+    }
+
+    for (key, child) in entries {
+        if key.is_empty()
+            || key.len() > MAX_PATH_COMPONENT_BYTES
+            || std::str::from_utf8(key).is_err()
+            || depth >= MAX_PATH_COMPONENTS
+        {
+            continue;
+        }
+        estimate_v2_file_tree_node(
+            child,
+            depth + 1,
+            path_component_bytes.saturating_add(key.len()),
+            piece_length,
+            estimate,
+        );
+    }
+}
+
+fn estimate_text_copy(value: Option<&BValue<'_>>, limit: usize) -> (usize, usize) {
+    let Some(bytes) = value.and_then(BValue::as_bytes) else {
+        return (0, 0);
+    };
+    if bytes.len() > limit
+        || std::str::from_utf8(bytes)
+            .ok()
+            .is_none_or(|text| text.trim().is_empty())
+    {
+        return (0, 0);
+    }
+    (bytes.len(), 1)
+}
+
+fn estimate_announce_list(root: &BValue<'_>, announce_count: usize) -> (usize, usize, usize) {
+    let Some(BValue::List(tiers)) = root.get(b"announce-list") else {
+        return (0, 0, 0);
+    };
+    if tiers.len() > MAX_TRACKER_TIERS {
+        return (0, 0, 0);
+    }
+
+    let mut tier_count = 0usize;
+    let mut url_count = announce_count;
+    let mut url_bytes = 0usize;
+    for tier in tiers {
+        let BValue::List(urls) = tier else {
+            continue;
+        };
+        let before = url_count;
+        for url in urls {
+            let Some(text) = url
+                .as_bytes()
+                .and_then(|bytes| std::str::from_utf8(bytes).ok())
+                .map(str::trim)
+                .filter(|text| !text.is_empty())
+            else {
+                continue;
+            };
+            if text.len() > MAX_TRACKER_URL_BYTES || url_count >= MAX_TRACKER_URLS {
+                break;
+            }
+            let Some(total) = url_bytes.checked_add(text.len()) else {
+                break;
+            };
+            if total.saturating_add(url_bytes_for_announce(root)) > MAX_TRACKER_URL_TOTAL_BYTES {
+                break;
+            }
+            url_count += 1;
+            url_bytes = total;
+        }
+        if url_count > before {
+            tier_count = tier_count.saturating_add(1).min(MAX_TRACKER_TIERS);
+        }
+    }
+    (
+        tier_count,
+        url_count.saturating_sub(announce_count),
+        url_bytes,
+    )
+}
+
+fn url_bytes_for_announce(root: &BValue<'_>) -> usize {
+    estimate_text_copy(root.get(b"announce"), MAX_TRACKER_URL_BYTES).0
+}
+
+fn estimate_webseeds(root: &BValue<'_>) -> (usize, usize) {
+    let mut count = 0usize;
+    let mut bytes_total = 0usize;
+    let mut add = |value: &[u8]| {
+        let Ok(text) = std::str::from_utf8(value) else {
+            return;
+        };
+        let text = text.trim();
+        if text.is_empty() || text.len() > MAX_WEBSEED_URL_BYTES || count >= MAX_WEBSEED_URLS {
+            return;
+        }
+        count += 1;
+        bytes_total = bytes_total.saturating_add(text.len());
+    };
+    match root.get(b"url-list") {
+        Some(BValue::Bytes(bytes)) => add(bytes),
+        Some(BValue::List(values)) => {
+            for value in values {
+                if let Some(bytes) = value.as_bytes() {
+                    add(bytes);
+                }
+            }
+        }
+        _ => {}
+    }
+    (count, bytes_total)
+}
+
+fn estimate_piece_layer_bytes(root: &BValue<'_>) -> usize {
+    let Some(BValue::Dict(entries)) = root.get(b"piece layers") else {
+        return 0;
+    };
+    entries.iter().fold(0usize, |total, (_, value)| {
+        total.saturating_add(value.as_bytes().map_or(0, <[u8]>::len))
+    })
+}
+
+fn add_file_projection_bytes<T>(
+    total: &mut usize,
+    estimate: FileProjectionEstimate,
+    growing: bool,
+) {
+    // A growing Vec can transiently hold both its old and replacement buffers.
+    // Capacity doubles, so reserving three slots per accepted output item
+    // covers the worst boundary where the final insertion triggers growth.
+    let capacity_factor = if growing { 3 } else { 1 };
+    *total = total.saturating_add(
+        estimate
+            .files
+            .saturating_mul(std::mem::size_of::<T>())
+            .saturating_mul(capacity_factor),
+    );
+    *total = total.saturating_add(
+        estimate
+            .path_components
+            .saturating_mul(std::mem::size_of::<String>()),
+    );
+    *total = total.saturating_add(estimate.path_component_bytes.saturating_mul(2));
+
+    // File-path collision validation builds a temporary sortable path vector.
+    // Windows also materializes UTF-16 components for ordinal case folding.
+    *total = total.saturating_add(
+        estimate
+            .paths
+            .saturating_mul(4 * std::mem::size_of::<usize>()),
+    );
+    if cfg!(windows) {
+        *total = total
+            .saturating_add(
+                estimate
+                    .path_components
+                    .saturating_mul(std::mem::size_of::<Vec<u16>>()),
+            )
+            .saturating_add(estimate.path_component_bytes.saturating_mul(2));
+    }
+    if estimate.paths > 1 {
+        *total = total.saturating_add(
+            MAX_PATH_COMPONENTS
+                .saturating_mul(MAX_PATH_COMPONENT_BYTES)
+                .saturating_add(MAX_PATH_COMPONENTS),
+        );
+    }
+}
+
+fn estimate_torrent_projection_allocation_bytes(
+    root: &BValue<'_>,
+    info: &BValue<'_>,
+    is_v2: bool,
+    is_hybrid: bool,
+) -> usize {
+    let mut total = 0usize;
+    let (announce_bytes, announce_count) =
+        estimate_text_copy(root.get(b"announce"), MAX_TRACKER_URL_BYTES);
+    let (tier_count, tracker_count, tracker_bytes) = estimate_announce_list(root, announce_count);
+    let (webseed_count, webseed_bytes) = estimate_webseeds(root);
+    let (comment_bytes, _) = estimate_text_copy(root.get(b"comment"), MAX_METADATA_TEXT_BYTES);
+    let (creator_bytes, _) = estimate_text_copy(root.get(b"created by"), MAX_METADATA_TEXT_BYTES);
+    let name_bytes = info
+        .get(b"name")
+        .and_then(BValue::as_bytes)
+        .filter(|bytes| bytes.len() <= MAX_NAME_BYTES && std::str::from_utf8(bytes).is_ok())
+        .map_or(0, <[u8]>::len);
+    let hybrid_factor = if is_hybrid { 2 } else { 1 };
+
+    let owned_text_bytes = announce_bytes
+        .saturating_add(tracker_bytes)
+        .saturating_add(webseed_bytes)
+        .saturating_add(comment_bytes)
+        .saturating_add(creator_bytes)
+        .saturating_add(name_bytes)
+        .saturating_mul(hybrid_factor)
+        .saturating_mul(2);
+    total = total.saturating_add(owned_text_bytes);
+    total = total.saturating_add(
+        tier_count
+            .saturating_mul(2)
+            .saturating_mul(std::mem::size_of::<Vec<String>>())
+            .saturating_mul(hybrid_factor),
+    );
+    total = total.saturating_add(
+        tracker_count
+            .saturating_mul(2)
+            .saturating_mul(std::mem::size_of::<String>())
+            .saturating_mul(hybrid_factor),
+    );
+    total = total.saturating_add(
+        webseed_count
+            .saturating_mul(2)
+            .saturating_mul(std::mem::size_of::<String>())
+            .saturating_mul(hybrid_factor),
+    );
+    total = total.saturating_add(estimate_hash_table_bytes::<&str, ()>(webseed_count));
+
+    let piece_bytes = info
+        .get(b"pieces")
+        .and_then(BValue::as_bytes)
+        .filter(|bytes| bytes.len().is_multiple_of(20) && bytes.len() / 20 <= MAX_PIECES)
+        .map_or(0, <[u8]>::len);
+    if !is_v2 || is_hybrid {
+        total = total.saturating_add(piece_bytes);
+        let v1 = estimate_v1_file_projection(
+            info,
+            info.get(b"name")
+                .and_then(BValue::as_bytes)
+                .unwrap_or_default(),
+        );
+        add_file_projection_bytes::<TorrentFileV1>(&mut total, v1, false);
+        // v1 constructs a temporary borrowed-component vector for one file at
+        // a time; only the largest single path can be live at once.
+        if v1.paths > 0 {
+            total = total.saturating_add(MAX_PATH_COMPONENTS * std::mem::size_of::<&str>());
+        }
+    }
+
+    if is_v2 {
+        let piece_length = info
+            .get(b"piece length")
+            .and_then(BValue::as_int)
+            .and_then(|value| u64::try_from(value).ok())
+            .unwrap_or(0);
+        let files = estimate_v2_file_projection(info, piece_length);
+        add_file_projection_bytes::<TorrentFileV2>(&mut total, files, true);
+        // walk_file_tree holds one borrowed path vector per recursion frame.
+        if files.paths > 0 {
+            total = total.saturating_add(
+                (MAX_PATH_COMPONENTS * (MAX_PATH_COMPONENTS + 1) / 2)
+                    .saturating_mul(std::mem::size_of::<&str>()),
+            );
+        }
+        let piece_layer_bytes = estimate_piece_layer_bytes(root);
+        total = total.saturating_add(piece_layer_bytes.saturating_mul(4));
+        total = total.saturating_add(estimate_hash_table_bytes::<[u8; 32], (u64, usize)>(
+            files.layered_files,
+        ));
+        total = total.saturating_add(estimate_hash_table_bytes::<[u8; 32], Vec<[u8; 32]>>(
+            files.layered_files,
+        ));
+    }
+
+    // Inline fields and the hybrid Box are small, but include their storage in
+    // the same admission instead of relying on the fixed parser baseline.
+    total.saturating_add(
+        hybrid_factor
+            .saturating_mul(std::mem::size_of::<TorrentMetaV1>())
+            .saturating_add(std::mem::size_of::<TorrentMetaV2>()),
+    )
+}
+
+fn estimate_hash_table_bytes<K, V>(entries: usize) -> usize {
+    // Account for bucket slack and old+new tables during a growth/rehash.
+    entries
+        .saturating_mul(std::mem::size_of::<(K, V)>().saturating_add(1))
+        .saturating_mul(5)
+}
+
+fn estimate_v2_requirements_allocation_bytes(info: &BValue<'_>, piece_length: u64) -> usize {
+    let files = estimate_v2_file_projection(info, piece_length);
+    let mut total = 0usize;
+    add_file_projection_bytes::<TorrentFileV2>(&mut total, files, true);
+    if files.paths > 0 {
+        total = total.saturating_add(
+            (MAX_PATH_COMPONENTS * (MAX_PATH_COMPONENTS + 1) / 2)
+                .saturating_mul(std::mem::size_of::<&str>()),
+        );
+    }
+    total = total.saturating_add(estimate_hash_table_bytes::<[u8; 32], (u64, usize)>(
+        files.layered_files,
+    ));
+    total.saturating_add(
+        files
+            .layered_files
+            .saturating_mul(std::mem::size_of::<V2PieceLayerRequirement>())
+            .saturating_mul(3),
+    )
+}
+
+fn reserve_projection_allocation_bytes(
+    bytes: usize,
+    reserve: &mut impl FnMut(usize) -> bool,
+) -> Result<(), MetainfoError> {
+    if bytes > 0 && !reserve(bytes) {
+        return Err(MetainfoError::Bencode(
+            rt_bencode::BencodeError::AllocationBudgetExceeded { bytes },
+        ));
+    }
+    Ok(())
+}
+
 /// Parse a `.torrent` file from raw bytes. Handles v1, v2 (BEP 52), and hybrid.
+///
+/// This convenience API caps parser allocations at
+/// [`MAX_CONVENIENCE_METAINFO_ALLOCATION_BYTES`]. Callers that need shared
+/// process-wide admission should use [`parse_torrent_with_allocation_reservation`].
 pub fn parse_torrent(raw: &[u8]) -> Result<TorrentMeta, MetainfoError> {
+    parse_torrent_with_allocation_limit(raw, MAX_CONVENIENCE_METAINFO_ALLOCATION_BYTES)
+}
+
+fn bounded_allocation_reservation(limit: usize) -> impl FnMut(usize) -> bool {
+    let mut reserved = 0usize;
+    move |additional| {
+        let Some(next) = reserved.checked_add(additional) else {
+            return false;
+        };
+        if next > limit {
+            return false;
+        }
+        reserved = next;
+        true
+    }
+}
+
+fn parse_torrent_with_allocation_limit(
+    raw: &[u8],
+    limit: usize,
+) -> Result<TorrentMeta, MetainfoError> {
+    let mut reserve = bounded_allocation_reservation(limit);
+    parse_torrent_with_allocation_reservation(raw, &mut reserve)
+}
+
+/// Parse a torrent while reserving decoded collection capacity and retained
+/// raw-metainfo copies before those allocations are made. This entry point has
+/// no built-in aggregate cap; the caller must enforce its own admission policy.
+pub fn parse_torrent_with_allocation_reservation(
+    raw: &[u8],
+    reserve: &mut impl FnMut(usize) -> bool,
+) -> Result<TorrentMeta, MetainfoError> {
     if raw.len() > MAX_TORRENT_BYTES {
         return Err(MetainfoError::LimitExceeded {
             field: "torrent bytes",
@@ -42,7 +561,8 @@ pub fn parse_torrent(raw: &[u8]) -> Result<TorrentMeta, MetainfoError> {
         });
     }
 
-    let (val, info_span) = decode_torrent_info_span(raw)?;
+    let (val, info_span) =
+        rt_bencode::decode_torrent_info_span_with_allocation_reservation(raw, reserve)?;
 
     let root = match &val {
         BValue::Dict(_) => &val,
@@ -89,6 +609,11 @@ pub fn parse_torrent(raw: &[u8]) -> Result<TorrentMeta, MetainfoError> {
     }
 
     let is_v2 = meta_version == Some(2) && has_file_tree;
+    let is_hybrid = is_v2 && has_pieces;
+    reserve_projection_allocation_bytes(
+        estimate_torrent_projection_allocation_bytes(root, info, is_v2, is_hybrid),
+        reserve,
+    )?;
 
     let announce = parse_announce(root)?;
     let announce_list = parse_announce_list(
@@ -114,11 +639,20 @@ pub fn parse_torrent(raw: &[u8]) -> Result<TorrentMeta, MetainfoError> {
         return Err(MetainfoError::InvalidPieceLength(piece_length));
     }
 
-    let private = info
-        .get(b"private")
-        .and_then(|v| v.as_int())
-        .map(|i| i == 1)
-        .unwrap_or(false);
+    let private = match info.get(b"private") {
+        None => false,
+        Some(value) => match value.as_int() {
+            Some(0) => false,
+            Some(1) => true,
+            Some(value) => {
+                return Err(MetainfoError::InvalidIntegerValue {
+                    field: "private",
+                    value,
+                });
+            }
+            None => return Err(MetainfoError::InvalidFieldType("private")),
+        },
+    };
 
     if is_v2 && has_pieces {
         // Hybrid: compute both infohashes
@@ -135,42 +669,57 @@ pub fn parse_torrent(raw: &[u8]) -> Result<TorrentMeta, MetainfoError> {
 
         let pieces = parse_piece_hashes(info)?;
         let files_v1 = parse_files_v1(info, &name)?;
+        validate_file_path_collisions(
+            files_v1
+                .iter()
+                .filter(|file| !file.pad)
+                .map(|file| &file.path),
+        )?;
         let files_v2 = parse_file_tree(info, piece_length)?;
+        validate_file_path_collisions(
+            files_v2
+                .iter()
+                .filter(|file| !file.pad)
+                .map(|file| &file.path),
+        )?;
         let piece_layers = parse_piece_layers(root, &files_v2, piece_length)?;
         validate_piece_count(&pieces, &files_v1, piece_length)?;
+        let raw_v1 = copy_raw_with_allocation_reservation(raw, reserve)?;
+        let raw_v2 = copy_raw_with_allocation_reservation(raw, reserve)?;
 
-        return Ok(TorrentMeta::Hybrid(
-            Box::new(TorrentMetaV1 {
-                info_hash: info_hash_v1,
-                announce: announce.clone(),
-                announce_list: announce_list.clone(),
-                webseeds: webseeds.clone(),
-                comment: comment.clone(),
-                created_by: created_by.clone(),
-                creation_date,
-                name: name.clone(),
-                piece_length,
-                pieces,
-                files: files_v1,
-                private,
-                raw: raw.to_vec(),
-            }),
-            TorrentMetaV2 {
-                info_hash_v2,
-                announce,
-                announce_list,
-                webseeds,
-                comment,
-                created_by,
-                creation_date,
-                name,
-                piece_length,
-                files: files_v2,
-                piece_layers,
-                private,
-                raw: raw.to_vec(),
-            },
-        ));
+        let meta_v1 = TorrentMetaV1 {
+            info_hash: info_hash_v1,
+            announce: announce.clone(),
+            announce_list: announce_list.clone(),
+            webseeds: webseeds.clone(),
+            comment: comment.clone(),
+            created_by: created_by.clone(),
+            creation_date,
+            name: name.clone(),
+            piece_length,
+            pieces,
+            files: files_v1,
+            private,
+            raw: raw_v1,
+        };
+        let meta_v2 = TorrentMetaV2 {
+            info_hash_v2,
+            announce,
+            announce_list,
+            webseeds,
+            comment,
+            created_by,
+            creation_date,
+            name,
+            piece_length,
+            files: files_v2,
+            piece_layers,
+            private,
+            raw: raw_v2,
+        };
+        validate_hybrid_file_layout(&meta_v1, &meta_v2)?;
+
+        return Ok(TorrentMeta::Hybrid(Box::new(meta_v1), meta_v2));
     }
 
     if is_v2 {
@@ -181,7 +730,14 @@ pub fn parse_torrent(raw: &[u8]) -> Result<TorrentMeta, MetainfoError> {
             h.finalize().into()
         };
         let files_v2 = parse_file_tree(info, piece_length)?;
+        validate_file_path_collisions(
+            files_v2
+                .iter()
+                .filter(|file| !file.pad)
+                .map(|file| &file.path),
+        )?;
         let piece_layers = parse_piece_layers(root, &files_v2, piece_length)?;
+        let raw_v2 = copy_raw_with_allocation_reservation(raw, reserve)?;
         return Ok(TorrentMeta::V2(TorrentMetaV2 {
             info_hash_v2,
             announce,
@@ -195,7 +751,7 @@ pub fn parse_torrent(raw: &[u8]) -> Result<TorrentMeta, MetainfoError> {
             files: files_v2,
             piece_layers,
             private,
-            raw: raw.to_vec(),
+            raw: raw_v2,
         }));
     }
 
@@ -207,7 +763,9 @@ pub fn parse_torrent(raw: &[u8]) -> Result<TorrentMeta, MetainfoError> {
     };
     let pieces = parse_piece_hashes(info)?;
     let files = parse_files_v1(info, &name)?;
+    validate_file_path_collisions(files.iter().filter(|file| !file.pad).map(|file| &file.path))?;
     validate_piece_count(&pieces, &files, piece_length)?;
+    let raw_v1 = copy_raw_with_allocation_reservation(raw, reserve)?;
 
     Ok(TorrentMeta::V1(TorrentMetaV1 {
         info_hash,
@@ -222,16 +780,213 @@ pub fn parse_torrent(raw: &[u8]) -> Result<TorrentMeta, MetainfoError> {
         pieces,
         files,
         private,
-        raw: raw.to_vec(),
+        raw: raw_v1,
     }))
+}
+
+fn copy_raw_with_allocation_reservation(
+    raw: &[u8],
+    reserve: &mut impl FnMut(usize) -> bool,
+) -> Result<Vec<u8>, MetainfoError> {
+    if !reserve(raw.len()) {
+        return Err(MetainfoError::Bencode(
+            rt_bencode::BencodeError::AllocationBudgetExceeded { bytes: raw.len() },
+        ));
+    }
+    let mut copy = Vec::new();
+    copy.try_reserve_exact(raw.len())
+        .map_err(|_| MetainfoError::Bencode(rt_bencode::BencodeError::AllocationFailed))?;
+    copy.extend_from_slice(raw);
+    Ok(copy)
+}
+
+/// Validate that the v1 and v2 views of a hybrid torrent describe the same
+/// payload files in the same order and at the same piece boundaries.
+///
+/// V1 padding files are synthetic zero bytes used to align the next real file;
+/// BEP 52 represents those gaps implicitly through `piece_offset` instead.
+///
+/// The v2 tree may either be rootless or include the v1 torrent name as its
+/// root. Older creators also omitted the otherwise unnecessary final v1 pad
+/// file, so both an unpadded end and a correctly piece-aligned padded end are
+/// accepted.
+pub fn validate_hybrid_file_layout(
+    v1: &TorrentMetaV1,
+    v2: &TorrentMetaV2,
+) -> Result<(), MetainfoError> {
+    if v1.piece_length == 0 || v1.piece_length != v2.piece_length {
+        return Err(MetainfoError::InconsistentHybridLayout(
+            "v1 and v2 piece lengths differ or are zero",
+        ));
+    }
+    if v1.name != v2.name {
+        return Err(MetainfoError::InconsistentHybridLayout(
+            "v1 and v2 torrent names differ",
+        ));
+    }
+
+    validate_file_path_collisions(
+        v1.files
+            .iter()
+            .filter(|file| !file.pad)
+            .map(|file| &file.path),
+    )?;
+    validate_file_path_collisions(
+        v2.files
+            .iter()
+            .filter(|file| !file.pad)
+            .map(|file| &file.path),
+    )?;
+
+    let piece_length = v1.piece_length;
+    let mut v1_stream_offset = 0u64;
+    let mut v1_payload_length = 0u64;
+    let mut v2_stream_offset = 0u64;
+    let mut v2_logical_end = 0u64;
+
+    for (index, file) in v2.files.iter().enumerate() {
+        if usize::try_from(file.index).ok() != Some(index) {
+            return Err(MetainfoError::InconsistentHybridLayout(
+                "v2 file indexes are not contiguous",
+            ));
+        }
+        if file.pad {
+            return Err(MetainfoError::InconsistentHybridLayout(
+                "v2 file tree contains an explicit padding file",
+            ));
+        }
+        if file.offset != v2_stream_offset {
+            return Err(MetainfoError::InconsistentHybridLayout(
+                "v2 file offsets are not contiguous",
+            ));
+        }
+        let expected_piece_offset = align_piece_offset(v2_logical_end, piece_length)?;
+        if file.piece_offset != expected_piece_offset {
+            return Err(MetainfoError::InconsistentHybridLayout(
+                "v2 file piece offsets are not correctly aligned",
+            ));
+        }
+        v2_stream_offset = v2_stream_offset
+            .checked_add(file.length)
+            .ok_or(MetainfoError::IntegerOverflow("hybrid v2 payload length"))?;
+        if file.length > 0 {
+            v2_logical_end = file
+                .piece_offset
+                .checked_add(file.length)
+                .ok_or(MetainfoError::IntegerOverflow("hybrid v2 logical length"))?;
+        }
+    }
+
+    let is_multifile_v1 = v1.files.iter().any(|file| file.path.components().len() > 1);
+    let mut path_layout_rooted = None;
+    let mut v2_files = v2.files.iter();
+
+    for (index, file) in v1.files.iter().enumerate() {
+        if usize::try_from(file.index).ok() != Some(index) {
+            return Err(MetainfoError::InconsistentHybridLayout(
+                "v1 file indexes are not contiguous",
+            ));
+        }
+        if file.offset != v1_stream_offset {
+            return Err(MetainfoError::InconsistentHybridLayout(
+                "v1 file offsets are not contiguous",
+            ));
+        }
+        v1_stream_offset = v1_stream_offset
+            .checked_add(file.length)
+            .ok_or(MetainfoError::IntegerOverflow("hybrid v1 stream length"))?;
+
+        if file.pad {
+            continue;
+        }
+
+        let Some(v2_file) = v2_files.next() else {
+            return Err(MetainfoError::InconsistentHybridLayout(
+                "v1 contains more payload files than v2",
+            ));
+        };
+        if file.length != v2_file.length {
+            return Err(MetainfoError::InconsistentHybridLayout(
+                "v1 and v2 payload file lengths differ",
+            ));
+        }
+
+        let v1_path = file.path.components();
+        let v2_path = v2_file.path.components();
+        let rooted_match = v1_path == v2_path;
+        let rootless_match = is_multifile_v1
+            && v1_path
+                .first()
+                .is_some_and(|component| component == &v1.name)
+            && v1_path.get(1..) == Some(v2_path);
+        let this_layout_rooted = if rooted_match {
+            true
+        } else if rootless_match {
+            false
+        } else {
+            return Err(MetainfoError::InconsistentHybridLayout(
+                "v1 and v2 payload file paths differ",
+            ));
+        };
+        if path_layout_rooted.is_some_and(|rooted| rooted != this_layout_rooted) {
+            return Err(MetainfoError::InconsistentHybridLayout(
+                "v2 file tree mixes rooted and rootless paths",
+            ));
+        }
+        path_layout_rooted = Some(this_layout_rooted);
+
+        if file.length > 0 && file.offset != v2_file.piece_offset {
+            return Err(MetainfoError::InconsistentHybridLayout(
+                "v1 padding does not align payload files to v2 piece boundaries",
+            ));
+        }
+        v1_payload_length = v1_payload_length
+            .checked_add(file.length)
+            .ok_or(MetainfoError::IntegerOverflow("hybrid payload length"))?;
+    }
+
+    if v2_files.next().is_some() {
+        return Err(MetainfoError::InconsistentHybridLayout(
+            "v2 contains more payload files than v1",
+        ));
+    }
+    if v1_payload_length == 0 {
+        return Err(MetainfoError::InconsistentHybridLayout(
+            "hybrid torrent contains no non-empty payload",
+        ));
+    }
+
+    let aligned_v2_end = align_piece_offset(v2_logical_end, piece_length)?;
+    if v1_stream_offset != v2_logical_end && v1_stream_offset != aligned_v2_end {
+        return Err(MetainfoError::InconsistentHybridLayout(
+            "v1 trailing padding does not match the v2 logical end",
+        ));
+    }
+
+    Ok(())
 }
 
 /// Return the exact bencoded `info` dictionary bytes used for v1 infohashes
 /// and BEP 9 metadata exchange.
 pub fn torrent_info_bytes(raw: &[u8]) -> Result<Vec<u8>, MetainfoError> {
-    let (_, info_span) = decode_torrent_info_span(raw)?;
+    let mut reserve = bounded_allocation_reservation(MAX_CONVENIENCE_METAINFO_ALLOCATION_BYTES);
+    torrent_info_bytes_with_allocation_reservation(raw, &mut reserve)
+}
+
+pub fn torrent_info_bytes_with_allocation_reservation(
+    raw: &[u8],
+    reserve: &mut impl FnMut(usize) -> bool,
+) -> Result<Vec<u8>, MetainfoError> {
+    if raw.len() > MAX_TORRENT_BYTES {
+        return Err(MetainfoError::LimitExceeded {
+            field: "torrent bytes",
+            limit: MAX_TORRENT_BYTES,
+        });
+    }
+    let (_, info_span) =
+        rt_bencode::decode_torrent_info_span_with_allocation_reservation(raw, reserve)?;
     let info_span = info_span.ok_or(MetainfoError::MissingField("info span"))?;
-    Ok(raw[info_span].to_vec())
+    copy_raw_with_allocation_reservation(&raw[info_span], reserve)
 }
 
 /// Extract the piece-layer work needed to complete a v2 or hybrid magnet.
@@ -245,7 +1000,21 @@ pub fn torrent_info_bytes(raw: &[u8]) -> Result<Vec<u8>, MetainfoError> {
 pub fn v2_piece_layer_requirements(
     info_bytes: &[u8],
 ) -> Result<Option<V2PieceLayerRequirements>, MetainfoError> {
-    let info = rt_bencode::decode(info_bytes)?;
+    let mut reserve = bounded_allocation_reservation(MAX_CONVENIENCE_METAINFO_ALLOCATION_BYTES);
+    v2_piece_layer_requirements_with_allocation_reservation(info_bytes, &mut reserve)
+}
+
+pub fn v2_piece_layer_requirements_with_allocation_reservation(
+    info_bytes: &[u8],
+    reserve: &mut impl FnMut(usize) -> bool,
+) -> Result<Option<V2PieceLayerRequirements>, MetainfoError> {
+    if info_bytes.len() > MAX_TORRENT_BYTES {
+        return Err(MetainfoError::LimitExceeded {
+            field: "info bytes",
+            limit: MAX_TORRENT_BYTES,
+        });
+    }
+    let info = rt_bencode::decode_with_allocation_reservation(info_bytes, reserve)?;
     let BValue::Dict(_) = &info else {
         return Err(MetainfoError::InvalidFieldType("info dict"));
     };
@@ -283,9 +1052,14 @@ pub fn v2_piece_layer_requirements(
         return Err(MetainfoError::InvalidPieceLength(piece_length));
     }
 
+    reserve_projection_allocation_bytes(
+        estimate_v2_requirements_allocation_bytes(&info, piece_length),
+        reserve,
+    )?;
     let files = parse_file_tree(&info, piece_length)?;
+    validate_file_path_collisions(files.iter().filter(|file| !file.pad).map(|file| &file.path))?;
     let mut requirements = Vec::new();
-    let mut seen_roots = std::collections::HashSet::new();
+    let mut seen_roots = HashMap::<[u8; 32], (u64, usize)>::new();
     for file in files {
         if file.length <= piece_length {
             continue;
@@ -306,11 +1080,17 @@ pub fn v2_piece_layer_requirements(
                 limit: MAX_PIECES,
             });
         }
-        if !seen_roots.insert(pieces_root) {
-            return Err(MetainfoError::InvalidPieceLayer(
-                "duplicate pieces root across layered files",
-            ));
+        if let Some(&(previous_length, previous_hash_count)) = seen_roots.get(&pieces_root) {
+            if previous_length != file.length || previous_hash_count != hash_count {
+                return Err(MetainfoError::InvalidPieceLayer(
+                    "same pieces root has conflicting file requirements",
+                ));
+            }
+            // A piece layer is keyed by pieces root. Identical files share
+            // that layer and should require only one network fetch.
+            continue;
         }
+        seen_roots.insert(pieces_root, (file.length, hash_count));
         requirements.push(V2PieceLayerRequirement {
             pieces_root,
             file_length: file.length,
@@ -337,6 +1117,7 @@ fn parse_file_tree(
     let mut files = Vec::new();
     let mut offset = 0u64;
     let mut piece_offset = 0u64;
+    let mut path_budget = FilePathBudget::default();
     // `name` is advisory in BEP 52. The tree itself is rootless and may
     // optionally contain a directory with the same name; adding `name`
     // unconditionally turns a standard single-file tree into a wrong path.
@@ -347,6 +1128,7 @@ fn parse_file_tree(
         &mut offset,
         &mut piece_offset,
         piece_length,
+        &mut path_budget,
     )?;
 
     if files.is_empty() {
@@ -362,6 +1144,7 @@ fn walk_file_tree<'a>(
     offset: &mut u64,
     piece_offset: &mut u64,
     piece_length: u64,
+    path_budget: &mut FilePathBudget,
 ) -> Result<(), MetainfoError> {
     if out.len() >= MAX_FILES {
         return Err(MetainfoError::LimitExceeded {
@@ -408,8 +1191,8 @@ fn walk_file_tree<'a>(
             None => return Err(MetainfoError::MissingField("pieces root")),
         };
 
-        let components: Vec<String> = path_components.iter().map(|s| s.to_string()).collect();
-        let path = SafeRelPath::from_components(&components, false)?;
+        path_budget.reserve(path_components)?;
+        let path = SafeRelPath::from_components(path_components, cfg!(windows))?;
 
         let index = out.len() as u32;
         let file_piece_offset = align_piece_offset(*piece_offset, piece_length)?;
@@ -446,7 +1229,15 @@ fn walk_file_tree<'a>(
             std::str::from_utf8(key).map_err(|_| MetainfoError::InvalidUtf8("file tree key"))?;
         let mut new_path: Vec<&str> = path_components.to_vec();
         new_path.push(component);
-        walk_file_tree(child, &new_path, out, offset, piece_offset, piece_length)?;
+        walk_file_tree(
+            child,
+            &new_path,
+            out,
+            offset,
+            piece_offset,
+            piece_length,
+            path_budget,
+        )?;
     }
     Ok(())
 }
@@ -471,7 +1262,8 @@ fn parse_piece_layers(
     files: &[TorrentFileV2],
     piece_length: u64,
 ) -> Result<HashMap<[u8; 32], Vec<[u8; 32]>>, MetainfoError> {
-    let mut required = HashMap::<[u8; 32], usize>::new();
+    // Layers are keyed by pieces root, so identical files share one entry.
+    let mut required = HashMap::<[u8; 32], (u64, usize)>::new();
     for file in files {
         if file.length <= piece_length {
             continue;
@@ -492,10 +1284,14 @@ fn parse_piece_layers(
                 limit: MAX_PIECES,
             });
         }
-        if required.insert(pieces_root, count).is_some() {
-            return Err(MetainfoError::InvalidPieceLayer(
-                "duplicate pieces root across layered files",
-            ));
+        if let Some((previous_length, previous_count)) =
+            required.insert(pieces_root, (file.length, count))
+        {
+            if previous_length != file.length || previous_count != count {
+                return Err(MetainfoError::InvalidPieceLayer(
+                    "same pieces root has conflicting file requirements",
+                ));
+            }
         }
     }
 
@@ -516,7 +1312,7 @@ fn parse_piece_layers(
             ));
         }
         let pieces_root: [u8; 32] = (*key).try_into().expect("length checked");
-        let Some(&expected_count) = required.get(&pieces_root) else {
+        let Some(&(_, expected_count)) = required.get(&pieces_root) else {
             return Err(MetainfoError::InvalidPieceLayer(
                 "piece-layer key has no matching layered file",
             ));
@@ -607,6 +1403,7 @@ fn parse_files_v1(info: &BValue<'_>, name: &str) -> Result<Vec<TorrentFileV1>, M
             }
             // Multi-file torrent: name is the root directory
             let mut offset = 0u64;
+            let mut path_budget = FilePathBudget::default();
             let mut files = Vec::with_capacity(file_list.len());
             for (idx, entry) in file_list.iter().enumerate() {
                 let length = get_nonnegative_u64(entry, b"length", "file length")?;
@@ -620,7 +1417,8 @@ fn parse_files_v1(info: &BValue<'_>, name: &str) -> Result<Vec<TorrentFileV1>, M
                         limit: MAX_PATH_COMPONENTS,
                     });
                 }
-                let mut components: Vec<String> = vec![name.to_owned()];
+                let mut components: Vec<&str> = Vec::with_capacity(path_list.len() + 1);
+                components.push(name);
                 for part in path_list {
                     let s = match part {
                         BValue::Bytes(b) => {
@@ -632,7 +1430,6 @@ fn parse_files_v1(info: &BValue<'_>, name: &str) -> Result<Vec<TorrentFileV1>, M
                             }
                             std::str::from_utf8(b)
                                 .map_err(|_| MetainfoError::InvalidUtf8("path component"))?
-                                .to_owned()
                         }
                         _ => return Err(MetainfoError::InvalidFieldType("path component")),
                     };
@@ -649,7 +1446,8 @@ fn parse_files_v1(info: &BValue<'_>, name: &str) -> Result<Vec<TorrentFileV1>, M
                         components.push(s);
                     }
                 }
-                let path = SafeRelPath::from_components(&components, false)?;
+                path_budget.reserve(&components)?;
+                let path = SafeRelPath::from_components(&components, cfg!(windows))?;
                 let pad = is_pad_attr(entry);
                 files.push(TorrentFileV1 {
                     index: idx as u32,
@@ -666,7 +1464,8 @@ fn parse_files_v1(info: &BValue<'_>, name: &str) -> Result<Vec<TorrentFileV1>, M
         None => {
             // Single-file torrent
             let length = get_nonnegative_u64(info, b"length", "length")?;
-            let path = SafeRelPath::from_name(name, false)?;
+            FilePathBudget::default().reserve(&[name])?;
+            let path = SafeRelPath::from_name(name, cfg!(windows))?;
             Ok(vec![TorrentFileV1 {
                 index: 0,
                 length,
@@ -676,6 +1475,15 @@ fn parse_files_v1(info: &BValue<'_>, name: &str) -> Result<Vec<TorrentFileV1>, M
             }])
         }
     }
+}
+
+fn validate_file_path_collisions<'a>(
+    paths: impl IntoIterator<Item = &'a SafeRelPath>,
+) -> Result<(), MetainfoError> {
+    rt_path::validate_unique_file_paths(paths).map_err(|error| match error {
+        rt_path::PathError::ConflictingPaths(path) => MetainfoError::ConflictingFilePaths(path),
+        error => MetainfoError::InvalidPath(error),
+    })
 }
 
 fn parse_announce_list(
@@ -743,12 +1551,13 @@ fn parse_webseeds(root: &BValue<'_>) -> Result<Vec<String>, MetainfoError> {
         return Ok(Vec::new());
     };
     let mut out = Vec::new();
+    let mut seen = HashSet::new();
     match value {
-        BValue::Bytes(bytes) => push_webseed_bytes(bytes, &mut out)?,
+        BValue::Bytes(bytes) => push_webseed_bytes(bytes, &mut out, &mut seen)?,
         BValue::List(values) => {
             for value in values {
                 if let Some(bytes) = value.as_bytes() {
-                    push_webseed_bytes(bytes, &mut out)?;
+                    push_webseed_bytes(bytes, &mut out, &mut seen)?;
                 }
             }
         }
@@ -757,12 +1566,25 @@ fn parse_webseeds(root: &BValue<'_>) -> Result<Vec<String>, MetainfoError> {
     Ok(out)
 }
 
-fn push_webseed_bytes(bytes: &[u8], out: &mut Vec<String>) -> Result<(), MetainfoError> {
+fn push_webseed_bytes<'a>(
+    bytes: &'a [u8],
+    out: &mut Vec<String>,
+    seen: &mut HashSet<&'a str>,
+) -> Result<(), MetainfoError> {
     let Ok(value) = std::str::from_utf8(bytes) else {
         return Ok(());
     };
     let value = value.trim();
-    if value.is_empty() || out.iter().any(|existing| existing == value) {
+    if value.is_empty() {
+        return Ok(());
+    }
+    if value.len() > MAX_WEBSEED_URL_BYTES {
+        return Err(MetainfoError::LimitExceeded {
+            field: "webseed url bytes",
+            limit: MAX_WEBSEED_URL_BYTES,
+        });
+    }
+    if seen.contains(value) {
         return Ok(());
     }
     if out.len() >= MAX_WEBSEED_URLS {
@@ -771,12 +1593,7 @@ fn push_webseed_bytes(bytes: &[u8], out: &mut Vec<String>) -> Result<(), Metainf
             limit: MAX_WEBSEED_URLS,
         });
     }
-    if value.len() > MAX_WEBSEED_URL_BYTES {
-        return Err(MetainfoError::LimitExceeded {
-            field: "webseed url bytes",
-            limit: MAX_WEBSEED_URL_BYTES,
-        });
-    }
+    seen.insert(value);
     out.push(value.to_owned());
     Ok(())
 }
@@ -806,10 +1623,10 @@ fn validate_piece_count(
             .checked_add(file.length)
             .ok_or(MetainfoError::IntegerOverflow("total length"))
     })?;
-    if total_length == 0 {
+    if total_length == 0 || !files.iter().any(|file| !file.pad && file.length > 0) {
         // The engine's v1 piece map has no meaningful piece-zero state. Keep
-        // an empty file inside an otherwise non-empty torrent valid, but
-        // reject a torrent whose complete content stream has no pieces.
+        // an empty file inside an otherwise non-empty torrent valid. BEP 47
+        // padding alone is synthetic and does not make a payload torrent.
         return Err(MetainfoError::ZeroTotalLength);
     }
     let expected = if total_length == 0 {
@@ -941,6 +1758,22 @@ mod tests {
         private: Option<i64>,
         piece_count: usize,
     ) -> Vec<u8> {
+        single_file_torrent_with_private_value(
+            name,
+            length,
+            piece_length,
+            private.map(BValue::Int),
+            piece_count,
+        )
+    }
+
+    fn single_file_torrent_with_private_value(
+        name: &str,
+        length: i64,
+        piece_length: i64,
+        private: Option<BValue<'_>>,
+        piece_count: usize,
+    ) -> Vec<u8> {
         let pieces_data = make_pieces(piece_count);
         let mut info_pairs: Vec<(&[u8], BValue<'_>)> = vec![
             (b"length", BValue::Int(length)),
@@ -948,8 +1781,8 @@ mod tests {
             (b"piece length", BValue::Int(piece_length)),
             (b"pieces", BValue::Bytes(&pieces_data)),
         ];
-        if let Some(p) = private {
-            info_pairs.push((b"private", BValue::Int(p)));
+        if let Some(value) = private {
+            info_pairs.push((b"private", value));
         }
         // bencode dict keys must be sorted
         info_pairs.sort_by(|a, b| a.0.cmp(b.0));
@@ -1000,6 +1833,106 @@ mod tests {
         encode(&BValue::Dict(pairs))
     }
 
+    fn v1_torrent_with_path_parts(path_parts: &[&str]) -> Vec<u8> {
+        let file = BValue::Dict(vec![
+            (b"length".as_ref(), BValue::Int(1024)),
+            (
+                b"path".as_ref(),
+                BValue::List(
+                    path_parts
+                        .iter()
+                        .map(|part| BValue::Bytes(part.as_bytes()))
+                        .collect(),
+                ),
+            ),
+        ]);
+        let pieces = make_pieces(1);
+        let mut info_fields: Vec<(&[u8], BValue<'_>)> = vec![
+            (b"files", BValue::List(vec![file])),
+            (b"name", BValue::Bytes(b"root")),
+            (b"piece length", BValue::Int(512 * 1024)),
+            (b"pieces", BValue::Bytes(&pieces)),
+        ];
+        info_fields.sort_by(|left, right| left.0.cmp(right.0));
+        let mut root_fields: Vec<(&[u8], BValue<'_>)> = vec![
+            (b"announce", BValue::Bytes(b"http://t.example/a")),
+            (b"info", BValue::Dict(info_fields)),
+        ];
+        root_fields.sort_by(|left, right| left.0.cmp(right.0));
+        encode(&BValue::Dict(root_fields))
+    }
+
+    fn hybrid_multi_file_torrent(
+        v1_files: &[(&[&str], i64, bool)],
+        v2_files: &[(&str, i64)],
+        rooted_v2_tree: bool,
+    ) -> Vec<u8> {
+        let piece_length = 16 * 1024;
+        let total_length = v1_files.iter().map(|(_, length, _)| *length).sum::<i64>();
+        let piece_count = usize::try_from((total_length + piece_length - 1) / piece_length)
+            .expect("test piece count");
+        let pieces_data = make_pieces(piece_count);
+        let pad_root = b"bundle";
+        let pieces_root = [0xA5; 32];
+
+        let file_entries = v1_files
+            .iter()
+            .map(|(path, length, pad)| {
+                let mut fields: Vec<(&[u8], BValue<'_>)> = vec![
+                    (b"length", BValue::Int(*length)),
+                    (
+                        b"path",
+                        BValue::List(
+                            path.iter()
+                                .map(|component| BValue::Bytes(component.as_bytes()))
+                                .collect(),
+                        ),
+                    ),
+                ];
+                if *pad {
+                    fields.push((b"attr", BValue::Bytes(b"p")));
+                }
+                fields.sort_by(|a, b| a.0.cmp(b.0));
+                BValue::Dict(fields)
+            })
+            .collect();
+
+        let mut v2_entries: Vec<(&[u8], BValue<'_>)> = v2_files
+            .iter()
+            .map(|(name, length)| {
+                let mut fields: Vec<(&[u8], BValue<'_>)> = vec![(b"length", BValue::Int(*length))];
+                if *length > 0 {
+                    fields.push((b"pieces root", BValue::Bytes(&pieces_root)));
+                }
+                fields.sort_by(|a, b| a.0.cmp(b.0));
+                (
+                    name.as_bytes(),
+                    BValue::Dict(vec![(b"".as_ref(), BValue::Dict(fields))]),
+                )
+            })
+            .collect();
+        v2_entries.sort_by(|a, b| a.0.cmp(b.0));
+        let file_tree_entries = if rooted_v2_tree {
+            vec![(pad_root.as_ref(), BValue::Dict(v2_entries))]
+        } else {
+            v2_entries
+        };
+
+        let mut info_pairs: Vec<(&[u8], BValue<'_>)> = vec![
+            (b"file tree", BValue::Dict(file_tree_entries)),
+            (b"files", BValue::List(file_entries)),
+            (b"meta version", BValue::Int(2)),
+            (b"name", BValue::Bytes(b"bundle")),
+            (b"piece length", BValue::Int(piece_length)),
+            (b"pieces", BValue::Bytes(&pieces_data)),
+        ];
+        info_pairs.sort_by(|a, b| a.0.cmp(b.0));
+        encode(&BValue::Dict(vec![(
+            b"info".as_ref(),
+            BValue::Dict(info_pairs),
+        )]))
+    }
+
     #[test]
     fn parse_single_file() {
         let raw = single_file_torrent("test.bin", 1024, 512 * 1024, None);
@@ -1014,6 +1947,136 @@ mod tests {
         assert!(m.is_single_file());
         assert!(!m.private);
         assert_eq!(m.info_hash.len(), 20);
+    }
+
+    #[test]
+    fn parse_allocation_reservation_covers_hybrid_tree_and_both_raw_copies() {
+        let raw = hybrid_multi_file_torrent(
+            &[(&["payload.bin"][..], 1024, false)],
+            &[("payload.bin", 1024)],
+            false,
+        );
+        let mut requested = Vec::new();
+        let mut reserve = |bytes| {
+            requested.push(bytes);
+            true
+        };
+        let parsed = parse_torrent_with_allocation_reservation(&raw, &mut reserve).unwrap();
+        assert!(matches!(parsed, TorrentMeta::Hybrid(_, _)));
+        assert!(
+            requested.len() > 3,
+            "decoder growth, metainfo projections, and raw copies must be charged"
+        );
+        assert_eq!(&requested[requested.len() - 2..], &[raw.len(), raw.len()]);
+        let before_raw_copies = requested.len() - 2;
+        let projection_bytes = requested[before_raw_copies - 1];
+        assert!(projection_bytes > 0);
+
+        let mut calls = 0;
+        let mut deny_projection = |_bytes| {
+            calls += 1;
+            calls < before_raw_copies
+        };
+        assert!(matches!(
+            parse_torrent_with_allocation_reservation(&raw, &mut deny_projection),
+            Err(MetainfoError::Bencode(
+                rt_bencode::BencodeError::AllocationBudgetExceeded { bytes }
+            )) if bytes == projection_bytes
+        ));
+        assert_eq!(calls, before_raw_copies);
+
+        let decoder_growth_count = before_raw_copies;
+        let mut denied_growth_count = 0;
+        let mut deny_first_raw_copy = |_bytes| {
+            denied_growth_count += 1;
+            denied_growth_count <= decoder_growth_count
+        };
+        assert!(matches!(
+            parse_torrent_with_allocation_reservation(&raw, &mut deny_first_raw_copy),
+            Err(MetainfoError::Bencode(
+                rt_bencode::BencodeError::AllocationBudgetExceeded { bytes }
+            )) if bytes == raw.len()
+        ));
+        assert_eq!(denied_growth_count, decoder_growth_count + 1);
+    }
+
+    #[test]
+    fn convenience_parse_budget_is_cumulative_and_denies_before_growth() {
+        let mut reserve = bounded_allocation_reservation(8);
+        assert!(reserve(6));
+        assert!(!reserve(3));
+        assert!(reserve(2));
+
+        let raw = single_file_torrent("bounded.bin", 1, 16_384, None);
+        assert!(matches!(
+            parse_torrent_with_allocation_limit(&raw, 0),
+            Err(MetainfoError::Bencode(
+                rt_bencode::BencodeError::AllocationBudgetExceeded { bytes }
+            )) if bytes > 0
+        ));
+    }
+
+    #[test]
+    fn webseed_deduplication_handles_many_repeated_entries() {
+        let duplicate = BValue::Bytes(b"https://seed.example/payload");
+        let root = BValue::Dict(vec![(
+            b"url-list".as_ref(),
+            BValue::List(vec![duplicate; 4096]),
+        )]);
+
+        assert_eq!(
+            parse_webseeds(&root).unwrap(),
+            ["https://seed.example/payload"]
+        );
+    }
+
+    #[test]
+    fn info_bytes_allocation_reservation_covers_decoder_and_output() {
+        let raw = v2_torrent("root", "payload.bin", 65_536);
+        let mut requested = Vec::new();
+        let mut reserve = |bytes| {
+            requested.push(bytes);
+            true
+        };
+        let info = torrent_info_bytes_with_allocation_reservation(&raw, &mut reserve).unwrap();
+        assert!(!requested.is_empty());
+        assert_eq!(requested.last(), Some(&info.len()));
+        assert_eq!(info, torrent_info_bytes(&raw).unwrap());
+    }
+
+    #[test]
+    fn v2_magnet_projection_is_reserved_before_file_graph_allocation() {
+        let raw = v2_torrent("root", "payload.bin", 65_536);
+        let info = torrent_info_bytes(&raw).unwrap();
+        let mut requested = Vec::new();
+        let mut reserve = |bytes| {
+            requested.push(bytes);
+            true
+        };
+        let requirements =
+            v2_piece_layer_requirements_with_allocation_reservation(&info, &mut reserve)
+                .unwrap()
+                .unwrap();
+        assert_eq!(requirements.files.len(), 1);
+        assert!(requested.len() >= 2);
+        let projection_bytes = *requested.last().unwrap();
+        assert!(projection_bytes > 0);
+
+        let mut calls = 0;
+        let mut deny_projection = |_bytes| {
+            calls += 1;
+            calls < requested.len()
+        };
+        assert!(matches!(
+            v2_piece_layer_requirements_with_allocation_reservation(
+                &info,
+                &mut deny_projection
+            ),
+            Err(MetainfoError::Bencode(
+                rt_bencode::BencodeError::AllocationBudgetExceeded { bytes }
+            )) if bytes == projection_bytes
+        ));
+        assert_eq!(calls, requested.len());
     }
 
     #[test]
@@ -1098,12 +2161,177 @@ mod tests {
     }
 
     #[test]
+    fn hybrid_layout_accepts_rootless_or_rooted_v2_with_optional_tail_padding() {
+        let with_tail_padding = hybrid_multi_file_torrent(
+            &[
+                (&["a.bin"], 1_000, false),
+                (&[".pad", "15384"], 15_384, true),
+                (&["b.bin"], 500, false),
+                (&[".pad", "15884"], 15_884, true),
+            ],
+            &[("a.bin", 1_000), ("b.bin", 500)],
+            false,
+        );
+        let TorrentMeta::Hybrid(v1, v2) = parse_torrent(&with_tail_padding).unwrap() else {
+            panic!("expected hybrid torrent");
+        };
+        assert_eq!(v1.total_length(), 32_768);
+        assert_eq!(v2.total_length(), 1_500);
+        assert_eq!(v2.piece_count(), 2);
+        assert_eq!(v2.files[0].path.as_display(), "a.bin");
+
+        let without_tail_padding = hybrid_multi_file_torrent(
+            &[
+                (&["a.bin"], 1_000, false),
+                (&[".pad", "15384"], 15_384, true),
+                (&["b.bin"], 500, false),
+            ],
+            &[("a.bin", 1_000), ("b.bin", 500)],
+            true,
+        );
+        let TorrentMeta::Hybrid(v1, v2) = parse_torrent(&without_tail_padding).unwrap() else {
+            panic!("expected hybrid torrent");
+        };
+        assert_eq!(v1.total_length(), 16_884);
+        assert_eq!(v2.files[0].path.as_display(), "bundle/a.bin");
+    }
+
+    #[test]
+    fn hybrid_layout_allows_reused_paths_for_synthetic_padding_files() {
+        let raw = hybrid_multi_file_torrent(
+            &[
+                (&["a.bin"], 1_000, false),
+                (&[".pad", "15384"], 15_384, true),
+                (&["b.bin"], 1_000, false),
+                (&[".pad", "15384"], 15_384, true),
+                (&["c.bin"], 1_000, false),
+            ],
+            &[("a.bin", 1_000), ("b.bin", 1_000), ("c.bin", 1_000)],
+            false,
+        );
+
+        let TorrentMeta::Hybrid(v1, v2) = parse_torrent(&raw).unwrap() else {
+            panic!("expected hybrid torrent");
+        };
+        assert_eq!(v1.files.iter().filter(|file| file.pad).count(), 2);
+        assert_eq!(v2.files.len(), 3);
+    }
+
+    #[test]
+    fn hybrid_layout_rejects_mismatched_paths_lengths_and_padding() {
+        let mismatched_path = hybrid_multi_file_torrent(
+            &[
+                (&["a.bin"], 1_000, false),
+                (&[".pad", "15384"], 15_384, true),
+                (&["other.bin"], 500, false),
+            ],
+            &[("a.bin", 1_000), ("b.bin", 500)],
+            false,
+        );
+        assert!(matches!(
+            parse_torrent(&mismatched_path),
+            Err(MetainfoError::InconsistentHybridLayout(
+                "v1 and v2 payload file paths differ"
+            ))
+        ));
+
+        let mismatched_length = hybrid_multi_file_torrent(
+            &[
+                (&["a.bin"], 1_000, false),
+                (&[".pad", "15384"], 15_384, true),
+                (&["b.bin"], 499, false),
+            ],
+            &[("a.bin", 1_000), ("b.bin", 500)],
+            false,
+        );
+        assert!(matches!(
+            parse_torrent(&mismatched_length),
+            Err(MetainfoError::InconsistentHybridLayout(
+                "v1 and v2 payload file lengths differ"
+            ))
+        ));
+
+        let misaligned_padding = hybrid_multi_file_torrent(
+            &[
+                (&["a.bin"], 1_000, false),
+                (&[".pad", "15383"], 15_383, true),
+                (&["b.bin"], 500, false),
+            ],
+            &[("a.bin", 1_000), ("b.bin", 500)],
+            false,
+        );
+        assert!(matches!(
+            parse_torrent(&misaligned_padding),
+            Err(MetainfoError::InconsistentHybridLayout(
+                "v1 padding does not align payload files to v2 piece boundaries"
+            ))
+        ));
+
+        let invalid_tail_padding = hybrid_multi_file_torrent(
+            &[
+                (&["a.bin"], 1_000, false),
+                (&[".pad", "15384"], 15_384, true),
+                (&["b.bin"], 500, false),
+                (&[".pad", "15883"], 15_883, true),
+            ],
+            &[("a.bin", 1_000), ("b.bin", 500)],
+            false,
+        );
+        assert!(matches!(
+            parse_torrent(&invalid_tail_padding),
+            Err(MetainfoError::InconsistentHybridLayout(
+                "v1 trailing padding does not match the v2 logical end"
+            ))
+        ));
+    }
+
+    #[test]
     fn parse_private_flag() {
         let raw = single_file_torrent("priv.bin", 512, 512 * 1024, Some(1));
         let TorrentMeta::V1(m) = parse_torrent(&raw).unwrap() else {
             panic!("expected V1")
         };
         assert!(m.private);
+    }
+
+    #[test]
+    fn parse_missing_and_zero_private_flags_as_public() {
+        for private in [None, Some(0)] {
+            let raw = single_file_torrent("public.bin", 512, 512 * 1024, private);
+            let TorrentMeta::V1(meta) = parse_torrent(&raw).unwrap() else {
+                panic!("expected V1")
+            };
+            assert!(!meta.private);
+        }
+    }
+
+    #[test]
+    fn parse_rejects_unknown_private_flag_integers() {
+        for value in [-1, 2] {
+            let raw = single_file_torrent("invalid-private.bin", 512, 512 * 1024, Some(value));
+            assert!(matches!(
+                parse_torrent(&raw),
+                Err(MetainfoError::InvalidIntegerValue {
+                    field: "private",
+                    value: actual,
+                }) if actual == value
+            ));
+        }
+    }
+
+    #[test]
+    fn parse_rejects_non_integer_private_flag() {
+        let raw = single_file_torrent_with_private_value(
+            "invalid-private.bin",
+            512,
+            512 * 1024,
+            Some(BValue::Bytes(b"1")),
+            1,
+        );
+        assert!(matches!(
+            parse_torrent(&raw),
+            Err(MetainfoError::InvalidFieldType("private"))
+        ));
     }
 
     #[test]
@@ -1211,6 +2439,104 @@ mod tests {
         root.sort_by(|a, b| a.0.cmp(b.0));
         let raw = encode(&BValue::Dict(root));
         assert!(parse_torrent(&raw).is_err());
+    }
+
+    #[test]
+    fn reject_duplicate_file_paths() {
+        let raw = multi_file_torrent("root", &[("same.bin", 1), ("same.bin", 1)]);
+        assert!(matches!(
+            parse_torrent(&raw),
+            Err(MetainfoError::ConflictingFilePaths(_))
+        ));
+
+        let parent = SafeRelPath::from_components(&["root", "node"], false).unwrap();
+        let child = SafeRelPath::from_components(&["root", "node", "child.bin"], false).unwrap();
+        assert!(matches!(
+            validate_file_path_collisions([&parent, &child]),
+            Err(MetainfoError::ConflictingFilePaths(_))
+        ));
+    }
+
+    #[test]
+    fn v1_paths_are_bounded_to_storage_walk_depth() {
+        let accepted = vec!["dir"; MAX_PATH_COMPONENTS - 1];
+        assert!(parse_torrent(&v1_torrent_with_path_parts(&accepted)).is_ok());
+
+        let rejected = vec!["dir"; MAX_PATH_COMPONENTS];
+        assert!(matches!(
+            parse_torrent(&v1_torrent_with_path_parts(&rejected)),
+            Err(MetainfoError::LimitExceeded {
+                field: "path components",
+                limit: MAX_PATH_COMPONENTS
+            })
+        ));
+    }
+
+    #[test]
+    fn v2_file_path_budget_rejects_expansion_before_owning_the_path() {
+        let leaf = BValue::Dict(vec![(b"length".as_ref(), BValue::Int(0))]);
+        let node = BValue::Dict(vec![(b"".as_ref(), leaf)]);
+        let mut budget = FilePathBudget {
+            total_components: MAX_TOTAL_FILE_PATH_COMPONENTS,
+            total_bytes: 0,
+        };
+        let mut files = Vec::new();
+        let mut offset = 0;
+        let mut piece_offset = 0;
+
+        let error = walk_file_tree(
+            &node,
+            &["payload"],
+            &mut files,
+            &mut offset,
+            &mut piece_offset,
+            16 * 1024,
+            &mut budget,
+        )
+        .unwrap_err();
+
+        assert!(matches!(
+            error,
+            MetainfoError::LimitExceeded {
+                field: "total file path components",
+                ..
+            }
+        ));
+        assert!(files.is_empty());
+
+        let mut byte_budget = FilePathBudget {
+            total_components: 0,
+            total_bytes: MAX_TOTAL_FILE_PATH_BYTES,
+        };
+        assert!(matches!(
+            byte_budget.reserve(&["x"]),
+            Err(MetainfoError::LimitExceeded {
+                field: "aggregate file path bytes",
+                ..
+            })
+        ));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn reject_windows_alternate_stream_paths_in_v1_and_v2() {
+        let v1 = single_file_torrent("payload:stream", 1024, 512 * 1024, None);
+        assert!(matches!(
+            parse_torrent(&v1),
+            Err(MetainfoError::InvalidPath(_))
+        ));
+
+        let v2 = v2_torrent("root", "payload:stream", 65_536);
+        assert!(matches!(
+            parse_torrent(&v2),
+            Err(MetainfoError::InvalidPath(_))
+        ));
+
+        let case_aliases = v2_multi_file_torrent("root", &[("Payload.bin", 1), ("payload.BIN", 1)]);
+        assert!(matches!(
+            parse_torrent(&case_aliases),
+            Err(MetainfoError::ConflictingFilePaths(_))
+        ));
     }
 
     #[test]
@@ -1445,6 +2771,54 @@ mod tests {
         encode(&BValue::Dict(root))
     }
 
+    fn v2_torrent_with_shared_piece_layer(files: &[(&str, i64)]) -> Vec<u8> {
+        const PIECE_LENGTH: i64 = 16 * 1024;
+        assert!(!files.is_empty());
+        let hash_count =
+            usize::try_from((files[0].1 as u64).div_ceil(PIECE_LENGTH as u64)).unwrap();
+        let layer_hashes = (0..hash_count)
+            .map(|index| rt_hash::BlockHash::of(&index.to_be_bytes()).0)
+            .collect::<Vec<_>>();
+        let pieces_root = rt_hash::merkle_root(&layer_hashes);
+        let mut layer_bytes = Vec::with_capacity(layer_hashes.len() * 32);
+        for hash in &layer_hashes {
+            layer_bytes.extend_from_slice(hash);
+        }
+
+        let mut file_entries: Vec<(&[u8], BValue<'_>)> = files
+            .iter()
+            .map(|(name, length)| {
+                let mut leaf_fields: Vec<(&[u8], BValue<'_>)> = vec![
+                    (b"length", BValue::Int(*length)),
+                    (b"pieces root", BValue::Bytes(&pieces_root)),
+                ];
+                leaf_fields.sort_by(|left, right| left.0.cmp(right.0));
+                let leaf = BValue::Dict(leaf_fields);
+                let node = BValue::Dict(vec![(b"".as_ref(), leaf)]);
+                (name.as_bytes(), node)
+            })
+            .collect();
+        file_entries.sort_by(|left, right| left.0.cmp(right.0));
+
+        let mut info_fields: Vec<(&[u8], BValue<'_>)> = vec![
+            (b"file tree", BValue::Dict(file_entries)),
+            (b"meta version", BValue::Int(2)),
+            (b"name", BValue::Bytes(b"shared")),
+            (b"piece length", BValue::Int(PIECE_LENGTH)),
+        ];
+        info_fields.sort_by(|left, right| left.0.cmp(right.0));
+
+        let mut root_fields: Vec<(&[u8], BValue<'_>)> = vec![
+            (b"info", BValue::Dict(info_fields)),
+            (
+                b"piece layers",
+                BValue::Dict(vec![(pieces_root.as_slice(), BValue::Bytes(&layer_bytes))]),
+            ),
+        ];
+        root_fields.sort_by(|left, right| left.0.cmp(right.0));
+        encode(&BValue::Dict(root_fields))
+    }
+
     #[test]
     fn parse_v2_torrent() {
         let raw = v2_torrent("mydir", "data.bin", 65536);
@@ -1457,6 +2831,39 @@ mod tests {
         assert_eq!(m.files[0].length, 65536);
         assert_eq!(m.files[0].path.as_display(), "data.bin");
         assert_eq!(m.info_hash_v2.len(), 32);
+    }
+
+    #[test]
+    fn identical_layered_files_share_one_piece_layer_and_magnet_requirement() {
+        let raw = v2_torrent_with_shared_piece_layer(&[("a.bin", 65_536), ("b.bin", 65_536)]);
+        let TorrentMeta::V2(meta) = parse_torrent(&raw).unwrap() else {
+            panic!("expected V2")
+        };
+        assert_eq!(meta.files.len(), 2);
+        assert_eq!(meta.files[0].pieces_root, meta.files[1].pieces_root);
+        assert_eq!(meta.piece_layers.len(), 1);
+        assert_eq!(meta.piece_layers.values().next().unwrap().len(), 4);
+
+        let info = torrent_info_bytes(&raw).unwrap();
+        let requirements = v2_piece_layer_requirements(&info).unwrap().unwrap();
+        assert_eq!(requirements.files.len(), 1);
+        assert_eq!(requirements.files[0].file_length, 65_536);
+        assert_eq!(requirements.files[0].hash_count, 4);
+    }
+
+    #[test]
+    fn identical_piece_root_with_conflicting_file_requirements_is_rejected() {
+        let raw = v2_torrent_with_shared_piece_layer(&[("a.bin", 65_536), ("b.bin", 81_920)]);
+        assert!(matches!(
+            parse_torrent(&raw),
+            Err(MetainfoError::InvalidPieceLayer(_))
+        ));
+
+        let info = torrent_info_bytes(&raw).unwrap();
+        assert!(matches!(
+            v2_piece_layer_requirements(&info),
+            Err(MetainfoError::InvalidPieceLayer(_))
+        ));
     }
 
     #[test]
@@ -1631,6 +3038,7 @@ mod tests {
             .unwrap();
         assert!(!real.pad);
         assert!(pad.pad);
+        assert_eq!(m.total_length(), 1_000);
     }
 
     #[test]

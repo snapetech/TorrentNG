@@ -1,9 +1,9 @@
 use std::collections::HashMap;
 use std::hash::Hash;
-use std::net::{IpAddr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::{
     atomic::{AtomicU64, Ordering},
-    Mutex, OnceLock,
+    Mutex, MutexGuard, OnceLock,
 };
 use std::time::Duration;
 
@@ -87,6 +87,21 @@ impl HttpClientCache {
 fn http_client_cache() -> &'static Mutex<HttpClientCache> {
     static CACHE: OnceLock<Mutex<HttpClientCache>> = OnceLock::new();
     CACHE.get_or_init(|| Mutex::new(HttpClientCache::default()))
+}
+
+fn lock_http_client_cache(cache: &Mutex<HttpClientCache>) -> MutexGuard<'_, HttpClientCache> {
+    match cache.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => {
+            // Every caller re-resolves and validates DNS before consulting
+            // this cache, so cached clients are disposable transport state.
+            // Drop any partially updated entries and rebuild on demand.
+            let mut guard = poisoned.into_inner();
+            *guard = HttpClientCache::default();
+            cache.clear_poison();
+            guard
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -183,6 +198,12 @@ impl OutboundEgressPolicy {
         self.validate_ip(addr.ip())
     }
 
+    /// Validate an outbound BitTorrent peer destination using the same address
+    /// classes as tracker and webseed egress.
+    pub fn validate_peer_addr(&self, addr: SocketAddr) -> Result<(), EgressPolicyError> {
+        self.validate_socket_addr(addr)
+    }
+
     /// Resolve a hostname and validate every answer before a request is sent.
     /// HTTP callers should use [`Self::http_client`] so the validated address
     /// is also pinned in the transport client.
@@ -264,16 +285,17 @@ impl OutboundEgressPolicy {
             timeout_millis: request_timeout.as_millis().min(u64::MAX as u128) as u64,
             user_agent: user_agent.to_owned(),
         };
-        if let Some(client) = http_client_cache()
-            .lock()
-            .expect("egress client cache poisoned")
-            .get(&key)
-        {
+        if let Some(client) = lock_http_client_cache(http_client_cache()).get(&key) {
             return Ok(client);
         }
         let client = reqwest::Client::builder()
             .timeout(request_timeout)
             .redirect(reqwest::redirect::Policy::none())
+            // Environment-configured proxies resolve the destination outside
+            // this policy boundary, bypassing both address validation and the
+            // pinned resolver entry above. Tracker/webseed requests therefore
+            // always connect directly to the validated address.
+            .no_proxy()
             .user_agent(user_agent)
             .resolve(host, address)
             .build()
@@ -281,9 +303,7 @@ impl OutboundEgressPolicy {
                 CLIENT_FAILED_TOTAL.fetch_add(1, Ordering::Relaxed);
                 EgressPolicyError::Client(error.to_string())
             })?;
-        let mut cache = http_client_cache()
-            .lock()
-            .expect("egress client cache poisoned");
+        let mut cache = lock_http_client_cache(http_client_cache());
         // A concurrent caller may have filled the same key while this client
         // was being built. Returning the existing clone avoids needless
         // duplicate connection pools without holding the mutex across DNS or
@@ -330,6 +350,7 @@ impl AddressClass {
     pub fn classify(addr: IpAddr) -> Self {
         match addr {
             IpAddr::V4(addr) => {
+                let octets = addr.octets();
                 if addr.is_unspecified() {
                     AddressClass::Unspecified
                 } else if addr.is_loopback() {
@@ -341,6 +362,8 @@ impl AddressClass {
                 } else if ipv4_in_range(addr, 198, 18, 15)
                     || ipv4_in_range(addr, 192, 0, 24)
                     || ipv4_in_range(addr, 240, 0, 4)
+                    || octets[0] == 0
+                    || (octets[0] == 192 && octets[1] == 88 && octets[2] == 99)
                 {
                     AddressClass::Reserved
                 } else if addr.is_link_local() {
@@ -360,11 +383,15 @@ impl AddressClass {
                 // inherit IPv4 policy. `Ipv6Addr::to_ipv4` also accepts the
                 // deprecated IPv4-compatible `::x.y.z.w` form, which would
                 // otherwise misclassify `::1` as public `0.0.0.1`.
-                if addr.segments()[..6] == [0, 0, 0, 0, 0, 0xffff] {
+                let segments = addr.segments();
+                if segments[..6] == [0, 0, 0, 0, 0, 0xffff] {
                     let mapped = addr
                         .to_ipv4()
                         .expect("IPv4-mapped address has an IPv4 tail");
                     return Self::classify(IpAddr::V4(mapped));
+                }
+                if let Some(translated) = ipv6_well_known_nat64_ipv4(addr) {
+                    return Self::classify(IpAddr::V4(translated));
                 }
                 if addr.is_unspecified() {
                     AddressClass::Unspecified
@@ -378,6 +405,8 @@ impl AddressClass {
                     AddressClass::UniqueLocal
                 } else if is_ipv6_documentation(addr) {
                     AddressClass::Documentation
+                } else if is_ipv6_reserved_prefix(addr) || !is_ipv6_global_unicast(addr) {
+                    AddressClass::Reserved
                 } else {
                     AddressClass::Public
                 }
@@ -459,12 +488,87 @@ fn is_ipv6_unique_local(addr: std::net::Ipv6Addr) -> bool {
 }
 
 fn is_ipv6_documentation(addr: std::net::Ipv6Addr) -> bool {
-    addr.segments()[0] == 0x2001 && addr.segments()[1] == 0x0db8
+    let segments = addr.segments();
+    (segments[0] == 0x2001 && segments[1] == 0x0db8)
+        || (segments[0] == 0x3fff && segments[1] & 0xf000 == 0)
+}
+
+fn ipv6_well_known_nat64_ipv4(addr: Ipv6Addr) -> Option<Ipv4Addr> {
+    let segments = addr.segments();
+    (segments[..6] == [0x0064, 0xff9b, 0, 0, 0, 0])
+        .then(|| Ipv4Addr::from((u32::from(segments[6]) << 16) | u32::from(segments[7])))
+}
+
+fn is_ipv6_reserved_prefix(addr: Ipv6Addr) -> bool {
+    let segments = addr.segments();
+    // IPv4-compatible addresses are deprecated. The IPv4-mapped form is
+    // handled separately so it inherits the corresponding IPv4 policy.
+    segments[..6] == [0, 0, 0, 0, 0, 0]
+        // IANA's 2001::/23 protocol-assignment block and 6to4 both carry
+        // transition/special-use semantics, not ordinary public unicast.
+        || (segments[0] == 0x2001 && segments[1] & 0xfe00 == 0)
+        || segments[0] == 0x2002
+}
+
+fn is_ipv6_global_unicast(addr: Ipv6Addr) -> bool {
+    // IANA's 2000::/3 is the assignable GUA space, not a blanket assertion
+    // that every address in it is allocated. Keep the current assigned
+    // prefixes and fail closed on the unlisted ranges reserved for future
+    // allocation. Registry snapshot: 2025-10-10.
+    const ALLOCATED_PREFIXES: &[(u16, u16, u32)] = &[
+        (0x2001, 0x0000, 23),
+        (0x2001, 0x0200, 23),
+        (0x2001, 0x0400, 23),
+        (0x2001, 0x0600, 23),
+        (0x2001, 0x0800, 22),
+        (0x2001, 0x0c00, 23),
+        (0x2001, 0x0e00, 23),
+        (0x2001, 0x1200, 23),
+        (0x2001, 0x1400, 22),
+        (0x2001, 0x1800, 23),
+        (0x2001, 0x1a00, 23),
+        (0x2001, 0x1c00, 22),
+        (0x2001, 0x2000, 19),
+        (0x2001, 0x4000, 23),
+        (0x2001, 0x4200, 23),
+        (0x2001, 0x4400, 23),
+        (0x2001, 0x4600, 23),
+        (0x2001, 0x4800, 23),
+        (0x2001, 0x4a00, 23),
+        (0x2001, 0x4c00, 23),
+        (0x2001, 0x5000, 20),
+        (0x2001, 0x8000, 19),
+        (0x2001, 0xa000, 20),
+        (0x2001, 0xb000, 20),
+        (0x2003, 0x0000, 18),
+        (0x2400, 0x0000, 12),
+        (0x2410, 0x0000, 12),
+        (0x2600, 0x0000, 12),
+        (0x2610, 0x0000, 23),
+        (0x2620, 0x0000, 23),
+        (0x2630, 0x0000, 12),
+        (0x2800, 0x0000, 12),
+        (0x2a00, 0x0000, 12),
+        (0x2a10, 0x0000, 12),
+        (0x2c00, 0x0000, 12),
+    ];
+    let address = u128::from(addr);
+    ALLOCATED_PREFIXES
+        .iter()
+        .any(|(first, second, prefix_len)| {
+            let network = (u128::from(*first) << 112) | (u128::from(*second) << 96);
+            let mask = u128::MAX << (128 - *prefix_len);
+            address & mask == network & mask
+        })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::{Read, Write};
+    use std::process::Command;
+    use std::thread;
+    use std::time::Instant;
 
     #[test]
     fn default_policy_allows_public_tracker_schemes_only() {
@@ -522,14 +626,35 @@ mod tests {
             "100.64.0.1".parse().unwrap(),
             "198.18.0.1".parse().unwrap(),
             "192.0.0.1".parse().unwrap(),
+            "0.0.0.1".parse().unwrap(),
+            "192.88.99.1".parse().unwrap(),
             "240.0.0.1".parse().unwrap(),
             "::ffff:127.0.0.1".parse().unwrap(),
+            "::8.8.8.8".parse().unwrap(),
+            "100::1".parse().unwrap(),
+            "2000::1".parse().unwrap(),
+            "2001::1".parse().unwrap(),
+            "2002:c0a8:0101::1".parse().unwrap(),
+            "2003:8000::1".parse().unwrap(),
+            "2004::1".parse().unwrap(),
+            "2500::1".parse().unwrap(),
+            "2d00::1".parse().unwrap(),
+            "3fff::1".parse().unwrap(),
+            "5f00::1".parse().unwrap(),
+            "64:ff9b::a9fe:a9fe".parse().unwrap(),
+            "64:ff9b:1::1".parse().unwrap(),
         ] {
             assert!(policy.validate_ip(addr).is_err(), "{addr}");
         }
         policy.validate_ip("8.8.8.8".parse().unwrap()).unwrap();
         policy
             .validate_ip("2001:4860:4860::8888".parse().unwrap())
+            .unwrap();
+        for addr in ["2003::1", "2404::1", "2410::1", "2630::1", "2c00::1"] {
+            policy.validate_ip(addr.parse().unwrap()).unwrap();
+        }
+        policy
+            .validate_ip("64:ff9b::808:808".parse().unwrap())
             .unwrap();
     }
 
@@ -578,15 +703,147 @@ mod tests {
         // a second cache entry, so assert the bounded cache contains this
         // exact policy tuple rather than relying on internal client details.
         let _ = (first, second);
-        let cache = http_client_cache()
-            .lock()
-            .expect("egress client cache poisoned");
+        let cache = lock_http_client_cache(http_client_cache());
         assert!(cache.clients.keys().any(|key| {
             key.kind == OutboundTargetKind::Tracker
                 && key.host == "127.0.0.1"
                 && key.port == 9
                 && key.user_agent == "TorrentNG/test"
         }));
+    }
+
+    #[test]
+    fn poisoned_http_client_cache_discards_clients_and_recovers() {
+        let cache = std::sync::Arc::new(Mutex::new(HttpClientCache::default()));
+        cache.lock().unwrap().insert(
+            HttpClientKey {
+                kind: OutboundTargetKind::Tracker,
+                host: "tracker.example".to_owned(),
+                port: 80,
+                address: "192.0.2.1:80".parse().unwrap(),
+                timeout_millis: 1_000,
+                user_agent: "TorrentNG/test".to_owned(),
+            },
+            reqwest::Client::new(),
+        );
+
+        let poisoner = std::sync::Arc::clone(&cache);
+        assert!(std::thread::spawn(move || {
+            let _guard = poisoner.lock().unwrap();
+            panic!("poison the derived HTTP client cache");
+        })
+        .join()
+        .is_err());
+        assert!(cache.is_poisoned());
+
+        assert!(lock_http_client_cache(&cache).clients.is_empty());
+        assert!(!cache.is_poisoned());
+    }
+
+    #[tokio::test]
+    async fn pinned_http_client_ignores_system_proxy_for_validated_destination() {
+        const CHILD_FLAG: &str = "TNG_EGRESS_PROXY_TEST_CHILD";
+        if std::env::var_os(CHILD_FLAG).is_some() {
+            let url = std::env::var("TNG_EGRESS_PROXY_TEST_TARGET").unwrap();
+            let url = Url::parse(&url).unwrap();
+            let policy = OutboundEgressPolicy {
+                allow_loopback: true,
+                ..OutboundEgressPolicy::default()
+            };
+            let client = policy
+                .http_client(
+                    OutboundTargetKind::Tracker,
+                    &url,
+                    Duration::from_secs(2),
+                    "TorrentNG/egress-proxy-test",
+                )
+                .await
+                .unwrap();
+            let response = client
+                .get(url)
+                .send()
+                .await
+                .unwrap()
+                .error_for_status()
+                .unwrap();
+            assert_eq!(response.text().await.unwrap(), "direct");
+            return;
+        }
+
+        fn serve_once(
+            listener: std::net::TcpListener,
+            body: &'static str,
+        ) -> thread::JoinHandle<bool> {
+            listener.set_nonblocking(true).unwrap();
+            thread::spawn(move || {
+                let deadline = Instant::now() + Duration::from_secs(2);
+                loop {
+                    match listener.accept() {
+                        Ok((mut stream, _)) => {
+                            stream
+                                .set_read_timeout(Some(Duration::from_secs(2)))
+                                .unwrap();
+                            let mut request = [0u8; 2048];
+                            let _ = stream.read(&mut request);
+                            let response = format!(
+                                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                                body.len(), body
+                            );
+                            stream.write_all(response.as_bytes()).unwrap();
+                            return true;
+                        }
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                            if Instant::now() >= deadline {
+                                return false;
+                            }
+                            thread::sleep(Duration::from_millis(10));
+                        }
+                        Err(_) => return false,
+                    }
+                }
+            })
+        }
+
+        let direct_listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let direct_address = direct_listener.local_addr().unwrap();
+        let proxy_listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        proxy_listener.set_nonblocking(true).unwrap();
+        let proxy_address = proxy_listener.local_addr().unwrap();
+        let direct_server = serve_once(direct_listener, "direct");
+        let target = format!("http://{direct_address}/announce");
+        let proxy = format!("http://{proxy_address}");
+
+        let output = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "egress_policy::tests::pinned_http_client_ignores_system_proxy_for_validated_destination",
+                "--nocapture",
+            ])
+            .env(CHILD_FLAG, "1")
+            .env("TNG_EGRESS_PROXY_TEST_TARGET", &target)
+            .env("HTTP_PROXY", &proxy)
+            .env("http_proxy", &proxy)
+            .env("ALL_PROXY", &proxy)
+            .env("all_proxy", &proxy)
+            .env("NO_PROXY", "")
+            .env("no_proxy", "")
+            .output()
+            .unwrap();
+        let direct_received = direct_server.join().unwrap();
+        let proxy_received = match proxy_listener.accept() {
+            Ok(_) => true,
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => false,
+            Err(error) => panic!("failed to inspect mock proxy listener: {error}"),
+        };
+
+        assert!(
+            output.status.success(),
+            "isolated proxy test failed: {}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(direct_received, "request did not reach validated address");
+        assert!(!proxy_received, "request escaped through environment proxy");
     }
 
     #[test]
@@ -599,5 +856,25 @@ mod tests {
         policy.validate_ip("192.168.1.1".parse().unwrap()).unwrap();
         policy.validate_ip("fe80::1".parse().unwrap()).unwrap();
         assert!(policy.validate_ip("127.0.0.1".parse().unwrap()).is_err());
+    }
+
+    #[test]
+    fn peer_destinations_use_the_configured_address_policy() {
+        let lan_peer: SocketAddr = "192.168.1.20:51413".parse().unwrap();
+        let loopback_peer: SocketAddr = "127.0.0.1:51413".parse().unwrap();
+        let public_peer: SocketAddr = "8.8.8.8:51413".parse().unwrap();
+        let default = OutboundEgressPolicy::default();
+
+        assert!(default.validate_peer_addr(lan_peer).is_err());
+        assert!(default.validate_peer_addr(loopback_peer).is_err());
+        assert!(default.validate_peer_addr(public_peer).is_ok());
+
+        let lan_enabled = OutboundEgressPolicy {
+            allow_private: true,
+            allow_loopback: true,
+            ..default
+        };
+        assert!(lan_enabled.validate_peer_addr(lan_peer).is_ok());
+        assert!(lan_enabled.validate_peer_addr(loopback_peer).is_ok());
     }
 }

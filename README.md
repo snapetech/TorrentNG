@@ -444,7 +444,8 @@ TorrentNG is dual-licensed under `AGPL-3.0-or-later OR Commercial`.
 
 Unless you have a separate signed commercial license, use is governed by the
 GNU Affero General Public License v3.0 or later. See [LICENSE](LICENSE) for
-details.
+the full AGPL-3.0 text and [COMMERCIAL-LICENSE.md](COMMERCIAL-LICENSE.md) for
+the commercial option.
 
 ## Attribution
 

@@ -14,7 +14,7 @@ on:
         default: false
         type: boolean
       base_url:
-        description: "Already-running TorrentNG client daemon URL for API load, e.g. http://host:28080"
+        description: "Loopback target, or remote HTTPS origin listed in TNG_PROTECTED_TARGET_ALLOWED_ORIGINS"
         required: false
         default: ""
         type: string
@@ -54,7 +54,7 @@ on:
         default: false
         type: boolean
       soak_url:
-        description: "Soak target URL"
+        description: "Loopback target, or remote HTTPS origin listed in TNG_PROTECTED_TARGET_ALLOWED_ORIGINS"
         required: false
         default: "http://localhost:18080"
         type: string
@@ -74,6 +74,8 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v7
+        with:
+          persist-credentials: false
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -96,12 +98,15 @@ jobs:
 
   live-fault:
     name: Live release-daemon fault matrix
-    if: inputs.run_live_fault == true
-    runs-on: self-hosted
+    if: github.ref == 'refs/heads/main' && inputs.run_live_fault == true
+    runs-on: [self-hosted, Linux, X64]
     timeout-minutes: 20
     steps:
       - name: Checkout
         uses: actions/checkout@v7
+        with:
+          ref: main
+          persist-credentials: false
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -127,17 +132,21 @@ jobs:
 
   api-load:
     name: Live many-client and slow-SSE load
-    if: inputs.run_api_load == true
-    runs-on: self-hosted
+    if: github.ref == 'refs/heads/main' && inputs.run_api_load == true
+    runs-on: [self-hosted, Linux, X64]
     timeout-minutes: 30
     steps:
       - name: Checkout
         uses: actions/checkout@v7
+        with:
+          ref: main
+          persist-credentials: false
 
       - name: Run API/SSE load
         env:
           TNG_BASE_URL: ${{ inputs.base_url }}
           TNG_API_TOKEN: ${{ secrets.TNG_BACKEND_API_TOKEN }}
+          TNG_PROTECTED_TARGET_ALLOWED_ORIGINS: ${{ vars.TNG_PROTECTED_TARGET_ALLOWED_ORIGINS || vars.TNG_BACKEND_API_ALLOWED_ORIGINS }}
           TNG_LOAD_DURATION_SECONDS: ${{ inputs.load_duration_seconds }}
           TNG_LOAD_CLIENTS: ${{ inputs.load_clients }}
           TNG_LOAD_SSE_CLIENTS: ${{ inputs.load_sse_clients }}
@@ -161,12 +170,15 @@ jobs:
 
   public-compatibility:
     name: Public/client compatibility evidence
-    if: inputs.run_public_compat == true
-    runs-on: self-hosted
+    if: github.ref == 'refs/heads/main' && inputs.run_public_compat == true
+    runs-on: [self-hosted, Linux, X64]
     timeout-minutes: 90
     steps:
       - name: Checkout
         uses: actions/checkout@v7
+        with:
+          ref: main
+          persist-credentials: false
 
       - name: Run explicitly opted-in public compatibility matrix
         env:
@@ -186,12 +198,15 @@ jobs:
 
   real-device:
     name: Real-device storage evidence
-    if: inputs.run_real_device == true
-    runs-on: self-hosted
+    if: github.ref == 'refs/heads/main' && inputs.run_real_device == true
+    runs-on: [self-hosted, Linux, X64]
     timeout-minutes: 60
     steps:
       - name: Checkout
         uses: actions/checkout@v7
+        with:
+          ref: main
+          persist-credentials: false
 
       - name: Run mounted-device matrix
         env:
@@ -215,17 +230,21 @@ jobs:
 
   soak:
     name: 24-hour production soak
-    if: inputs.run_24h_soak == true
-    runs-on: self-hosted
+    if: github.ref == 'refs/heads/main' && inputs.run_24h_soak == true
+    runs-on: [self-hosted, Linux, X64]
     timeout-minutes: 1500
     steps:
       - name: Checkout
         uses: actions/checkout@v7
+        with:
+          ref: main
+          persist-credentials: false
 
       - name: Run blocking soak
         env:
           TNG_HOST_URL: ${{ inputs.soak_url }}
           TNG_API_TOKEN: ${{ secrets.TNG_BACKEND_API_TOKEN }}
+          TNG_PROTECTED_TARGET_ALLOWED_ORIGINS: ${{ vars.TNG_PROTECTED_TARGET_ALLOWED_ORIGINS || vars.TNG_BACKEND_API_ALLOWED_ORIGINS }}
           TNG_CONTAINER: ${{ inputs.soak_container }}
           SOAK_DURATION_SECONDS: "86400"
           SOAK_INTERVAL_SECONDS: "60"

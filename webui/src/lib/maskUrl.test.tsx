@@ -1,22 +1,38 @@
 import { describe, expect, it } from 'vitest'
-import { maskAnnounceUrl } from './maskUrl'
+import { maskAnnounceUrl, redactUrlForDisplay } from './maskUrl'
 
 describe('maskAnnounceUrl', () => {
-  it('masks credential query parameters while preserving ordinary values', () => {
+  it('shows only the HTTP tracker origin despite userinfo, path, query, and fragment secrets', () => {
     const masked = maskAnnounceUrl(
-      'https://tracker.example/announce?passkey=abc123&source=client',
+      'https://user:auth-secret@tracker.example/short-passkey/announce?signature=query-secret#fragment-secret',
     )
 
-    expect(masked).toContain('passkey=••••••••')
-    expect(masked).toContain('source=client')
-    expect(masked).not.toContain('abc123')
+    expect(masked).toBe('https://tracker.example/…')
+    for (const secret of ['user', 'auth-secret', 'short-passkey', 'query-secret', 'fragment-secret']) {
+      expect(masked).not.toContain(secret)
+    }
   })
 
-  it('masks opaque path credentials without hiding the host', () => {
-    const masked = maskAnnounceUrl(
-      'https://tracker.example/ABC1234567890def/announce',
+  it('shows UDP tracker origins and fails closed for unsupported or malformed URLs', () => {
+    expect(maskAnnounceUrl('udp://user:password@tracker.example:6969/key/announce?sig=secret'))
+      .toBe('udp://tracker.example:6969/…')
+    expect(maskAnnounceUrl('magnet:?xt=urn:btih:secret')).toBe('[redacted URL]')
+    expect(maskAnnounceUrl('not a URL with passkey=secret')).toBe('[redacted URL]')
+  })
+
+  it('redacts all endpoint details while retaining a valid HTTP(S) origin', () => {
+    const redacted = redactUrlForDisplay(
+      'https://user:auth-secret@hooks.example/api/webhooks/123/opaque-token?signature=query-secret#fragment-secret',
     )
 
-    expect(masked).toBe('https://tracker.example/••••••••/announce')
+    expect(redacted).toBe('https://hooks.example/…')
+    for (const secret of ['user', 'auth-secret', 'opaque-token', 'query-secret', 'fragment-secret']) {
+      expect(redacted).not.toContain(secret)
+    }
+  })
+
+  it('fails closed for malformed and non-HTTP(S) endpoint strings', () => {
+    expect(redactUrlForDisplay('not a URL with credential=secret')).toBe('[redacted URL]')
+    expect(redactUrlForDisplay('ftp://files.example/private')).toBe('[redacted URL]')
   })
 })

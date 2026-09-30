@@ -3,7 +3,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::SocketAddr;
 use std::ops::{Deref, DerefMut};
 use std::sync::Arc;
-use std::sync::Mutex;
+use std::sync::{Mutex, MutexGuard};
 
 use tokio::sync::Notify;
 
@@ -63,6 +63,11 @@ impl RegistryRecord {
 pub struct SessionRegistry {
     /// Keyed by hex infohash for O(1) lookup by hash.
     by_hash: HashMap<String, TorrentHandle>,
+    /// Pure-v2 torrents are keyed durably by 32-byte hashes but present only
+    /// their 20-byte prefix in peer handshakes. Keep that reverse lookup
+    /// incremental so an unrecognized inbound handshake cannot scan the
+    /// entire registry.
+    v2_by_wire_hash: HashMap<String, Vec<TorrentHandle>>,
     entries: HashMap<TorrentHandle, RegistryRecord>,
     /// Monotonic generation for snapshot consumers. Mutable access advances
     /// this when the guard is actually dereferenced mutably; callers therefore
@@ -124,6 +129,20 @@ pub const MAX_BANNED_PEERS: usize = 65_536;
 /// Kept a power of two so shard assignment is a cheap mask instead of a
 /// modulo.
 const SNAPSHOT_SHARDS: usize = 64;
+
+/// Snapshot mutexes guard only derived projections. If a panic poisons one,
+/// its revision check or explicit invalidation will force a rebuild; do not
+/// turn that recoverable cache state into a process-wide API panic.
+fn lock_projection_cache<T>(cache: &Mutex<T>) -> MutexGuard<'_, T> {
+    match cache.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => {
+            let guard = poisoned.into_inner();
+            cache.clear_poison();
+            guard
+        }
+    }
+}
 
 /// Deterministic, stable shard assignment for a canonical info hash. Uses an
 /// explicit FNV-1a instead of `std`'s `DefaultHasher` because shard
@@ -218,6 +237,13 @@ fn canonical_info_hash(info_hash: &str) -> String {
     } else {
         info_hash.to_owned()
     }
+}
+
+fn v2_wire_hash_prefix(info_hash: &str) -> Option<String> {
+    if info_hash.len() != 64 || !info_hash.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return None;
+    }
+    Some(info_hash[..40].to_ascii_lowercase())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -345,6 +371,12 @@ impl Drop for SessionRegistryEntryMut<'_> {
         if !self.touched {
             return;
         }
+        // The info hash is the registry's identity key and also indexes v2
+        // wire-prefix lookup. Keep it immutable even though the compatibility
+        // guard exposes the rest of TorrentEntry through DerefMut.
+        if self.entry.info_hash != self.info_hash {
+            self.entry.info_hash.clone_from(&self.info_hash);
+        }
         let after = EntryContribution::from_entry(self.entry);
         self.aggregate.apply_delta(self.before, after);
         *self.revision = self.revision.wrapping_add(1);
@@ -361,10 +393,7 @@ impl Drop for SessionRegistryEntryMut<'_> {
         // add/remove/category mutations. Invalidate the projection cache at
         // the same boundary; otherwise snapshot consumers can keep seeing
         // the pre-mutation entry even though its revision has advanced.
-        self.snapshot_cache
-            .lock()
-            .expect("session snapshot cache mutex poisoned")
-            .take();
+        lock_projection_cache(self.snapshot_cache).take();
         self.change_notify.notify_waiters();
     }
 }
@@ -373,6 +402,7 @@ impl SessionRegistry {
     pub fn new() -> Self {
         SessionRegistry {
             by_hash: HashMap::new(),
+            v2_by_wire_hash: HashMap::new(),
             entries: HashMap::new(),
             revision: 0,
             shard_revisions: vec![0; SNAPSHOT_SHARDS],
@@ -415,11 +445,15 @@ impl SessionRegistry {
         if self.by_hash.contains_key(&info_hash) {
             return Err(SessionError::AlreadyExists(info_hash));
         }
+        let v2_wire_prefix = v2_wire_hash_prefix(&info_hash);
         let handle = match &record {
             RegistryRecord::Active(entry) => entry.handle,
             RegistryRecord::Dormant(entry) => entry.handle,
         };
         self.by_hash.insert(info_hash.clone(), handle);
+        if let Some(prefix) = v2_wire_prefix {
+            self.v2_by_wire_hash.entry(prefix).or_default().push(handle);
+        }
         self.stats.add_contribution(record.contribution());
         match &record {
             RegistryRecord::Active(_) => self.active_count += 1,
@@ -439,6 +473,23 @@ impl SessionRegistry {
             .ok_or_else(|| SessionError::NotFound(info_hash.clone()))?;
         let record = self.entries.remove(&handle).unwrap();
         let info_hash = record.info_hash().to_owned();
+        if let Some(prefix) = v2_wire_hash_prefix(&info_hash) {
+            let remove_prefix = if let Some(handles) = self.v2_by_wire_hash.get_mut(&prefix) {
+                let previous_len = handles.len();
+                handles.retain(|candidate| *candidate != handle);
+                debug_assert!(
+                    handles.len() < previous_len,
+                    "v2 prefix index lost a handle"
+                );
+                handles.is_empty()
+            } else {
+                debug_assert!(false, "v2 prefix index entry is missing");
+                false
+            };
+            if remove_prefix {
+                self.v2_by_wire_hash.remove(&prefix);
+            }
+        }
         let removed_entry = record.to_entry();
         self.stats.remove_contribution(record.contribution());
         match &record {
@@ -486,6 +537,29 @@ impl SessionRegistry {
         self.entries.get(handle).map(RegistryRecord::to_entry)
     }
 
+    /// Check whether a canonical or case-insensitive hex infohash is present
+    /// without cloning its active or dormant projection.
+    pub fn contains_hash(&self, info_hash: &str) -> bool {
+        self.by_hash.contains_key(&canonical_info_hash(info_hash))
+    }
+
+    /// Return at most two pure-v2 identities matching a 20-byte wire hash.
+    /// Two results are sufficient for the caller to fail closed on an
+    /// ambiguous truncated-hash collision.
+    pub fn find_v2_wire_hash_matches(&self, wire_hash: &str) -> Vec<String> {
+        let prefix = canonical_info_hash(wire_hash);
+        if prefix.len() != 40 || !prefix.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            return Vec::new();
+        }
+        self.v2_by_wire_hash
+            .get(&prefix)
+            .into_iter()
+            .flat_map(|handles| handles.iter().take(2))
+            .filter_map(|handle| self.entries.get(handle))
+            .map(|record| record.info_hash().to_owned())
+            .collect()
+    }
+
     /// Report whether a torrent is currently held in the compact dormant
     /// representation.  Persistence rollback paths use this to restore the
     /// representation that existed before a failed mutable update; assigning
@@ -504,10 +578,7 @@ impl SessionRegistry {
     /// shared by read-heavy handlers instead of cloning the registry on every
     /// request. Dormant records are expanded only while refreshing this view.
     pub fn snapshot(&self) -> SessionSnapshot {
-        let mut cache = self
-            .snapshot_cache
-            .lock()
-            .expect("session snapshot cache mutex poisoned");
+        let mut cache = lock_projection_cache(&self.snapshot_cache);
         if let Some((revision, entries)) = cache.as_ref() {
             if *revision == self.revision {
                 return SessionSnapshot {
@@ -550,9 +621,7 @@ impl SessionRegistry {
     /// shard. Rebuilding walks only `shard_members[shard]`, not the whole
     /// registry.
     fn shard_snapshot(&self, shard: usize) -> Arc<Vec<TorrentEntry>> {
-        let mut cache = self.shard_snapshot_cache[shard]
-            .lock()
-            .expect("session shard snapshot cache mutex poisoned");
+        let mut cache = lock_projection_cache(&self.shard_snapshot_cache[shard]);
         let current_revision = self.shard_revisions[shard];
         if let Some((revision, entries)) = cache.as_ref() {
             if *revision == current_revision {
@@ -583,9 +652,7 @@ impl SessionRegistry {
     /// shard's cache entry was reused (same allocation) rather than rebuilt.
     #[cfg(test)]
     fn shard_snapshot_ptr(&self, shard: usize) -> Option<*const Vec<TorrentEntry>> {
-        self.shard_snapshot_cache[shard]
-            .lock()
-            .expect("session shard snapshot cache mutex poisoned")
+        lock_projection_cache(&self.shard_snapshot_cache[shard])
             .as_ref()
             .map(|(_, entries)| Arc::as_ptr(entries))
     }
@@ -883,10 +950,7 @@ impl SessionRegistry {
     }
 
     fn bump_revision(&mut self, info_hash: String, removed: bool) {
-        self.snapshot_cache
-            .lock()
-            .expect("session snapshot cache mutex poisoned")
-            .take();
+        lock_projection_cache(&self.snapshot_cache).take();
         self.revision = self.revision.wrapping_add(1);
         let shard = &mut self.shard_revisions[snapshot_shard(&info_hash)];
         *shard = shard.wrapping_add(1);
@@ -926,6 +990,37 @@ mod tests {
     }
 
     #[test]
+    fn poisoned_snapshot_cache_recovers_from_registry_projection() {
+        let mut reg = SessionRegistry::new();
+        reg.add(entry("aaa")).unwrap();
+        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = reg.snapshot_cache.lock().unwrap();
+            panic!("inject snapshot-cache panic while locked");
+        }));
+        assert!(panic.is_err());
+
+        let snapshot = reg.snapshot();
+        assert_eq!(snapshot.len(), 1);
+        assert!(!reg.snapshot_cache.is_poisoned());
+    }
+
+    #[test]
+    fn poisoned_shard_cache_is_rebuilt_on_snapshot_read() {
+        let mut reg = SessionRegistry::new();
+        reg.add(entry("aaa")).unwrap();
+        let shard = SessionRegistry::shard_of("aaa");
+        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = reg.shard_snapshot_cache[shard].lock().unwrap();
+            panic!("inject shard-cache panic while locked");
+        }));
+        assert!(panic.is_err());
+
+        let snapshot = reg.snapshot();
+        assert_eq!(snapshot.len(), 1);
+        assert!(!reg.shard_snapshot_cache[shard].is_poisoned());
+    }
+
+    #[test]
     fn valid_hex_infohashes_are_canonical_and_case_insensitive() {
         let mut reg = SessionRegistry::new();
         let uppercase = "ABCDEF0123456789ABCDEF0123456789ABCDEF01";
@@ -938,6 +1033,46 @@ mod tests {
         assert!(reg.get(&uppercase.to_ascii_lowercase()).is_some());
         assert!(reg.get_mut(&uppercase.to_ascii_lowercase()).is_some());
         assert!(reg.remove(uppercase).is_ok());
+    }
+
+    #[test]
+    fn v2_wire_hash_index_tracks_collisions_demotion_and_removal() {
+        let mut reg = SessionRegistry::new();
+        let prefix = "ab".repeat(20);
+        let first = format!("{prefix}{}", "01".repeat(12));
+        let second = format!("{prefix}{}", "02".repeat(12));
+
+        reg.add(entry(&first)).unwrap();
+        assert_eq!(reg.find_v2_wire_hash_matches(&prefix), vec![first.clone()]);
+        reg.add(entry(&second)).unwrap();
+        assert_eq!(reg.find_v2_wire_hash_matches(&prefix).len(), 2);
+        assert!(reg.demote(&second).unwrap());
+        assert_eq!(reg.find_v2_wire_hash_matches(&prefix).len(), 2);
+
+        reg.remove(&first).unwrap();
+        assert_eq!(reg.find_v2_wire_hash_matches(&prefix), vec![second.clone()]);
+        assert!(reg.contains_hash(&second.to_ascii_uppercase()));
+        reg.remove(&second).unwrap();
+        assert!(reg.find_v2_wire_hash_matches(&prefix).is_empty());
+        assert!(reg.find_v2_wire_hash_matches("not-a-wire-hash").is_empty());
+    }
+
+    #[test]
+    fn mutable_entry_cannot_change_registry_identity_or_v2_index() {
+        let mut reg = SessionRegistry::new();
+        let original = "a".repeat(64);
+        let replacement = "b".repeat(64);
+        reg.add(entry(&original)).unwrap();
+
+        reg.get_mut(&original).unwrap().info_hash = replacement.clone();
+
+        assert!(reg.contains_hash(&original));
+        assert!(!reg.contains_hash(&replacement));
+        assert_eq!(
+            reg.find_v2_wire_hash_matches(&original[..40]),
+            vec![original.clone()]
+        );
+        assert!(reg.find_v2_wire_hash_matches(&replacement[..40]).is_empty());
     }
 
     #[test]

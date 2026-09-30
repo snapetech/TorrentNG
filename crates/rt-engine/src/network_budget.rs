@@ -1,8 +1,8 @@
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicU16, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
-use tokio::sync::{Notify, Semaphore};
+use tokio::sync::{mpsc, oneshot, Notify, Semaphore};
 // tokio's Instant, not std's: it respects the paused/mockable clock that
 // `#[tokio::test(start_paused = true)]` and `tokio::time::advance()` use.
 // Using std::time::Instant here would make the refill calculation below see
@@ -22,6 +22,14 @@ pub(crate) struct GlobalNetworkBudget {
     peer_slots: Arc<Semaphore>,
     download: Arc<SharedRateLimiter>,
     upload: Arc<SharedRateLimiter>,
+    listen_port: Arc<AtomicU16>,
+    listener_rebind_tx: mpsc::Sender<PeerListenerRebindRequest>,
+    listener_rebind_rx: Arc<Mutex<Option<mpsc::Receiver<PeerListenerRebindRequest>>>>,
+}
+
+pub(crate) struct PeerListenerRebindRequest {
+    pub(crate) port: u16,
+    pub(crate) reply: oneshot::Sender<Result<(), String>>,
 }
 
 impl GlobalNetworkBudget {
@@ -30,11 +38,55 @@ impl GlobalNetworkBudget {
         download_limit_bytes_per_sec: Option<u64>,
         upload_limit_bytes_per_sec: Option<u64>,
     ) -> Self {
+        let (listener_rebind_tx, listener_rebind_rx) = mpsc::channel(4);
         Self {
             peer_slots: Arc::new(Semaphore::new(max_peers.max(1))),
             download: Arc::new(SharedRateLimiter::new(download_limit_bytes_per_sec)),
             upload: Arc::new(SharedRateLimiter::new(upload_limit_bytes_per_sec)),
+            listen_port: Arc::new(AtomicU16::new(0)),
+            listener_rebind_tx,
+            listener_rebind_rx: Arc::new(Mutex::new(Some(listener_rebind_rx))),
         }
+    }
+
+    pub(crate) fn listen_port(&self) -> u16 {
+        self.listen_port.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn set_listen_port(&self, port: u16) {
+        self.listen_port.store(port, Ordering::Release);
+    }
+
+    pub(crate) fn listen_port_shared(&self) -> Arc<AtomicU16> {
+        Arc::clone(&self.listen_port)
+    }
+
+    pub(crate) fn take_listener_rebind_receiver(
+        &self,
+    ) -> Option<mpsc::Receiver<PeerListenerRebindRequest>> {
+        self.listener_rebind_rx
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take()
+    }
+
+    pub(crate) async fn rebind_peer_listener(&self, port: u16) -> Result<(), String> {
+        if port == 0 {
+            return Err("listen_port must be between 1 and 65535".to_owned());
+        }
+        let (reply, response) = oneshot::channel();
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            self.listener_rebind_tx
+                .send(PeerListenerRebindRequest { port, reply }),
+        )
+        .await
+        .map_err(|_| "peer listener rebind queue timed out".to_owned())?
+        .map_err(|_| "peer listener is not running".to_owned())?;
+        tokio::time::timeout(Duration::from_secs(10), response)
+            .await
+            .map_err(|_| "peer listener rebind timed out".to_owned())?
+            .map_err(|_| "peer listener dropped rebind reply".to_owned())?
     }
 
     #[allow(dead_code)]
@@ -133,12 +185,28 @@ impl SharedRateLimiter {
         }
     }
 
+    fn lock_state(&self) -> MutexGuard<'_, RateState> {
+        match self.state.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => {
+                // Keep the existing token balance and rate limit. Resetting
+                // this state would grant an attacker a fresh burst.
+                let guard = poisoned.into_inner();
+                self.state.clear_poison();
+                guard
+            }
+        }
+    }
+
     fn set_limit(&self, limit: Option<u64>) {
         let limit = limit.filter(|limit| *limit > 0);
+        let mut state = self.lock_state();
+        if state.limit_bytes_per_sec == limit {
+            return;
+        }
         let capacity = limit
             .map(|limit| limit.max(MAX_INITIAL_BURST_BYTES))
             .unwrap_or(u64::MAX);
-        let mut state = self.state.lock().expect("network budget mutex poisoned");
         state.limit_bytes_per_sec = limit;
         state.tokens = capacity;
         state.updated_at = Instant::now();
@@ -154,7 +222,7 @@ impl SharedRateLimiter {
         let mut limit_generation = self.limit_changed.generation();
         loop {
             let wait = {
-                let mut state = self.state.lock().expect("network budget mutex poisoned");
+                let mut state = self.lock_state();
                 let Some(limit) = state.limit_bytes_per_sec else {
                     return;
                 };
@@ -224,7 +292,7 @@ impl SharedRateLimiter {
                 return false;
             }
             let wait = {
-                let mut state = self.state.lock().expect("network budget mutex poisoned");
+                let mut state = self.lock_state();
                 let Some(limit) = state.limit_bytes_per_sec else {
                     return true;
                 };
@@ -346,6 +414,44 @@ mod tests {
         assert!(!waiter.is_finished());
         limiter.set_limit(None);
         waiter.await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn reapplying_same_limit_does_not_restore_spent_burst_tokens() {
+        let limiter = Arc::new(SharedRateLimiter::new(Some(1)));
+        limiter.acquire(MAX_INITIAL_BURST_BYTES).await;
+
+        // Runtime API updates may persist and reapply an unchanged effective
+        // limit. That is not a grant of a new token-bucket burst.
+        limiter.set_limit(Some(1));
+        let waiter_limiter = Arc::clone(&limiter);
+        let waiter = tokio::spawn(async move { waiter_limiter.acquire(1).await });
+        tokio::task::yield_now().await;
+        assert!(!waiter.is_finished());
+
+        tokio::time::advance(Duration::from_secs(1)).await;
+        waiter.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn poisoned_rate_limiter_preserves_tokens_and_recovers() {
+        let limiter = Arc::new(SharedRateLimiter::new(Some(1_000_000)));
+        limiter.acquire(1_000).await;
+        let tokens_before_poison = limiter.lock_state().tokens;
+
+        let poisoner = Arc::clone(&limiter);
+        assert!(std::thread::spawn(move || {
+            let _guard = poisoner.state.lock().unwrap();
+            panic!("poison the shared network token bucket");
+        })
+        .join()
+        .is_err());
+        assert!(limiter.state.is_poisoned());
+
+        limiter.set_limit(Some(1_000_000));
+        assert_eq!(limiter.lock_state().tokens, tokens_before_poison);
+        assert!(!limiter.state.is_poisoned());
+        limiter.acquire(1).await;
     }
 
     #[test]

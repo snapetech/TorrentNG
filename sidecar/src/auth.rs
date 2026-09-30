@@ -1,20 +1,107 @@
 use axum::{
     body::Body,
-    extract::State,
-    http::{Request, StatusCode},
+    extract::{ConnectInfo, State},
+    http::{header, HeaderMap, HeaderValue, Method, Request, StatusCode},
     middleware::Next,
     response::{IntoResponse, Response},
 };
 use hmac::{Hmac, KeyInit, Mac};
 use rand::Rng;
 use sha2::Sha256;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::{
+    collections::HashMap,
+    net::{IpAddr, SocketAddr},
+    sync::Arc,
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+};
 use subtle::ConstantTimeEq;
+use tokio::sync::Mutex;
 
 use crate::api::server::AppState;
 
 type SessionMac = Hmac<Sha256>;
 const SESSION_TTL_SECS: u64 = 24 * 60 * 60;
+const MAX_LOGIN_ATTEMPTS: u8 = 10;
+const LOGIN_ATTEMPT_WINDOW: Duration = Duration::from_secs(60);
+const MAX_TRACKED_LOGIN_CLIENTS: usize = 4_096;
+
+/// Bounds unauthenticated login submissions by the TCP peer address. When
+/// ConnectInfo is absent (for embedded/test routers), those requests share a
+/// single bounded bucket instead of silently bypassing the control.
+#[derive(Clone, Default)]
+pub struct LoginAttemptLimiter {
+    state: Arc<Mutex<LoginAttemptState>>,
+}
+
+#[derive(Default)]
+struct LoginAttemptState {
+    clients: HashMap<Option<IpAddr>, LoginAttemptWindow>,
+}
+
+struct LoginAttemptWindow {
+    started: Instant,
+    attempts: u8,
+}
+
+impl LoginAttemptLimiter {
+    /// Reserve one login submission, returning whole seconds until retry when
+    /// this peer has exhausted its window.
+    pub(crate) async fn begin_attempt(&self, client: Option<IpAddr>) -> Result<(), u64> {
+        self.begin_attempt_at(client, Instant::now()).await
+    }
+
+    async fn begin_attempt_at(&self, client: Option<IpAddr>, now: Instant) -> Result<(), u64> {
+        let mut state = self.state.lock().await;
+        if let Some(window) = state.clients.get_mut(&client) {
+            let elapsed = now.saturating_duration_since(window.started);
+            if elapsed >= LOGIN_ATTEMPT_WINDOW {
+                *window = LoginAttemptWindow {
+                    started: now,
+                    attempts: 1,
+                };
+                return Ok(());
+            }
+            if window.attempts >= MAX_LOGIN_ATTEMPTS {
+                let remaining = LOGIN_ATTEMPT_WINDOW.saturating_sub(elapsed);
+                let seconds = remaining
+                    .as_secs()
+                    .saturating_add(u64::from(remaining.subsec_nanos() != 0))
+                    .max(1);
+                return Err(seconds);
+            }
+            window.attempts += 1;
+            return Ok(());
+        }
+
+        if state.clients.len() >= MAX_TRACKED_LOGIN_CLIENTS {
+            state.clients.retain(|_, window| {
+                now.saturating_duration_since(window.started) < LOGIN_ATTEMPT_WINDOW
+            });
+            if state.clients.len() >= MAX_TRACKED_LOGIN_CLIENTS {
+                if let Some(oldest) = state
+                    .clients
+                    .iter()
+                    .min_by_key(|(_, window)| window.started)
+                    .map(|(client, _)| *client)
+                {
+                    state.clients.remove(&oldest);
+                }
+            }
+        }
+        state.clients.insert(
+            client,
+            LoginAttemptWindow {
+                started: now,
+                attempts: 1,
+            },
+        );
+        Ok(())
+    }
+
+    pub(crate) async fn clear(&self, client: Option<IpAddr>) {
+        self.state.lock().await.clients.remove(&client);
+    }
+}
 
 /// Tower middleware: require a valid Bearer token or signed session cookie.
 /// Health remains public for orchestrator probes; metrics and control-plane
@@ -42,15 +129,20 @@ pub async fn require_auth(
         return next.run(req).await;
     }
 
-    // If no API tokens configured, allow everything (development / no-auth mode)
+    // No-token mode is intended for loopback development and non-browser
+    // clients. It still needs browser-origin checks: loopback-only does not
+    // prevent a hostile website from posting cookie-free forms to localhost,
+    // or opening a WebSocket and reading the event stream.
     if state.cfg.auth.api_tokens.is_empty() {
-        return next.run(req).await;
-    }
-
-    // A reverse proxy may authenticate the user and pass that decision over a
-    // loopback-only hop. Config validation rejects this mode on a non-loopback
-    // listener, so a client cannot spoof the header over a public socket.
-    if state.cfg.auth.trust_proxy_header && trusted_proxy_user(&req) {
+        if (path == "/ws" || (is_mutating(&req) && has_browser_request_headers(req.headers())))
+            && !csrf_request_allowed(req.headers())
+        {
+            return (
+                StatusCode::FORBIDDEN,
+                "cross-origin browser request rejected",
+            )
+                .into_response();
+        }
         return next.run(req).await;
     }
 
@@ -67,6 +159,22 @@ pub async fn require_auth(
         return next.run(req).await;
     }
 
+    // A reverse proxy may authenticate the user and pass that decision over a
+    // loopback-only hop. This identity is ambient browser authentication, so
+    // state changes and the private event stream still require same-origin
+    // evidence. Config validation prevents clients from spoofing the header
+    // over a public socket.
+    if state.cfg.auth.trust_proxy_header && trusted_proxy_user(&req) {
+        if (is_mutating(&req) || path == "/ws") && !csrf_request_allowed(req.headers()) {
+            return (
+                StatusCode::FORBIDDEN,
+                "cross-site authenticated request rejected",
+            )
+                .into_response();
+        }
+        return next.run(req).await;
+    }
+
     // Check the browser/qBit session cookie. qBit login issues this cookie when
     // the submitted username or password matches a configured API token.
     if cookie_token(&state, &req).is_some_and(|token| {
@@ -77,7 +185,12 @@ pub async fn require_auth(
             .iter()
             .any(|allowed| tokens_match(allowed, &token))
     }) {
-        if is_mutating(&req) && !csrf_request_allowed(req.headers()) {
+        // A cookie-authenticated WebSocket GET can expose the same private
+        // event stream as an API read. Browsers attach cookies to same-site
+        // cross-origin WebSocket handshakes, so the ordinary safe-method
+        // exemption would permit cross-origin event reads from a sibling
+        // subdomain. Require same-origin evidence for this route as well.
+        if (is_mutating(&req) || path == "/ws") && !csrf_request_allowed(req.headers()) {
             return (StatusCode::FORBIDDEN, "cross-site cookie mutation rejected").into_response();
         }
         return next.run(req).await;
@@ -86,6 +199,29 @@ pub async fn require_auth(
     // Only the documented login/logout endpoints are public. Do not make an
     // accidentally added future auth route public by prefix matching.
     if is_public_auth_path(&path) {
+        if is_mutating(&req)
+            && has_browser_request_headers(req.headers())
+            && !csrf_request_allowed(req.headers())
+        {
+            return (
+                StatusCode::FORBIDDEN,
+                "cross-origin browser authentication request rejected",
+            )
+                .into_response();
+        }
+        if is_public_login_path(&path) && req.method() == Method::POST {
+            let peer_ip = peer_ip(&req);
+            if let Err(retry_after_secs) = state.login_attempt_limiter.begin_attempt(peer_ip).await
+            {
+                let mut response = (StatusCode::TOO_MANY_REQUESTS, "Fails.").into_response();
+                response.headers_mut().insert(
+                    header::RETRY_AFTER,
+                    HeaderValue::from_str(&retry_after_secs.to_string())
+                        .expect("integer Retry-After is a valid header value"),
+                );
+                return response;
+            }
+        }
         return next.run(req).await;
     }
 
@@ -127,11 +263,17 @@ pub(crate) fn tokens_match(allowed: &str, candidate: &str) -> bool {
 }
 
 fn bearer_token(req: &Request<Body>) -> Option<String> {
-    req.headers()
+    let mut parts = req
+        .headers()
         .get("Authorization")
-        .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.strip_prefix("Bearer "))
-        .map(str::to_owned)
+        .and_then(|value| value.to_str().ok())?
+        .split_whitespace();
+    let scheme = parts.next()?;
+    let token = parts.next()?;
+    if parts.next().is_some() || !scheme.eq_ignore_ascii_case("Bearer") {
+        return None;
+    }
+    Some(token.to_owned())
 }
 
 fn trusted_proxy_user(req: &Request<Body>) -> bool {
@@ -142,6 +284,12 @@ fn trusted_proxy_user(req: &Request<Body>) -> bool {
             let value = value.trim();
             !value.is_empty() && value.len() <= 256 && !value.chars().any(char::is_control)
         })
+}
+
+fn peer_ip(req: &Request<Body>) -> Option<IpAddr> {
+    req.extensions()
+        .get::<ConnectInfo<SocketAddr>>()
+        .map(|ConnectInfo(addr)| addr.ip())
 }
 
 fn cookie_token(state: &AppState, req: &Request<Body>) -> Option<String> {
@@ -155,7 +303,13 @@ fn cookie_token(state: &AppState, req: &Request<Body>) -> Option<String> {
         if let Some(secret) = state.cfg.auth.secret_key.as_deref() {
             return verify_signed_session(secret, &state.cfg.auth.api_tokens, &decoded);
         }
-        Some(decoded)
+        state
+            .cfg
+            .auth
+            .api_tokens
+            .iter()
+            .find(|token| tokens_match(token, &decoded))
+            .cloned()
     })
 }
 
@@ -204,13 +358,20 @@ fn is_mutating(req: &Request<Body>) -> bool {
     )
 }
 
+fn has_browser_request_headers(headers: &HeaderMap) -> bool {
+    headers.contains_key("Origin")
+        || headers.contains_key("Referer")
+        || headers.contains_key("Sec-Fetch-Site")
+}
+
 fn csrf_request_allowed(headers: &axum::http::HeaderMap) -> bool {
-    if headers
-        .get("Sec-Fetch-Site")
-        .and_then(|value| value.to_str().ok())
-        .is_some_and(|value| value.eq_ignore_ascii_case("cross-site"))
-    {
-        return false;
+    if let Some(value) = headers.get("Sec-Fetch-Site") {
+        if !value
+            .to_str()
+            .is_ok_and(|value| value.eq_ignore_ascii_case("same-origin"))
+        {
+            return false;
+        }
     }
     // Fail closed rather than open: a mutating cookie-authenticated request
     // needs positive same-origin evidence. A missing Host header, or an
@@ -290,6 +451,13 @@ fn is_public_auth_path(path: &str) -> bool {
     )
 }
 
+fn is_public_login_path(path: &str) -> bool {
+    matches!(
+        path,
+        "/api/v1/auth/login" | "/api/qb/v2/auth/login" | "/api/v2/auth/login"
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -319,6 +487,21 @@ mod tests {
     #[test]
     fn tokens_match_rejects_different_length_secrets() {
         assert!(!tokens_match("short", "much-longer-token"));
+    }
+
+    #[test]
+    fn bearer_scheme_is_case_insensitive_but_credential_shape_is_exact() {
+        let request = Request::builder()
+            .header("Authorization", "bearer opaque-token")
+            .body(Body::empty())
+            .unwrap();
+        assert_eq!(bearer_token(&request).as_deref(), Some("opaque-token"));
+
+        let request = Request::builder()
+            .header("Authorization", "Bearer opaque-token extra")
+            .body(Body::empty())
+            .unwrap();
+        assert!(bearer_token(&request).is_none());
     }
 
     #[test]
@@ -353,6 +536,16 @@ mod tests {
     }
 
     #[test]
+    fn csrf_rejects_same_site_metadata_even_with_matching_authority() {
+        let h = headers(&[
+            ("Host", "example.com"),
+            ("Origin", "https://example.com"),
+            ("Sec-Fetch-Site", "same-site"),
+        ]);
+        assert!(!csrf_request_allowed(&h));
+    }
+
+    #[test]
     fn csrf_fails_closed_without_origin_or_referer() {
         // No Origin/Referer is not proof of same-origin; some clients simply
         // omit both. Absent evidence must not be treated as a same-origin pass.
@@ -364,5 +557,60 @@ mod tests {
     fn csrf_fails_closed_without_host() {
         let h = headers(&[("Origin", "https://example.com")]);
         assert!(!csrf_request_allowed(&h));
+    }
+
+    #[test]
+    fn public_login_path_match_is_exact() {
+        assert!(is_public_login_path("/api/v1/auth/login"));
+        assert!(is_public_login_path("/api/qb/v2/auth/login"));
+        assert!(is_public_login_path("/api/v2/auth/login"));
+        assert!(!is_public_login_path("/api/v2/auth/logout"));
+        assert!(!is_public_login_path("/api/v2/auth/login/extra"));
+    }
+
+    #[tokio::test]
+    async fn login_attempt_limiter_is_per_peer_and_expires() {
+        let limiter = LoginAttemptLimiter::default();
+        let first: IpAddr = "192.0.2.10".parse().unwrap();
+        let second: IpAddr = "192.0.2.11".parse().unwrap();
+        let now = Instant::now();
+
+        for _ in 0..MAX_LOGIN_ATTEMPTS {
+            assert!(limiter.begin_attempt_at(Some(first), now).await.is_ok());
+        }
+        assert_eq!(
+            limiter.begin_attempt_at(Some(first), now).await,
+            Err(LOGIN_ATTEMPT_WINDOW.as_secs())
+        );
+        assert!(limiter.begin_attempt_at(Some(second), now).await.is_ok());
+        assert!(limiter
+            .begin_attempt_at(Some(first), now + LOGIN_ATTEMPT_WINDOW)
+            .await
+            .is_ok());
+    }
+
+    #[tokio::test]
+    async fn login_attempt_limiter_bounds_tracked_peers() {
+        let limiter = LoginAttemptLimiter::default();
+        let now = Instant::now();
+        {
+            let mut state = limiter.state.lock().await;
+            for address in 0..MAX_TRACKED_LOGIN_CLIENTS as u32 {
+                state.clients.insert(
+                    Some(IpAddr::V4(std::net::Ipv4Addr::from(address))),
+                    LoginAttemptWindow {
+                        started: now,
+                        attempts: 1,
+                    },
+                );
+            }
+        }
+
+        let new_peer = Some(IpAddr::V4("203.0.113.7".parse().unwrap()));
+        assert!(limiter.begin_attempt_at(new_peer, now).await.is_ok());
+        assert_eq!(
+            limiter.state.lock().await.clients.len(),
+            MAX_TRACKED_LOGIN_CLIENTS
+        );
     }
 }

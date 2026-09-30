@@ -31,6 +31,8 @@ capabilities; compatible does not mean every client exposes identical features.
   field coverage, and the remaining cross-client projection gaps.
 - [RELEASE_EVIDENCE.md](RELEASE_EVIDENCE.md) - operator runbook for clearing
   warning rows, enforcing strict readiness, and packaging release evidence.
+- [Release-note fragments](../release-notes/README.md) - contribution and
+  validation rules for the release notes published to GitHub and Discord.
 
 ## Deploy And Operate
 

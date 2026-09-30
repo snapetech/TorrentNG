@@ -1,13 +1,21 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+ROOT="$(realpath -- "$(dirname "${BASH_SOURCE[0]}")/..")"
+# shellcheck source=scripts/curl_policy.sh
+source "$ROOT/scripts/curl_policy.sh"
 COMPOSE_FILE="$ROOT/deploy/interop/compose.yml"
 PUBLIC_TOML="$ROOT/deploy/interop/public-torrents.toml"
-WORKDIR="${INTEROP_WORKDIR:-$ROOT/certification/interop}"
-REPORT_DIR="$ROOT/certification/reports"
 STAMP="$(date -u +%Y%m%dT%H%M%SZ)"
-REPORT="${INTEROP_REPORT:-$REPORT_DIR/interop-matrix-$STAMP.md}"
+WORKDIR_OVERRIDE="${INTEROP_WORKDIR:-}"
+if [[ -n "$WORKDIR_OVERRIDE" && -L "$WORKDIR_OVERRIDE" ]]; then
+  echo "refusing symlink INTEROP_WORKDIR: $WORKDIR_OVERRIDE" >&2
+  exit 2
+fi
+WORKDIR="${WORKDIR_OVERRIDE:-$ROOT/certification/interop-runs/$STAMP-$$}"
+WORKDIR="$(realpath -m -- "$WORKDIR")"
+REPORT_DIR="$ROOT/certification/reports"
+REPORT="${INTEROP_REPORT:-$REPORT_DIR/interop-matrix-$STAMP-$$.md}"
 
 MODE="all"
 TIMEOUT_LOCAL="${INTEROP_LOCAL_TIMEOUT_SECS:-900}"
@@ -16,6 +24,9 @@ PUBLIC_MAX_PARALLEL="${INTEROP_PUBLIC_MAX_PARALLEL:-3}"
 PUBLIC_MIN_RUST_PEERS="${INTEROP_PUBLIC_MIN_RUST_PEERS:-2}"
 KEEP_STACK="${INTEROP_KEEP_STACK:-0}"
 KEEP_PUBLIC_DATA="${INTEROP_KEEP_PUBLIC_DATA:-0}"
+if [[ -n "$WORKDIR_OVERRIDE" && "${INTEROP_REUSE_STACK:-0}" == "1" && -z "${INTEROP_KEEP_PUBLIC_DATA:-}" ]]; then
+  KEEP_PUBLIC_DATA="1"
+fi
 RUST_TOKEN="${INTEROP_RUST_TOKEN:-interop-backend-token-20260904}"
 CURL_MAX_TIME="${INTEROP_CURL_MAX_TIME:-10}"
 EXTENDED_LOCAL="${INTEROP_EXTENDED_LOCAL:-1}"
@@ -70,7 +81,8 @@ Environment:
   INTEROP_EXTENDED_LOCAL=1
   INTEROP_PROTOCOL_LOCAL=1
   INTEROP_PROTOCOL_ONLY=rust-magnet-with-tracker
-  INTEROP_WORKDIR=certification/interop
+  INTEROP_WORKDIR=/path/to/new-or-empty-directory
+  INTEROP_REUSE_STACK=1 requires this workdir's marker; inspected unmarked stacks may set INTEROP_ADOPT_WORKDIR=1
 USAGE
 }
 
@@ -103,6 +115,89 @@ require_cmd() {
     echo "missing required command: $1" >&2
     exit 127
   }
+}
+
+validate_workdir() {
+  local home_path="${HOME:-}" relative_home="" marker="$WORKDIR/.tng-interop-workdir"
+  if [[ "$WORKDIR" == *:* || "$WORKDIR" == *[[:space:]]* ]]; then
+    echo "refusing INTEROP_WORKDIR with a colon or whitespace: $WORKDIR" >&2
+    return 2
+  fi
+  if [[ "$WORKDIR" == "/" || "$WORKDIR" == "$ROOT" || "$WORKDIR" == "$ROOT/certification" ]]; then
+    echo "refusing unsafe INTEROP_WORKDIR: $WORKDIR" >&2
+    return 2
+  fi
+  case "$WORKDIR" in
+    /home|/root|/var|/usr|/etc|/opt|/tmp|/mnt|/media|/srv|/proc|/sys|/dev|/run|/boot|/bin|/sbin|/lib|/lib64|/var/lib|/var/log|/var/cache|/var/tmp)
+      echo "refusing broad INTEROP_WORKDIR: $WORKDIR" >&2
+      return 2
+      ;;
+    /usr/*|/etc/*|/opt/*|/root/*|/var/log/*|/var/cache/*|/var/tmp/*|/var/spool/*|/proc/*|/sys/*|/dev/*|/run/*|/boot/*|/bin/*|/sbin/*|/lib/*|/lib64/*)
+      echo "refusing system INTEROP_WORKDIR: $WORKDIR" >&2
+      return 2
+      ;;
+  esac
+  if [[ "$WORKDIR" == /var/lib/* ]]; then
+    local varlib_app="${WORKDIR#/var/lib/}"
+    varlib_app="${varlib_app%%/*}"
+    case "$varlib_app" in
+      torrentng|torrentngd|rtorrent) ;;
+      *)
+        echo "refusing system INTEROP_WORKDIR: $WORKDIR" >&2
+        return 2
+        ;;
+    esac
+  fi
+  if [[ -n "$home_path" ]]; then
+    home_path="$(realpath -m -- "$home_path")"
+    if [[ "$WORKDIR" == "$home_path" || "$home_path" == "$WORKDIR/"* ]]; then
+      echo "refusing INTEROP_WORKDIR that is or contains the home directory: $WORKDIR" >&2
+      return 2
+    fi
+    relative_home="${WORKDIR#"$home_path"/}"
+    case "$relative_home" in
+      Downloads|Downloads/*|Documents|Documents/*|Desktop|Desktop/*|Pictures|Pictures/*|Music|Music/*|Videos|Videos/*|Public|Public/*)
+        echo "refusing a user-data directory as INTEROP_WORKDIR: $WORKDIR" >&2
+        return 2
+        ;;
+    esac
+  fi
+  if [[ "$WORKDIR" == "$ROOT/certification/interop-runs" ]]; then
+    echo "refusing the shared interop-runs parent as INTEROP_WORKDIR" >&2
+    return 2
+  fi
+  if [[ "$WORKDIR" == "$ROOT/"* && "$WORKDIR" != "$ROOT/certification/interop-runs/"* ]]; then
+    echo "refusing a repository path outside certification/interop-runs as INTEROP_WORKDIR" >&2
+    return 2
+  fi
+  if [[ "${INTEROP_REUSE_STACK:-0}" == "1" ]]; then
+    if [[ -z "$WORKDIR_OVERRIDE" || ! -d "$WORKDIR" ]]; then
+      echo "INTEROP_REUSE_STACK=1 requires an existing explicit INTEROP_WORKDIR" >&2
+      return 2
+    fi
+    if [[ ! -f "$marker" || -L "$marker" || "$(<"$marker")" != "torrentng-interop-workdir-v1" ]]; then
+      if [[ "${INTEROP_ADOPT_WORKDIR:-0}" != "1" ]]; then
+        echo "refusing to reuse an unmarked workdir; set INTEROP_ADOPT_WORKDIR=1 only for an inspected stack" >&2
+        return 2
+      fi
+    fi
+    local symlink_path
+    if ! symlink_path="$(find "$WORKDIR" -type l -print -quit 2>/dev/null)"; then
+      echo "refusing to reuse an interop workdir that cannot be inspected: $WORKDIR" >&2
+      return 2
+    fi
+    if [[ -n "$symlink_path" ]]; then
+      echo "refusing to reuse an interop workdir containing symlinks" >&2
+      return 2
+    fi
+    return 0
+  fi
+  if [[ -e "$WORKDIR" ]]; then
+    if [[ ! -d "$WORKDIR" ]] || [[ -n "$(find "$WORKDIR" -mindepth 1 -maxdepth 1 -print -quit 2>/dev/null)" ]]; then
+      echo "refusing to reset non-empty INTEROP_WORKDIR: $WORKDIR (choose an empty path or set INTEROP_REUSE_STACK=1)" >&2
+      return 2
+    fi
+  fi
 }
 
 validate_protocol_only() {
@@ -153,6 +248,8 @@ host_download_dir() {
 
 prepare_dirs() {
   mkdir -p "$REPORT_DIR" "$WORKDIR"/{artifacts,torrents,fixtures,downloads,logs,watch/rtorrent,config}
+  printf '%s\n' "torrentng-interop-workdir-v1" >"$WORKDIR/.tng-interop-workdir"
+  chmod 600 "$WORKDIR/.tng-interop-workdir"
   for client in "${CLIENTS[@]}"; do
     mkdir -p "$WORKDIR/downloads/$client"
   done
@@ -165,10 +262,11 @@ acquire_interop_lock() {
   if [[ "${INTEROP_NO_LOCK:-0}" == "1" ]]; then
     return 0
   fi
-  mkdir -p "$WORKDIR"
-  exec 9>"$WORKDIR/interop.lock"
+  local lock_path="$ROOT/certification/.interop-matrix.lock"
+  mkdir -p "$(dirname "$lock_path")"
+  exec 9>"$lock_path"
   if ! flock -w "${INTEROP_LOCK_TIMEOUT_SECS:-1800}" 9; then
-    echo "timed out waiting for interop lock at $WORKDIR/interop.lock" >&2
+    echo "timed out waiting for interop lock at $lock_path" >&2
     return 1
   fi
 }
@@ -419,13 +517,15 @@ copy_torrent_to_rtorrent_watch() {
 }
 
 qb_login() {
-  local pass
-  if curl --max-time "$CURL_MAX_TIME" -fsS -H 'Host: localhost:8080' -c "$WORKDIR/artifacts/qbit.cookie" -d 'username=admin&password=adminadmin' "$(client_url qbittorrent)/api/v2/auth/login" >/dev/null; then
-    return 0
+  local username="${INTEROP_QBITTORRENT_USERNAME:-admin}"
+  local pass="${INTEROP_QBITTORRENT_PASSWORD:-}"
+  if [[ -z "$pass" ]]; then
+    pass="$(compose logs --no-color qbittorrent 2>/dev/null | sed -n 's/.*temporary password is provided for this session: //p' | tail -n1)"
   fi
-  pass="$(compose logs --no-color qbittorrent 2>/dev/null | sed -n 's/.*temporary password is provided for this session: //p' | tail -n1)"
   [[ -n "$pass" ]] || return 1
-  curl --max-time "$CURL_MAX_TIME" -fsS -H 'Host: localhost:8080' -c "$WORKDIR/artifacts/qbit.cookie" --data-urlencode 'username=admin' --data-urlencode "password=$pass" "$(client_url qbittorrent)/api/v2/auth/login" >/dev/null
+  curl --max-time "$CURL_MAX_TIME" -fsS -H 'Host: localhost:8080' -c "$WORKDIR/artifacts/qbit.cookie" \
+    --data-urlencode "username=$username" --data-urlencode "password=$pass" \
+    "$(client_url qbittorrent)/api/v2/auth/login" >/dev/null
 }
 
 add_qb() {
@@ -1862,7 +1962,9 @@ main() {
   require_cmd jq
   require_cmd base64
   validate_protocol_only
+  validate_workdir
   acquire_interop_lock
+  validate_workdir
 
   if [[ "${INTEROP_REUSE_STACK:-0}" != "1" ]]; then
     compose down --remove-orphans -v >/dev/null 2>&1 || true
