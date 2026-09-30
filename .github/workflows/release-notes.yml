@@ -50,8 +50,7 @@ jobs:
               --repo "$GITHUB_REPOSITORY" \
               --limit 1000 \
               --json tagName,isDraft \
-              --jq '.[] | select(.isDraft == false) | .tagName' \
-              | head -n1)"
+              --jq '[.[] | select(.isDraft == false) | .tagName] | .[0] // ""')"
             if [[ -z "$base" ]]; then
               base="$PUSH_BEFORE_SHA"
             fi
