@@ -73,6 +73,10 @@
       "get": {"operationId": "sessionFeatures", "responses": {"200": {"$ref": "#/components/responses/JsonOk"}}},
       "put": {"operationId": "updateSessionFeatures", "parameters": [{"$ref": "#/components/parameters/IdempotencyKey"}], "requestBody": {"$ref": "#/components/requestBodies/JsonObject"}, "responses": {"204": {"$ref": "#/components/responses/Empty"}}}
     },
+    "/api/v1/session/settings": {
+      "get": {"operationId": "sessionSettings", "responses": {"200": {"$ref": "#/components/responses/JsonOk"}, "503": {"$ref": "#/components/responses/JsonError"}}},
+      "patch": {"operationId": "updateSessionSettings", "parameters": [{"$ref": "#/components/parameters/IdempotencyKey"}], "requestBody": {"$ref": "#/components/requestBodies/JsonObject"}, "responses": {"204": {"$ref": "#/components/responses/Empty"}, "400": {"$ref": "#/components/responses/JsonError"}, "503": {"$ref": "#/components/responses/JsonError"}}}
+    },
     "/api/v1/categories": {
       "get": {"operationId": "listCategories", "responses": {"200": {"$ref": "#/components/responses/JsonOk"}}},
       "post": {"operationId": "upsertCategory", "parameters": [{"$ref": "#/components/parameters/IdempotencyKey"}], "requestBody": {"$ref": "#/components/requestBodies/CategoryUpsert"}, "responses": {"200": {"$ref": "#/components/responses/JsonOk"}, "400": {"$ref": "#/components/responses/JsonError"}, "422": {"$ref": "#/components/responses/InvalidRequest"}}}
