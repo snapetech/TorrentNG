@@ -437,11 +437,9 @@ mod tests {
         is_public_unicast, is_valid_unicast, ratio_milli, MAX_REMOTE_DNS_ADDRESSES,
     };
     use std::{
-        io::{Read, Write},
         net::{IpAddr, SocketAddr},
         process::Command,
-        thread,
-        time::{Duration, Instant},
+        time::Duration,
     };
 
     #[test]
@@ -629,11 +627,13 @@ mod tests {
 
     #[tokio::test]
     async fn pinned_remote_client_ignores_environment_proxy() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
         const CHILD_FLAG: &str = "TNG_SIDECAR_EGRESS_PROXY_TEST_CHILD";
         if std::env::var_os(CHILD_FLAG).is_some() {
             let url = std::env::var("TNG_SIDECAR_EGRESS_PROXY_TEST_TARGET").unwrap();
             let (client, url) =
-                bounded_remote_client(&url, true, Duration::from_secs(2), "workflow webhook URL")
+                bounded_remote_client(&url, true, Duration::from_secs(10), "workflow webhook URL")
                     .await
                     .unwrap();
             let response = client
@@ -647,69 +647,64 @@ mod tests {
             return;
         }
 
-        fn serve_once(listener: std::net::TcpListener) -> thread::JoinHandle<bool> {
-            listener.set_nonblocking(true).unwrap();
-            thread::spawn(move || {
-                let deadline = Instant::now() + Duration::from_secs(2);
-                loop {
-                    match listener.accept() {
-                        Ok((mut stream, _)) => {
-                            stream
-                                .set_read_timeout(Some(Duration::from_secs(2)))
-                                .unwrap();
-                            let mut request = [0u8; 2048];
-                            let _ = stream.read(&mut request);
-                            let body = "direct";
-                            let response = format!(
-                                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                                body.len(), body
-                            );
-                            stream.write_all(response.as_bytes()).unwrap();
-                            return true;
-                        }
-                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                            if Instant::now() >= deadline {
-                                return false;
-                            }
-                            thread::sleep(Duration::from_millis(10));
-                        }
-                        Err(_) => return false,
-                    }
-                }
-            })
-        }
-
-        let direct_listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let direct_listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
         let direct_address = direct_listener.local_addr().unwrap();
-        let proxy_listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
-        proxy_listener.set_nonblocking(true).unwrap();
+        let proxy_listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
         let proxy_address = proxy_listener.local_addr().unwrap();
-        let direct_server = serve_once(direct_listener);
+        let direct_server = tokio::spawn(async move {
+            let (mut stream, _) =
+                tokio::time::timeout(Duration::from_secs(10), direct_listener.accept())
+                    .await
+                    .expect("mock direct server was not called before timeout")
+                    .unwrap();
+            let mut request = [0u8; 2048];
+            tokio::time::timeout(Duration::from_secs(10), stream.read(&mut request))
+                .await
+                .expect("mock direct server request read timed out")
+                .unwrap();
+            let body = "direct";
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            stream.write_all(response.as_bytes()).await.unwrap();
+        });
         let target = format!("http://{direct_address}/webhook");
         let proxy = format!("http://{proxy_address}");
 
-        let output = Command::new(std::env::current_exe().unwrap())
-            .args([
-                "--exact",
-                "backend::tests::pinned_remote_client_ignores_environment_proxy",
-                "--nocapture",
-            ])
-            .env(CHILD_FLAG, "1")
-            .env("TNG_SIDECAR_EGRESS_PROXY_TEST_TARGET", &target)
-            .env("HTTP_PROXY", &proxy)
-            .env("http_proxy", &proxy)
-            .env("ALL_PROXY", &proxy)
-            .env("all_proxy", &proxy)
-            .env("NO_PROXY", "")
-            .env("no_proxy", "")
-            .output()
-            .unwrap();
-        let direct_received = direct_server.join().unwrap();
-        let proxy_received = match proxy_listener.accept() {
-            Ok(_) => true,
-            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => false,
-            Err(error) => panic!("failed to inspect mock proxy listener: {error}"),
-        };
+        let test_executable = std::env::current_exe().unwrap();
+        let output = tokio::task::spawn_blocking(move || {
+            Command::new(test_executable)
+                .args([
+                    "--exact",
+                    "backend::tests::pinned_remote_client_ignores_environment_proxy",
+                    "--nocapture",
+                ])
+                .env(CHILD_FLAG, "1")
+                .env("TNG_SIDECAR_EGRESS_PROXY_TEST_TARGET", target)
+                .env("HTTP_PROXY", &proxy)
+                .env("http_proxy", &proxy)
+                .env("ALL_PROXY", &proxy)
+                .env("all_proxy", &proxy)
+                .env("NO_PROXY", "")
+                .env("no_proxy", "")
+                .output()
+        })
+        .await
+        .unwrap()
+        .unwrap();
+        direct_server.await.unwrap();
+        let proxy_received =
+            match tokio::time::timeout(Duration::from_millis(100), proxy_listener.accept()).await {
+                Ok(Ok(_)) => true,
+                Ok(Err(error)) => panic!("failed to inspect mock proxy listener: {error}"),
+                Err(_) => false,
+            };
 
         assert!(
             output.status.success(),
@@ -717,7 +712,6 @@ mod tests {
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
         );
-        assert!(direct_received, "request did not reach validated address");
         assert!(!proxy_received, "request escaped through environment proxy");
     }
 

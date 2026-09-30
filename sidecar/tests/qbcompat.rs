@@ -4,7 +4,13 @@
 //! They do NOT require a running rTorrent instance — endpoints that touch rTorrent
 //! are skipped unless RTORRENT_SOCKET is set.
 
-use axum::{extract::State, http::StatusCode, routing::post, Json, Router};
+use axum::{
+    body::Body,
+    extract::State,
+    http::{Method, Request, StatusCode},
+    routing::post,
+    Json, Router,
+};
 use reqwest::Client;
 use rusqlite::{params, Connection};
 use std::{
@@ -18,6 +24,7 @@ use tokio::{
     net::TcpListener,
     sync::{broadcast, mpsc},
 };
+use tower::ServiceExt;
 
 // Re-use internal modules via the binary crate root.
 use torrentng::{
@@ -75,6 +82,30 @@ async fn spawn_server_with_existing_db_and_events(
     backend: Arc<dyn TorrentBackend>,
     db: Arc<Db>,
 ) -> (SocketAddr, Client, Arc<Db>, broadcast::Sender<Event>) {
+    let (app, tx) = build_test_app_with_existing_db_and_events(cfg, rt, backend, db.clone());
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<SocketAddr>(),
+        )
+        .await
+        .unwrap();
+    });
+
+    let client = Client::builder().cookie_store(true).build().unwrap();
+
+    (addr, client, db, tx)
+}
+
+fn build_test_app_with_existing_db_and_events(
+    cfg: Config,
+    rt: Arc<torrentng::rtorrent::Client>,
+    backend: Arc<dyn TorrentBackend>,
+    db: Arc<Db>,
+) -> (Router, broadcast::Sender<Event>) {
     let cfg = Arc::new(cfg);
     let (tx, _) = broadcast::channel::<Event>(16);
     let metrics = Metrics::new();
@@ -94,20 +125,42 @@ async fn spawn_server_with_existing_db_and_events(
     };
     let app: Router = torrentng::api::server::build_router(state);
 
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    tokio::spawn(async move {
-        axum::serve(
-            listener,
-            app.into_make_service_with_connect_info::<SocketAddr>(),
-        )
-        .await
+    (app, tx)
+}
+
+fn build_test_app_with_backend(cfg: Config, backend: Arc<dyn TorrentBackend>) -> (Router, Arc<Db>) {
+    let rt = Arc::new(torrentng::rtorrent::Client::new_unix("/nonexistent", 1));
+    let db_path = tempfile::NamedTempFile::new().unwrap().into_temp_path();
+    let db = Arc::new(Db::open(db_path.as_ref()).unwrap());
+    let (app, _) = build_test_app_with_existing_db_and_events(cfg, rt, backend, db.clone());
+    (app, db)
+}
+
+fn multipart_body(boundary: &str, fields: &[(&str, String)]) -> Vec<u8> {
+    let mut body = String::new();
+    for (name, value) in fields {
+        body.push_str(&format!(
+            "--{boundary}\r\nContent-Disposition: form-data; name=\"{name}\"\r\n\r\n{value}\r\n"
+        ));
+    }
+    body.push_str(&format!("--{boundary}--\r\n"));
+    body.into_bytes()
+}
+
+async fn send_to_test_app(
+    app: Router,
+    method: Method,
+    path: &str,
+    content_type: &str,
+    body: Vec<u8>,
+) -> axum::response::Response {
+    let request = Request::builder()
+        .method(method)
+        .uri(path)
+        .header("content-type", content_type)
+        .body(Body::from(body))
         .unwrap();
-    });
-
-    let client = Client::builder().cookie_store(true).build().unwrap();
-
-    (addr, client, db, tx)
+    app.oneshot(request).await.unwrap()
 }
 
 async fn spawn_server_with_backend(
@@ -2147,23 +2200,29 @@ async fn qb_torrent_properties_from_cache() {
 
 #[tokio::test]
 async fn native_torrent_add_multipart_fields_are_bounded_and_unique() {
-    let (addr, client, _) =
-        spawn_server_with_backend(Config::test_default(), successful_backend()).await;
-
-    let oversized_category = reqwest::multipart::Form::new()
-        .text(
-            "magnet",
-            "magnet:?xt=urn:btih:0123456789012345678901234567890123456789",
-        )
-        .text("category", "x".repeat(1024 * 1024));
-    let res = client
-        .post(url(addr, "/api/v1/torrents"))
-        .multipart(oversized_category)
-        .send()
-        .await
-        .unwrap();
+    let boundary = "native-category-limit";
+    let (app, _) = build_test_app_with_backend(Config::test_default(), successful_backend());
+    let res = send_to_test_app(
+        app,
+        Method::POST,
+        "/api/v1/torrents",
+        &format!("multipart/form-data; boundary={boundary}"),
+        multipart_body(
+            boundary,
+            &[
+                (
+                    "magnet",
+                    "magnet:?xt=urn:btih:0123456789012345678901234567890123456789".to_owned(),
+                ),
+                ("category", "x".repeat(1024 * 1024)),
+            ],
+        ),
+    )
+    .await;
     assert_eq!(res.status(), StatusCode::BAD_REQUEST);
 
+    let (addr, client, _) =
+        spawn_server_with_backend(Config::test_default(), successful_backend()).await;
     let duplicate_magnet = reqwest::multipart::Form::new()
         .text(
             "magnet",
@@ -2255,8 +2314,7 @@ async fn qb_torrent_add_accepts_the_full_64_mib_payload_with_multipart_envelope(
 
 #[tokio::test]
 async fn larger_multipart_limit_does_not_raise_json_extractor_limit() {
-    let (addr, client, db) =
-        spawn_server_with_backend(Config::test_default(), successful_backend()).await;
+    let (app, db) = build_test_app_with_backend(Config::test_default(), successful_backend());
     let body = serde_json::json!({
         "id": "oversized",
         "name": "x".repeat(3 * 1024 * 1024),
@@ -2271,12 +2329,14 @@ async fn larger_multipart_limit_does_not_raise_json_extractor_limit() {
         "target_path": null
     });
 
-    let response = client
-        .post(url(addr, "/api/v1/workflows"))
-        .json(&body)
-        .send()
-        .await
-        .unwrap();
+    let response = send_to_test_app(
+        app,
+        Method::POST,
+        "/api/v1/workflows",
+        "application/json",
+        serde_json::to_vec(&body).unwrap(),
+    )
+    .await;
 
     assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
     assert!(db.list_workflow_rules().unwrap().is_empty());
@@ -3999,14 +4059,16 @@ async fn add_torrent_rejects_empty_payloads() {
         .unwrap();
     assert_eq!(res.status(), StatusCode::BAD_REQUEST);
 
-    let oversized_category =
-        reqwest::multipart::Form::new().text("category", "x".repeat(1024 * 1024));
-    let res = client
-        .post(url(addr, "/api/qb/v2/torrents/add"))
-        .multipart(oversized_category)
-        .send()
-        .await
-        .unwrap();
+    let boundary = "qb-category-limit";
+    let (app, _) = build_test_app_with_backend(Config::test_default(), successful_backend());
+    let res = send_to_test_app(
+        app,
+        Method::POST,
+        "/api/qb/v2/torrents/add",
+        &format!("multipart/form-data; boundary={boundary}"),
+        multipart_body(boundary, &[("category", "x".repeat(1024 * 1024))]),
+    )
+    .await;
     assert_eq!(res.status(), StatusCode::BAD_REQUEST);
 }
 
