@@ -397,6 +397,58 @@ jobs:
           docker build --pull --network host -f deploy/docker/Dockerfile -t "torrentng:${RELEASE_TAG}" .
           docker build --pull --network host -f deploy/docker/Dockerfile.phase1 -t "torrentng-phase1:${RELEASE_TAG}" .
 
+      - name: Smoke native image with authenticated read-only runtime
+        env:
+          RELEASE_TAG: ${{ needs.validate-release-tag.outputs.tag }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          name="torrentng-native-smoke-${GITHUB_RUN_ID}"
+          data_volume="${name}-data"
+          downloads_volume="${name}-downloads"
+          state_volume="${name}-state"
+          config_volume="${name}-config"
+          containers=("$name")
+          volumes=("$data_volume" "$downloads_volume" "$state_volume" "$config_volume")
+          cleanup() {
+            docker rm -f "${containers[@]}" >/dev/null 2>&1 || true
+            docker volume rm "${volumes[@]}" >/dev/null 2>&1 || true
+          }
+          trap cleanup EXIT
+
+          for volume in "${volumes[@]}"; do
+            docker volume create "$volume" >/dev/null
+          done
+          docker run -d --name "$name" --network none --read-only \
+            --tmpfs /tmp:rw,nosuid,nodev,size=256m \
+            --tmpfs /run:rw,nosuid,nodev,size=16m \
+            -v "$data_volume:/data" \
+            -v "$downloads_volume:/downloads" \
+            -v "$state_volume:/var/lib/torrentngd" \
+            -v "$config_volume:/config" \
+            -e PUID=1000 \
+            -e PGID=1000 \
+            -e TORRENTNGD_API_TOKEN=release-smoke-only-token \
+            "torrentng-native:${RELEASE_TAG}" >/dev/null
+
+          healthy=0
+          for _ in $(seq 1 60); do
+            if docker exec "$name" curl -fsS http://127.0.0.1:8080/health >/dev/null 2>&1; then
+              healthy=1
+              break
+            fi
+            sleep 1
+          done
+          if [[ "$healthy" != 1 ]]; then
+            docker logs "$name"
+            exit 1
+          fi
+          [[ "$(docker exec "$name" awk '/^Uid:/{print $2}' /proc/1/status)" == 1000 ]]
+          [[ "$(docker exec "$name" awk '/^Gid:/{print $2}' /proc/1/status)" == 1000 ]]
+          docker exec --user 1000:1000 "$name" sh -c \
+            'test -w /data && test -w /downloads && test -w /var/lib/torrentngd && test -w /run/secrets/torrentngd_api_token'
+          docker exec "$name" /usr/local/bin/torrentngd --version
+
       - name: Smoke compatible-client image with root-owned persistent files
         env:
           RELEASE_TAG: ${{ needs.validate-release-tag.outputs.tag }}

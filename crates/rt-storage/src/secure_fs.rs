@@ -704,7 +704,34 @@ fn secure_rename(
     Ok(())
 }
 
-#[cfg(any(target_os = "linux", target_os = "android"))]
+#[cfg(all(any(target_os = "linux", target_os = "android"), target_env = "musl"))]
+fn rename_without_replace(
+    source_parent: &File,
+    source_name: &CString,
+    destination_parent: &File,
+    destination_name: &CString,
+) -> io::Result<()> {
+    let result = unsafe {
+        libc::syscall(
+            libc::SYS_renameat2,
+            source_parent.as_raw_fd(),
+            source_name.as_ptr(),
+            destination_parent.as_raw_fd(),
+            destination_name.as_ptr(),
+            libc::RENAME_NOREPLACE,
+        )
+    };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
+#[cfg(all(
+    any(target_os = "linux", target_os = "android"),
+    not(target_env = "musl")
+))]
 fn rename_without_replace(
     source_parent: &File,
     source_name: &CString,

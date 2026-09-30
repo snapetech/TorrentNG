@@ -45,8 +45,16 @@ jobs:
             base="origin/${PR_BASE_REF}"
             head="$PR_HEAD_SHA"
           else
-            base="$PUSH_BEFORE_SHA"
             head="$GITHUB_SHA"
+            base="$(gh release list \
+              --repo "$GITHUB_REPOSITORY" \
+              --limit 1000 \
+              --json tagName,isDraft \
+              --jq '.[] | select(.isDraft == false) | .tagName' \
+              | head -n1)"
+            if [[ -z "$base" ]]; then
+              base="$PUSH_BEFORE_SHA"
+            fi
             associated_pr_bodies="$(gh api \
               "repos/$GITHUB_REPOSITORY/commits/$head/pulls" \
               --jq '.[].body')"

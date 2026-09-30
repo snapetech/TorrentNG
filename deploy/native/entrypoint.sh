@@ -1,7 +1,11 @@
 #!/bin/sh
 set -e
 
-TNG_INIT=/usr/bin/tini
+TNG_INIT="$(command -v tini || true)"
+if [ -z "$TNG_INIT" ]; then
+  echo "torrentngd init wrapper is not installed: tini" >&2
+  exit 1
+fi
 TNG_IDENTITY_PATHS="/data /downloads /var/lib/torrentngd /run/secrets"
 . /usr/local/lib/torrentng/identity.sh
 tng_identity_enter "$@"
