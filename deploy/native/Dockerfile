@@ -13,11 +13,12 @@ RUN npm ci
 COPY webui/ ./
 RUN TNG_WEBUI_OUT_DIR=dist npm run build
 
-FROM debian:bookworm-slim
+FROM debian:trixie-slim
 ARG TNG_UID=1000
 ARG TNG_GID=1000
 
 RUN apt-get update \
+    && apt-get upgrade -y --no-install-recommends \
     && apt-get install -y --no-install-recommends ca-certificates curl jq tini util-linux \
     && rm -rf /var/lib/apt/lists/* \
     && case "$TNG_UID" in ''|*[!0-9]*) echo "TNG_UID must be a nonzero numeric ID" >&2; exit 1;; *[1-9]*) :;; *) echo "TNG_UID must be a nonzero numeric ID" >&2; exit 1;; esac \

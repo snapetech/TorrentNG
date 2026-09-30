@@ -393,9 +393,9 @@ jobs:
         env:
           RELEASE_TAG: ${{ needs.validate-release-tag.outputs.tag }}
         run: |
-          docker build --network host -f deploy/native/Dockerfile -t "torrentng-native:${RELEASE_TAG}" .
-          docker build --network host -f deploy/docker/Dockerfile -t "torrentng:${RELEASE_TAG}" .
-          docker build --network host -f deploy/docker/Dockerfile.phase1 -t "torrentng-phase1:${RELEASE_TAG}" .
+          docker build --pull --network host -f deploy/native/Dockerfile -t "torrentng-native:${RELEASE_TAG}" .
+          docker build --pull --network host -f deploy/docker/Dockerfile -t "torrentng:${RELEASE_TAG}" .
+          docker build --pull --network host -f deploy/docker/Dockerfile.phase1 -t "torrentng-phase1:${RELEASE_TAG}" .
 
       - name: Smoke compatible-client image with root-owned persistent files
         env:
