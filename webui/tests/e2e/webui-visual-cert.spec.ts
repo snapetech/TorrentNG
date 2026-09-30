@@ -1,5 +1,8 @@
 import { expect, test, type Page } from '@playwright/test'
 
+// Hosted PR runners and the self-hosted push runner render system fonts differently.
+const snapshotProfile = process.env.TNG_WEBUI_SNAPSHOT_PROFILE === 'hosted' ? 'hosted' : 'self-hosted'
+
 const torrents = Array.from({ length: 80 }, (_, i) => {
   const n = i + 1
   const complete = n % 6 !== 0
@@ -159,7 +162,7 @@ test.beforeEach(async ({ page }) => {
 })
 
 test('torrent workspace visual baseline', async ({ page }) => {
-  await expect(page).toHaveScreenshot('torrent-workspace.png', {
+  await expect(page).toHaveScreenshot(`torrent-workspace-${snapshotProfile}.png`, {
     fullPage: true,
     maxDiffPixelRatio: 0.01,
   })
@@ -170,7 +173,7 @@ test('settings storage visual baseline', async ({ page, isMobile }) => {
 
   await page.getByRole('button', { name: 'Settings' }).click()
   await expect(page.getByText('Storage Plan')).toBeVisible()
-  await expect(page).toHaveScreenshot('settings-storage.png', {
+  await expect(page).toHaveScreenshot(`settings-storage-${snapshotProfile}.png`, {
     fullPage: true,
     maxDiffPixelRatio: 0.01,
   })
