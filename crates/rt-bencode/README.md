@@ -20,13 +20,17 @@ let bytes = rt_bencode::encode(&val);
 let val = rt_bencode::Decoder::new(bytes)
     .with_max_depth(32)
     .with_max_string(4 * 1024 * 1024)
+    .with_max_nodes(250_000)
     .decode()?;
 ```
 
 ## Acceptance criteria
 
 - Parse integers, byte strings, lists, dicts
-- Reject `-0`, leading zeros, unsorted dict keys (strict mode)
-- Enforce configurable depth and string length limits
+- Reject `-0`, leading plus signs, leading zeros, and unsorted dict keys
+  (strict mode)
+- Enforce configurable depth, string length, and node-count limits
+- Bound integer tokens to the supported `i64` width and length prefixes to a
+  pointer-width-derived limit, with errors that do not echo oversized input
 - Capture info dict byte span for exact infohash computation
 - Fuzz targets in `fuzz/`

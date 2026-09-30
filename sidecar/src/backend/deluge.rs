@@ -5,8 +5,8 @@ use reqwest::Url;
 use serde_json::{json, Value};
 
 use super::{
-    response_json_bounded, BackendCapabilities, BackendStatus, BackendType, TorrentBackend,
-    MAX_BACKEND_JSON_BYTES,
+    checked_backend_file_index, response_json_bounded, BackendCapabilities, BackendStatus,
+    BackendType, TorrentBackend, MAX_BACKEND_JSON_BYTES,
 };
 use crate::{
     config::DelugeConfig,
@@ -21,7 +21,7 @@ pub struct DelugeBackend {
 
 impl DelugeBackend {
     pub fn new(cfg: &DelugeConfig) -> Result<Self> {
-        let client = reqwest::Client::builder()
+        let client = super::backend_client_builder()
             .cookie_store(true)
             .timeout(std::time::Duration::from_secs(cfg.timeout_secs.max(1)))
             .danger_accept_invalid_certs(cfg.accept_invalid_certs)
@@ -60,6 +60,7 @@ impl DelugeBackend {
                 .json(&json!({ "id": 1, "method": method, "params": params }))
                 .send()
                 .await
+                .map_err(reqwest::Error::without_url)
                 .with_context(|| format!("Deluge RPC {method}"))?,
             MAX_BACKEND_JSON_BYTES,
             &format!("Deluge RPC {method}"),
@@ -289,7 +290,7 @@ impl TorrentBackend for DelugeBackend {
             }
         }
         if !changed {
-            bail!("Deluge tracker not found: {original_url}");
+            bail!("Deluge tracker not found");
         }
         self.set_trackers(hash, &trackers).await
     }
@@ -302,7 +303,7 @@ impl TorrentBackend for DelugeBackend {
             .filter(|tracker| tracker.url != url)
             .collect();
         if trackers.len() == original_len {
-            bail!("Deluge tracker not found: {url}");
+            bail!("Deluge tracker not found");
         }
         self.set_trackers(hash, &trackers).await
     }
@@ -394,11 +395,9 @@ impl TorrentBackend for DelugeBackend {
     }
 
     async fn rename_file(&self, hash: &str, file_index: usize, name: &str) -> Result<()> {
+        let file_index = checked_backend_file_index(file_index, "Deluge")?;
         let result = self
-            .rpc(
-                "core.rename_files",
-                json!([hash, [[file_index as i64, name]]]),
-            )
+            .rpc("core.rename_files", json!([hash, [[file_index, name]]]))
             .await?;
         require_not_false(result, "core.rename_files")?;
         Ok(())
@@ -732,6 +731,22 @@ mod tests {
         assert!(require_not_false(Value::Bool(false), "core.pause_torrent").is_err());
         assert!(require_torrent_id(json!("abc"), "core.add_torrent_magnet").is_ok());
         assert!(require_torrent_id(Value::Null, "core.add_torrent_file").is_err());
+    }
+
+    #[tokio::test]
+    async fn deluge_rpc_redirects_are_rejected_without_following() {
+        super::super::assert_backend_redirect_rejected(|base_url| async move {
+            let config = DelugeConfig {
+                url: base_url,
+                ..DelugeConfig::default()
+            };
+            let backend = DelugeBackend::new(&config)?;
+            backend
+                .rpc_raw("web.connected", json!([]))
+                .await
+                .map(|_| ())
+        })
+        .await;
     }
 
     #[test]

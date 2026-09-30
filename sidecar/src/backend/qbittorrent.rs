@@ -1,6 +1,6 @@
 use anyhow::{bail, Context, Result};
 use async_trait::async_trait;
-use reqwest::Url;
+use reqwest::{StatusCode, Url};
 use std::{collections::BTreeMap, net::SocketAddr};
 use tokio::sync::Mutex;
 
@@ -26,7 +26,7 @@ pub struct QbittorrentBackend {
 
 impl QbittorrentBackend {
     pub fn new(cfg: &QbittorrentConfig) -> Result<Self> {
-        let client = reqwest::Client::builder()
+        let client = super::backend_client_builder()
             .cookie_store(true)
             .timeout(std::time::Duration::from_secs(cfg.timeout_secs.max(1)))
             .danger_accept_invalid_certs(cfg.accept_invalid_certs)
@@ -57,6 +57,7 @@ impl QbittorrentBackend {
             .form(&[("username", username.as_str()), ("password", password)])
             .send()
             .await
+            .map_err(reqwest::Error::without_url)
             .context("qBittorrent login request")?;
         let status = response.status();
         let body = super::response_bytes_bounded(
@@ -65,7 +66,7 @@ impl QbittorrentBackend {
             "qBittorrent login",
         )
         .await?;
-        if !status.is_success() || std::str::from_utf8(&body).ok().map(str::trim) != Some("Ok.") {
+        if !qbit_login_succeeded(status, &body) {
             bail!("qBittorrent login failed with status {status}");
         }
         Ok(())
@@ -82,6 +83,7 @@ impl QbittorrentBackend {
                 .get(self.url(path)?)
                 .send()
                 .await
+                .map_err(reqwest::Error::without_url)
                 .with_context(|| format!("qBittorrent GET {path}"))?,
             MAX_BACKEND_JSON_BYTES,
             &format!("qBittorrent GET {path}"),
@@ -97,11 +99,28 @@ impl QbittorrentBackend {
             .form(form)
             .send()
             .await
+            .map_err(reqwest::Error::without_url)
             .with_context(|| format!("qBittorrent POST {path}"))?;
         let body = response_bytes_bounded(response, 16 * 1024, &format!("qBittorrent POST {path}"))
             .await?;
         validate_qbit_mutation_body(&body, path)?;
         Ok(())
+    }
+
+    async fn get_text(&self, path: &str) -> Result<String> {
+        self.ensure_login().await?;
+        let body = response_bytes_bounded(
+            self.client
+                .get(self.url(path)?)
+                .send()
+                .await
+                .map_err(reqwest::Error::without_url)
+                .with_context(|| format!("qBittorrent GET {path}"))?,
+            16 * 1024,
+            &format!("qBittorrent GET {path}"),
+        )
+        .await?;
+        String::from_utf8(body).with_context(|| format!("decode qBittorrent GET {path} response"))
     }
 
     async fn limit_map(&self, path: &str, hashes: &[String]) -> Result<BTreeMap<String, i64>> {
@@ -114,6 +133,7 @@ impl QbittorrentBackend {
                 .get(url)
                 .send()
                 .await
+                .map_err(reqwest::Error::without_url)
                 .with_context(|| format!("qBittorrent GET {path}"))?,
             MAX_BACKEND_JSON_BYTES,
             &format!("qBittorrent GET {path}"),
@@ -153,6 +173,20 @@ impl QbittorrentBackend {
     }
 }
 
+fn qbit_login_succeeded(status: StatusCode, body: &[u8]) -> bool {
+    match status {
+        StatusCode::NO_CONTENT => body.is_empty(),
+        status if status.is_success() => {
+            std::str::from_utf8(body).ok().map(str::trim) == Some("Ok.")
+        }
+        _ => false,
+    }
+}
+
+fn qbit_version_is_usable(version: &str) -> bool {
+    !version.trim().is_empty()
+}
+
 #[derive(Debug, serde::Deserialize)]
 struct QbitTorrent {
     hash: String,
@@ -183,7 +217,6 @@ struct QbitTransferInfo {
     up_info_speed: i64,
     dl_rate_limit: i64,
     up_rate_limit: i64,
-    use_alt_speed_limits: bool,
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -239,8 +272,8 @@ impl TorrentBackend for QbittorrentBackend {
     }
 
     async fn health(&self) -> BackendStatus {
-        match self.get_json::<String>("api/v2/app/version").await {
-            Ok(version) if !version.trim().is_empty() => BackendStatus::Connected,
+        match self.get_text("api/v2/app/version").await {
+            Ok(version) if qbit_version_is_usable(&version) => BackendStatus::Connected,
             Err(_) => BackendStatus::Unreachable,
             Ok(_) => BackendStatus::Unreachable,
         }
@@ -286,6 +319,7 @@ impl TorrentBackend for QbittorrentBackend {
                 .get(url)
                 .send()
                 .await
+                .map_err(reqwest::Error::without_url)
                 .context("qBittorrent paged torrents/info request")?,
             MAX_BACKEND_JSON_BYTES,
             "qBittorrent paged torrents/info",
@@ -336,6 +370,7 @@ impl TorrentBackend for QbittorrentBackend {
             .multipart(form)
             .send()
             .await
+            .map_err(reqwest::Error::without_url)
             .context("qBittorrent POST api/v2/torrents/add")?;
         let body =
             response_bytes_bounded(response, 16 * 1024, "qBittorrent POST api/v2/torrents/add")
@@ -354,6 +389,7 @@ impl TorrentBackend for QbittorrentBackend {
                 ))?)
                 .send()
                 .await
+                .map_err(reqwest::Error::without_url)
                 .context("qBittorrent GET api/v2/torrents/export")?,
             MAX_BACKEND_JSON_BYTES,
             "qBittorrent GET api/v2/torrents/export",
@@ -590,10 +626,19 @@ impl TorrentBackend for QbittorrentBackend {
 
     async fn global_limits(&self) -> Result<BackendTransferLimits> {
         let info: QbitTransferInfo = self.get_json("api/v2/transfer/info").await?;
+        let speed_limits_mode = match self
+            .get_text("api/v2/transfer/speedLimitsMode")
+            .await?
+            .trim()
+        {
+            "0" => false,
+            "1" => true,
+            value => bail!("invalid qBittorrent speedLimitsMode response: {value:?}"),
+        };
         Ok(BackendTransferLimits {
             download_limit: qbit_nonnegative_i64(Some(info.dl_rate_limit), "dl_rate_limit")?,
             upload_limit: qbit_nonnegative_i64(Some(info.up_rate_limit), "up_rate_limit")?,
-            speed_limits_mode: info.use_alt_speed_limits,
+            speed_limits_mode,
         })
     }
 
@@ -720,6 +765,7 @@ impl TorrentBackend for QbittorrentBackend {
                 .get(url)
                 .send()
                 .await
+                .map_err(reqwest::Error::without_url)
                 .context("qBittorrent torrent tag lookup")?,
             MAX_BACKEND_JSON_BYTES,
             "qBittorrent torrent tag lookup",
@@ -896,7 +942,7 @@ fn map_tracker((idx, tracker): (usize, QbitTracker)) -> Result<RawTracker> {
             idx,
             "num_downloaded",
         )?,
-        message: tracker.msg.unwrap_or_default(),
+        message: crate::url_redaction::redact_sensitive_text(&tracker.msg.unwrap_or_default()),
     })
 }
 
@@ -982,6 +1028,38 @@ mod tests {
     }
 
     #[test]
+    fn qbit_login_accepts_successful_no_content_responses() {
+        assert!(qbit_login_succeeded(StatusCode::NO_CONTENT, b""));
+        assert!(qbit_login_succeeded(StatusCode::OK, b"Ok.\n"));
+        assert!(!qbit_login_succeeded(StatusCode::NO_CONTENT, b"unexpected"));
+        assert!(!qbit_login_succeeded(StatusCode::OK, b""));
+        assert!(!qbit_login_succeeded(StatusCode::UNAUTHORIZED, b"Ok."));
+    }
+
+    #[test]
+    fn qbit_health_accepts_plain_text_version_responses() {
+        assert!(qbit_version_is_usable("v5.2.3"));
+        assert!(!qbit_version_is_usable(" \n"));
+    }
+
+    #[tokio::test]
+    async fn qbit_api_redirects_are_rejected_without_following() {
+        super::super::assert_backend_redirect_rejected(|base_url| async move {
+            let config = QbittorrentConfig {
+                url: base_url,
+                no_auth: true,
+                ..QbittorrentConfig::default()
+            };
+            let backend = QbittorrentBackend::new(&config)?;
+            backend
+                .get_json::<serde_json::Value>("api/v2/app/version")
+                .await
+                .map(|_| ())
+        })
+        .await;
+    }
+
+    #[test]
     fn parses_qbit_peer_response() {
         let response = serde_json::json!({
             "peers": {
@@ -1034,8 +1112,42 @@ mod tests {
         assert!(!paused_complete.is_active);
         assert!(paused_complete.complete);
 
-        let uploading_with_short_progress = map_torrent(torrent_fixture("uploading", 100, 25)).unwrap();
+        let uploading_with_short_progress =
+            map_torrent(torrent_fixture("uploading", 100, 25)).unwrap();
         assert_eq!(uploading_with_short_progress.bytes_done, 100);
+    }
+
+    #[test]
+    fn qbit_tracker_messages_redact_echoed_announce_credentials() {
+        let mapped = map_tracker((
+            0,
+            QbitTracker {
+                url: "https://tracker.example/announce".to_owned(),
+                status: Some(4),
+                msg: Some(
+                    "HTTP 401 https://user:password@tracker.example/short-passkey?signature=query-secret authkey=auth-secret"
+                        .to_owned(),
+                ),
+                num_seeds: None,
+                num_leeches: None,
+                num_downloaded: None,
+            },
+        ))
+        .unwrap();
+
+        assert_eq!(
+            mapped.message,
+            "HTTP 401 https://tracker.example/ authkey=[redacted]"
+        );
+        for secret in [
+            "user",
+            "password",
+            "short-passkey",
+            "query-secret",
+            "auth-secret",
+        ] {
+            assert!(!mapped.message.contains(secret), "{}", mapped.message);
+        }
     }
 
     #[test]

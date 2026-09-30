@@ -16,6 +16,7 @@ interface WsEvent {
     | 'workflow_runs_updated'
     | 'rss_rules_updated'
     | 'saved_views_updated'
+    | 'resync_required'
     | 'stats'
   hash?: string
   upload_speed?: number
@@ -68,6 +69,13 @@ export function useWebSocket(onStats?: (stats: LiveStats) => void, enabled = tru
     }
 
     function handleEvent(msg: WsEvent) {
+      if (msg.type === 'resync_required') {
+        // The server emits this after the bounded broadcast receiver drops
+        // events. Refresh every cached projection so the UI does not remain
+        // stale until the slower polling fallback fires.
+        void qc.invalidateQueries()
+        return
+      }
       if (msg.type === 'stats') {
         statsRef.current?.({
           upload_speed: msg.upload_speed ?? 0,

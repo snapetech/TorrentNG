@@ -3,6 +3,7 @@ use std::time::{Duration, Instant};
 use crate::{
     backoff::{jitter_interval, Backoff},
     error::TrackerError,
+    redaction::sanitize_tracker_message,
     response::{AnnounceResponse, TrackerStatus},
 };
 
@@ -14,6 +15,7 @@ pub const MAX_TRACKER_STATE_TEXT_BYTES: usize = 16 * 1024;
 pub const MAX_TRACKER_STATE_ID_BYTES: usize = 16 * 1024;
 
 fn bound_tracker_state_text(value: String) -> String {
+    let value = sanitize_tracker_message(&value);
     if value.len() <= MAX_TRACKER_STATE_TEXT_BYTES {
         return value;
     }
@@ -212,6 +214,50 @@ mod tests {
         let mut ts = TrackerState::new("http://tracker.example.com/announce");
         ts.on_success(&mock_response(1800, Some("peer limit exceeded")));
         assert!(matches!(ts.status, TrackerStatus::Warning(_)));
+    }
+
+    #[test]
+    fn direct_warning_messages_are_sanitized_before_retention() {
+        let mut ts = TrackerState::new("http://tracker.example.com/announce");
+        ts.on_success(&mock_response(
+            1800,
+            Some(
+                "https://user:password@tracker.example/private/short-key?signature=secret#fragment",
+            ),
+        ));
+
+        let TrackerStatus::Warning(message) = &ts.status else {
+            panic!("expected warning status");
+        };
+        assert_eq!(message, "https://tracker.example/");
+        assert!(!message.contains("password"));
+        assert!(!message.contains("short-key"));
+        assert!(!message.contains("secret"));
+        assert!(!message.contains("fragment"));
+    }
+
+    #[test]
+    fn direct_failure_reasons_are_sanitized_before_retention() {
+        let mut ts = TrackerState::new("http://tracker.example.com/announce");
+        ts.on_failure(TrackerError::FailureReason(
+            "passkey=direct-secret https://user:password@tracker.example/private?sig=url-secret#fragment"
+                .to_owned(),
+        ));
+
+        let TrackerStatus::Error(error) = &ts.status else {
+            panic!("expected tracker error status");
+        };
+        let message = error.to_string();
+        for secret in [
+            "direct-secret",
+            "password",
+            "private",
+            "url-secret",
+            "fragment",
+        ] {
+            assert!(!message.contains(secret), "{message}");
+        }
+        assert!(message.contains("https://tracker.example/"));
     }
 
     #[test]

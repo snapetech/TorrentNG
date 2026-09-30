@@ -1,6 +1,21 @@
 use http::{header, HeaderMap};
 use subtle::ConstantTimeEq;
 
+/// Parse an HTTP Bearer authorization value. Authentication schemes are
+/// case-insensitive, but the credential itself remains an exact opaque token.
+pub fn bearer_token(headers: &HeaderMap) -> Option<String> {
+    let mut parts = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())?
+        .split_whitespace();
+    let scheme = parts.next()?;
+    let token = parts.next()?;
+    if parts.next().is_some() || !scheme.eq_ignore_ascii_case("Bearer") {
+        return None;
+    }
+    Some(token.to_owned())
+}
+
 /// Compare a presented API token with every configured token without
 /// short-circuiting on the first differing byte.
 pub fn api_token_allowed(api_tokens: &[String], candidate: &str) -> bool {
@@ -18,6 +33,17 @@ pub fn has_session_cookie(headers: &HeaderMap, names: &[&str]) -> bool {
     session_cookie_value(headers, names).is_some()
 }
 
+/// Return whether a request carries metadata that identifies it as a browser
+/// request.  Keep this separate from [`csrf_request_allowed`]: clients that
+/// do not send browser metadata remain compatible, while browser requests
+/// must provide positive same-origin evidence before a public auth endpoint
+/// sets or clears a session cookie.
+pub fn has_browser_request_headers(headers: &HeaderMap) -> bool {
+    headers.contains_key(header::ORIGIN)
+        || headers.contains_key(header::REFERER)
+        || headers.contains_key("sec-fetch-site")
+}
+
 /// Decode one of the percent-encoded session-cookie values used by the
 /// compatibility facades.
 pub fn session_cookie_value(headers: &HeaderMap, names: &[&str]) -> Option<String> {
@@ -33,7 +59,8 @@ pub fn session_cookie_value(headers: &HeaderMap, names: &[&str]) -> Option<Strin
     })
 }
 
-/// Reject browser cookie mutations that carry an explicit cross-site signal.
+/// Reject browser cookie mutations that do not carry positive same-origin
+/// evidence when Fetch Metadata is present.
 ///
 /// API clients using an Authorization header do not need this check.  Missing
 /// browser metadata remains allowed for non-browser clients, while an
@@ -42,12 +69,17 @@ pub fn session_cookie_value(headers: &HeaderMap, names: &[&str]) -> Option<Strin
 /// scheme and works behind TLS-terminating proxies without trusting a proxy
 /// header supplied by the caller.
 pub fn csrf_request_allowed(headers: &HeaderMap) -> bool {
-    if headers
-        .get("sec-fetch-site")
-        .and_then(|value| value.to_str().ok())
-        .is_some_and(|value| value.eq_ignore_ascii_case("cross-site"))
-    {
-        return false;
+    if let Some(value) = headers.get("sec-fetch-site") {
+        // `same-site` is still cross-origin, and `none`/unknown values do not
+        // prove that a cookie-backed mutation originated from this service.
+        // Treat invalid header bytes the same way instead of silently
+        // downgrading to the non-browser compatibility path.
+        if !value
+            .to_str()
+            .is_ok_and(|value| value.eq_ignore_ascii_case("same-origin"))
+        {
+            return false;
+        }
     }
 
     let Some(host) = headers
@@ -136,6 +168,7 @@ fn hex_value(byte: u8) -> Option<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use http::HeaderValue;
 
     #[test]
     fn api_token_comparison_requires_an_exact_match() {
@@ -146,6 +179,25 @@ mod tests {
         assert!(!api_token_allowed(&tokens, "short-secret-extra"));
         assert!(!api_token_allowed(&tokens, "short-secre"));
         assert!(!api_token_allowed(&tokens, ""));
+    }
+
+    #[test]
+    fn bearer_scheme_is_case_insensitive_but_credential_shape_is_exact() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::AUTHORIZATION,
+            "bearer opaque-token".parse().unwrap(),
+        );
+        assert_eq!(bearer_token(&headers).as_deref(), Some("opaque-token"));
+
+        headers.insert(
+            header::AUTHORIZATION,
+            "BEARER opaque-token extra".parse().unwrap(),
+        );
+        assert!(bearer_token(&headers).is_none());
+
+        headers.insert(header::AUTHORIZATION, "Basic opaque-token".parse().unwrap());
+        assert!(bearer_token(&headers).is_none());
     }
 
     #[test]
@@ -167,6 +219,24 @@ mod tests {
 
         headers.remove("sec-fetch-site");
         headers.insert(header::ORIGIN, "https://attacker.example".parse().unwrap());
+        assert!(!csrf_request_allowed(&headers));
+    }
+
+    #[test]
+    fn csrf_rejects_same_site_or_invalid_fetch_metadata() {
+        let mut headers = HeaderMap::new();
+        headers.insert(header::HOST, "torrentng.example".parse().unwrap());
+        headers.insert("sec-fetch-site", "same-site".parse().unwrap());
+        headers.insert(header::ORIGIN, "https://torrentng.example".parse().unwrap());
+        assert!(!csrf_request_allowed(&headers));
+
+        headers.insert("sec-fetch-site", "none".parse().unwrap());
+        assert!(!csrf_request_allowed(&headers));
+
+        headers.insert(
+            "sec-fetch-site",
+            HeaderValue::from_bytes(b"same-origin\x80").unwrap(),
+        );
         assert!(!csrf_request_allowed(&headers));
     }
 

@@ -11,13 +11,12 @@
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
 use rusqlite::{Connection, TransactionBehavior};
 use tokio::sync::{mpsc, oneshot, Notify, Semaphore};
 use tokio::task::{JoinHandle, JoinSet};
-use tokio::time::timeout;
 use tracing::{debug, warn};
 
 use rt_storage::{StorageError, StoragePlan, StoragePlanStep};
@@ -193,6 +192,33 @@ struct StorageJobControl {
     fault_delay_ms: u64,
     fault_delay_consumed: AtomicBool,
     notify: Notify,
+}
+
+fn lock_storage_job_controls(
+    controls: &Mutex<HashMap<String, Arc<StorageJobControl>>>,
+) -> MutexGuard<'_, HashMap<String, Arc<StorageJobControl>>> {
+    match controls.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => {
+            // This map only stores owned IDs and atomic control handles; no
+            // user code runs while it is locked. Recovering it keeps a prior
+            // worker panic from taking down the supervisor during cleanup.
+            warn!(
+                component = "storage_jobs",
+                operation = "controls_lock",
+                result = "recovered_poison",
+                "recovering storage job controls after mutex poisoning"
+            );
+            let guard = poisoned.into_inner();
+            controls.clear_poison();
+            guard
+        }
+    }
+}
+
+fn lock_storage_job_db(db: &Mutex<Connection>) -> Result<MutexGuard<'_, Connection>, String> {
+    db.lock()
+        .map_err(|_| "database mutex poisoned during storage job persistence".to_owned())
 }
 
 impl StorageJobControl {
@@ -381,9 +407,7 @@ struct StorageJobRegistration {
 
 impl Drop for StorageJobRegistration {
     fn drop(&mut self) {
-        if let Ok(mut controls) = self.controls.lock() {
-            controls.remove(&self.job_id);
-        }
+        lock_storage_job_controls(&self.controls).remove(&self.job_id);
     }
 }
 
@@ -690,10 +714,7 @@ impl StorageJobDispatcher {
             control.apply(StorageJobAction::Cancel);
         }
         {
-            let mut controls = self
-                .controls
-                .lock()
-                .expect("storage job controls mutex poisoned");
+            let mut controls = lock_storage_job_controls(&self.controls);
             if controls.len() >= self.max_inflight {
                 return Err("storage job dispatcher is at capacity".to_owned());
             }
@@ -713,10 +734,7 @@ impl StorageJobDispatcher {
             completion,
         };
         if let Err(error) = self.tx.try_send(request) {
-            self.controls
-                .lock()
-                .expect("storage job controls mutex poisoned")
-                .remove(&job_id);
+            lock_storage_job_controls(&self.controls).remove(&job_id);
             return Err(match error {
                 mpsc::error::TrySendError::Full(_) => "storage job worker queue is full".to_owned(),
                 mpsc::error::TrySendError::Closed(_) => {
@@ -728,10 +746,7 @@ impl StorageJobDispatcher {
     }
 
     pub(crate) fn control(&self, job_id: &str, action: StorageJobAction) -> Result<(), String> {
-        let control = self
-            .controls
-            .lock()
-            .expect("storage job controls mutex poisoned")
+        let control = lock_storage_job_controls(&self.controls)
             .get(job_id)
             .cloned()
             .ok_or_else(|| format!("storage worker has no active job {job_id}"))?;
@@ -740,11 +755,7 @@ impl StorageJobDispatcher {
     }
 
     pub(crate) fn stats(&self) -> StorageJobStats {
-        let inflight = self
-            .controls
-            .lock()
-            .expect("storage job controls mutex poisoned")
-            .len();
+        let inflight = lock_storage_job_controls(&self.controls).len();
         StorageJobStats {
             queue_depth: self.max_inflight.saturating_sub(self.tx.capacity()),
             inflight,
@@ -767,16 +778,16 @@ impl StorageJobDispatcher {
         let Some(task) = join.task.as_mut() else {
             return;
         };
-        if timeout(timeout_budget, &mut *task).await.is_err() {
-            warn!(
-                component = "storage_jobs",
-                operation = "shutdown",
-                result = "timeout",
-                "storage workers did not drain before shutdown deadline"
-            );
-            task.abort();
-            let _ = timeout(STORAGE_WORKER_ABORT_GRACE, &mut *task).await;
-        }
+        let _ = crate::shutdown_join_task(
+            task,
+            timeout_budget,
+            STORAGE_WORKER_ABORT_GRACE,
+            "storage_jobs",
+            "shutdown",
+            "storage worker supervisor",
+            || {},
+        )
+        .await;
     }
 }
 
@@ -787,10 +798,9 @@ impl Drop for StorageJobDispatcher {
         // currently running `spawn_blocking` filesystem execution can still
         // observe shutdown at its next step boundary and persist a queued
         // recovery state instead of continuing as an unowned write.
-        if let Ok(controls) = self.controls.lock() {
-            for control in controls.values() {
-                control.apply(StorageJobAction::Shutdown);
-            }
+        let controls = lock_storage_job_controls(&self.controls);
+        for control in controls.values() {
+            control.apply(StorageJobAction::Shutdown);
         }
         if let Some(shutdown_tx) = self.shutdown_tx.take() {
             let _ = shutdown_tx.send(());
@@ -818,9 +828,7 @@ async fn run_supervisor(
                 // `try_recv` below and leave it permanently without a
                 // supervisor or completion channel.
                 rx.close();
-                let active_controls = controls
-                    .lock()
-                    .expect("storage job controls mutex poisoned")
+                let active_controls = lock_storage_job_controls(&controls)
                     .values()
                     .cloned()
                     .collect::<Vec<_>>();
@@ -839,13 +847,16 @@ async fn run_supervisor(
             Some(result) = active.join_next(), if !active.is_empty() => {
                 match result {
                     Ok(job_id) => {
-                        controls
-                            .lock()
-                            .expect("storage job controls mutex poisoned")
-                            .remove(&job_id);
+                        lock_storage_job_controls(&controls).remove(&job_id);
                     }
                     Err(error) => {
-                        warn!(component = "storage_jobs", operation = "join", result = "error", error = %error, "storage worker join failed");
+                        warn!(
+                            component = "storage_jobs",
+                            operation = "join",
+                            result = "error",
+                            error = %crate::task_join_error_summary("storage supervisor task", &error),
+                            "storage worker join failed"
+                        );
                     }
                 }
             }
@@ -864,13 +875,16 @@ async fn run_supervisor(
     while let Some(result) = active.join_next().await {
         match result {
             Ok(job_id) => {
-                controls
-                    .lock()
-                    .expect("storage job controls mutex poisoned")
-                    .remove(&job_id);
+                lock_storage_job_controls(&controls).remove(&job_id);
             }
             Err(error) => {
-                warn!(component = "storage_jobs", operation = "join", result = "error", error = %error, "storage worker join failed during drain");
+                warn!(
+                    component = "storage_jobs",
+                    operation = "join",
+                    result = "error",
+                    error = %crate::task_join_error_summary("storage supervisor task", &error),
+                    "storage worker join failed during drain"
+                );
             }
         }
     }
@@ -902,10 +916,7 @@ async fn run_supervisor(
             )
         };
         let _ = request.completion.send(completion);
-        controls
-            .lock()
-            .expect("storage job controls mutex poisoned")
-            .remove(&request.job_id);
+        lock_storage_job_controls(&controls).remove(&request.job_id);
     }
 }
 
@@ -1048,7 +1059,7 @@ async fn run_storage_request(
         let completion_result = match result {
             Ok(completion_result) => completion_result,
             Err(error) => {
-                let reason = format!("storage worker panicked: {error}");
+                let reason = crate::task_join_error_summary("storage worker", &error);
                 let durable_reason = manual_recovery_reason(&reason);
                 let _ = persist_terminal(
                     &recovery_db,
@@ -1064,7 +1075,7 @@ async fn run_storage_request(
                     operation = "worker",
                     job_id = %job_id,
                     result = "panic",
-                    error = %error,
+                    error = %reason,
                     "storage worker task failed; durable job marked failed"
                 );
                 StorageJobCompletion::failed_with_manual_recovery(
@@ -1295,7 +1306,8 @@ async fn cancelled_before_start_completion_async(
     {
         Ok(completion) => completion,
         Err(error) => {
-            let reason = format!("storage cancellation cleanup worker panicked: {error}");
+            let reason =
+                crate::task_join_error_summary("storage cancellation cleanup worker", &error);
             let durable_reason = manual_recovery_reason(&reason);
             let _ = persist_terminal(
                 &fallback_db,
@@ -1651,7 +1663,7 @@ fn persist_requeued(
     completed_steps: &[usize],
     reason: &str,
 ) -> Result<(), String> {
-    let mut conn = db.lock().expect("database mutex poisoned");
+    let mut conn = lock_storage_job_db(db)?;
     let tx = conn
         .transaction_with_behavior(TransactionBehavior::Immediate)
         .map_err(|error| error.to_string())?;
@@ -1717,7 +1729,7 @@ fn persist_running(
     db: &Arc<Mutex<Connection>>,
     job_id: &str,
 ) -> Result<PersistRunningResult, String> {
-    let mut conn = db.lock().expect("database mutex poisoned");
+    let mut conn = lock_storage_job_db(db)?;
     let tx = conn
         .transaction_with_behavior(TransactionBehavior::Immediate)
         .map_err(|error| error.to_string())?;
@@ -1767,7 +1779,7 @@ fn persist_checkpoint(
     plan: &StoragePlan,
     completed_steps: &[usize],
 ) -> Result<(), String> {
-    let mut conn = db.lock().expect("database mutex poisoned");
+    let mut conn = lock_storage_job_db(db)?;
     let tx = conn
         .transaction_with_behavior(TransactionBehavior::Immediate)
         .map_err(|error| error.to_string())?;
@@ -1808,7 +1820,7 @@ fn persist_terminal(
     state: &str,
     error: Option<String>,
 ) -> Result<(), String> {
-    let mut conn = db.lock().expect("database mutex poisoned");
+    let mut conn = lock_storage_job_db(db)?;
     let tx = conn
         .transaction_with_behavior(TransactionBehavior::Immediate)
         .map_err(|error| error.to_string())?;
@@ -1879,6 +1891,36 @@ mod tests {
 
     use rt_db::migrate;
     use rt_storage::{plan_import, plan_move, ImportPlanRequest, MovePlanRequest};
+
+    #[test]
+    fn poisoned_controls_mutex_is_recovered_for_worker_cleanup() {
+        let controls = Arc::new(Mutex::new(HashMap::new()));
+        let controls_to_poison = Arc::clone(&controls);
+        let panic = std::panic::catch_unwind(move || {
+            let _guard = controls_to_poison.lock().unwrap();
+            panic!("inject control-map panic while locked");
+        });
+        assert!(panic.is_err());
+
+        let control = Arc::new(StorageJobControl::new(false));
+        lock_storage_job_controls(&controls).insert("recoverable".to_owned(), control);
+        assert!(!controls.is_poisoned());
+        assert!(lock_storage_job_controls(&controls).contains_key("recoverable"));
+    }
+
+    #[test]
+    fn poisoned_database_mutex_is_reported_instead_of_panicking() {
+        let db = Arc::new(Mutex::new(Connection::open_in_memory().unwrap()));
+        let db_to_poison = Arc::clone(&db);
+        let panic = std::panic::catch_unwind(move || {
+            let _guard = db_to_poison.lock().unwrap();
+            panic!("inject database panic while locked");
+        });
+        assert!(panic.is_err());
+
+        let error = persist_running(&db, "poisoned-lock-test").unwrap_err();
+        assert!(error.contains("database mutex poisoned during storage job persistence"));
+    }
 
     #[tokio::test]
     async fn queue_is_bounded_and_control_is_shared() {

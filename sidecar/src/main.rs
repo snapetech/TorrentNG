@@ -1,6 +1,9 @@
 use anyhow::{Context, Result};
 use std::{sync::Arc, time::Duration};
-use tokio::sync::broadcast;
+use tokio::{
+    sync::broadcast,
+    task::{JoinError, JoinHandle},
+};
 use torrentng::{api, backend, cache, config, metrics, rtorrent, rtorrent_logs, stats, sync};
 use tracing::{info, warn};
 
@@ -13,6 +16,64 @@ use cache::{AppEventRow, Db};
 use config::{BackendKind, Config};
 use metrics::Metrics;
 use rtorrent::Client;
+
+struct BackgroundTasks {
+    sync: JoinHandle<()>,
+    stats: JoinHandle<()>,
+    rtorrent_logs: Option<JoinHandle<()>>,
+}
+
+impl BackgroundTasks {
+    async fn wait_for_exit(&mut self) -> anyhow::Error {
+        tokio::select! {
+            biased;
+            result = &mut self.sync => task_exit_error("sync loop", result),
+            result = &mut self.stats => task_exit_error("stats loop", result),
+            result = wait_for_optional_task(&mut self.rtorrent_logs) => {
+                match result {
+                    Some(result) => task_exit_error("rTorrent log ingestion loop", result),
+                    None => unreachable!("disabled optional task has a pending waiter"),
+                }
+            }
+        }
+    }
+}
+
+impl Drop for BackgroundTasks {
+    fn drop(&mut self) {
+        self.sync.abort();
+        self.stats.abort();
+        if let Some(task) = &self.rtorrent_logs {
+            task.abort();
+        }
+    }
+}
+
+async fn wait_for_optional_task(
+    task: &mut Option<JoinHandle<()>>,
+) -> Option<std::result::Result<(), JoinError>> {
+    match task {
+        Some(task) => Some(task.await),
+        None => std::future::pending().await,
+    }
+}
+
+fn task_exit_error(
+    task: &'static str,
+    result: std::result::Result<(), JoinError>,
+) -> anyhow::Error {
+    match result {
+        Ok(()) => anyhow::anyhow!("{task} exited unexpectedly"),
+        Err(error) => {
+            let outcome = if error.is_panic() {
+                "panicked"
+            } else {
+                "was cancelled"
+            };
+            anyhow::anyhow!("{task} {outcome}")
+        }
+    }
+}
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -84,7 +145,7 @@ async fn main() -> Result<()> {
                 component = "rtorrent",
                 operation = "startup_identity",
                 result = "error",
-                error = %error,
+                error = %torrentng::redact_log_display(&error),
                 "refusing to serve until rTorrent tracker identity is applied"
             );
             append_startup_event(
@@ -117,58 +178,17 @@ async fn main() -> Result<()> {
         );
     }
 
-    {
-        let backend2 = backend.clone();
-        let db2 = db.clone();
-        let tx2 = tx.clone();
-        let mx2 = metrics.clone();
-        let interval = cfg.sync_interval();
-        let retention = cfg.logging.event_retention;
-        tokio::spawn(async move {
-            sync::run(backend2, db2, tx2, mx2, interval, retention).await;
-        });
-    }
-
-    {
-        let backend2 = backend.clone();
-        let db2 = db.clone();
-        let tx2 = tx.clone();
-        let retention = cfg.logging.event_retention;
-        tokio::spawn(async move {
-            stats::run(
-                backend2,
-                db2,
-                tx2,
-                std::time::Duration::from_secs(2),
-                retention,
-            )
-            .await;
-        });
-    }
-
-    if cfg.backend.backend_type == BackendKind::Rtorrent
-        && cfg.rtorrent.logs.enabled
-        && !cfg.rtorrent.logs.paths.is_empty()
-    {
-        let db2 = db.clone();
-        let log_cfg = cfg.rtorrent.logs.clone();
-        let retention = cfg.logging.event_retention;
-        tokio::spawn(async move {
-            rtorrent_logs::run(db2, log_cfg, retention).await;
-        });
-    }
-
     let state = AppState {
         cfg: Arc::new(cfg.clone()),
         rt,
-        backend,
-        db,
-        events: tx,
-        metrics,
+        backend: backend.clone(),
+        db: db.clone(),
+        events: tx.clone(),
+        metrics: metrics.clone(),
         qbit_search_plugins: Arc::new(tokio::sync::RwLock::new(serde_json::Map::new())),
         qbit_search_jobs: Arc::new(tokio::sync::RwLock::new(serde_json::Map::new())),
         qbit_next_search_id: Arc::new(std::sync::atomic::AtomicU64::new(1)),
-        qbit_rss_items: Arc::new(tokio::sync::RwLock::new(serde_json::Map::new())),
+        login_attempt_limiter: torrentng::auth::LoginAttemptLimiter::default(),
         control_plane_write: Arc::new(tokio::sync::Mutex::new(())),
     };
     let app = build_router(state);
@@ -189,13 +209,81 @@ async fn main() -> Result<()> {
         .await
         .with_context(|| format!("bind {addr}"))?;
 
-    axum::serve(
-        listener,
-        app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
-    )
-    .with_graceful_shutdown(shutdown_signal())
-    .await
-    .context("http server")?;
+    let sync_backend = backend.clone();
+    let sync_db = db.clone();
+    let sync_events = tx.clone();
+    let sync_metrics = metrics.clone();
+    let sync_interval = cfg.sync_interval();
+    let retention = cfg.logging.event_retention;
+    let sync_task = tokio::spawn(async move {
+        sync::run(
+            sync_backend,
+            sync_db,
+            sync_events,
+            sync_metrics,
+            sync_interval,
+            retention,
+        )
+        .await;
+    });
+
+    let stats_backend = backend.clone();
+    let stats_db = db.clone();
+    let stats_events = tx.clone();
+    let retention = cfg.logging.event_retention;
+    let stats_task = tokio::spawn(async move {
+        stats::run(
+            stats_backend,
+            stats_db,
+            stats_events,
+            std::time::Duration::from_secs(2),
+            retention,
+        )
+        .await;
+    });
+
+    let rtorrent_logs_task = if cfg.backend.backend_type == BackendKind::Rtorrent
+        && cfg.rtorrent.logs.enabled
+        && !cfg.rtorrent.logs.paths.is_empty()
+    {
+        let log_db = db.clone();
+        let log_cfg = cfg.rtorrent.logs.clone();
+        let retention = cfg.logging.event_retention;
+        Some(tokio::spawn(async move {
+            rtorrent_logs::run(log_db, log_cfg, retention).await;
+        }))
+    } else {
+        None
+    };
+    let mut background_tasks = BackgroundTasks {
+        sync: sync_task,
+        stats: stats_task,
+        rtorrent_logs: rtorrent_logs_task,
+    };
+
+    let server = async move {
+        axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        )
+        .with_graceful_shutdown(shutdown_signal())
+        .await
+    };
+    tokio::pin!(server);
+    tokio::select! {
+        biased;
+        error = background_tasks.wait_for_exit() => {
+            tracing::error!(
+                component = "sidecar",
+                operation = "background_task",
+                result = "stopped",
+                error = %error,
+                "sidecar background task exited; terminating service"
+            );
+            return Err(error);
+        }
+        result = &mut server => result.context("http server")?,
+    }
 
     info!(
         component = "sidecar",
@@ -243,7 +331,7 @@ async fn initialize_rtorrent_identity(rt: &Client, user_agent: &str, peer_id: &s
                     operation = "startup_identity",
                     result = "retry",
                     attempt,
-                    error = %error,
+                    error = %torrentng::redact_log_display(&error),
                     "rTorrent tracker identity setup failed"
                 );
                 last_error = Some(error);
@@ -288,7 +376,7 @@ fn append_startup_event(
             operation = "append",
             kind,
             result = "error",
-            error = %e,
+            error = %torrentng::redact_log_display(&e),
             "failed to append startup app event"
         );
     }
@@ -312,5 +400,52 @@ async fn shutdown_signal() {
     tokio::select! {
         _ = ctrl_c => {},
         _ = terminate => {},
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn supervised_background_panic_is_reported_without_its_payload() {
+        let sync = tokio::spawn(async {
+            std::panic::panic_any("sidecar-background-panic-canary");
+        });
+        let mut tasks = BackgroundTasks {
+            sync,
+            stats: tokio::spawn(std::future::pending()),
+            rtorrent_logs: None,
+        };
+
+        let error = tasks.wait_for_exit().await;
+        let rendered = format!("{error:#}");
+        assert_eq!(rendered, "sync loop panicked");
+        assert!(!rendered.contains("sidecar-background-panic-canary"));
+    }
+
+    #[tokio::test]
+    async fn supervised_background_cancellation_is_not_silent() {
+        let sync = tokio::spawn(std::future::pending());
+        sync.abort();
+        let mut tasks = BackgroundTasks {
+            sync,
+            stats: tokio::spawn(std::future::pending()),
+            rtorrent_logs: None,
+        };
+
+        assert_eq!(
+            tasks.wait_for_exit().await.to_string(),
+            "sync loop was cancelled"
+        );
+    }
+
+    #[tokio::test]
+    async fn normally_returned_background_loop_is_still_unexpected() {
+        let result = tokio::spawn(async {}).await;
+        assert_eq!(
+            task_exit_error("stats loop", result).to_string(),
+            "stats loop exited unexpectedly"
+        );
     }
 }

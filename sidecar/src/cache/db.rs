@@ -1,18 +1,22 @@
+use super::categories::{
+    check_category_capacity, check_tag_capacity, check_torrent_tag_capacity,
+    MAX_CACHED_LABEL_NAME_BYTES, MAX_CACHED_TAGS_PER_MUTATION, MAX_CACHED_TAG_MUTATION_BYTES,
+};
 use anyhow::{Context, Result};
 use rusqlite::{params, Connection, OptionalExtension};
 use std::{
     collections::{BTreeMap, HashSet},
     path::Path,
     sync::{
-        atomic::{AtomicUsize, Ordering},
-        Arc, Mutex, MutexGuard, OnceLock,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+        Arc, Mutex, MutexGuard, OnceLock, TryLockError,
     },
     time::{SystemTime, UNIX_EPOCH},
 };
 use tokio::sync::Semaphore;
 
 /// qBittorrent's `sync/maindata.rid` is a logical change cursor, not a wall
-    /// clock.  Keep it in the cache database so it survives service restarts and
+/// clock.  Keep it in the cache database so it survives service restarts and
 /// cannot miss two updates made in the same second.
 pub(crate) const CACHE_REVISION_KEY: &str = "cache_revision";
 pub(crate) const CACHE_REVISION_FLOOR_KEY: &str = "cache_revision_floor";
@@ -26,6 +30,25 @@ const MAX_BLOCKING_DB_READS: usize = 8;
 /// writer's mutex. Kept small and fixed-size -- this is a read cache in
 /// front of a poll loop, not a general-purpose connection pool.
 const READ_POOL_SIZE: usize = 4;
+
+fn parse_cached_tags(raw: &str) -> Result<Vec<String>> {
+    if raw.len() > MAX_CACHED_TAG_MUTATION_BYTES {
+        anyhow::bail!("cached torrent tag list exceeds the byte limit");
+    }
+    let mut tags = Vec::new();
+    for tag in raw.split(',').map(str::trim).filter(|tag| !tag.is_empty()) {
+        if tags.len() >= MAX_CACHED_TAGS_PER_MUTATION {
+            anyhow::bail!(
+                "cached torrent tag list exceeds the {MAX_CACHED_TAGS_PER_MUTATION}-item limit"
+            );
+        }
+        if tag.len() > MAX_CACHED_LABEL_NAME_BYTES {
+            anyhow::bail!("cached tag name exceeds the {MAX_CACHED_LABEL_NAME_BYTES}-byte limit");
+        }
+        tags.push(tag.to_owned());
+    }
+    Ok(tags)
+}
 static BLOCKING_DB_READ_GATE: OnceLock<Arc<Semaphore>> = OnceLock::new();
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -74,6 +97,7 @@ pub struct AppEventRow {
 /// other.
 struct Inner {
     writer: Mutex<Connection>,
+    writer_poison_reported: AtomicBool,
     readers: ReadPool,
 }
 
@@ -86,6 +110,7 @@ struct Inner {
 struct ReadPool {
     conns: Vec<Mutex<Connection>>,
     next: AtomicUsize,
+    poison_reported: AtomicBool,
 }
 
 impl ReadPool {
@@ -106,21 +131,46 @@ impl ReadPool {
         Ok(Self {
             conns,
             next: AtomicUsize::new(0),
+            poison_reported: AtomicBool::new(false),
         })
     }
 
-    fn checkout(&self) -> MutexGuard<'_, Connection> {
+    fn checkout(&self) -> Result<MutexGuard<'_, Connection>> {
         let len = self.conns.len();
+        if len == 0 {
+            anyhow::bail!("cache read connection pool is empty");
+        }
         let start = self.next.fetch_add(1, Ordering::Relaxed) % len;
         for offset in 0..len {
             let idx = (start + offset) % len;
-            if let Ok(guard) = self.conns[idx].try_lock() {
-                return guard;
+            match self.conns[idx].try_lock() {
+                Ok(guard) => return Ok(guard),
+                Err(TryLockError::WouldBlock) => {}
+                Err(TryLockError::Poisoned(_)) => self.note_poisoned_connection(),
             }
         }
-        // Every connection is currently busy: block on the assigned slot
-        // instead of spinning across all of them.
-        self.conns[start].lock().expect("read pool mutex poisoned")
+        // Every healthy connection is currently busy: block on the first
+        // usable slot rather than spinning. A poisoned slot is skipped so a
+        // single failed reader cannot turn later requests into repeat panics.
+        for offset in 0..len {
+            let idx = (start + offset) % len;
+            match self.conns[idx].lock() {
+                Ok(guard) => return Ok(guard),
+                Err(_) => self.note_poisoned_connection(),
+            }
+        }
+        anyhow::bail!("cache read connection pool has no healthy connections")
+    }
+
+    fn note_poisoned_connection(&self) {
+        if !self.poison_reported.swap(true, Ordering::AcqRel) {
+            tracing::warn!(
+                component = "db",
+                operation = "read_connection",
+                result = "mutex_poisoned",
+                "skipping poisoned cache read connection"
+            );
+        }
     }
 }
 
@@ -157,6 +207,7 @@ impl Db {
 
         Ok(Self(Arc::new(Inner {
             writer: Mutex::new(writer_conn),
+            writer_poison_reported: AtomicBool::new(false),
             readers,
         })))
     }
@@ -164,15 +215,28 @@ impl Db {
     /// Acquire the dedicated writer connection. Every mutation must go
     /// through this so writes stay serialized -- WAL allows exactly one
     /// writer connection at a time.
-    pub(crate) fn conn(&self) -> MutexGuard<'_, Connection> {
-        self.0.writer.lock().expect("db writer mutex poisoned")
+    pub(crate) fn conn(&self) -> Result<MutexGuard<'_, Connection>> {
+        match self.0.writer.lock() {
+            Ok(guard) => Ok(guard),
+            Err(_) => {
+                if !self.0.writer_poison_reported.swap(true, Ordering::AcqRel) {
+                    tracing::error!(
+                        component = "db",
+                        operation = "writer_connection",
+                        result = "mutex_poisoned",
+                        "cache writer connection is unavailable after mutex poisoning"
+                    );
+                }
+                anyhow::bail!("cache writer connection is unavailable after mutex poisoning")
+            }
+        }
     }
 
     /// Check out a connection from the read-only pool. Safe to call
     /// concurrently with other reads and with an in-progress write: WAL lets
     /// readers proceed against the last-committed snapshot without blocking
     /// on, or being blocked by, the writer.
-    pub(crate) fn read(&self) -> MutexGuard<'_, Connection> {
+    pub(crate) fn read(&self) -> Result<MutexGuard<'_, Connection>> {
         self.0.readers.checkout()
     }
 
@@ -199,7 +263,12 @@ impl Db {
             f(&db)
         })
         .await
-        .with_context(|| format!("cache blocking task failed: {operation}"))?
+        .map_err(|error| {
+            anyhow::anyhow!(
+                "cache blocking task failed: {}",
+                crate::task_join_error_summary(operation, &error)
+            )
+        })?
     }
 
     pub fn upsert(&self, t: &TorrentRow) -> Result<()> {
@@ -211,37 +280,60 @@ impl Db {
     /// `TorrentRow::tags` in that case means "not exposed", not "remove every
     /// cached tag".
     pub fn upsert_with_tags(&self, t: &TorrentRow, sync_tags: bool) -> Result<bool> {
-        let mut conn = self.conn();
+        if t.category.len() > MAX_CACHED_LABEL_NAME_BYTES {
+            anyhow::bail!("category name exceeds the {MAX_CACHED_LABEL_NAME_BYTES}-byte limit");
+        }
+        let mut desired_tags = if sync_tags {
+            parse_cached_tags(&t.tags)?
+        } else {
+            Vec::new()
+        };
+        desired_tags.sort_unstable();
+        desired_tags.dedup();
+        let mut conn = self.conn()?;
         let tx = conn.transaction()?;
         // qBittorrent treats info hashes case-insensitively.  The legacy
         // schema has a binary-collated primary key, so resolve an existing
         // row before the INSERT ... ON CONFLICT path or a differently-cased
         // refresh would create a second logical torrent.
         let hash = canonical_hash(&tx, &t.hash)?.unwrap_or_else(|| t.hash.clone());
-        let mut desired_tags = if sync_tags {
-            t.tags
-                .split(',')
-                .map(str::trim)
-                .filter(|tag| !tag.is_empty())
-                .map(str::to_owned)
-                .collect::<Vec<_>>()
-        } else {
-            Vec::new()
-        };
-        desired_tags.sort_unstable();
-        desired_tags.dedup();
-        let current_tags = if sync_tags {
-            let mut stmt = tx.prepare(
-                "SELECT tag FROM torrent_tags WHERE hash=?1 COLLATE NOCASE ORDER BY tag",
+        check_category_capacity(&tx, Some(&hash), &t.category)?;
+        if sync_tags {
+            let tag_refs = desired_tags.iter().map(String::as_str).collect::<Vec<_>>();
+            check_tag_capacity(&tx, &tag_refs)?;
+            check_torrent_tag_capacity(&tx, &hash, &tag_refs, false)?;
+        }
+        let tags_changed = if sync_tags {
+            let (current_count, max_tag_bytes): (i64, i64) = tx.query_row(
+                "SELECT COUNT(*), COALESCE(MAX(length(CAST(tag AS BLOB))), 0)
+                 FROM torrent_tags WHERE hash=?1 COLLATE NOCASE",
+                params![hash.as_str()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
             )?;
-            let rows = stmt
-                .query_map(params![hash.as_str()], |row| row.get::<_, String>(0))?
-                .collect::<rusqlite::Result<Vec<_>>>()?;
-            rows
+            if current_count < 0
+                || current_count as usize > MAX_CACHED_TAGS_PER_MUTATION
+                || max_tag_bytes < 0
+                || max_tag_bytes as usize > MAX_CACHED_LABEL_NAME_BYTES
+            {
+                // A backend refresh is allowed to repair an over-limit legacy
+                // projection; avoid collecting it into an unbounded Vec first.
+                true
+            } else {
+                let mut stmt = tx.prepare(
+                    "SELECT tag FROM torrent_tags WHERE hash=?1 COLLATE NOCASE
+                     ORDER BY tag LIMIT ?2",
+                )?;
+                let rows = stmt
+                    .query_map(
+                        params![hash.as_str(), (MAX_CACHED_TAGS_PER_MUTATION + 1) as i64],
+                        |row| row.get::<_, String>(0),
+                    )?
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                rows != desired_tags
+            }
         } else {
-            Vec::new()
+            false
         };
-        let tags_changed = sync_tags && current_tags != desired_tags;
 
         // `updated_at` is a last-seen timestamp, not a logical content
         // change. Sync runs may refresh it without waking every qBittorrent
@@ -396,7 +488,7 @@ impl Db {
     }
 
     pub fn delete(&self, hash: &str) -> Result<()> {
-        let mut conn = self.conn();
+        let mut conn = self.conn()?;
         let tx = conn.transaction()?;
         let Some(canonical) = canonical_hash(&tx, hash)? else {
             tx.commit()?;
@@ -425,23 +517,20 @@ impl Db {
     /// intentionally independent from `TorrentRow::updated_at`, which is a
     /// wall-clock freshness value and is not a safe change cursor.
     pub fn current_revision(&self) -> Result<i64> {
-        current_revision_locked(&self.read())
+        let conn = self.read()?;
+        current_revision_locked(&conn)
     }
 
     pub fn append_app_event(&self, event: &AppEventRow, retention: usize) -> Result<i64> {
         serde_json::from_str::<serde_json::Value>(&event.payload)
             .with_context(|| "validate app event payload JSON")?;
-        let conn = self.conn();
+        let message = crate::url_redaction::redact_sensitive_text(&event.message);
+        let payload = crate::url_redaction::redact_sensitive_json(&event.payload);
+        let conn = self.conn()?;
         conn.execute(
             "INSERT INTO app_events (occurred_at, level, kind, message, payload)
              VALUES (?1, ?2, ?3, ?4, ?5)",
-            params![
-                event.occurred_at,
-                event.level,
-                event.kind,
-                event.message,
-                event.payload,
-            ],
+            params![event.occurred_at, event.level, event.kind, message, payload,],
         )?;
         let id = conn.last_insert_rowid();
         prune_app_events_locked(&conn, retention.max(1))?;
@@ -459,7 +548,7 @@ impl Db {
         levels: &[&str],
         last_known_id: Option<i64>,
     ) -> Result<Vec<AppEventRow>> {
-        let conn = self.read();
+        let conn = self.read()?;
         let limit = limit.max(1) as i64;
         let mut sql = "SELECT event_id, occurred_at, level, kind, message, payload
              FROM app_events"
@@ -504,13 +593,15 @@ impl Db {
         let mut stmt = conn.prepare(&sql)?;
         let rows = stmt
             .query_map(rusqlite::params_from_iter(values), |row| {
+                let message: String = row.get(4)?;
+                let payload: String = row.get(5)?;
                 Ok(AppEventRow {
                     event_id: Some(row.get(0)?),
                     occurred_at: row.get(1)?,
                     level: row.get(2)?,
                     kind: row.get(3)?,
-                    message: row.get(4)?,
-                    payload: row.get(5)?,
+                    message: crate::url_redaction::redact_sensitive_text(&message),
+                    payload: crate::url_redaction::redact_sensitive_json(&payload),
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -519,7 +610,7 @@ impl Db {
 
     pub fn get_kv(&self, key: &str) -> Result<Option<String>> {
         Ok(self
-            .read()
+            .read()?
             .query_row("SELECT value FROM kv WHERE key=?1", params![key], |r| {
                 r.get(0)
             })
@@ -527,7 +618,7 @@ impl Db {
     }
 
     pub fn set_kv(&self, key: &str, value: &str) -> Result<()> {
-        self.conn().execute(
+        self.conn()?.execute(
             "INSERT INTO kv(key, value) VALUES(?1,?2)
              ON CONFLICT(key) DO UPDATE SET value=excluded.value",
             params![key, value],
@@ -536,13 +627,13 @@ impl Db {
     }
 
     pub fn delete_kv(&self, key: &str) -> Result<()> {
-        self.conn()
+        self.conn()?
             .execute("DELETE FROM kv WHERE key=?1", params![key])?;
         Ok(())
     }
 
     pub fn exists(&self, hash: &str) -> Result<bool> {
-        let exists: i64 = self.read().query_row(
+        let exists: i64 = self.read()?.query_row(
             "SELECT EXISTS(SELECT 1 FROM torrents WHERE hash=?1 COLLATE NOCASE)",
             params![hash],
             |r| r.get(0),
@@ -558,13 +649,13 @@ impl Db {
     /// backend; otherwise a backend that treats an unknown id as a no-op can
     /// make a successful HTTP response lie about the requested torrent.
     pub fn canonical_hash(&self, hash: &str) -> Result<Option<String>> {
-        let conn = self.read();
+        let conn = self.read()?;
         canonical_hash(&conn, hash)
     }
 
     pub fn count(&self) -> Result<i64> {
         let n: i64 = self
-            .read()
+            .read()?
             .query_row("SELECT COUNT(*) FROM torrents", [], |r| r.get(0))?;
         Ok(n)
     }
@@ -576,7 +667,7 @@ impl Db {
     /// they were library totals. Keep the aggregation in SQLite and run it at
     /// the end of a complete sync cycle.
     pub fn sync_counts(&self) -> Result<(i64, i64, i64, i64, i64)> {
-        Ok(self.read().query_row(
+        Ok(self.read()?.query_row(
             "SELECT
                 COALESCE(SUM(CASE
                     WHEN state = 3 THEN 1 ELSE 0 END), 0),
@@ -607,11 +698,24 @@ impl Db {
     }
 
     pub fn all_hashes(&self) -> Result<HashSet<String>> {
-        let conn = self.read();
+        let conn = self.read()?;
         let mut stmt = conn.prepare("SELECT hash FROM torrents")?;
         let hashes = stmt
             .query_map([], |r| r.get(0))?
             .collect::<rusqlite::Result<HashSet<String>>>()?;
+        Ok(hashes)
+    }
+
+    /// Read no more than `limit` torrent hashes. Callers that need to reject
+    /// over-limit selections can request `max + 1` rows without materializing
+    /// the entire cache first.
+    pub fn all_hashes_bounded(&self, limit: usize) -> Result<Vec<String>> {
+        let limit = i64::try_from(limit).context("hash limit does not fit SQLite integer")?;
+        let conn = self.read()?;
+        let mut stmt = conn.prepare("SELECT hash FROM torrents ORDER BY hash LIMIT ?1")?;
+        let hashes = stmt
+            .query_map([limit], |row| row.get(0))?
+            .collect::<rusqlite::Result<Vec<String>>>()?;
         Ok(hashes)
     }
 }
@@ -774,6 +878,18 @@ fn migrate(conn: &mut Connection) -> Result<()> {
             PRIMARY KEY (hash, tag)
         );
 
+        CREATE TABLE IF NOT EXISTS torrent_tag_totals (
+            singleton         INTEGER PRIMARY KEY CHECK (singleton=1),
+            assignment_count  INTEGER NOT NULL,
+            assignment_bytes  INTEGER NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS torrent_tag_stats (
+            hash              TEXT PRIMARY KEY,
+            assignment_count  INTEGER NOT NULL,
+            assignment_bytes  INTEGER NOT NULL
+        );
+
         CREATE TABLE IF NOT EXISTS kv (
             key   TEXT PRIMARY KEY,
             value TEXT NOT NULL
@@ -817,6 +933,7 @@ fn migrate(conn: &mut Connection) -> Result<()> {
     // otherwise one spelling would remain invisible to reads and tombstone
     // replay could report a phantom duplicate.
     collapse_case_duplicate_hashes(conn)?;
+    rebuild_torrent_tag_stats(conn)?;
 
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -855,6 +972,86 @@ fn migrate(conn: &mut Connection) -> Result<()> {
             params![CACHE_REVISION_FLOOR_KEY, revision.to_string()],
         )?;
     }
+    Ok(())
+}
+
+fn rebuild_torrent_tag_stats(conn: &mut Connection) -> Result<()> {
+    let tx = conn.transaction()?;
+    // The base table remains authoritative. Rebuild once at startup so an
+    // interrupted older process or a pre-migration database cannot leave the
+    // O(1) capacity summaries stale.
+    tx.execute("DELETE FROM torrent_tag_stats", [])?;
+    tx.execute(
+        "INSERT INTO torrent_tag_stats(hash, assignment_count, assignment_bytes)
+         SELECT hash, COUNT(*), COALESCE(SUM(length(CAST(tag AS BLOB))), 0)
+         FROM torrent_tags GROUP BY hash",
+        [],
+    )?;
+    tx.execute(
+        "INSERT INTO torrent_tag_totals(singleton, assignment_count, assignment_bytes)
+         VALUES (
+             1,
+             (SELECT COUNT(*) FROM torrent_tags),
+             (SELECT COALESCE(SUM(length(CAST(tag AS BLOB))), 0) FROM torrent_tags)
+         )
+         ON CONFLICT(singleton) DO UPDATE SET
+             assignment_count=excluded.assignment_count,
+             assignment_bytes=excluded.assignment_bytes",
+        [],
+    )?;
+    tx.execute_batch(
+        "
+        CREATE TRIGGER IF NOT EXISTS torrent_tags_stats_after_insert
+        AFTER INSERT ON torrent_tags
+        BEGIN
+            UPDATE torrent_tag_totals
+            SET assignment_count=assignment_count + 1,
+                assignment_bytes=assignment_bytes + length(CAST(NEW.tag AS BLOB))
+            WHERE singleton=1;
+            INSERT INTO torrent_tag_stats(hash, assignment_count, assignment_bytes)
+            VALUES (NEW.hash, 1, length(CAST(NEW.tag AS BLOB)))
+            ON CONFLICT(hash) DO UPDATE SET
+                assignment_count=assignment_count + 1,
+                assignment_bytes=assignment_bytes + excluded.assignment_bytes;
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS torrent_tags_stats_after_delete
+        AFTER DELETE ON torrent_tags
+        BEGIN
+            UPDATE torrent_tag_totals
+            SET assignment_count=MAX(assignment_count - 1, 0),
+                assignment_bytes=MAX(assignment_bytes - length(CAST(OLD.tag AS BLOB)), 0)
+            WHERE singleton=1;
+            UPDATE torrent_tag_stats
+            SET assignment_count=MAX(assignment_count - 1, 0),
+                assignment_bytes=MAX(assignment_bytes - length(CAST(OLD.tag AS BLOB)), 0)
+            WHERE hash=OLD.hash;
+            DELETE FROM torrent_tag_stats
+            WHERE hash=OLD.hash AND assignment_count=0;
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS torrent_tags_stats_after_update
+        AFTER UPDATE OF hash, tag ON torrent_tags
+        BEGIN
+            UPDATE torrent_tag_totals
+            SET assignment_bytes=MAX(assignment_bytes - length(CAST(OLD.tag AS BLOB)), 0)
+                                  + length(CAST(NEW.tag AS BLOB))
+            WHERE singleton=1;
+            UPDATE torrent_tag_stats
+            SET assignment_count=MAX(assignment_count - 1, 0),
+                assignment_bytes=MAX(assignment_bytes - length(CAST(OLD.tag AS BLOB)), 0)
+            WHERE hash=OLD.hash;
+            DELETE FROM torrent_tag_stats
+            WHERE hash=OLD.hash AND assignment_count=0;
+            INSERT INTO torrent_tag_stats(hash, assignment_count, assignment_bytes)
+            VALUES (NEW.hash, 1, length(CAST(NEW.tag AS BLOB)))
+            ON CONFLICT(hash) DO UPDATE SET
+                assignment_count=assignment_count + 1,
+                assignment_bytes=assignment_bytes + excluded.assignment_bytes;
+        END;
+        ",
+    )?;
+    tx.commit()?;
     Ok(())
 }
 
@@ -953,6 +1150,76 @@ mod tests {
     use super::*;
     use crate::cache::query::ListParams;
 
+    fn poison_mutex<T: Send>(mutex: &Mutex<T>) {
+        std::thread::scope(|scope| {
+            let handle = scope.spawn(|| {
+                let _guard = mutex.lock().expect("mutex starts unpoisoned");
+                std::panic::panic_any("cache-mutex-poison-test");
+            });
+            assert!(handle.join().is_err());
+        });
+    }
+
+    #[test]
+    fn poisoned_writer_fails_closed_without_repeated_panics() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("cache.db")).unwrap();
+        poison_mutex(&db.0.writer);
+
+        let error = match db.conn() {
+            Ok(_) => panic!("poisoned writer unexpectedly remained available"),
+            Err(error) => error,
+        };
+        assert_eq!(
+            error.to_string(),
+            "cache writer connection is unavailable after mutex poisoning"
+        );
+        assert!(db.0.writer.is_poisoned());
+        assert!(db.conn().is_err());
+    }
+
+    #[test]
+    fn poisoned_readers_are_skipped_and_all_poisoned_pool_fails_cleanly() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("cache.db")).unwrap();
+
+        poison_mutex(&db.0.readers.conns[0]);
+        let conn = db.read().expect("remaining reader connections stay usable");
+        let one: i64 = conn
+            .query_row("SELECT 1", [], |row| row.get(0))
+            .expect("healthy reader can execute queries");
+        assert_eq!(one, 1);
+        drop(conn);
+        assert!(db.0.readers.conns[0].is_poisoned());
+
+        for reader in db.0.readers.conns.iter().skip(1) {
+            poison_mutex(reader);
+        }
+        let error = match db.read() {
+            Ok(_) => panic!("fully poisoned reader pool unexpectedly remained available"),
+            Err(error) => error,
+        };
+        assert_eq!(
+            error.to_string(),
+            "cache read connection pool has no healthy connections"
+        );
+    }
+
+    #[tokio::test]
+    async fn blocking_task_error_does_not_retain_panic_payload() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("cache.db")).unwrap();
+        let error = db
+            .run_blocking("panic_probe", |_| -> Result<()> {
+                std::panic::panic_any("cache-blocking-panic-secret");
+            })
+            .await
+            .expect_err("panicking blocking task should fail");
+        let rendered = format!("{error:#}");
+        assert_eq!(rendered, "cache blocking task failed: panic_probe panicked");
+        assert!(!rendered.contains("cache-blocking-panic-secret"));
+    }
+
     /// TEMP tables are connection-local in SQLite -- a `CREATE TEMP TABLE`
     /// on one `Connection` is invisible to every other `Connection`, even
     /// against the same file. Creating one on the writer and failing to
@@ -965,11 +1232,13 @@ mod tests {
         let db = Db::open(&dir.path().join("cache.db")).unwrap();
 
         db.conn()
+            .expect("healthy test writer")
             .execute_batch("CREATE TEMP TABLE writer_only(x INTEGER);")
             .unwrap();
 
         let visible: i64 = db
             .read()
+            .expect("healthy test reader")
             .query_row(
                 "SELECT COUNT(*) FROM sqlite_temp_master WHERE name='writer_only'",
                 [],
@@ -980,6 +1249,18 @@ mod tests {
             visible, 0,
             "a read-pool connection must not share the writer's connection"
         );
+    }
+
+    #[test]
+    fn bounded_hash_read_stops_at_the_requested_row_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("cache.db")).unwrap();
+        for hash in ["bounded-a", "bounded-b", "bounded-c"] {
+            db.upsert(&torrent_row(hash, 0, false, false)).unwrap();
+        }
+
+        let hashes = db.all_hashes_bounded(2).unwrap();
+        assert_eq!(hashes.len(), 2);
     }
 
     /// Demonstrates the actual point of the read pool: two reads issued at
@@ -1000,7 +1281,7 @@ mod tests {
             for _ in 0..2 {
                 let db = db.clone();
                 scope.spawn(move || {
-                    let _guard = db.read();
+                    let _guard = db.read().expect("healthy test reader");
                     std::thread::sleep(hold_for);
                 });
             }
@@ -1135,6 +1416,128 @@ mod tests {
     }
 
     #[test]
+    fn app_events_redact_sensitive_messages_and_payloads_on_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("cache.db")).unwrap();
+        let message = "failed https://log-user:log-password@tracker.example/path-passkey?signature=log-query-secret /srv/private/log-file.bin\npasskey=split-line-secret \u{202e}spoof";
+        let payload = serde_json::json!({
+            "error": "request to https://payload-user:payload-password@tracker.example/private?token=payload-url-secret failed",
+            "credentials": {
+                "access_token": "payload-access-secret",
+                "safe_label": "ordinary"
+            },
+            "path": "/srv/private/payload-file.bin"
+        })
+        .to_string();
+        db.append_app_event(
+            &AppEventRow {
+                event_id: None,
+                occurred_at: 1,
+                level: "error".to_owned(),
+                kind: "test".to_owned(),
+                message: message.to_owned(),
+                payload,
+            },
+            10,
+        )
+        .unwrap();
+
+        let conn = db.conn().expect("healthy test writer");
+        let (stored_message, stored_payload): (String, String) = conn
+            .query_row(
+                "SELECT message, payload FROM app_events ORDER BY event_id DESC LIMIT 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        drop(conn);
+        let stored_rendered = format!("{stored_message} {stored_payload}");
+        for secret in [
+            "log-user",
+            "log-password",
+            "path-passkey",
+            "log-query-secret",
+            "split-line-secret",
+            "/srv/private",
+            "payload-user",
+            "payload-password",
+            "payload-url-secret",
+            "payload-access-secret",
+        ] {
+            assert!(!stored_rendered.contains(secret), "{stored_rendered}");
+        }
+        assert!(!stored_message.chars().any(char::is_control));
+
+        let event = db.list_app_events(10).unwrap().remove(0);
+        let payload: serde_json::Value = serde_json::from_str(&event.payload).unwrap();
+        assert_eq!(payload["credentials"]["access_token"], "[redacted]");
+        assert_eq!(payload["credentials"]["safe_label"], "ordinary");
+        assert!(event.message.contains("https://tracker.example/"));
+        assert!(event.message.contains("[redacted-path:log-file.bin]"));
+        assert!(event.message.contains("passkey=[redacted]"));
+        assert!(!event.message.chars().any(char::is_control));
+
+        let rendered = format!("{} {payload}", event.message);
+        for secret in [
+            "log-user",
+            "log-password",
+            "path-passkey",
+            "log-query-secret",
+            "split-line-secret",
+            "/srv/private",
+            "payload-user",
+            "payload-password",
+            "payload-url-secret",
+            "payload-access-secret",
+        ] {
+            assert!(!rendered.contains(secret), "{rendered}");
+        }
+    }
+
+    #[test]
+    fn app_events_redact_legacy_sensitive_messages_and_payloads_on_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("cache.db")).unwrap();
+        let raw_message = "legacy https://old-user:old-password@tracker.example/old-passkey?signature=old-query-secret /var/private/legacy.bin\u{001b}[31m";
+        let raw_payload = serde_json::json!({
+            "error": "old response https://payload-old-user:payload-old-password@tracker.example/private?token=payload-old-url-secret",
+            "api_key": "payload-old-api-secret",
+            "path": "/var/private/legacy-payload.bin"
+        })
+        .to_string();
+        let conn = db.conn().expect("healthy test writer");
+        conn.execute(
+            "INSERT INTO app_events (occurred_at, level, kind, message, payload)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![1_i64, "warn", "legacy", raw_message, raw_payload],
+        )
+        .unwrap();
+        drop(conn);
+
+        let event = db.list_app_events(10).unwrap().remove(0);
+        let payload: serde_json::Value = serde_json::from_str(&event.payload).unwrap();
+        assert_eq!(payload["api_key"], "[redacted]");
+        assert!(event.message.contains("https://tracker.example/"));
+        assert!(event.message.contains("[redacted-path:"));
+        assert!(!event.message.chars().any(char::is_control));
+
+        let rendered = format!("{} {payload}", event.message);
+        for secret in [
+            "old-user",
+            "old-password",
+            "old-passkey",
+            "old-query-secret",
+            "payload-old-user",
+            "payload-old-password",
+            "payload-old-url-secret",
+            "payload-old-api-secret",
+            "/var/private",
+        ] {
+            assert!(!rendered.contains(secret), "{rendered}");
+        }
+    }
+
+    #[test]
     fn legacy_cache_migration_adds_revision_tracking() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("cache.db");
@@ -1154,7 +1557,7 @@ mod tests {
         }
 
         let db = Db::open(&path).unwrap();
-        let conn = db.conn();
+        let conn = db.conn().expect("healthy test writer");
         let columns = conn
             .prepare("PRAGMA table_info(torrents)")
             .unwrap()
@@ -1209,7 +1612,7 @@ mod tests {
         }
 
         let db = Db::open(&path).unwrap();
-        let conn = db.conn();
+        let conn = db.conn().expect("healthy test writer");
         assert_eq!(
             conn.query_row("SELECT COUNT(*) FROM torrents", [], |row| row
                 .get::<_, i64>(0))
@@ -1310,7 +1713,7 @@ mod tests {
         db.delete("abcdef1234567890").unwrap();
         assert!(!db.exists("ABCDEF1234567890").unwrap());
         assert!(db.get("abcdef1234567890").unwrap().is_none());
-        let conn = db.conn();
+        let conn = db.conn().expect("healthy test writer");
         assert_eq!(
             conn.query_row("SELECT hash FROM removed_torrents", [], |row| row
                 .get::<_, String>(0))
@@ -1437,6 +1840,292 @@ mod tests {
         torrent.tags.clear();
         db.upsert_with_tags(&torrent, true).unwrap();
         assert!(db.get("tagged").unwrap().unwrap().tags.is_empty());
+    }
+
+    #[test]
+    fn label_dictionaries_and_backend_tag_projection_are_bounded() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("cache.db")).unwrap();
+        {
+            let mut conn = db.conn().expect("healthy test writer");
+            let tx = conn.transaction().unwrap();
+            for index in 0..crate::cache::categories::MAX_CACHED_LABEL_DICTIONARY_ITEMS {
+                tx.execute(
+                    "INSERT INTO categories(name, save_path) VALUES(?1, '')",
+                    params![format!("category-{index:05}")],
+                )
+                .unwrap();
+                tx.execute(
+                    "INSERT INTO tags(name) VALUES(?1)",
+                    params![format!("tag-{index:05}")],
+                )
+                .unwrap();
+            }
+            tx.commit().unwrap();
+        }
+
+        let tag_error = db.ensure_tag("one-more-tag").unwrap_err();
+        assert!(tag_error
+            .downcast_ref::<crate::cache::categories::CategoryTagCapacityError>()
+            .is_some());
+        let category_error = db
+            .upsert_category("one-more-category", "/downloads")
+            .unwrap_err();
+        assert!(category_error
+            .downcast_ref::<crate::cache::categories::CategoryTagCapacityError>()
+            .is_some());
+
+        let mut torrent = torrent_row("oversized-tag-projection", 1, true, true);
+        torrent.tags = "x".repeat(MAX_CACHED_LABEL_NAME_BYTES + 1);
+        assert!(db.upsert_with_tags(&torrent, true).is_err());
+        torrent.tags.clear();
+        torrent.category = "x".repeat(MAX_CACHED_LABEL_NAME_BYTES + 1);
+        assert!(db.upsert(&torrent).is_err());
+
+        {
+            let conn = db.conn().expect("healthy test writer");
+            conn.execute("INSERT INTO tags(name) VALUES('legacy-extra-tag')", [])
+                .unwrap();
+            conn.execute(
+                "INSERT INTO categories(name, save_path) VALUES('legacy-extra-category', '')",
+                [],
+            )
+            .unwrap();
+        }
+        assert!(db
+            .list_tags()
+            .unwrap_err()
+            .downcast_ref::<crate::cache::categories::CategoryTagCapacityError>()
+            .is_some());
+        assert!(db
+            .list_categories()
+            .unwrap_err()
+            .downcast_ref::<crate::cache::categories::CategoryTagCapacityError>()
+            .is_some());
+    }
+
+    #[test]
+    fn per_torrent_tag_assignment_and_legacy_label_rows_are_bounded() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("cache.db")).unwrap();
+        let torrent = torrent_row("bounded-tag-list", 1, true, true);
+        db.upsert(&torrent).unwrap();
+
+        let tags = (0..MAX_CACHED_TAGS_PER_MUTATION)
+            .map(|index| format!("tag-{index:04}"))
+            .collect::<Vec<_>>();
+        let tag_refs = tags.iter().map(String::as_str).collect::<Vec<_>>();
+        db.add_torrent_tags("bounded-tag-list", &tag_refs).unwrap();
+        assert_eq!(
+            db.get_torrent_tags("bounded-tag-list").unwrap().len(),
+            MAX_CACHED_TAGS_PER_MUTATION
+        );
+
+        let error = db
+            .add_torrent_tag("bounded-tag-list", "one-more")
+            .unwrap_err();
+        assert!(error
+            .downcast_ref::<crate::cache::categories::CategoryTagCapacityError>()
+            .is_some());
+        assert!(!db.list_tags().unwrap().iter().any(|tag| tag == "one-more"));
+
+        {
+            let conn = db.conn().expect("healthy test writer");
+            conn.execute("INSERT INTO tags(name) VALUES('legacy-extra')", [])
+                .unwrap();
+            conn.execute(
+                "INSERT INTO torrent_tags(hash, tag) VALUES('bounded-tag-list', 'legacy-extra')",
+                [],
+            )
+            .unwrap();
+        }
+        let error = db.get("bounded-tag-list").unwrap_err();
+        assert!(crate::cache::is_category_tag_capacity_error(&error));
+        let error = db
+            .list_page(&crate::cache::query::ListParams::default())
+            .unwrap_err();
+        assert!(crate::cache::is_category_tag_capacity_error(&error));
+
+        {
+            let conn = db.conn().expect("healthy test writer");
+            conn.execute(
+                "INSERT INTO tags(name) VALUES(?1)",
+                params!["x".repeat(MAX_CACHED_TAG_MUTATION_BYTES + 1)],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO categories(name, save_path) VALUES('oversized-path', ?1)",
+                params!["x".repeat(MAX_CACHED_TAG_MUTATION_BYTES + 1)],
+            )
+            .unwrap();
+        }
+        assert!(db
+            .list_tags()
+            .unwrap_err()
+            .downcast_ref::<crate::cache::categories::CategoryTagCapacityError>()
+            .is_some());
+        assert!(db
+            .list_categories()
+            .unwrap_err()
+            .downcast_ref::<crate::cache::categories::CategoryTagCapacityError>()
+            .is_some());
+    }
+
+    #[test]
+    fn tag_assignment_summaries_track_mutations_cascades_and_startup_rebuild() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("cache.db");
+        let db = Db::open(&db_path).unwrap();
+        db.upsert(&torrent_row("tag-summary-a", 1, true, true))
+            .unwrap();
+        db.upsert(&torrent_row("tag-summary-b", 1, true, true))
+            .unwrap();
+        db.set_torrent_tags("tag-summary-a", &["one", "two"])
+            .unwrap();
+        db.add_torrent_tag("tag-summary-b", "two").unwrap();
+
+        {
+            let conn = db.conn().expect("healthy test writer");
+            assert_eq!(
+                conn.query_row(
+                    "SELECT assignment_count, assignment_bytes FROM torrent_tag_totals",
+                    [],
+                    |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+                )
+                .unwrap(),
+                (3, 9)
+            );
+            assert_eq!(
+                conn.query_row(
+                    "SELECT assignment_count, assignment_bytes
+                     FROM torrent_tag_stats WHERE hash='tag-summary-a'",
+                    [],
+                    |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+                )
+                .unwrap(),
+                (2, 6)
+            );
+
+            conn.execute("INSERT INTO tags(name) VALUES('longer')", [])
+                .unwrap();
+            conn.execute(
+                "UPDATE torrent_tags SET tag='longer'
+                 WHERE hash='tag-summary-a' AND tag='one'",
+                [],
+            )
+            .unwrap();
+            assert_eq!(
+                conn.query_row(
+                    "SELECT assignment_count, assignment_bytes FROM torrent_tag_totals",
+                    [],
+                    |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+                )
+                .unwrap(),
+                (3, 12)
+            );
+        }
+
+        db.delete("tag-summary-a").unwrap();
+        {
+            let conn = db.conn().expect("healthy test writer");
+            assert_eq!(
+                conn.query_row(
+                    "SELECT assignment_count, assignment_bytes FROM torrent_tag_totals",
+                    [],
+                    |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+                )
+                .unwrap(),
+                (1, 3)
+            );
+            conn.execute(
+                "UPDATE torrent_tag_totals
+                 SET assignment_count=999, assignment_bytes=999",
+                [],
+            )
+            .unwrap();
+            conn.execute("DELETE FROM torrent_tag_stats", []).unwrap();
+        }
+
+        drop(db);
+        let reopened = Db::open(&db_path).unwrap();
+        let conn = reopened.conn().expect("healthy test writer");
+        assert_eq!(
+            conn.query_row(
+                "SELECT assignment_count, assignment_bytes FROM torrent_tag_totals",
+                [],
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+            )
+            .unwrap(),
+            (1, 3)
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT assignment_count, assignment_bytes
+                 FROM torrent_tag_stats WHERE hash='tag-summary-b'",
+                [],
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+            )
+            .unwrap(),
+            (1, 3)
+        );
+    }
+
+    #[test]
+    fn over_limit_global_tag_assignments_block_list_projections_and_new_links() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("cache.db")).unwrap();
+        db.upsert(&torrent_row("global-tag-cap", 1, true, true))
+            .unwrap();
+        db.add_torrent_tag("global-tag-cap", "existing").unwrap();
+        let revision = db.current_revision().unwrap();
+        {
+            let conn = db.conn().expect("healthy test writer");
+            conn.execute(
+                "UPDATE torrent_tag_totals SET assignment_count=?1",
+                params![(crate::cache::categories::MAX_CACHED_TAG_ASSIGNMENTS + 1) as i64],
+            )
+            .unwrap();
+        }
+
+        let mutation_error = db.add_torrent_tag("global-tag-cap", "blocked").unwrap_err();
+        assert!(crate::cache::is_category_tag_capacity_error(
+            &mutation_error
+        ));
+        assert!(!db.list_tags().unwrap().iter().any(|tag| tag == "blocked"));
+
+        let page_error = db.list_page(&ListParams::default()).unwrap_err();
+        assert!(crate::cache::is_category_tag_capacity_error(&page_error));
+        let delta_error = db.list_since_bounded(revision, 10).unwrap_err();
+        assert!(crate::cache::is_category_tag_capacity_error(&delta_error));
+
+        // A single-detail read remains bounded by the per-torrent SQL cap and
+        // does not need to reject unrelated metadata outside its projection.
+        assert_eq!(db.get("global-tag-cap").unwrap().unwrap().tags, "existing");
+    }
+
+    #[test]
+    fn bulk_tag_capacity_preflight_counts_combined_hash_deltas() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("cache.db")).unwrap();
+        db.upsert(&torrent_row("bulk-tag-a", 1, true, true))
+            .unwrap();
+        db.upsert(&torrent_row("bulk-tag-b", 1, true, true))
+            .unwrap();
+        {
+            let conn = db.conn().expect("healthy test writer");
+            conn.execute(
+                "UPDATE torrent_tag_totals SET assignment_count=?1",
+                params![(crate::cache::categories::MAX_CACHED_TAG_ASSIGNMENTS - 1) as i64],
+            )
+            .unwrap();
+        }
+
+        let hashes = vec!["bulk-tag-a".to_owned(), "bulk-tag-b".to_owned()];
+        let error =
+            crate::cache::categories::ensure_torrent_tag_capacities(&db, &hashes, &["one"], true)
+                .unwrap_err();
+        assert!(crate::cache::is_category_tag_capacity_error(&error));
+        assert!(!db.list_tags().unwrap().iter().any(|tag| tag == "one"));
     }
 
     fn torrent_row(hash: &str, state: i64, is_active: bool, is_open: bool) -> TorrentRow {

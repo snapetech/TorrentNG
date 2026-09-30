@@ -45,7 +45,7 @@ impl From<SavedViewParams> for ListParams {
 
 impl Db {
     pub fn list_saved_views(&self) -> Result<Vec<SavedView>> {
-        let conn = self.read();
+        let conn = self.read()?;
         let raw: Option<String> = conn
             .query_row("SELECT value FROM kv WHERE key=?1", params![KEY], |r| {
                 r.get(0)
@@ -80,7 +80,7 @@ impl Db {
     where
         F: FnOnce(&mut Vec<SavedView>),
     {
-        let mut conn = self.conn();
+        let mut conn = self.conn()?;
         let tx = conn.transaction()?;
         let raw: Option<String> = tx
             .query_row("SELECT value FROM kv WHERE key=?1", params![KEY], |r| {

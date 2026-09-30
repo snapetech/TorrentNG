@@ -148,7 +148,7 @@ for family in "${families[@]}"; do
   if [[ "$files" -gt 0 ]]; then
     row "$family" "PASS" "$files" "$dir"
     while IFS= read -r evidence; do
-      rel="${evidence#$ROOT/}"
+      rel="${evidence#"$ROOT"/}"
       if command -v sha256sum >/dev/null 2>&1; then
         hash="$(sha256sum "$evidence" | awk '{print $1}')"
       else

@@ -14,4 +14,4 @@ network.http.dns_cache_timeout.set = 25
 
 schedule2 = low_diskspace, 5, 60, ((close_low_diskspace, 2000M))
 
-import = /etc/rtorrent/user.rc
+import = /run/rtorrent/user.rc

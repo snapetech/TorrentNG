@@ -122,8 +122,8 @@ fn classify(name: &str, category: &str, directory: &str, tags: &str) -> &'static
     } else if contains_any_word(
         &haystack,
         &[
-            "movie", "movies", "film", "bluray", "bdrip", "dvdrip", "x264", "x265",
-            "h.264", "h.265", "2160p", "1080p", "720p",
+            "movie", "movies", "film", "bluray", "bdrip", "dvdrip", "x264", "x265", "h.264",
+            "h.265", "2160p", "1080p", "720p",
         ],
     ) || contains_any_ext(&haystack, &[".mkv", ".mp4", ".avi", ".mov", ".wmv", ".m4v"])
     {
@@ -138,7 +138,14 @@ fn classify(name: &str, category: &str, directory: &str, tags: &str) -> &'static
     } else if contains_any_word(
         &haystack,
         &[
-            "iso", "installer", "image", "linux", "ubuntu", "debian", "archlinux", "fedora",
+            "iso",
+            "installer",
+            "image",
+            "linux",
+            "ubuntu",
+            "debian",
+            "archlinux",
+            "fedora",
         ],
     ) || contains_any_ext(&haystack, &[".iso", ".img", ".dmg"])
     {
@@ -158,8 +165,7 @@ fn classify(name: &str, category: &str, directory: &str, tags: &str) -> &'static
     ) || contains_any_ext(
         &haystack,
         &[
-            ".exe", ".msi", ".pkg", ".deb", ".rpm", ".zip", ".tar", ".gz", ".xz", ".7z",
-            ".rar",
+            ".exe", ".msi", ".pkg", ".deb", ".rpm", ".zip", ".tar", ".gz", ".xz", ".7z", ".rar",
         ],
     ) {
         "software"
