@@ -9,8 +9,9 @@ pub enum WireError {
     InfohashMismatch,
 
     #[error(
-        "message length {0} exceeds maximum {}",
-        crate::message::MAX_MESSAGE_LEN
+        "message length {length} exceeds maximum {maximum}",
+        length = .0,
+        maximum = crate::message::MAX_MESSAGE_LEN
     )]
     MessageTooLarge(u32),
 
