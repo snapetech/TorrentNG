@@ -31,13 +31,15 @@ pub(crate) fn ensure_storage_tree_depth(
     }
 }
 
+#[cfg(all(windows, test))]
+use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_DIRECTORY;
 #[cfg(windows)]
-use windows_sys::Win32::Storage::FileSystem::{
-    FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT,
-};
+use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT;
 
 #[cfg(unix)]
 use crate::secure_fs;
+#[cfg(windows)]
+use crate::windows_secure_fs;
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum PlannedStorageAction {
@@ -406,7 +408,7 @@ pub fn reconcile_storage_plan_under_roots(
     let checkpointed = checkpointed_steps.iter().copied().collect::<HashSet<_>>();
     let mut completed = HashSet::new();
     for index in checkpointed_steps {
-        if storage_step_is_applied(plan, *index, checkpointed.contains(index))? {
+        if storage_step_is_applied_for_roots(plan, *index, &roots, checkpointed.contains(index))? {
             completed.insert(*index);
         }
     }
@@ -419,7 +421,12 @@ pub fn reconcile_storage_plan_under_roots(
             if completed.contains(&index) {
                 continue;
             }
-            if storage_step_is_applied(plan, index, checkpointed.contains(&index))? {
+            if storage_step_is_applied_for_roots(
+                plan,
+                index,
+                &roots,
+                checkpointed.contains(&index),
+            )? {
                 completed.insert(index);
                 changed = true;
                 continue;
@@ -446,6 +453,28 @@ pub fn reconcile_storage_plan_under_roots(
     Ok(completed)
 }
 
+fn storage_step_is_applied_for_roots(
+    plan: &StoragePlan,
+    index: usize,
+    roots: &[PathBuf],
+    checkpointed: bool,
+) -> Result<bool, StorageError> {
+    #[cfg(unix)]
+    {
+        secure_fs::step_is_applied(plan, index, roots, checkpointed)
+    }
+    #[cfg(windows)]
+    {
+        windows_secure_fs::step_is_applied(plan, index, roots, checkpointed)
+    }
+    #[cfg(all(not(unix), not(windows)))]
+    {
+        let _ = roots;
+        storage_step_is_applied(plan, index, checkpointed)
+    }
+}
+
+#[cfg(any(all(not(unix), not(windows)), test))]
 fn storage_step_is_applied(
     plan: &StoragePlan,
     index: usize,
@@ -585,6 +614,7 @@ fn storage_step_is_applied(
     }
 }
 
+#[cfg(any(all(not(unix), not(windows)), test))]
 fn reconcile_content_matches(source: &Path, destination: &Path) -> Result<(), StorageError> {
     verify_content_matches(source, destination).map_err(|error| match error {
         StorageError::FilesystemStateUncertain { .. } => error,
@@ -595,6 +625,7 @@ fn reconcile_content_matches(source: &Path, destination: &Path) -> Result<(), St
     })
 }
 
+#[cfg(any(all(not(unix), not(windows)), test))]
 fn verify_reconciled_length(path: &Path, expected_bytes: u64) -> Result<(), StorageError> {
     if expected_bytes == u64::MAX {
         return Ok(());
@@ -868,7 +899,7 @@ fn has_committed_destructive_step(plan: &StoragePlan, completed: &HashSet<usize>
     })
 }
 
-fn is_cancellation_error(error: &StorageError) -> bool {
+pub(crate) fn is_cancellation_error(error: &StorageError) -> bool {
     matches!(
         error,
         StorageError::Cancelled | StorageError::StagedMoveFailed { step: "cancel", .. }
@@ -999,12 +1030,30 @@ where
             check_control_ref,
         )
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
     {
-        // The non-Unix executor has a weaker path-authority implementation,
-        // but it still must honor the worker control plane. Ignoring pause,
-        // cancel, or shutdown here would turn a portability fallback into an
-        // uninterruptible storage job.
+        let check_control_ref: &dyn Fn() -> Result<(), StorageError> = &check_control;
+        execute_storage_plan_with_executor(
+            plan,
+            completed_steps,
+            checkpoint_step,
+            |step| windows_secure_fs::execute_step_with_control(step, &roots, check_control_ref),
+            |plan| windows_secure_fs::rollback_plan(plan, &roots),
+            |index, _step| {
+                windows_secure_fs::step_is_applied(
+                    plan,
+                    index,
+                    &roots,
+                    checkpointed.contains(&index),
+                )
+            },
+            check_control_ref,
+        )
+    }
+    #[cfg(all(not(unix), not(windows)))]
+    {
+        // Other non-Unix platforms retain a portable path executor. Windows
+        // uses the handle-relative implementation above.
         let check_control_ref: &dyn Fn() -> Result<(), StorageError> = &check_control;
         execute_storage_plan_with_executor(
             plan,
@@ -1033,7 +1082,9 @@ pub fn rollback_storage_plan_under_roots(
     }
     #[cfg(unix)]
     let (rolled_back_steps, rollback_failures) = secure_fs::rollback_plan(plan, &roots);
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    let (rolled_back_steps, rollback_failures) = windows_secure_fs::rollback_plan(plan, &roots);
+    #[cfg(all(not(unix), not(windows)))]
     let (rolled_back_steps, rollback_failures) = rollback_plan(plan);
     Ok(StoragePlanExecution {
         applied_steps: Vec::new(),
@@ -1042,13 +1093,13 @@ pub fn rollback_storage_plan_under_roots(
     })
 }
 
-#[cfg(any(not(unix), test))]
+#[cfg(any(all(not(unix), not(windows)), test))]
 fn execute_step(step: &StoragePlanStep) -> Result<(), StorageError> {
     let no_control = || Ok(());
     execute_step_with_control(step, &no_control)
 }
 
-#[cfg(any(not(unix), test))]
+#[cfg(any(all(not(unix), not(windows)), test))]
 fn execute_step_with_control(
     step: &StoragePlanStep,
     check_control: &dyn Fn() -> Result<(), StorageError>,
@@ -1161,7 +1212,7 @@ fn execute_step_with_control(
     }
 }
 
-#[cfg(any(not(unix), test))]
+#[cfg(any(all(not(unix), not(windows)), test))]
 fn safe_delete_with_control(
     path: &Path,
     missing_ok: bool,
@@ -1234,7 +1285,7 @@ fn safe_delete_with_control(
     }
 }
 
-#[cfg(any(not(unix), test))]
+#[cfg(any(all(not(unix), not(windows)), test))]
 fn remove_directory_contents_with_control(
     path: &Path,
     depth: usize,
@@ -1285,7 +1336,7 @@ fn remove_directory_contents_with_control(
     Ok(())
 }
 
-#[cfg(any(not(unix), test))]
+#[cfg(any(all(not(unix), not(windows)), test))]
 fn prune_empty_dirs_with_control(
     mut current: &Path,
     root: &Path,
@@ -1520,7 +1571,7 @@ fn ensure_path_under_roots(
     }
 }
 
-fn resolve_confined_path(path: &Path) -> Result<PathBuf, StorageError> {
+pub(crate) fn resolve_confined_path(path: &Path) -> Result<PathBuf, StorageError> {
     let has_non_absolute_prefix = path
         .components()
         .any(|component| matches!(component, Component::Prefix(_)))
@@ -1571,7 +1622,7 @@ fn resolve_confined_path(path: &Path) -> Result<PathBuf, StorageError> {
 /// independent staging/cleanup). Returns which steps succeeded and, just as
 /// importantly, which ones failed and why: TNG-003 explicitly calls out
 /// that dropping failed rollback steps silently is not acceptable.
-#[cfg(any(not(unix), test))]
+#[cfg(any(all(not(unix), not(windows)), test))]
 fn rollback_plan(plan: &StoragePlan) -> (Vec<StoragePlanStep>, Vec<(StoragePlanStep, String)>) {
     let mut rolled_back = Vec::new();
     let mut failures = Vec::new();
@@ -1584,7 +1635,8 @@ fn rollback_plan(plan: &StoragePlan) -> (Vec<StoragePlanStep>, Vec<(StoragePlanS
     (rolled_back, failures)
 }
 
-fn required_path<'a>(
+#[cfg(any(not(unix), test))]
+pub(crate) fn required_path<'a>(
     path: Option<&'a PathBuf>,
     step: &'static str,
 ) -> Result<&'a Path, StorageError> {
@@ -1595,7 +1647,7 @@ fn required_path<'a>(
         })
 }
 
-#[cfg(any(not(unix), test))]
+#[cfg(any(all(not(unix), not(windows)), test))]
 fn create_parent(path: &Path) -> Result<(), StorageError> {
     if let Some(parent) = path.parent() {
         crate::open::create_dir_all_no_follow(parent)
@@ -1604,7 +1656,7 @@ fn create_parent(path: &Path) -> Result<(), StorageError> {
     Ok(())
 }
 
-#[cfg(any(not(unix), test))]
+#[cfg(any(all(not(unix), not(windows)), test))]
 fn rename_plan_no_replace(source: &Path, destination: &Path) -> std::io::Result<()> {
     #[cfg(windows)]
     {
@@ -1624,7 +1676,7 @@ fn rename_plan_no_replace(source: &Path, destination: &Path) -> std::io::Result<
     }
 }
 
-#[cfg(any(not(unix), test))]
+#[cfg(any(all(not(unix), not(windows)), test))]
 fn ensure_destination_available(path: &Path) -> Result<(), StorageError> {
     if path_exists_no_follow(path) {
         return Err(StorageError::StagedMoveFailed {
@@ -1635,7 +1687,7 @@ fn ensure_destination_available(path: &Path) -> Result<(), StorageError> {
     Ok(())
 }
 
-#[cfg(any(not(unix), test))]
+#[cfg(any(all(not(unix), not(windows)), test))]
 fn copy_verify_with_control(
     source: &Path,
     destination: &Path,
@@ -1667,7 +1719,7 @@ fn copy_verify_with_control(
     Ok(())
 }
 
-#[cfg(any(not(unix), test))]
+#[cfg(any(all(not(unix), not(windows)), test))]
 fn copy_verify_inner(
     source: &Path,
     destination: &Path,
@@ -1710,7 +1762,7 @@ fn copy_verify_inner(
     verify_content_matches_with_control(source, destination, check_control)
 }
 
-#[cfg(any(not(unix), test))]
+#[cfg(any(all(not(unix), not(windows)), test))]
 fn remove_partial_destination(destination: &Path) -> Result<(), StorageError> {
     let no_control = || Ok(());
     safe_delete_with_control(destination, true, &no_control)
@@ -1720,11 +1772,13 @@ fn remove_partial_destination(destination: &Path) -> Result<(), StorageError> {
 /// identical to its counterpart under `destination`, via a streaming SHA-1
 /// content hash (never loads a whole file into memory). Never follows
 /// symlinks on either side.
+#[cfg(any(all(not(unix), not(windows)), test))]
 fn verify_content_matches(source: &Path, destination: &Path) -> Result<(), StorageError> {
     let no_control = || Ok(());
     verify_content_matches_with_control(source, destination, &no_control)
 }
 
+#[cfg(any(all(not(unix), not(windows)), test))]
 fn verify_content_matches_with_control(
     source: &Path,
     destination: &Path,
@@ -1737,6 +1791,7 @@ fn verify_content_matches_with_control(
     verify_content_matches_inner_with_control(source, destination, 0, check_control)
 }
 
+#[cfg(any(all(not(unix), not(windows)), test))]
 fn verify_content_matches_inner_with_control(
     source: &Path,
     destination: &Path,
@@ -1865,6 +1920,7 @@ fn verify_content_matches_inner_with_control(
     }
 }
 
+#[cfg(any(all(not(unix), not(windows)), test))]
 fn hash_file_sha1_with_control(
     path: &Path,
     check_control: &dyn Fn() -> Result<(), StorageError>,
@@ -1889,7 +1945,7 @@ fn hash_file_sha1_with_control(
     Ok(hasher.finalize().into())
 }
 
-#[cfg(any(not(unix), test))]
+#[cfg(any(all(not(unix), not(windows)), test))]
 fn verify_path_len_with_control(
     path: &Path,
     expected_bytes: u64,
@@ -1909,7 +1965,7 @@ fn verify_path_len_with_control(
     }
 }
 
-#[cfg(any(not(unix), test))]
+#[cfg(any(all(not(unix), not(windows)), test))]
 fn copy_dir_recursive(
     source: &Path,
     destination: &Path,
@@ -1924,7 +1980,7 @@ fn copy_dir_recursive(
     copy_dir_contents(source, destination, depth, check_control)
 }
 
-#[cfg(any(not(unix), test))]
+#[cfg(any(all(not(unix), not(windows)), test))]
 fn copy_dir_contents(
     source: &Path,
     destination: &Path,
@@ -1973,6 +2029,7 @@ fn copy_dir_contents(
     Ok(())
 }
 
+#[cfg(any(all(not(unix), not(windows)), test))]
 fn path_content_len(path: &Path) -> Result<u64, StorageError> {
     let no_control = || Ok(());
     let _parent_guard = crate::open::hold_parent_dirs_no_follow(path)
@@ -1980,6 +2037,7 @@ fn path_content_len(path: &Path) -> Result<u64, StorageError> {
     path_content_len_with_control(path, 0, &no_control)
 }
 
+#[cfg(any(all(not(unix), not(windows)), test))]
 fn path_content_len_with_control(
     path: &Path,
     depth: usize,
@@ -2018,7 +2076,7 @@ fn path_content_len_with_control(
     }
 }
 
-#[cfg(any(not(unix), test))]
+#[cfg(any(all(not(unix), not(windows)), test))]
 fn copy_file_with_control(
     source: &Path,
     destination: &Path,
@@ -2069,6 +2127,7 @@ fn safe_symlink_metadata(
     })
 }
 
+#[cfg(any(not(unix), test))]
 fn metadata_is_reparse_point(metadata: &std::fs::Metadata) -> bool {
     #[cfg(windows)]
     {
@@ -2080,7 +2139,7 @@ fn metadata_is_reparse_point(metadata: &std::fs::Metadata) -> bool {
     }
 }
 
-#[cfg(any(windows, test))]
+#[cfg(any(all(not(unix), not(windows)), test))]
 fn remove_reparse_point_no_follow(
     path: &Path,
     metadata: &std::fs::Metadata,
@@ -2100,7 +2159,7 @@ fn remove_reparse_point_no_follow(
     }
 }
 
-#[cfg(any(not(unix), test))]
+#[cfg(any(all(not(unix), not(windows)), test))]
 fn reject_symlink(path: &Path, step: &'static str) -> Result<(), StorageError> {
     if metadata_is_reparse_point(&safe_symlink_metadata(path, step)?) {
         Err(unsafe_symlink_error(path, step))
@@ -2109,7 +2168,8 @@ fn reject_symlink(path: &Path, step: &'static str) -> Result<(), StorageError> {
     }
 }
 
-fn unsafe_symlink_error(path: &Path, step: &'static str) -> StorageError {
+#[cfg(any(not(unix), test))]
+pub(crate) fn unsafe_symlink_error(path: &Path, step: &'static str) -> StorageError {
     StorageError::StagedMoveFailed {
         step,
         reason: format!(
@@ -2119,21 +2179,16 @@ fn unsafe_symlink_error(path: &Path, step: &'static str) -> StorageError {
     }
 }
 
-/// Re-checks that no ancestor directory of `path` is a reparse point, immediately
-/// before a mutating filesystem call uses that path.
+/// Rejects reparse-point ancestors before a storage-plan path is used.
 ///
-/// `validate_plan_paths_under_roots` canonicalizes and root-checks every step
-/// path once, up front, before the plan starts executing. On Unix,
-/// `secure_fs` closes the gap between that check and each step's actual
-/// syscalls by walking every ancestor through `O_NOFOLLOW`-opened, fd-anchored
-/// directory handles, so a symlink swapped in after validation cannot be
-/// followed. This fallback executor has no equivalent descriptor-anchoring
-/// primitive available portably, so it cannot close that window — but it can
-/// shrink it, by re-walking the ancestor chain and rejecting a reparse point right
-/// before the syscall that would otherwise follow it, rather than trusting a
-/// validation result from earlier in a potentially long-running plan.
+/// Unix and Windows executors also anchor the actual filesystem operations to
+/// opened root-relative directory handles; this path-based check is an early
+/// rejection and does not authorize a later operation by itself.
 #[cfg(any(not(unix), test))]
-fn reject_symlink_ancestors(path: &Path, step: &'static str) -> Result<(), StorageError> {
+pub(crate) fn reject_symlink_ancestors(
+    path: &Path,
+    step: &'static str,
+) -> Result<(), StorageError> {
     for ancestor in path.ancestors().skip(1) {
         if ancestor.as_os_str().is_empty() {
             continue;

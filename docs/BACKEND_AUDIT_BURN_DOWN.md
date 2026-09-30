@@ -1,6 +1,7 @@
 # TorrentNG Backend Audit Burn-down
 
-Status: **implementation burn-down continuing; local source validation refreshed 2026-09-21**
+Status: **reviewed implementation, module-decomposition, and safe dependency-cleanup scope complete (2026-09-25).**
+Root and sidecar debug/release builds pass; external qualification remains separately tracked.
 Baseline: 2026-09-01, `main`  
 Scope: the TorrentNG client (`torrentngd`), the compatible-client WebUI/API
 service (`torrentng`), their API facades, storage, deployment, CI, and release
@@ -52,10 +53,12 @@ particular private deployment. P0 means release-blocking for any deployment
 that exposes the affected surface. P1 means material production risk. P2 means
 important correctness, evidence, or maintainability debt.
 
-## Current source validation (2026-09-21)
+## Latest full-suite source validation (2026-09-21)
 
-This is verification of the in-progress source tree, not a refreshed release
-artifact or external qualification claim.
+This is the latest recorded full-suite verification of the source tree, not a
+refreshed release artifact or external qualification claim. The scoped
+2026-09-25 Windows storage executor checks are recorded after this table and in
+the implementation timeline; they did not rerun the full suite.
 
 This refresh reran the workspace tests and warnings-denied clippy, sidecar
 tests/clippy/formatting, WebUI tests/lint/build, repository-wide
@@ -106,6 +109,28 @@ and make no unverified deployment-capacity claim.
 | RustSec audit | PASS | All three lockfiles have zero known vulnerabilities or yanked-package warnings. |
 | Other security checks | PASS | `shellcheck -S warning` across all repository shell scripts, Bash/POSIX-shell syntax checks, Compose hardening and custom Phase 1 TCP/UDP port mapping, all three RustSec lockfiles, and Trivy image/config scans pass; no HIGH/CRITICAL findings were reported. |
 
+## Scoped implementation update (2026-09-25)
+
+The repository-plan scan found one remaining implementation item: Windows
+storage-plan operations still used path-based recursive execution. That code
+item is now complete. Configured roots are opened as capability directories;
+traversal, recursive copy and verification, deletion, pruning, reconciliation,
+and no-replace rename operate relative to opened directory handles.
+
+The following scoped checks passed:
+
+- `cargo fmt --all -- --check`
+- `cargo check --locked -p rt-storage --target x86_64-pc-windows-msvc`
+- `cargo check --locked --tests -p rt-storage --target x86_64-pc-windows-msvc`
+- `cargo build --locked --workspace`
+- `cargo build --release --locked --workspace`
+- `git diff --check`
+
+No tests were run in this scoped update, and no native Windows runtime was
+available. Native Windows runtime and filesystem-race behavior remain
+qualification items; the implementation work identified in the reviewed
+plans is complete.
+
 Hybrid metadata now has one shared validator for the parser and engine: it
 checks that both views contain the same non-padding payload in the same order,
 with matching paths and lengths and v1 padding at the v2 piece boundaries.
@@ -122,11 +147,12 @@ The Windows planner uses atomic no-replace moves, no-follow source/hash opens,
 exclusive no-follow destination creation, and copy-only imports instead of
 path-based hard-link creation. Windows documents that hard-link creation
 follows a symbolic-link target ([Microsoft reference](https://learn.microsoft.com/en-us/windows/win32/fileio/symbolic-link-effects-on-file-systems-functions)).
-Recursive operations now retain ancestor and active-directory handles opened
-without delete-sharing, preventing directory replacement while those
-path-based traversals are in progress. The executor is still not fully
-handle-relative; exact native Windows race behavior remains unqualified, and
-the remaining gap is explicit below rather than treated as Unix parity.
+The Windows storage-plan executor now opens configured roots as capability
+directories and performs traversal, recursive copy/verification/deletion,
+pruning, reconciliation, and no-replace rename relative to opened directory
+handles. It rejects reparse points during handle-relative traversal. The
+Windows target and test target cross-check; native Windows runtime behavior
+remains unqualified.
 
 Windows-compatible torrent paths now reject alternate-stream syntax, invalid
 Win32 characters, reserved device names (including superscript COM/LPT aliases),
@@ -361,11 +387,12 @@ Implemented in the current source tree:
   reconciled, and the TorrentNG API OpenAPI contract is checked in with a standard
   library validation script.
 
-Still genuinely open after this pass:
+Remaining qualification boundaries after the implementation scan:
 
-- TNG-001's Linux descriptor-relative implementation is present. Portability,
-  adversarial race, and non-Linux evidence remain deferred; this is no longer
-  an unimplemented storage-authority path.
+- TNG-001's Linux descriptor-relative implementation and Windows
+  storage-plan capability executor are present. Native Windows runtime,
+  adversarial race, and other-platform qualification remain deferred; no
+  unimplemented storage-plan authority path was found.
 - TNG-002/003/008/011 now have deterministic cancellation/failure coverage and
   a live release-daemon crash/restart, API cancellation, injected
   database-failure, and filesystem-failure matrix. Permission, disk-full,
@@ -392,11 +419,11 @@ Still genuinely open after this pass:
   evidence remain open.
 - TNG-027 has real parser fuzz targets, local runs, and a passing hosted fuzz
   smoke; broader mutation replay remains evidence work.
-- TNG-029's stated synchronous actor-owned persistence defect is resolved:
-  production authoritative DB work crosses a bounded supervised worker and
-  the live crash/cancellation/DB/storage fault matrix passes. The engine/API
-  remain large modules, so deeper decomposition is non-release maintainability
-  work.
+- TNG-029's persistence defect and scoped module-decomposition work are
+  complete. Authoritative DB work crosses the bounded supervised worker;
+  command facade, lifecycle/restore, storage workflow, read model, and peer
+  connection/session/transfer code now have private module boundaries while
+  actor ordering stays unchanged. No scoped repository code item remains.
 
 Confidence: high for the implemented code paths and local verification;
 moderate for the remaining acceptance gaps because they require hosted CI,
@@ -404,10 +431,12 @@ external hardware, real client traffic, or long-running fault/load evidence.
 
 ## Authoritative current source reconciliation
 
-Updated after the current source pass, full local test matrix, warnings-denied
-clippy, OpenAPI validation, compatible-client service tests, release build, authenticated
-release-binary smoke, live fault matrix, API/SSE load, and local client
-interoperability matrix on 2026-09-04 UTC.
+The full source reconciliation below was last updated after the local test
+matrix, warnings-denied clippy, OpenAPI validation, compatible-client service
+tests, release build, authenticated release-binary smoke, live fault matrix,
+API/SSE load, and local client interoperability matrix on 2026-09-04 UTC. The
+scoped Windows storage implementation update on 2026-09-25 is recorded above;
+it did not rerun that full matrix.
 
 The detailed TNG sections below are the original audit narratives and burn-down
 history. Some of them intentionally describe the defect before it was fixed.
@@ -429,7 +458,7 @@ and is superseded by the source reconciliation above.
 
 | Finding | Current disposition | Remaining action |
 |---|---|---|
-| TNG-001 | Implemented locally for Linux production storage paths | Keep portability fallback scoped; adversarial race and non-Linux evidence deferred |
+| TNG-001 | Implemented locally for Linux production storage paths and Windows storage-plan execution | Native Windows runtime and adversarial filesystem-race qualification only |
 | TNG-002 | Implemented locally: quiesce/resume, async plans, stale-job guards | Broader disk/device deployment permutations remain external |
 | TNG-003 | Implemented locally: checked verification, rollback, checkpoint recovery | Permission/space/device-failure permutations remain external |
 | TNG-004 | Implemented locally: bounded parser and checked numeric conversions | Extend corpus/fuzz execution beyond current local targets |
@@ -457,7 +486,7 @@ and is superseded by the source reconciliation above.
 | TNG-026 | Runtime source is `b393eb0`; release evidence was reconciled at `3cb0ba4` and the certification harness was hardened at `50e0fc3`; clean deployment smoke, backup/restore, WebUI, and shutdown now pass | One official public Debian transfer, completed named soak, canonical all-live local/mobile/public compatibility, and kspls0 LVM storage now pass; remaining public sources and strict readiness remain external gates |
 | TNG-027 | Resolved for the repository gate: fuzz targets, OpenAPI validator, idempotency tests, and hosted bounded fuzz smoke are green | Broader parser and mutation replay corpus remains optional evidence work |
 | TNG-028 | Resolved for the repository gate: format, clippy, locked tests, and declared MSRV pass locally and in hosted CI | Branch-protection enforcement still needs repository-settings review |
-| TNG-029 | Resolved for the stated persistence-isolation finding: authoritative engine DB work uses a dedicated bounded supervised worker; live crash/DB/storage fault matrix and local client matrix pass | Full actor decomposition and deployment-specific fault evidence remain non-release structural follow-up |
+| TNG-029 | Resolved for the stated persistence-isolation finding and the scoped source decomposition: supervised DB ownership; private command-facade, lifecycle/restore, storage, read-model, peer-connection/session/transfer modules preserve actor ordering | None for the scoped repository work; deployment-specific fault qualification remains external |
 | TNG-030 | Resolved locally: sidecar APIs canonicalize cache identities, native/qBittorrent selections and peer-address lists are bounded, URL dot hashes cannot normalize into other endpoints, and no-follow file reads do not block on FIFOs | Public-client, network, and soak evidence remain separate qualification work |
 | TNG-031 | Resolved locally: qBittorrent delimited inputs and transient plugin/job state are bounded; RSS items/rules persist in SQLite with transactional updates and shared rule capacity | Search execution remains intentionally inert; public-network and soak evidence remain separate |
 | TNG-032 | Resolved locally: root and sidecar category/tag mutation inputs now bound names, category paths, and tag arrays before persistence/backend work | Sidecar-wide dictionary and read-projection bounds are tracked in TNG-033; external-client interoperability remains separate |
@@ -584,26 +613,32 @@ scale proof are not complete.**
 
 **Status: Functional implementation complete; evidence deferred** · **Priority: P0** · **Confidence: high**
 
-The implementation is complete for the supported Unix/Linux execution path.
-`ServerStorageRoots::authorize_path()` rejects non-absolute paths and `..`
-components, and `secure_fs` executes plan operations from already-opened root
-descriptors with `openat`/`renameat`/`unlinkat`-style no-follow checks. The
-shared `open_path_no_follow` path is used by scheduler/file-cache operations;
-delete validates the save root and every resolved payload path. Add,
-magnet-add, restore/startup, save-path updates, moves, rechecks, and storage
-plans all use server-owned configured roots. Preview roots are not an
-execution authority, and no configured writable root fails closed.
+The implementation is complete for Linux production storage paths and
+Windows storage-plan execution. `ServerStorageRoots::authorize_path()` rejects
+non-absolute paths and `..` components, and Linux `secure_fs` executes plan
+operations from already-opened root descriptors with
+`openat`/`renameat`/`unlinkat`-style no-follow checks. The shared
+`open_path_no_follow` path is used by scheduler/file-cache operations; delete
+validates the save root and every resolved payload path. Add, magnet-add,
+restore/startup, save-path updates, moves, rechecks, and storage plans use
+server-owned configured roots. Preview roots are not an execution authority,
+and no configured writable root fails closed. The Windows storage-plan
+executor opens configured roots as capability directories and performs
+recursive operations relative to opened directory handles.
 
-Focused coverage includes outside-root and `..` rejection, final and ancestor
-symlink rejection, broken symlink handling, missing-ancestor creation, plan
-execution, scheduler/file-cache opening, delete, and an ancestor replacement
-regression on Linux. The remaining work is evidence: portability on other
-platforms and a hostile concurrent filesystem-race run against a real mount.
-Those are release qualification gates, not missing production wiring.
+Focused Linux coverage includes outside-root and `..` rejection, final and
+ancestor symlink rejection, broken symlink handling, missing-ancestor
+creation, plan execution, scheduler/file-cache opening, delete, and an
+ancestor-replacement regression. Windows regression cases cover nested
+copy/rename, no-overwrite behavior, reparse-target deletion safety, and
+reparse-ancestor rejection; the Windows library and test target cross-check.
+Native Windows runtime and hostile concurrent filesystem-race behavior remain
+qualification items, not missing repository implementation work.
 
-Acceptance for the implementation gate is met. Keep the Linux descriptor-
-relative path as the production authority and do not broaden the non-Unix
-fallback without equivalent no-follow guarantees.
+The repository implementation gate for configured-root authority is met.
+Native Windows execution and adversarial race testing remain qualification
+work; the portable path must continue to fail closed when equivalent no-follow
+guarantees are unavailable.
 
 ### TNG-002 — Storage moves can race active writes
 
@@ -3440,7 +3475,7 @@ evidence is implied.
 
 ### TNG-029 — The engine has poor fault/change isolation
 
-**Status: Persistence-isolation implementation and local fault evidence complete; broader decomposition deferred** · **Priority: P2** · **Confidence: high**
+**Status: Persistence isolation and scoped module decomposition complete** · **Priority: P2** · **Confidence: high**
 
 Verified evidence (2026-09-04): explicit seams now exist for storage-job
 dispatch/control/recovery, registry revisions and mutation deltas, TorrentNG and
@@ -3468,18 +3503,21 @@ bounded and registry mutations wake streams through a shared notifier.
 The current functional isolation pass also adds per-torrent durable-job
 admission guards, stale-completion checks for detached workers, transactional
 job/event projection updates, rollback of registry projections when durable
-writes fail, and coalesced transfer-stat persistence. These contain the most
-dangerous move/delete/recheck and partial-projection races without pretending
-that the actor has been decomposed. Storage plans now fail closed when a live
+writes fail, and coalesced transfer-stat persistence. At the 2026-09-04
+checkpoint, these contained the highest-risk move/delete/recheck and
+partial-projection races before the source modules were split. Storage plans now fail closed when a live
 target cannot acknowledge quiescence; any targets already paused for that plan
 are resumed before the error is returned. File-priority writes share the same
 active-job admission gate, and generic move/delete plans require explicit,
 registry-valid torrent targets because arbitrary filesystem paths cannot be
 reliably attributed to a torrent by the engine.
 
-The architecture is still a large actor monolith (`Engine`, `TorrentTask`,
-and API handler modules remain oversized), but the highest-risk ownership
-boundary is now structural rather than a naming convention. In
+At the 2026-09-04 baseline, `Engine` and `TorrentTask` still held large
+monolithic implementations. The 2026-09-25 scoped split moved the command
+facade, lifecycle/restore, storage workflow, and read model out of `engine.rs`,
+and peer connection/session/transfer methods out of `torrent_task.rs`. The
+engine remains the ordering coordinator; the split did not create additional
+state-owning actors. In
 `crates/rt-engine/src/storage_control.rs`, storage-plan validation,
 quiesce/submit/completion choreography, and resume-on-failure are isolated
 from the general command dispatcher. In
@@ -3523,9 +3561,10 @@ passes 204,936 requests from 32 JSON clients and 8 slow consumers over 30
 seconds with zero errors. These are real local process checks, not a claim
 that every dependency failure mode or public deployment has been certified.
 
-Full inversion of tracker, peer, and every API dependency is not required to
-resolve the stated TNG-029 persistence defect and remains a separate
-maintainability choice. The remaining evidence is deployment-specific:
+The scoped module decomposition is complete. `Engine` and `TorrentTask`
+remain their respective state-ordering authorities, and API handler ownership
+was outside this rt-engine change. The remaining qualification is
+deployment-specific:
 physical storage/device faults, public compatibility, and long-soak behavior.
 Hosted repository CI is now green; branch-protection enforcement still needs
 settings review.
@@ -3535,8 +3574,9 @@ liveness is truthful, failed torrent tasks are reaped and projected as errors,
 shutdown work remains recoverable, delete recovery is idempotent, API streams
 have bounded initial event size, authoritative production SQLite work is
 owned by supervised worker boundaries, and the local live fault matrix keeps
-the daemon healthy across injected failures. Full actor decomposition remains
-non-release structural follow-up.
+the daemon healthy across injected failures. The 2026-09-25 scoped source
+decomposition is complete; it preserves the engine and per-torrent actors as
+their respective ordering authorities.
 
 ### TNG-036 — Poisoned mutexes turn isolated panics into persistent failures
 
@@ -4002,6 +4042,8 @@ claims:
 | 2026-09-21 UTC | Closed TNG-142: qBittorrent auth and native idempotency public exceptions now match exact registered auth paths rather than suffixes. | Locked offline qBittorrent router regression and native facade suite pass; warnings-denied Clippy, formatting, and `git diff --check` pass. | This closes local public-path allowlist drift; no public-network request, torrent-count proof, or soak was run. |
 | 2026-09-24 UTC | Closed TNG-143: WebUI compatibility ratio normalization now saturates large finite values before the thousandths conversion can overflow to `Infinity`. | The focused WebUI client suite passes all 4 tests, including the `1e308` ratio regression; WebUI lint, `tsc --noEmit`, and `git diff --check` pass. | Compatibility normalization remains local UI behavior; no network or release-capacity evidence is implied. |
 | 2026-09-24 UTC | Closed TNG-144: qBittorrent-compatible file indexes above the signed backend RPC range are rejected instead of wrapping during Deluge/rTorrent rename and rTorrent priority operations. | Sidecar tests pass (260 library / 3 binary / 117 compatibility; two synthetic benchmarks ignored), including the checked conversion and `400` response regressions; warnings-denied Clippy, formatting, and `git diff --check` pass. | Only malformed out-of-range indexes are affected; no backend network call, release-capacity proof, or client-interoperability claim is implied. |
+| 2026-09-25 UTC | Closed the Windows storage-plan path-authority implementation follow-up: plans now traverse configured-root capability directories and perform recursive copy/verification/deletion, pruning, reconciliation, and no-replace rename relative to opened handles. | `cargo check --locked -p rt-storage --target x86_64-pc-windows-msvc` and `cargo check --locked --tests -p rt-storage --target x86_64-pc-windows-msvc` pass. | Native Windows runtime behavior remains unqualified; that is evidence-only follow-up. |
+| 2026-09-25 UTC | Completed the scoped TNG-029 module decomposition and dependency cleanup: engine command facade, lifecycle/restore, storage workflow, and read model moved to private modules; per-torrent peer connection, session, and transfer code moved to private modules. Root `base64` now shares Axum-compatible 0.22, and root `sha1` is aligned to 0.10.7. | `cargo check --workspace --locked --offline`, debug/release root workspace builds, release sidecar build, formatting, and `git diff --check` pass. | Public API and actor ordering are preserved. Remaining framework/dev-tool dependency versions are constrained by Axum/Reqwest and test-tool generations; no benchmark or runtime behavior claim is made. |
 
 ## Release gate
 

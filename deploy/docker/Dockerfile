@@ -56,11 +56,13 @@ COPY deploy/docker/patches/rtorrent-0.16.11-user-agent-command.patch /tmp/rtorre
 COPY deploy/docker/patches/rtorrent-0.16.11-local-id-command.patch /tmp/rtorrent-local-id-command.patch
 COPY deploy/docker/patches/rtorrent-0.16.11-multicall-range.patch /tmp/rtorrent-multicall-range.patch
 COPY deploy/docker/patches/rtorrent-0.16.11-tracker-identity-gate.patch /tmp/rtorrent-tracker-identity-gate.patch
+COPY deploy/docker/patches/rtorrent-0.16.11-unlimited-queue-refill.patch /tmp/rtorrent-unlimited-queue-refill.patch
 RUN cd rtorrent && \
     git apply /tmp/rtorrent-user-agent-command.patch && \
     git apply /tmp/rtorrent-local-id-command.patch && \
     git apply /tmp/rtorrent-multicall-range.patch && \
-    git apply /tmp/rtorrent-tracker-identity-gate.patch
+    git apply /tmp/rtorrent-tracker-identity-gate.patch && \
+    git apply /tmp/rtorrent-unlimited-queue-refill.patch
 RUN cd libtorrent && autoreconf -fi && \
     ./configure --prefix=/usr/local && \
     make -j"$(nproc)" && make install
@@ -97,7 +99,7 @@ ENV TNG_DEFAULT_UID="${TNG_UID}"
 ENV TNG_DEFAULT_GID="${TNG_GID}"
 ENV TNG_PACKAGED_RTORRENT_VERSION=0.16.11
 ENV TNG_PACKAGED_LIBTORRENT_VERSION=0.16.11
-ENV TNG_RTORRENT_PATCHES=rtorrent-0.16.11-user-agent-command,rtorrent-0.16.11-local-id-command,rtorrent-0.16.11-multicall-range,rtorrent-0.16.11-tracker-identity-gate
+ENV TNG_RTORRENT_PATCHES=rtorrent-0.16.11-user-agent-command,rtorrent-0.16.11-local-id-command,rtorrent-0.16.11-multicall-range,rtorrent-0.16.11-tracker-identity-gate,rtorrent-0.16.11-unlimited-queue-refill
 
 LABEL org.opencontainers.image.title="TorrentNG Compatible-Client Service" \
       org.opencontainers.image.description="TorrentNG compatible-client WebUI/API service for existing qBittorrent, rTorrent, Transmission, and Deluge deployments."
