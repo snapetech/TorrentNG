@@ -23,6 +23,9 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
 
+      - name: Test release-note validation
+        run: python3 -m unittest scripts.test_release_notes
+
       - name: Fetch base branch
         if: github.event_name == 'pull_request'
         env:

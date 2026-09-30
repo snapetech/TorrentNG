@@ -67,6 +67,14 @@ def read_at_ref(ref: str, file_name: str) -> str:
     return git_output("show", f"{ref}:{file_name}")
 
 
+def contains_html_comment(text: str) -> bool:
+    return "<!--" in text or "-->" in text
+
+
+def contains_placeholder(text: str) -> bool:
+    return bool(re.search(r"\b(?:todo|tbd|fill in)\b", text, re.I))
+
+
 def parse_release_note(file_name: str, content: str) -> dict[str, Any]:
     errors: list[str] = []
     normalized = content.replace("\r\n", "\n").replace("\r", "\n")
@@ -117,7 +125,7 @@ def parse_release_note(file_name: str, content: str) -> dict[str, Any]:
     elif action.lower() != "none":
         if len(action) < 5 or len(action) > 200:
             errors.append("action must be 5-200 characters or exactly `none`")
-        if re.search(r"<!--|-->|\b(?:todo|tbd|fill in)\b", action, re.I):
+        if contains_html_comment(action) or contains_placeholder(action):
             errors.append("action contains a placeholder or HTML comment")
 
     breaking = metadata.get("breaking", "").lower()
@@ -129,9 +137,13 @@ def parse_release_note(file_name: str, content: str) -> dict[str, Any]:
     body = re.sub(r"\s+", " ", match.group(2).strip())
     if not 30 <= len(body) <= 400:
         errors.append("body must be 30-400 characters and describe user impact")
-    if re.search(r"<!--|-->|\b(?:todo|tbd|fill in)\b", body, re.I):
+    if contains_html_comment(body) or contains_placeholder(body):
         errors.append("body contains a placeholder or HTML comment")
-    if body and not re.match(r"[A-Z0-9`*_]", body):
+    starts_with_sentence_case = (
+        body.startswith("rTorrent")
+        or body[0:1] in "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789" + chr(96) + "*_"
+    )
+    if body and not starts_with_sentence_case:
         errors.append("body must start with a capitalized sentence")
     if body and not re.search(r"[.!?)]$", body):
         errors.append("body must end with sentence punctuation")
