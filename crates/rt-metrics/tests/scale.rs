@@ -210,6 +210,8 @@ async fn idle_memory_15k_under_2_5gb() {
 
 #[tokio::test]
 async fn idle_memory_100k_keeps_fixed_rss_task_fd_budget() {
+    // This reads process-wide /proc/self/task counts. CI serializes tests within
+    // each binary so unrelated test-harness threads do not consume the budget.
     let before_rss = current_rss_bytes();
     let before_fds = current_fd_count();
     let before_tasks = current_task_count();

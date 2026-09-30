@@ -39,7 +39,7 @@ jobs:
         run: python3 -m unittest scripts.test_protected_target scripts.test_backend_burndown_api_load scripts.test_workflow_security
 
       - name: Test TorrentNG client workspace
-        run: cargo test --workspace --all-targets --locked
+        run: cargo test --workspace --all-targets --locked -- --test-threads=1
 
       - name: Lint TorrentNG client workspace
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
