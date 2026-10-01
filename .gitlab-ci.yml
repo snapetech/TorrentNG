@@ -200,6 +200,7 @@ package-smoke:arch:
 github:release:
   extends: .github_publication_defaults
   stage: promote
+  # Bootstrap gh from Alpine's signed package repository on the GitLab runner.
   image: alpine:3.24.2
   before_script:
     - apk add --no-cache github-cli
