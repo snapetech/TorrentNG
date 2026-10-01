@@ -76,9 +76,10 @@ IFS=$'\t' read -r resolved_tag is_draft is_prerelease <<< "$release_info"
 [[ "$resolved_tag" == "$release_tag" && "$is_draft" == false && "$is_prerelease" == false ]] ||
   fail "Tag $release_tag must identify a published, non-prerelease GitHub release."
 
+gpg_home="$(gpgconf --list-dirs homedir)" || fail "Could not determine the active GPG home."
 secret_listing="$(gpg --batch --with-colons --fingerprint --list-secret-keys \
   "$EXPECTED_FINGERPRINT" 2>/dev/null)" ||
-  fail "Could not read the Launchpad signing key from the local GPG keyring."
+  fail "No Launchpad private key is available in $gpg_home. Import the original private-key backup with 'gpg --import /path/to/key.asc', or set GNUPGHOME to the keyring that contains it. Launchpad stores only the public key."
 actual_fingerprint="$(awk -F: '$1 == "fpr" { print $10; exit }' <<< "$secret_listing")"
 [[ "$actual_fingerprint" == "$EXPECTED_FINGERPRINT" ]] ||
   fail "The local GPG keyring must contain Launchpad's upload key $EXPECTED_FINGERPRINT."
