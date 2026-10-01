@@ -12,9 +12,9 @@ installs, and the package keeps its state separate from downloaded payloads.
 
 Create a `yunohost-*` tag to publish portable bundles through the dedicated
 YunoHost release workflow. Future `main-*` upstream releases also build
-YunoHost bundles. The app catalog is a separate YunoHost repository; the
-package should be listed there only after the release assets and YunoHost
-package checks are available.
+YunoHost bundles. The app catalog is maintained in a separate YunoHost
+repository. New listings remain marked in progress until YunoHost package CI
+has exercised the package on supported server versions and architectures.
 
 ## Local package check
 

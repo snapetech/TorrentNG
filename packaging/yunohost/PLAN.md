@@ -52,7 +52,7 @@ must not install a second torrent engine in existing-client mode.
 
 ## Validation gates
 
-Before catalog submission:
+### Before publishing the package and submitting the catalog entry
 
 1. Parse/lint the v2 manifest and shell/Python scripts.
 2. Build WebUI and both Rust binaries for amd64 and arm64; inspect the binaries
@@ -61,13 +61,21 @@ Before catalog submission:
    starts the native engine and the existing-client sidecar, connects the
    sidecar to the engine, and checks health, token login, protected API access,
    static assets, and the subpath runtime configuration.
-4. Verify root and subpath API, WebSocket, cookie, SSO permission, and native
-   peer-firewall behavior on a YunoHost 12 host or official package-check VM.
-5. Run official app package CI for install, backup/restore, upgrade, URL change,
-   and removal in both install modes.
-6. Publish a separate YunoHost package repository with release URLs and SHA256
-   values, then submit its catalog entry and logo to `YunoHost/apps`. Keep the
-   catalog state `inprogress` until YunoHost's own package CI passes.
+4. Publish the separate YunoHost package repository with real release URLs and
+   SHA256 values, validate those downloads, and submit its `YunoHost/apps`
+   catalog entry and logo with state `inprogress`.
+
+### Before marking the catalog entry working
+
+1. Verify root and subpath API routing, WebSocket upgrades, cookie scoping,
+   SSO permissions, and native peer-firewall behavior on YunoHost 12.
+2. Run official app package CI for install, backup/restore, upgrade, URL change,
+   and removal in both install modes and on supported architectures.
+3. Let YunoHost's app CI assign the catalog level; do not set that field by hand.
+
+If a YunoHost host or official package-check VM is not available during initial
+publication, leave the catalog state `inprogress` until those hosted acceptance
+gates pass.
 
 See the [YunoHost v2 packaging guide](https://doc.yunohost.org/dev/packaging/advanced/packaging_v2/),
 [resource guide](https://doc.yunohost.org/en/dev/packaging/resources/), and
