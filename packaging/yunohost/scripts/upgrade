@@ -20,7 +20,7 @@ fi
 ynh_script_progression --message="Refreshing service configuration..." --weight=1
 ynh_add_nginx_config
 ynh_add_systemd_config
-ensure_native_peer_firewall
+reconcile_peer_firewall
 ynh_systemctl --service="$app" --action=restart
 
 ynh_print_info --message="TorrentNG was upgraded. Existing app state, settings, and download payloads were preserved."

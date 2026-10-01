@@ -103,9 +103,15 @@ login_status="$(curl --noproxy '*' -sS -o "$WORK_DIR/login.body" -D "$WORK_DIR/l
 [[ "$login_status" == "200" ]]
 grep -q 'Ok\.' "$WORK_DIR/login.body"
 grep -qi '^set-cookie: tng_session=.*Secure' "$WORK_DIR/login.headers"
+SESSION_COOKIE="$(awk 'tolower($1) == "set-cookie:" && $2 ~ /^tng_session=/ { sub(/^tng_session=/, "", $2); sub(/;.*/, "", $2); print $2; exit }' "$WORK_DIR/login.headers")"
+[[ -n "$SESSION_COOKIE" ]]
+curl --noproxy '*' -fsS \
+	-H "Cookie: tng_session=$SESSION_COOKIE" \
+	"http://127.0.0.1:$SIDECAR_PORT/api/v1/transfer/info" \
+	-o "$WORK_DIR/session-transfer.json"
 curl --noproxy '*' -fsS \
 	-H "Authorization: Bearer $TOKEN" \
 	"http://127.0.0.1:$SIDECAR_PORT/api/v1/transfer/info" \
-	-o "$WORK_DIR/transfer.json"
+	-o "$WORK_DIR/token-transfer.json"
 
 echo "YunoHost bundle smoke passed: native mode, existing-client sidecar, token login, protected API, and subpath WebUI config."

@@ -609,10 +609,14 @@ jobs:
             --target bundle \
             --output "type=local,dest=bundle" \
             .
+          chmod -R a+rX bundle
+          chmod 0755 bundle
           test -x bundle/bin/torrentngd
           test -x bundle/bin/torrentng
           test -s bundle/webui/index.html
-          tar -czf "torrentng-yunohost-${RELEASE_TAG}-${ASSET_SUFFIX}.tar.gz" -C bundle .
+          bundle_file="torrentng-yunohost-${RELEASE_TAG}-${ASSET_SUFFIX}.tar.gz"
+          tar -czf "$bundle_file" -C bundle .
+          [[ "$(tar -tvf "$bundle_file" | awk 'NR == 1 { print $1 }')" == "drwxr-xr-x" ]]
 
       - name: Upload YunoHost bundle
         uses: actions/upload-artifact@v7

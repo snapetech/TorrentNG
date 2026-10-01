@@ -78,9 +78,12 @@ install_launch_script() {
 		"$package_dir/scripts/launch" "$install_dir/bin/launch"
 }
 
-ensure_native_peer_firewall() {
+reconcile_peer_firewall() {
 	if [[ "$deployment_mode" == "native" ]]; then
 		yunohost firewall allow Both "$port_peer"
 		ynh_app_setting_set --app="$app" --key=peer_firewall_open --value=1
+	elif [[ "${peer_firewall_open:-0}" == "1" && -n "${port_peer:-}" ]]; then
+		yunohost firewall disallow Both "$port_peer" || true
+		ynh_app_setting_set --app="$app" --key=peer_firewall_open --value=0
 	fi
 }
