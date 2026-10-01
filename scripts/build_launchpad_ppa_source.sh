@@ -139,6 +139,7 @@ fi
 cp -- "$orig_tarball" "$workspace/"
 
 cp -a "$repo_root/packaging/launchpad/debian" "$source_root/debian"
+cp "$repo_root/packaging/launchpad/config.toml" "$source_root/debian/config.toml"
 source_date="$(date -Ru)"
 cat > "$source_root/debian/changelog" <<CHANGELOG
 torrentngd (${debian_version}) ${series}; urgency=medium
