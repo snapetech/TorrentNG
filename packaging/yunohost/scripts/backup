@@ -1,0 +1,6 @@
+#!/bin/bash
+
+source "$(dirname "$0")/_common.sh"
+
+ynh_backup --src_path="$install_dir"
+ynh_backup --src_path="$data_dir"

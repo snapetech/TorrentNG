@@ -1,0 +1,15 @@
+#!/bin/sh
+set -eu
+
+case "${TNG_DEPLOYMENT_MODE:-}" in
+    native)
+        exec "$TNG_INSTALL_DIR/bin/torrentngd" "$TNG_DATA_DIR/config.toml"
+        ;;
+    existing)
+        exec "$TNG_INSTALL_DIR/bin/torrentng" "$TNG_DATA_DIR/config.toml"
+        ;;
+    *)
+        echo "Invalid TNG_DEPLOYMENT_MODE: ${TNG_DEPLOYMENT_MODE:-unset}" >&2
+        exit 64
+        ;;
+esac

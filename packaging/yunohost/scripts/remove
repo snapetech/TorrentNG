@@ -1,0 +1,15 @@
+#!/bin/bash
+
+source "$(dirname "$0")/_common.sh"
+
+ynh_script_progression --message="Stopping TorrentNG..." --weight=1
+ynh_systemctl --service="$app" --action=stop || true
+ynh_remove_nginx_config
+ynh_remove_systemd_config
+
+if [[ "${peer_firewall_open:-0}" == "1" && -n "${port_peer:-}" ]]; then
+	yunohost firewall disallow Both "$port_peer" || true
+fi
+
+# Download payloads intentionally live outside data_dir/install_dir. They are
+# kept on uninstall and are never folded into YunoHost's app-state backup.

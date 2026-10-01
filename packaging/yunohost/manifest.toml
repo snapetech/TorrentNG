@@ -1,0 +1,187 @@
+packaging_format = 2
+
+id = "torrentng"
+name = "TorrentNG"
+description.en = "TorrentNG WebUI with a native engine or an existing torrent client"
+description.fr = "Interface Web TorrentNG avec moteur natif ou client torrent existant"
+version = "0.1.0~ynh1"
+maintainers = ["snapetech"]
+
+[upstream]
+license = "AGPL-3.0-or-later"
+website = "https://torrentng.org"
+admindoc = "https://github.com/snapetech/TorrentNG/tree/main/packaging/yunohost/doc"
+code = "https://github.com/snapetech/TorrentNG"
+
+[integration]
+yunohost = ">= 12.1.38"
+helpers_version = "2.1"
+architectures = ["amd64", "arm64"]
+multi_instance = false
+ldap = false
+sso = false
+disk = "100M"
+ram.runtime = "512M"
+
+[install]
+    [install.domain]
+    type = "domain"
+
+    [install.path]
+    type = "path"
+    default = "/torrentng"
+
+    [install.deployment_mode]
+    ask.en = "Deployment mode"
+    help.en = "Native runs the TorrentNG engine. Existing client runs only the WebUI/API service and connects to one client you already run."
+    type = "select"
+    default = "native"
+    choices.native = "TorrentNG engine and WebUI"
+    choices.existing = "WebUI/API for an existing torrent client"
+
+    [install.api_token]
+    ask.en = "TorrentNG API password"
+    help.en = "Use this password to sign in to TorrentNG and for API clients. Enter at least 32 URL-safe characters."
+    type = "password"
+    redact = true
+
+    [install.download_dir]
+    ask.en = "Download directory"
+    help.en = "Native mode stores payloads here. Files are kept outside YunoHost app state and are shared through the multimedia group."
+    type = "string"
+    default = "/home/yunohost.multimedia/share/TorrentNG"
+    pattern.regexp = '^/[A-Za-z0-9._/-]+$'
+    pattern.error.en = "Use an absolute path with letters, digits, dots, underscores, hyphens, and slashes only."
+    visible = "deployment_mode == 'native'"
+
+    [install.backend_type]
+    ask.en = "Existing torrent client"
+    help.en = "Choose the client TorrentNG should control."
+    type = "select"
+    default = "qbittorrent"
+    visible = "deployment_mode == 'existing'"
+    choices.qbittorrent = "qBittorrent"
+    choices.transmission = "Transmission"
+    choices.deluge = "Deluge"
+    choices.rtorrent = "rTorrent (SCGI)"
+    choices.torrentng = "Another TorrentNG engine"
+
+    [install.storage_root]
+    ask.en = "Local storage path used by the selected client"
+    help.en = "Use a path visible on this YunoHost server. This enables TorrentNG's storage and file browsing views."
+    type = "string"
+    default = "/home/yunohost.multimedia/share"
+    visible = "deployment_mode == 'existing'"
+
+    [install.qbittorrent_url]
+    ask.en = "qBittorrent Web API URL"
+    type = "url"
+    default = "http://127.0.0.1:8080"
+    visible = "deployment_mode == 'existing' && backend_type == 'qbittorrent'"
+
+    [install.qbittorrent_username]
+    ask.en = "qBittorrent username"
+    type = "string"
+    optional = true
+    visible = "deployment_mode == 'existing' && backend_type == 'qbittorrent'"
+
+    [install.qbittorrent_password]
+    ask.en = "qBittorrent password"
+    type = "password"
+    optional = true
+    redact = true
+    visible = "deployment_mode == 'existing' && backend_type == 'qbittorrent'"
+
+    [install.transmission_url]
+    ask.en = "Transmission RPC URL"
+    type = "url"
+    default = "http://127.0.0.1:9091/transmission/rpc"
+    visible = "deployment_mode == 'existing' && backend_type == 'transmission'"
+
+    [install.transmission_username]
+    ask.en = "Transmission RPC username"
+    type = "string"
+    optional = true
+    visible = "deployment_mode == 'existing' && backend_type == 'transmission'"
+
+    [install.transmission_password]
+    ask.en = "Transmission RPC password"
+    type = "password"
+    optional = true
+    redact = true
+    visible = "deployment_mode == 'existing' && backend_type == 'transmission'"
+
+    [install.deluge_url]
+    ask.en = "Deluge Web JSON-RPC URL"
+    type = "url"
+    default = "http://127.0.0.1:8112/json"
+    visible = "deployment_mode == 'existing' && backend_type == 'deluge'"
+
+    [install.deluge_password]
+    ask.en = "Deluge Web password"
+    type = "password"
+    redact = true
+    visible = "deployment_mode == 'existing' && backend_type == 'deluge'"
+
+    [install.rtorrent_transport]
+    ask.en = "rTorrent SCGI connection type"
+    type = "select"
+    default = "socket"
+    visible = "deployment_mode == 'existing' && backend_type == 'rtorrent'"
+    choices.socket = "Unix socket"
+    choices.tcp = "TCP SCGI address"
+
+    [install.rtorrent_socket]
+    ask.en = "rTorrent SCGI socket path"
+    type = "string"
+    default = "/run/rtorrent/rpc.sock"
+    visible = "deployment_mode == 'existing' && backend_type == 'rtorrent' && rtorrent_transport == 'socket'"
+
+    [install.rtorrent_scgi_addr]
+    ask.en = "rTorrent SCGI address"
+    help.en = "Enter host:port for a trusted SCGI endpoint. Do not expose an unauthenticated SCGI port to the Internet."
+    type = "string"
+    visible = "deployment_mode == 'existing' && backend_type == 'rtorrent' && rtorrent_transport == 'tcp'"
+
+    [install.torrentng_url]
+    ask.en = "TorrentNG engine URL"
+    type = "url"
+    default = "http://127.0.0.1:8080"
+    visible = "deployment_mode == 'existing' && backend_type == 'torrentng'"
+
+    [install.torrentng_api_token]
+    ask.en = "TorrentNG engine API token"
+    type = "password"
+    redact = true
+    visible = "deployment_mode == 'existing' && backend_type == 'torrentng'"
+
+[resources]
+    [resources.sources.main]
+    in_subdir = false
+    amd64.url = "https://github.com/snapetech/TorrentNG/releases/download/main-REPLACE/torrentng-yunohost-main-REPLACE-linux-amd64.tar.gz"
+    amd64.sha256 = "REPLACE_WITH_RELEASE_SHA256"
+    arm64.url = "https://github.com/snapetech/TorrentNG/releases/download/main-REPLACE/torrentng-yunohost-main-REPLACE-linux-arm64.tar.gz"
+    arm64.sha256 = "REPLACE_WITH_RELEASE_SHA256"
+
+    [resources.system_user]
+
+    [resources.install_dir]
+
+    [resources.data_dir]
+    subdirs = ["engine", "sidecar"]
+
+    [resources.ports]
+    main.default = 8787
+    peer.default = 51413
+
+    [resources.permissions]
+    main.url = "/"
+    main.allowed = "admins"
+    main.protected = true
+    api.url = "/api"
+    api.allowed = "visitors"
+    api.auth_header = false
+    api.show_tile = false
+
+    [resources.apt]
+    packages = ["ca-certificates", "openssl", "python3"]

@@ -1,0 +1,36 @@
+[Unit]
+Description=TorrentNG WebUI and torrent client
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=__APP__
+Group=__APP__
+SupplementaryGroups=multimedia
+WorkingDirectory=__DATA_DIR__
+Environment="TNG_INSTALL_DIR=__INSTALL_DIR__"
+Environment="TNG_DATA_DIR=__DATA_DIR__"
+Environment="TNG_STATIC_DIR=__INSTALL_DIR__/webui"
+Environment="TNG_DEPLOYMENT_MODE=__DEPLOYMENT_MODE__"
+ExecStart=__INSTALL_DIR__/bin/launch
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=30
+LimitNOFILE=65535
+UMask=0002
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectSystem=strict
+ProtectHome=read-only
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+LockPersonality=yes
+RestrictSUIDSGID=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+ReadWritePaths=__DATA_DIR__ __DOWNLOAD_DIR__
+
+[Install]
+WantedBy=multi-user.target

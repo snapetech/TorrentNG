@@ -1,4 +1,9 @@
-const BASE = '/api/v1'
+export const appBasePath = (window.__TNG_BASE_PATH__ ?? '').replace(/\/+$/, '')
+const BASE = `${appBasePath}/api/v1`
+
+function appPath(path: string): string {
+  return `${appBasePath}${path.startsWith('/') ? path : `/${path}`}`
+}
 
 export class AuthError extends Error {
   constructor(message = 'Unauthorized') {
@@ -239,7 +244,7 @@ function normalizeTorrentList(
 }
 
 async function getRoot<T>(path: string): Promise<T> {
-  const res = await fetch(path, { credentials: 'same-origin' })
+  const res = await fetch(appPath(path), { credentials: 'same-origin' })
   if (res.status === 401) throw new AuthError()
   if (!res.ok) throw new Error(`API ${res.status}: ${path}`)
   return res.json()

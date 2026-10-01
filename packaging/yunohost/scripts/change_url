@@ -1,0 +1,8 @@
+#!/bin/bash
+
+source "$(dirname "$0")/_common.sh"
+
+ynh_script_progression --message="Updating TorrentNG's URL configuration..." --weight=1
+write_runtime_config "$new_path"
+ynh_change_url_nginx_config
+ynh_systemctl --service="$app" --action=restart

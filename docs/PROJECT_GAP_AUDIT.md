@@ -42,10 +42,10 @@ compatibility depth:
 - the current TorrentNG-client and compatible-client service security reviews pass their configuration,
   token, and script-policy checks; rendered-secret, proxy, metrics-exposure,
   dependency, and image-scan review remains deployment/operator evidence;
-- the completed public Debian soak is recorded as PASS in both its finalization
-  report and the refreshed external preflight; the preflight now recognizes a
-  completed PASS report instead of treating the absence of a live process as a
-  warning.
+- the counted public Debian run completed its 24-hour health, sync, metrics,
+  completed-torrent, and disk-free checks. Its RSS/FD/thread samples read Tini
+  (container PID 1), not `torrentngd`; daemon resource soak evidence remains
+  open under TNG-145 even though the original finalizer recorded PASS.
 
 ## Certification Snapshot
 
@@ -72,8 +72,8 @@ Current `scripts/certification_status.sh` highlights:
 | Broad compatibility | PASS_WITH_SKIPS; current b393 Docker, mobile, and public Debian legs pass, while target storage is certified separately |
 | Broad live compatibility | PASS_WITH_SKIPS; canonical b393 all-live report passes local Docker, mobile, and public Debian legs, with the real-device wrapper explicitly skipped |
 | Migration corpus | PASS with generated checked-in corpus; strict local gate passes |
-| External evidence preflight | PASS in strict mode for Docker, public opt-in, writable storage target, corpus, and completed soak |
-| 24h soak | PASS; 1,437 samples and exact completed public torrent |
+| External evidence preflight | Original strict run recorded PASS; daemon RSS/FD/thread soak evidence is invalid because it sampled Tini |
+| 24h service continuity | PASS; 1,437 samples and exact completed public torrent; process resource metrics are unqualified |
 
 ## Roadmaps
 
@@ -87,8 +87,9 @@ Remaining qualification gates:
 - `docs/CLIENT_COMPATIBILITY_MATRICES.md` and `docs/INTEROP_MATRIX.md` retain
   optional live-client, public-network, and broader protocol qualification rows;
   they are not unassigned TorrentNG-client implementation work.
-- The 24-hour soak remains an explicit release-evidence gate. The named Debian
-  run is complete; future release artifacts still need their own operator-owned
+- The named Debian run confirms service and torrent continuity for 24 hours.
+  Daemon RSS/FD/thread evidence remains open because the sampler read container
+  PID 1 (Tini). Future release artifacts still need their own operator-owned
   soak when the runtime artifact or configuration materially changes.
 
 ## Storage

@@ -1,8 +1,8 @@
 # Public Torrent Transfer and Soak — 2026-09-05
 
-Status: **COMPLETE / PASS**
-Confidence: **high** for both the public transfer and the counted soak; the
-finalizer accepted the completed source report and all configured checks.
+Status: **public transfer and service-continuity PASS; daemon resource telemetry invalid**
+Confidence: **high** for the public transfer and 24-hour service/torrent
+continuity; **unknown** for daemon RSS, FD, and thread ceilings.
 
 ## Public transfer
 
@@ -43,16 +43,21 @@ The counted soak started at `2026-09-05T19:32:58Z` under the user-systemd unit
 - live log: `.run/soak-24h-public-debian-20260905-v3.log`
 
 The run completed with 1,437 retained samples. Every sample returned healthy
-`/health`, qBittorrent `sync/maindata`, and metrics responses; the exact
-expected Debian torrent remained present and completed; and the configured RSS,
-file-descriptor, thread, and disk-free ceilings passed. The final observed
-resource maxima/floor were 1.3 MB RSS, 3 file descriptors, 1 thread, and
-14,382 MB free disk.
+`/health`, qBittorrent `sync/maindata`, and metrics responses, and the exact
+expected Debian torrent remained present and completed. The 14,382 MB disk-free
+floor is valid. The recorded RSS, FD, and thread figures are not daemon
+measurements: `scripts/soak_certification.sh` reads `/proc/1`, while the native
+container entrypoint runs Tini as PID 1 and `torrentngd` as its child. The
+reported 1.3 MB RSS, 3 FDs, and 1 thread belong to Tini. Do not use them as
+daemon resource-ceiling evidence; the resource-qualified soak remains open
+under TNG-145.
 
 The counted source report is [`soak-24h-public-debian-20260905-v3.md`](../.run/soak-24h-public-debian-20260905-v3.md), and the checked finalization report
 is [`soak-final-public-debian-20260910.md`](../certification/reports/soak-final-public-debian-20260910.md).
 The finalizer required at least 1,200 samples and one matching torrent; it
-recorded `Overall status: PASS`.
+recorded `Overall status: PASS` under the original sampler. That historical
+status still describes HTTP and torrent-continuity checks, but overstates the
+process-resource checks because it sampled Tini.
 
 The soak source predates the b393 code/evidence refresh; the current b393
 public matrix above is the artifact-specific transfer evidence. The user-systemd unit owned the process and had automatic restart disabled, so

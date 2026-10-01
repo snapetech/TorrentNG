@@ -3910,6 +3910,65 @@ claims:
 - “fuzz/OpenAPI/idempotency certified” without hosted CI output and a broader
   replay corpus.
 
+### TNG-145 — Public soak resource telemetry samples the container init process
+
+**Status: Open; service continuity remains valid, daemon resource evidence is invalid** · **Priority: P1** · **Confidence: high**
+
+`scripts/soak_certification.sh` reads `/proc/1/status` and `/proc/1/fd` for
+RSS, thread count, and file descriptors. The native container's identity
+wrapper runs Tini as container PID 1 and `torrentngd` as its child. The public
+Debian soak's reported 1.3 MB RSS, 3 FDs, and 1 thread therefore describe Tini,
+not the daemon. Its 1,437 healthy HTTP/sync/metrics samples, expected completed
+torrent, and disk-free measurements remain valid; the original resource
+ceiling PASS does not. The 24-hour run also predates the b393 artifact refresh.
+
+Resolution: identify and validate the daemon process or collect validated
+cgroup totals; record the image/binary digest; make the finalizer reject
+wrapper-process samples; update the historical narrative; and rerun before
+claiming daemon resource ceilings over a soak.
+
+### TNG-146 — Storage hardware certification can pass on tmpfs
+
+**Status: Open; physical-device and throughput status must be distinct from local smoke status** · **Priority: P1** · **Confidence: high**
+
+The 2026-09-16 `storage-release-certification-lab-current` report targeted
+`/tmp` on tmpfs, inferred profile `Unknown`, and still recorded PASS. Its
+`io_uring` stream used 4 MiB and sub-millisecond reads; throughput ratios were
+not required. `scripts/storage_hardware_matrix.sh` only enables the 5x HDD
+check for a detected rotational target with `TNG_STORAGE_REQUIRE_HDD_5X=1`,
+so an unknown/tmpfs target can complete as a green “hardware” matrix. The
+report is useful as local capability smoke, not disk or physical-device
+qualification. This does not invalidate the separate 2026-09-10 b393 ext4/LVM
+HDD report, which ran three 128 MiB shuffled-read trials and recorded 5.11x
+median speedup.
+
+Resolution: mark unknown/tmpfs/network targets as smoke-only or SKIP for
+hardware status; require an actual target device for release hardware PASS;
+record when the HDD ratio is enforced; and keep `io_uring` selection and
+throughput gates separate.
+
+### TNG-147 — Performance and capacity claims need measured-scope labels
+
+**Status: Open; supported wording and outcomes are recorded in `PERFORMANCE_SCALE_CLAIMS_AUDIT.md`** · **Priority: P2** · **Confidence: high**
+
+The source and reports support real but separate outcomes: a single-run
+50,000-row synthetic sidecar corpus returning a capped 5,000-row page; an
+older native release binary restoring a simple 100,000-row mostly-stopped
+SQLite corpus; a small-corpus many-client API/SSE run; and one real public v1
+transfer. The memory test called a 1,000-hot “cap” checks only the top ten
+estimated rows. The 512 MB governor limit covers selected leased allocations,
+not total process RSS. The WebUI 15,000-row browser test is mocked and fetches
+200 rows at a time. The `STORAGE_NG.md` 200+ TB and competitor statements are
+design goals, not measured outcomes.
+
+Resolution: scope opening “fast/high-volume” language; label synthetic,
+mostly-dormant, public-swarm, and WebUI results precisely; distinguish
+governor-managed memory from RSS; include artifact, corpus, page, concurrency,
+host, and timing scope in performance summaries; label 200+ TB and comparative
+claims as goals; and improve manual large-library navigation or state its
+limits. Do not combine independent counts and workloads into one capacity
+claim.
+
 ## Burn-down log
 
 | Date | Change | Evidence | Ledger impact |
@@ -4044,9 +4103,13 @@ claims:
 | 2026-09-24 UTC | Closed TNG-144: qBittorrent-compatible file indexes above the signed backend RPC range are rejected instead of wrapping during Deluge/rTorrent rename and rTorrent priority operations. | Sidecar tests pass (260 library / 3 binary / 117 compatibility; two synthetic benchmarks ignored), including the checked conversion and `400` response regressions; warnings-denied Clippy, formatting, and `git diff --check` pass. | Only malformed out-of-range indexes are affected; no backend network call, release-capacity proof, or client-interoperability claim is implied. |
 | 2026-09-25 UTC | Closed the Windows storage-plan path-authority implementation follow-up: plans now traverse configured-root capability directories and perform recursive copy/verification/deletion, pruning, reconciliation, and no-replace rename relative to opened handles. | `cargo check --locked -p rt-storage --target x86_64-pc-windows-msvc` and `cargo check --locked --tests -p rt-storage --target x86_64-pc-windows-msvc` pass. | Native Windows runtime behavior remains unqualified; that is evidence-only follow-up. |
 | 2026-09-25 UTC | Completed the scoped TNG-029 module decomposition and dependency cleanup: engine command facade, lifecycle/restore, storage workflow, and read model moved to private modules; per-torrent peer connection, session, and transfer code moved to private modules. Root `base64` now shares Axum-compatible 0.22, and root `sha1` is aligned to 0.10.7. | `cargo check --workspace --locked --offline`, debug/release root workspace builds, release sidecar build, formatting, and `git diff --check` pass. | Public API and actor ordering are preserved. Remaining framework/dev-tool dependency versions are constrained by Axum/Reqwest and test-tool generations; no benchmark or runtime behavior claim is made. |
+| 2026-10-01 | Opened TNG-145 through TNG-147 after auditing the resource, storage, API, swarm, and count claims against current source and retained reports. Corrected the public-soak narrative: PID 1 is Tini, so recorded RSS/FD/thread values are not `torrentngd` measurements. Classified the tmpfs “hardware matrix” PASS as smoke-only and separated useful scoped outcomes from production-capacity claims. | Source paths and reports are linked in [`PERFORMANCE_SCALE_CLAIMS_AUDIT.md`](PERFORMANCE_SCALE_CLAIMS_AUDIT.md); no tests or benchmarks were run for the audit. The 2026-09-10 physical HDD report remains valid for its host/workload; the 2026-09-16 tmpfs report is not hardware evidence. | TNG-145/146/147 remain Open pending sampler/gate fixes and claim reconciliation. |
 
 ## Release gate
 
 The TorrentNG-client release gate must fail while any P0 item is Open or while TNG-025,
 TNG-026, or TNG-028 is Open. A production-scale claim additionally requires
 TNG-010, TNG-013, and TNG-014 to be Resolved with release-artifact evidence.
+Daemon resource-soak, physical storage qualification, and broad
+performance/capacity wording also remain subject to TNG-145, TNG-146, and
+TNG-147 respectively.

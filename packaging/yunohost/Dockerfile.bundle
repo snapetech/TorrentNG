@@ -1,0 +1,24 @@
+FROM rust:1.97-alpine AS rust-build
+
+RUN apk add --no-cache build-base musl-dev perl pkgconf
+WORKDIR /src
+COPY Cargo.toml Cargo.lock ./
+COPY crates ./crates
+COPY sidecar/Cargo.toml sidecar/Cargo.lock ./sidecar/
+COPY sidecar/src ./sidecar/src
+
+RUN cargo build --release --locked -p torrentngd \
+    && cargo build --release --locked --manifest-path sidecar/Cargo.toml
+
+FROM node:22-alpine AS webui-build
+WORKDIR /src/webui
+COPY webui/package.json webui/package-lock.json ./
+RUN npm ci --ignore-scripts
+COPY webui/ ./
+RUN TNG_WEBUI_OUT_DIR=/src/webui/dist npm run build
+
+FROM alpine:3.22 AS bundle
+WORKDIR /out
+COPY --from=rust-build /src/target/release/torrentngd /out/bin/torrentngd
+COPY --from=rust-build /src/sidecar/target/release/torrentng /out/bin/torrentng
+COPY --from=webui-build /src/webui/dist /out/webui

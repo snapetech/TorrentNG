@@ -1,0 +1,12 @@
+#!/bin/bash
+
+source "$(dirname "$0")/_common.sh"
+
+ynh_restore_file --origin_path="$install_dir"
+ynh_restore_file --origin_path="$data_dir"
+install_launch_script
+write_runtime_config "$path"
+ynh_add_nginx_config
+ynh_add_systemd_config
+ensure_native_peer_firewall
+ynh_systemctl --service="$app" --action=start

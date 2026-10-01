@@ -1,0 +1,61 @@
+#!/bin/bash
+
+source "$(dirname "$0")/_common.sh"
+
+# The API password is provided as a shell variable during installation. Keep
+# it out of debug traces even if this script is run with bash -x.
+case "$-" in
+	*x*) set +x ;;
+esac
+
+ynh_script_progression --message="Validating TorrentNG configuration..." --weight=1
+
+if [[ ! "$api_token" =~ ^[A-Za-z0-9_-]{32,128}$ ]]; then
+	ynh_die --message="The TorrentNG API password must contain 32 to 128 letters, digits, underscores, or hyphens."
+fi
+
+if [[ "$deployment_mode" == "native" ]]; then
+	storage_root="$download_dir"
+else
+	# The sidecar never writes payload data. Its writable download path remains
+	# inside app state; storage_root is read by the WebUI's file views.
+	download_dir="$data_dir"
+fi
+ynh_app_setting_set --app="$app" --key=download_dir --value="$download_dir"
+if [[ -n "${storage_root:-}" ]]; then
+	ynh_app_setting_set --app="$app" --key=storage_root --value="$storage_root"
+fi
+
+if [[ "$deployment_mode" == "native" ]]; then
+	case "$download_dir" in
+		/*) ;;
+		*) ynh_die --message="The download directory must be an absolute filesystem path." ;;
+	esac
+fi
+
+ynh_script_progression --message="Installing TorrentNG binaries and WebUI..." --weight=3
+ynh_setup_source --dest_dir="$install_dir"
+install_launch_script
+write_runtime_config "$path"
+
+if [[ "$deployment_mode" == "native" ]]; then
+	initialize_multimedia_access
+else
+	ynh_multimedia_build_main_dir
+	ynh_multimedia_addaccess "$app"
+fi
+
+ynh_script_progression --message="Writing private TorrentNG configuration..." --weight=2
+session_secret="$(openssl rand -hex 32)"
+write_app_config "$deployment_mode" "$session_secret" "$api_token"
+
+ynh_script_progression --message="Configuring NGINX and systemd..." --weight=2
+ynh_add_nginx_config
+ynh_add_systemd_config
+
+ensure_native_peer_firewall
+
+ynh_script_progression --message="Starting TorrentNG..." --weight=1
+ynh_systemctl --service="$app" --action=start
+
+ynh_print_info --message="TorrentNG is installed at https://$domain$path/. Sign in with any username and the API password entered during installation."
