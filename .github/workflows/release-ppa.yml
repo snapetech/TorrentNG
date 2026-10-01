@@ -7,6 +7,11 @@ on:
         description: Existing published release tag to upload, for example main-20260930-4
         required: true
         type: string
+      include_orig:
+        description: Include the upstream source archive on the first upload; disable when retrying after it was accepted
+        required: false
+        default: true
+        type: boolean
 
 permissions:
   contents: read
@@ -96,6 +101,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           RELEASE_TAG: ${{ steps.tag.outputs.tag }}
+          INPUT_INCLUDE_ORIG: ${{ inputs.include_orig }}
           LAUNCHPAD_GPG_FINGERPRINT: 07E2531E1F470F8008ACCFC996A07606FE65392F
         shell: bash
         run: |
@@ -103,9 +109,13 @@ jobs:
           output_dir="$RUNNER_TEMP/launchpad-ppa"
           mkdir -p "$output_dir"
           for series in jammy noble resolute; do
+            include_orig="$INPUT_INCLUDE_ORIG"
+            if [[ "$series" != jammy ]]; then
+              include_orig=false
+            fi
             changes_file="$(scripts/build_launchpad_ppa_source.sh \
               "$RELEASE_TAG" "$series" "$GITHUB_RUN_ID" \
-              "$GITHUB_RUN_ATTEMPT" "$output_dir")"
+              "$GITHUB_RUN_ATTEMPT" "$output_dir" "$include_orig")"
             dput ppa:keefshape/torrentng "$changes_file"
             echo "Uploaded $series source package: $(basename "$changes_file")"
           done

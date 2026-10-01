@@ -24,13 +24,14 @@ wait for its source uploads to finish. It also creates and enrolls an
 additional Launchpad signing key, preserving the existing release key.
 
 Usage:
-  scripts/publish_launchpad_ppa.sh [RELEASE_TAG]
+  scripts/publish_launchpad_ppa.sh [--no-orig] [RELEASE_TAG]
 
 With no tag, the latest published, non-prerelease GitHub release is selected.
 The existing Launchpad upload key must be available in the local GPG keyring.
 The new key's passphrase is kept in Secret Service. The script pauses for the
-Launchpad import and confirmation steps, then reads the existing key's
-passphrase without echo and sends it to GitHub through stdin.
+Launchpad import and signed confirmation steps, then reads the existing key's
+passphrase without echo and sends it to GitHub through stdin. Use --no-orig only
+when retrying after Launchpad has already accepted the upstream source archive.
 EOF
 }
 
@@ -221,6 +222,12 @@ if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
   exit 0
 fi
 
+include_orig=true
+if [[ "${1:-}" == "--no-orig" ]]; then
+  include_orig=false
+  shift
+fi
+
 if (( $# > 1 )); then
   usage >&2
   exit 2
@@ -366,7 +373,8 @@ unset passphrase
 trap - EXIT
 
 printf 'Dispatching %s for release %s...\n' "$WORKFLOW" "$release_tag"
-gh workflow run "$WORKFLOW" --repo "$REPO" --ref main --field "tag=$release_tag" ||
+gh workflow run "$WORKFLOW" --repo "$REPO" --ref main \
+  --field "tag=$release_tag" --field "include_orig=$include_orig" ||
   fail "GitHub could not dispatch the PPA workflow. Check $ACTIONS_URL"
 
 run_id=""

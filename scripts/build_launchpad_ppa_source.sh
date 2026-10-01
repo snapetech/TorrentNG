@@ -3,7 +3,7 @@ set -Eeuo pipefail
 
 usage() {
   cat >&2 <<'USAGE'
-usage: build_launchpad_ppa_source.sh <release-tag> <ubuntu-series> <run-id> <run-attempt> <output-dir>
+usage: build_launchpad_ppa_source.sh <release-tag> <ubuntu-series> <run-id> <run-attempt> <output-dir> [include-orig]
 
 Builds a signed Launchpad source package containing the matching amd64 and
 arm64 TorrentNG release assets. Requires gh authentication, dpkg packaging
@@ -11,7 +11,7 @@ tools, and the Launchpad-authorized private OpenPGP key in GPG's keyring.
 USAGE
 }
 
-if [[ $# -ne 5 ]]; then
+if [[ $# -lt 5 || $# -gt 6 ]]; then
   usage
   exit 2
 fi
@@ -21,6 +21,12 @@ series="$2"
 run_id="$3"
 run_attempt="$4"
 output_dir="$5"
+include_orig="${6:-true}"
+
+if [[ "$include_orig" != true && "$include_orig" != false ]]; then
+  echo "include-orig must be true or false." >&2
+  exit 2
+fi
 
 if [[ ! "$release_tag" =~ ^main-[A-Za-z0-9][A-Za-z0-9._-]*$ ]] ||
   [[ "$release_tag" == *..* ]] || ! git check-ref-format "refs/tags/$release_tag"; then
@@ -123,7 +129,11 @@ CHANGELOG
 signer="$repo_root/scripts/launchpad-gpg-sign"
 (
   cd "$source_root"
-  dpkg-buildpackage -S -sa \
+  source_archive_option=-sd
+  if [[ "$include_orig" == true ]]; then
+    source_archive_option=-sa
+  fi
+  dpkg-buildpackage -S "$source_archive_option" \
     -k"$signing_key" \
     -p"$signer" \
     --sign-backend=gpg
