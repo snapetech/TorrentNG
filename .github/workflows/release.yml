@@ -85,7 +85,7 @@ jobs:
             --limit 1000 \
             --json tagName,isDraft \
             --jq '.[] | select(.isDraft == false) | .tagName' \
-            | awk -v current="$RELEASE_TAG" '$0 != current { print; exit }')"
+            | awk -v current="$RELEASE_TAG" '$0 != current && !found { print; found = 1 }')"
           echo "tag=$previous_tag" >> "$GITHUB_OUTPUT"
 
       - name: Assemble curated release notes

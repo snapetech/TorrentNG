@@ -812,9 +812,11 @@ mod tests {
 
     #[test]
     fn auth_config_debug_redacts_password_and_api_tokens() {
-        let mut auth = AuthConfig::default();
-        auth.password = "private-password-value".to_owned();
-        auth.api_tokens = vec!["private-api-token-value".to_owned()];
+        let auth = AuthConfig {
+            password: "private-password-value".to_owned(),
+            api_tokens: vec!["private-api-token-value".to_owned()],
+            ..AuthConfig::default()
+        };
 
         let debug = format!("{auth:?}");
         assert!(!debug.contains("private-password-value"));
