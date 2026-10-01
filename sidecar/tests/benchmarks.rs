@@ -20,6 +20,10 @@ const QBIT_INFO_PAGE_LIMIT: usize = 5_000;
 
 async fn spawn_server_with_db() -> (SocketAddr, Client, Arc<Db>) {
     let cfg = Arc::new(Config::test_default());
+    let configured_auth_credentials = torrentng::auth::AuthCredentials {
+        username: cfg.auth.username.clone(),
+        password: cfg.auth.password.clone(),
+    };
     let db_path = tempfile::NamedTempFile::new().unwrap().into_temp_path();
     let db = Arc::new(Db::open(db_path.as_ref()).unwrap());
     let (tx, _) = broadcast::channel::<Event>(16);
@@ -39,6 +43,17 @@ async fn spawn_server_with_db() -> (SocketAddr, Client, Arc<Db>) {
         qbit_search_jobs: Arc::new(tokio::sync::RwLock::new(serde_json::Map::new())),
         qbit_next_search_id: Arc::new(std::sync::atomic::AtomicU64::new(1)),
         login_attempt_limiter: torrentng::auth::LoginAttemptLimiter::default(),
+        auth_credentials: Arc::new(tokio::sync::RwLock::new(
+            configured_auth_credentials.clone(),
+        )),
+        configured_auth_credentials,
+        auth_settings_path: std::env::temp_dir().join(format!(
+            "torrentng-benchmark-auth-{}.json",
+            uuid::Uuid::new_v4().simple()
+        )),
+        auth_settings_write: Arc::new(tokio::sync::Mutex::new(())),
+        local_webui_session_token: Some(format!("tng-benchmark-{}", uuid::Uuid::new_v4().simple())),
+        public_bind: false,
         control_plane_write: Arc::new(tokio::sync::Mutex::new(())),
     };
     let app: Router = torrentng::api::server::build_router(state);

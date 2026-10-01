@@ -106,6 +106,31 @@ fn build_test_app_with_existing_db_and_events(
     backend: Arc<dyn TorrentBackend>,
     db: Arc<Db>,
 ) -> (Router, broadcast::Sender<Event>) {
+    let configured_auth_credentials = torrentng::auth::AuthCredentials {
+        username: cfg.auth.username.clone(),
+        password: cfg.auth.password.clone(),
+    };
+    let public_bind = !cfg
+        .listen_addr
+        .parse::<SocketAddr>()
+        .unwrap()
+        .ip()
+        .is_loopback();
+    let local_webui_session_token = if cfg.auth.api_tokens.is_empty() {
+        Some(format!("tng-test-{}", uuid::Uuid::new_v4().simple()))
+    } else {
+        None
+    };
+    let auth_settings_path = cfg
+        .data_dir
+        .as_ref()
+        .map(|directory| directory.join("auth-settings.json"))
+        .unwrap_or_else(|| {
+            std::env::temp_dir().join(format!(
+                "torrentng-test-auth-{}.json",
+                uuid::Uuid::new_v4().simple()
+            ))
+        });
     let cfg = Arc::new(cfg);
     let (tx, _) = broadcast::channel::<Event>(16);
     let metrics = Metrics::new();
@@ -121,6 +146,14 @@ fn build_test_app_with_existing_db_and_events(
         qbit_search_jobs: Arc::new(tokio::sync::RwLock::new(serde_json::Map::new())),
         qbit_next_search_id: Arc::new(std::sync::atomic::AtomicU64::new(1)),
         login_attempt_limiter: torrentng::auth::LoginAttemptLimiter::default(),
+        auth_credentials: Arc::new(tokio::sync::RwLock::new(
+            configured_auth_credentials.clone(),
+        )),
+        configured_auth_credentials,
+        auth_settings_path,
+        auth_settings_write: Arc::new(tokio::sync::Mutex::new(())),
+        local_webui_session_token,
+        public_bind,
         control_plane_write: Arc::new(tokio::sync::Mutex::new(())),
     };
     let app: Router = torrentng::api::server::build_router(state);
@@ -724,16 +757,149 @@ async fn ratio_and_workflow_rule_stores_reject_growth_and_oversized_fields() {
 // --- qBit auth ---
 
 #[tokio::test]
-async fn qb_login_accepts_any_credentials() {
+async fn loopback_login_requires_default_or_configured_credentials() {
     let (addr, client) = spawn_server().await;
-    let res = client
+    let invalid = client
         .post(url(addr, "/api/qb/v2/auth/login"))
         .form(&[("username", "admin"), ("password", "wrong")])
         .send()
         .await
         .unwrap();
-    assert_eq!(res.status(), 200);
-    assert_eq!(res.text().await.unwrap(), "Ok.");
+    assert_eq!(invalid.status(), 200);
+    assert_eq!(invalid.text().await.unwrap(), "Fails.");
+
+    let valid = client
+        .post(url(addr, "/api/qb/v2/auth/login"))
+        .form(&[("username", "torrentng"), ("password", "torrentng")])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(valid.status(), 200);
+    assert_eq!(valid.text().await.unwrap(), "Ok.");
+}
+
+#[tokio::test]
+async fn public_bind_rejects_default_password_and_allows_api_token_login() {
+    let mut cfg = Config::test_default();
+    cfg.listen_addr = "0.0.0.0:8080".to_owned();
+    cfg.auth.username = "operator".to_owned();
+    cfg.auth.api_tokens = vec!["public-api-token-0123456789".to_owned()];
+    cfg.auth.secret_key = Some("public-test-session-secret-key-32-bytes".to_owned());
+    let (addr, client, _) = spawn_server_with_config(cfg).await;
+
+    let default_password = client
+        .post(url(addr, "/api/qb/v2/auth/login"))
+        .form(&[("username", "operator"), ("password", "torrentng")])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(default_password.status(), StatusCode::OK);
+    assert_eq!(default_password.text().await.unwrap(), "Fails.");
+
+    let api_token = client
+        .post(url(addr, "/api/qb/v2/auth/login"))
+        .form(&[
+            ("username", "public-api-token-0123456789"),
+            ("password", ""),
+        ])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(api_token.status(), StatusCode::OK);
+    assert_eq!(api_token.text().await.unwrap(), "Ok.");
+
+    let default_password_update = client
+        .put(url(addr, "/api/v1/auth/settings"))
+        .bearer_auth("public-api-token-0123456789")
+        .json(&serde_json::json!({"username":"operator", "password":"torrentng"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(default_password_update.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn webui_login_and_auth_settings_are_configurable_and_persisted() {
+    let data_dir = tempfile::tempdir().unwrap();
+    let mut cfg = Config::test_default();
+    cfg.data_dir = Some(data_dir.path().to_owned());
+    cfg.auth.secure_cookies = false;
+    let settings_path = data_dir.path().join("auth-settings.json");
+    let (addr, client, _) = spawn_server_with_config(cfg).await;
+
+    let anonymous_browser = Client::new()
+        .get(url(addr, "/api/v1/torrents"))
+        .header("sec-fetch-site", "same-origin")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(anonymous_browser.status(), 401);
+
+    let login = client
+        .post(url(addr, "/api/v1/auth/login"))
+        .form(&[("username", "torrentng"), ("password", "torrentng")])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(login.text().await.unwrap(), "Ok.");
+
+    let settings = client
+        .get(url(addr, "/api/v1/auth/settings"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(settings.status(), 200);
+    let settings: serde_json::Value = settings.json().await.unwrap();
+    assert_eq!(settings["username"], "torrentng");
+    assert_eq!(settings["password_is_default"], true);
+    assert!(settings.get("password").is_none());
+
+    let saved = client
+        .put(url(addr, "/api/v1/auth/settings"))
+        .json(&serde_json::json!({"username":"keith", "password":"torrentng"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(saved.status(), 200);
+    assert_eq!(
+        saved.json::<serde_json::Value>().await.unwrap()["username"],
+        "keith"
+    );
+    assert!(settings_path.exists());
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(
+            std::fs::metadata(&settings_path)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+    }
+    let loaded = torrentng::auth::load_auth_credentials(
+        &settings_path,
+        &torrentng::auth::AuthCredentials {
+            username: "torrentng".to_owned(),
+            password: "torrentng".to_owned(),
+        },
+    )
+    .unwrap();
+    assert_eq!(loaded.username, "keith");
+    assert_eq!(loaded.password, "torrentng");
+
+    let restored = client
+        .delete(url(addr, "/api/v1/auth/settings"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(restored.status(), 200);
+    assert!(!settings_path.exists());
+    assert_eq!(
+        restored.json::<serde_json::Value>().await.unwrap()["username"],
+        "torrentng"
+    );
 }
 
 #[tokio::test]
@@ -773,6 +939,32 @@ async fn qb_login_sets_session_cookie_for_api_token() {
         .await
         .unwrap();
     assert_eq!(res.status(), 200);
+}
+
+#[tokio::test]
+async fn api_token_login_accepts_token_in_username_field() {
+    let mut cfg = Config::test_default();
+    cfg.auth.api_tokens = vec!["username-field-api-token".to_owned()];
+    let (addr, client, _) = spawn_server_with_config(cfg).await;
+
+    let login = client
+        .post(url(addr, "/api/v1/auth/login"))
+        .form(&[
+            ("username", "username-field-api-token"),
+            ("password", "ignored-password"),
+        ])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(login.status(), 200);
+    assert_eq!(login.text().await.unwrap(), "Ok.");
+
+    let private_api = client
+        .get(url(addr, "/api/v2/app/preferences"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(private_api.status(), 200);
 }
 
 #[tokio::test]
@@ -2459,12 +2651,37 @@ async fn cookie_and_proxy_authenticated_websockets_reject_cross_origin_handshake
         websocket_status(addr, &host, Some(&cookie), &format!("http://{host}"), None).await;
     assert!(response.starts_with("HTTP/1.1 101"), "{response}");
 
-    let (addr, _, _) = spawn_server_with_db().await;
+    let mut no_auth_cfg = Config::test_default();
+    no_auth_cfg.auth.secure_cookies = false;
+    let (addr, no_auth_client, _) = spawn_server_with_config(no_auth_cfg).await;
     let host = format!("torrentng.example.test:{}", addr.port());
     let attacker_origin = format!("http://attacker.example.test:{}", addr.port());
     let response = websocket_status(addr, &host, None, &attacker_origin, None).await;
-    assert!(response.starts_with("HTTP/1.1 403"), "{response}");
+    assert!(response.starts_with("HTTP/1.1 401"), "{response}");
     let response = websocket_status(addr, &host, None, &format!("http://{host}"), None).await;
+    assert!(response.starts_with("HTTP/1.1 401"), "{response}");
+
+    let login = no_auth_client
+        .post(url(addr, "/api/qb/v2/auth/login"))
+        .form(&[("username", "torrentng"), ("password", "torrentng")])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(login.status(), StatusCode::OK);
+    let cookie = login
+        .headers()
+        .get_all(reqwest::header::SET_COOKIE)
+        .iter()
+        .find_map(|value| {
+            let value = value.to_str().ok()?;
+            let cookie = value.strip_prefix("SID=")?.split(';').next()?;
+            Some(format!("SID={cookie}"))
+        })
+        .expect("loopback login should issue a session cookie");
+    let response = websocket_status(addr, &host, Some(&cookie), &attacker_origin, None).await;
+    assert!(response.starts_with("HTTP/1.1 403"), "{response}");
+    let response =
+        websocket_status(addr, &host, Some(&cookie), &format!("http://{host}"), None).await;
     assert!(response.starts_with("HTTP/1.1 101"), "{response}");
 
     let mut proxy_cfg = Config::test_default();
@@ -2534,8 +2751,10 @@ async fn trusted_proxy_identity_checks_browser_mutations() {
 }
 
 #[tokio::test]
-async fn no_auth_mode_rejects_cross_origin_browser_mutations() {
-    let (addr, client) = spawn_server().await;
+async fn loopback_browser_mutations_require_login_and_reject_cross_origin() {
+    let mut cfg = Config::test_default();
+    cfg.auth.secure_cookies = false;
+    let (addr, client, _) = spawn_server_with_config(cfg).await;
     let cross_origin = client
         .post(url(addr, "/api/qb/v2/torrents/createCategory"))
         .header(
@@ -2546,16 +2765,48 @@ async fn no_auth_mode_rejects_cross_origin_browser_mutations() {
         .send()
         .await
         .unwrap();
-    assert_eq!(cross_origin.status(), StatusCode::FORBIDDEN);
+    assert_eq!(cross_origin.status(), StatusCode::UNAUTHORIZED);
+
+    let login = client
+        .post(url(addr, "/api/qb/v2/auth/login"))
+        .form(&[("username", "torrentng"), ("password", "torrentng")])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(login.status(), StatusCode::OK);
+    let cookie = login
+        .headers()
+        .get_all(reqwest::header::SET_COOKIE)
+        .iter()
+        .find_map(|value| {
+            let value = value.to_str().ok()?;
+            let cookie = value.strip_prefix("SID=")?.split(';').next()?;
+            Some(format!("SID={cookie}"))
+        })
+        .expect("loopback login should issue a session cookie");
 
     let same_origin = client
         .post(url(addr, "/api/qb/v2/torrents/createCategory"))
+        .header("Cookie", &cookie)
         .header("Origin", format!("http://{addr}"))
         .form(&[("category", "allowed"), ("savePath", "/tmp/allowed")])
         .send()
         .await
         .unwrap();
     assert_eq!(same_origin.status(), StatusCode::OK);
+
+    let cross_origin = client
+        .post(url(addr, "/api/qb/v2/torrents/createCategory"))
+        .header("Cookie", cookie)
+        .header(
+            "Origin",
+            format!("http://attacker.example.test:{}", addr.port()),
+        )
+        .form(&[("category", "forged"), ("savePath", "/tmp/forged")])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(cross_origin.status(), StatusCode::FORBIDDEN);
 }
 
 #[tokio::test]

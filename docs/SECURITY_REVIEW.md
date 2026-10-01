@@ -22,6 +22,10 @@ Required production policy:
 
 Runtime behavior:
 
+- Fresh loopback installs default to the documented `torrentng` / `torrentng` WebUI credentials. The default password is rejected on non-loopback binds; those installs require API-token login until an administrator saves a unique password in Settings -> Security.
+- WebUI credentials can be configured in `[auth].username` / `[auth].password` or changed through the authenticated auth-settings API. Runtime values are stored in `auth-settings.json` under the protected session or service data directory with mode `0600`; the API never returns the password.
+- API tokens remain valid for bearer authentication and can be entered in either WebUI login field. The UI identifies the token source for Unraid and config-file deployments without returning the secret through an API read.
+- Native and compatible-client WebUI login attempts are limited to 10 per TCP peer per 60 seconds; successful login clears that peer's bucket.
 - The compatible-client service refuses script actions unless `allow_scripts` is true.
 - Script commands must use an absolute executable path. The path is canonicalized before launch and must live under one of the configured allowlist directories. Workflow webhooks use address-pinned, no-redirect HTTP with bounded responses and reject private/local destinations unless `allow_private_webhooks` is explicitly enabled.
 - qBittorrent, Transmission, Deluge, and TorrentNG backend API clients do not follow redirects; configure the final API/RPC URL directly so an upstream cannot redirect authenticated operations to another endpoint.

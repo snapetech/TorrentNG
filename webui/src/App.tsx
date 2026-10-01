@@ -30,10 +30,11 @@ const RatioGroupsPanel = lazy(() => import('./components/RatioGroupsPanel').then
 const WorkflowsPanel = lazy(() => import('./components/WorkflowsPanel').then(module => ({ default: module.WorkflowsPanel })))
 const RssRulesPanel = lazy(() => import('./components/RssRulesPanel').then(module => ({ default: module.RssRulesPanel })))
 const LogsPanel = lazy(() => import('./components/LogsPanel').then(module => ({ default: module.LogsPanel })))
+const AuthPanel = lazy(() => import('./components/AuthPanel').then(module => ({ default: module.AuthPanel })))
 
 type View = 'torrents' | 'settings'
 type AuthState = 'checking' | 'authenticated' | 'unauthenticated'
-type SettingsSection = 'library' | 'engine' | 'automation' | 'support'
+type SettingsSection = 'library' | 'engine' | 'automation' | 'security' | 'support'
 type SelectionMode = 'toggle' | 'replace' | 'range' | 'range-add'
 const MEDIA_INFERENCE_KEY = 'tng.mediaInference'
 const DETAIL_AUTO_DISPLAY_KEY = 'tng.detailAutoDisplay'
@@ -114,6 +115,7 @@ const preloadSettingsPanels = {
     void import('./components/WorkflowsPanel')
     void import('./components/RssRulesPanel')
   },
+  security: () => void import('./components/AuthPanel'),
   support: () => {},
 } satisfies Record<SettingsSection, () => void>
 
@@ -170,7 +172,7 @@ function loadDetailPosition(): DetailPosition {
 }
 
 function isSettingsSection(value: string | null): value is SettingsSection {
-  return value === 'library' || value === 'engine' || value === 'automation' || value === 'support'
+  return value === 'library' || value === 'engine' || value === 'automation' || value === 'security' || value === 'support'
 }
 
 function loadSettingsSection(): SettingsSection {
@@ -1178,6 +1180,7 @@ function SettingsView({ section, onSection, mediaInference, onMediaInference, th
     ['library', 'Library', '▦'],
     ['engine', 'Backend', '⚙'],
     ['automation', 'Automation', '⟲'],
+    ['security', 'Security', '🔒'],
     ['support', 'Support', '?'],
   ]
   function moveSection(current: SettingsSection, delta: number) {
@@ -1272,6 +1275,10 @@ function SettingsView({ section, onSection, mediaInference, onMediaInference, th
           <PanelFrame><RatioGroupsPanel /></PanelFrame>
           <PanelFrame><WorkflowsPanel /></PanelFrame>
           <PanelFrame><RssRulesPanel /></PanelFrame>
+        </section>)}
+        {section === 'security' && (<section id="settings-panel-security" role="tabpanel" aria-labelledby="settings-tab-security" tabIndex={0}>
+          <PanelTitle title="Security" subtitle="WebUI sign-in and API-token access" />
+          <PanelFrame><AuthPanel /></PanelFrame>
         </section>)}
         {section === 'support' && (<section id="settings-panel-support" role="tabpanel" aria-labelledby="settings-tab-support" tabIndex={0}>
           <PanelTitle title="Support" subtitle="Appearance, community links, and project resources" />
@@ -1492,12 +1499,12 @@ function LoginScreen({ message, onLogin }: {
             }} />
             <h1 style={{ margin: 0, fontWeight: 800, fontSize: 18 }}>TorrentNG</h1>
           </div>
-          <div style={{ color: 'var(--faint)', fontSize: 12, marginTop: 4 }}>
-            Sign in with this server’s API token. The username can be any value.
+          <div style={{ color: 'var(--faint)', fontSize: 12, marginTop: 4, lineHeight: 1.5 }}>
+            Fresh loopback installs use <strong>torrentng / torrentng</strong>. An API token also works in either field. On Unraid, find it in the native template’s <strong>API Token</strong> setting or the WebUI template’s <strong>API Tokens</strong> setting. Native config uses <code>[auth].api_tokens</code> or <code>[auth].api_tokens_file</code>; the WebUI service also accepts <code>TNG_API_TOKENS</code> or <code>RTNG_API_TOKENS</code>.
           </div>
         </div>
         <label className="tng-form-card" style={{ display: 'flex', flexDirection: 'column', gap: 5, fontSize: 12, color: 'var(--muted)' }}>
-          Username (any value)
+          Username or API token
           <input
             id="tng-login-username"
             name="username"
@@ -1512,7 +1519,7 @@ function LoginScreen({ message, onLogin }: {
           />
         </label>
         <label className="tng-form-card" style={{ display: 'flex', flexDirection: 'column', gap: 5, fontSize: 12, color: 'var(--muted)' }}>
-          API token
+          Password or API token
           <input
             id="tng-login-password"
             name="password"

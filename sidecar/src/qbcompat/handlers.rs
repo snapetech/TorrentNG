@@ -1,7 +1,7 @@
 use axum::{
     extract::{ConnectInfo, DefaultBodyLimit, Extension, Form, Multipart, Query, State},
     http::{header, HeaderMap, HeaderValue, StatusCode},
-    response::{AppendHeaders, IntoResponse},
+    response::{AppendHeaders, IntoResponse, Response},
     routing::{get, post},
     Json, Router,
 };
@@ -301,30 +301,49 @@ pub(crate) async fn auth_login(
     peer: Option<Extension<ConnectInfo<SocketAddr>>>,
     Form(f): Form<HashMap<String, String>>,
 ) -> impl IntoResponse {
-    if s.cfg.auth.api_tokens.is_empty() {
-        return "Ok.".into_response();
-    }
-
     let peer_ip = peer.map(|Extension(ConnectInfo(addr))| addr.ip());
 
-    let candidate = f
-        .get("password")
-        .or_else(|| f.get("username"))
+    let token = [f.get("password"), f.get("username")]
+        .into_iter()
+        .flatten()
         .map(String::as_str)
-        .unwrap_or("");
+        .find(|candidate| {
+            s.cfg
+                .auth
+                .api_tokens
+                .iter()
+                .any(|token| crate::auth::tokens_match(token, candidate))
+        });
 
-    if s.cfg
-        .auth
-        .api_tokens
-        .iter()
-        .any(|token| crate::auth::tokens_match(token, candidate))
-    {
+    let credentials = s.auth_credentials.read().await;
+    let password_valid = f
+        .get("password")
+        .is_some_and(|candidate| crate::auth::tokens_match(&credentials.password, candidate));
+    let credentials_valid = f
+        .get("username")
+        .is_some_and(|candidate| candidate == &credentials.username)
+        && password_valid
+        && (!s.public_bind || credentials.password != "torrentng");
+    drop(credentials);
+
+    if token.is_none() && !credentials_valid {
+        "Fails.".into_response()
+    } else {
         s.login_attempt_limiter.clear(peer_ip).await;
-        // API tokens are operator-provided strings, not cookie-safe strings.
-        // Encode the value before putting it in a header; the auth middleware
-        // decodes it again before comparison.
-        let cookie_value =
-            crate::auth::session_cookie_value(s.cfg.auth.secret_key.as_deref(), candidate);
+        let session_credential = token
+            .map(str::to_owned)
+            .or_else(|| s.cfg.auth.api_tokens.first().cloned())
+            .or_else(|| s.local_webui_session_token.clone());
+        let Some(session_credential) = session_credential else {
+            return "Fails.".into_response();
+        };
+        // Signed sessions keep configured API tokens out of cookies. In local
+        // no-token mode the ephemeral session credential is valid only until
+        // this service process exits.
+        let cookie_value = crate::auth::session_cookie_value(
+            s.cfg.auth.secret_key.as_deref(),
+            &session_credential,
+        );
         let secure_attribute = if s.cfg.auth.secure_cookies {
             "; Secure"
         } else {
@@ -342,9 +361,149 @@ pub(crate) async fn auth_login(
             "Ok.",
         )
             .into_response()
-    } else {
-        "Fails.".into_response()
     }
+}
+
+#[derive(Serialize)]
+struct AuthSettingsResponse {
+    username: String,
+    password_is_default: bool,
+    default_credentials_allowed: bool,
+    api_token_login_enabled: bool,
+}
+
+fn auth_settings_response(
+    state: &AppState,
+    credentials: &crate::auth::AuthCredentials,
+) -> AuthSettingsResponse {
+    let password_is_default = credentials.password == "torrentng";
+    AuthSettingsResponse {
+        username: credentials.username.clone(),
+        password_is_default,
+        default_credentials_allowed: !state.public_bind || !password_is_default,
+        api_token_login_enabled: !state.cfg.auth.api_tokens.is_empty(),
+    }
+}
+
+pub(crate) async fn auth_settings(State(state): State<AppState>) -> impl IntoResponse {
+    let credentials = state.auth_credentials.read().await;
+    Json(auth_settings_response(&state, &credentials))
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct UpdateAuthSettingsRequest {
+    username: String,
+    password: String,
+}
+
+pub(crate) async fn update_auth_settings(
+    State(state): State<AppState>,
+    Json(request): Json<UpdateAuthSettingsRequest>,
+) -> Response {
+    let credentials = crate::auth::AuthCredentials {
+        username: request.username.trim().to_owned(),
+        password: request.password,
+    };
+    if let Err(error) = crate::auth::validate_auth_credentials(&credentials) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"code": "BAD_REQUEST", "message": error.to_string()})),
+        )
+            .into_response();
+    }
+    if state.public_bind && credentials.password == "torrentng" {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "code": "BAD_REQUEST",
+                "message": "the default WebUI password is disabled on public binds"
+            })),
+        )
+            .into_response();
+    }
+
+    let _guard = state.auth_settings_write.lock().await;
+    if let Err(error) = persist_auth_credentials(&state.auth_settings_path, &credentials).await {
+        tracing::error!(
+            component = "auth",
+            operation = "settings_persist",
+            %error,
+            "failed to persist WebUI authentication settings"
+        );
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({
+                "code": "INTERNAL_ERROR",
+                "message": "unable to persist authentication settings"
+            })),
+        )
+            .into_response();
+    }
+    *state.auth_credentials.write().await = credentials.clone();
+    Json(auth_settings_response(&state, &credentials)).into_response()
+}
+
+pub(crate) async fn reset_auth_settings(State(state): State<AppState>) -> Response {
+    let _guard = state.auth_settings_write.lock().await;
+    match tokio::fs::remove_file(&state.auth_settings_path).await {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            tracing::error!(
+                component = "auth",
+                operation = "settings_reset",
+                %error,
+                "failed to reset WebUI authentication settings"
+            );
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({
+                    "code": "INTERNAL_ERROR",
+                    "message": "unable to reset authentication settings"
+                })),
+            )
+                .into_response();
+        }
+    }
+    *state.auth_credentials.write().await = state.configured_auth_credentials.clone();
+    Json(auth_settings_response(
+        &state,
+        &state.configured_auth_credentials,
+    ))
+    .into_response()
+}
+
+async fn persist_auth_credentials(
+    path: &std::path::Path,
+    credentials: &crate::auth::AuthCredentials,
+) -> std::io::Result<()> {
+    use tokio::io::AsyncWriteExt;
+
+    let temporary_path = path.with_extension("json.tmp");
+    match tokio::fs::remove_file(&temporary_path).await {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
+    }
+
+    let mut options = tokio::fs::OpenOptions::new();
+    options.create_new(true).write(true);
+    #[cfg(unix)]
+    {
+        options.mode(0o600);
+    }
+    let mut file = options.open(&temporary_path).await?;
+    let bytes = serde_json::to_vec(credentials)
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+    file.write_all(&bytes).await?;
+    file.sync_all().await?;
+    drop(file);
+    if let Err(error) = tokio::fs::rename(&temporary_path, path).await {
+        let _ = tokio::fs::remove_file(&temporary_path).await;
+        return Err(error);
+    }
+    Ok(())
 }
 pub(crate) async fn auth_logout(State(s): State<AppState>) -> impl IntoResponse {
     let secure_attribute = if s.cfg.auth.secure_cookies {

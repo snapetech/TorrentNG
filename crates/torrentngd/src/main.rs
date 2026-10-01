@@ -23,7 +23,7 @@ use rt_api_model::{
     api_token_allowed, csrf_request_allowed, has_browser_request_headers, session_cookie_value,
     ApiRuntimeMetrics,
 };
-use rt_api_native::state::AppState as TorrentNgApiState;
+use rt_api_native::state::{AppState as TorrentNgApiState, AuthCredentials};
 use rt_api_qbit::state::AppState as QbitState;
 use rt_api_transmission::AppState as TransmissionState;
 use rt_config::Config;
@@ -48,6 +48,12 @@ static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 /// facades share one budget instead of each compatibility router admitting
 /// its own workload.
 const MAX_CONCURRENT_DAEMON_REQUESTS: usize = 256;
+
+#[derive(Clone)]
+struct DaemonAuthGate {
+    api_tokens: Arc<Vec<String>>,
+    local_webui_session_token: Option<String>,
+}
 
 fn install_panic_payload_redacting_hook() {
     use std::io::Write as _;
@@ -104,6 +110,17 @@ async fn main() -> anyhow::Result<()> {
     }
 
     let config = Arc::new(load_config()?);
+    let api_addr: SocketAddr = config
+        .daemon
+        .api_bind
+        .parse()
+        .context("invalid api_bind address")?;
+    let public_bind = !api_addr.ip().is_loopback();
+    let local_webui_session_token = if config.auth.api_tokens.is_empty() {
+        Some(format!("tng-local-{}", uuid::Uuid::new_v4().simple()))
+    } else {
+        None
+    };
     rt_logging::init(&config.logging, Some(&config.daemon.log_level));
     if config.metrics.include_torrent_ids {
         tracing::warn!(
@@ -125,6 +142,14 @@ async fn main() -> anyhow::Result<()> {
     rt_storage::create_dir_all_no_follow(&config.daemon.session_dir)
         .with_context(|| format!("creating session_dir {:?}", config.daemon.session_dir))?;
 
+    let configured_auth_credentials = AuthCredentials {
+        username: config.auth.username.clone(),
+        password: config.auth.password.clone(),
+    };
+    let auth_settings_path = config.daemon.session_dir.join("auth-settings.json");
+    let auth_credentials =
+        load_auth_credentials(&auth_settings_path, &configured_auth_credentials)?;
+
     // Resolve (and persist, if not already done) this install's tracker
     // peer id before any engine/tracker task can observe it. Must run
     // before Engine::start. See docs/TRACKER-IDENTITY.md.
@@ -140,12 +165,19 @@ async fn main() -> anyhow::Result<()> {
 
     // Build the API routers
     let api_metrics = ApiRuntimeMetrics::new();
-    let torrentng_api_state = TorrentNgApiState::with_engine_and_tokens_metrics_config(
+    let mut torrentng_api_state = TorrentNgApiState::with_engine_and_tokens_metrics_config(
         Arc::clone(&registry),
         engine_handle.clone(),
         config.auth.api_tokens.clone(),
         Arc::clone(&api_metrics),
         config.metrics.include_torrent_ids,
+    );
+    torrentng_api_state.configure_auth_credentials(
+        auth_credentials,
+        configured_auth_credentials,
+        auth_settings_path,
+        public_bind,
+        local_webui_session_token.clone(),
     );
     let torrentng_api_router = rt_api_native::router::build_router(torrentng_api_state);
 
@@ -208,26 +240,16 @@ async fn main() -> anyhow::Result<()> {
         )
         .layer(middleware::from_fn(request_log))
         .layer(middleware::from_fn_with_state(
-            Arc::new(config.auth.api_tokens.clone()),
+            DaemonAuthGate {
+                api_tokens: Arc::new(config.auth.api_tokens.clone()),
+                local_webui_session_token: local_webui_session_token.clone(),
+            },
             daemon_auth_guard,
         ))
         .layer(middleware::from_fn_with_state(
             Arc::new(Semaphore::new(MAX_CONCURRENT_DAEMON_REQUESTS)),
             request_concurrency_guard,
         ));
-
-    let api_addr: std::net::SocketAddr = match config
-        .daemon
-        .api_bind
-        .parse()
-        .context("invalid api_bind address")
-    {
-        Ok(api_addr) => api_addr,
-        Err(error) => {
-            engine_handle.shutdown().await;
-            return Err(error);
-        }
-    };
 
     info!(
         component = "http",
@@ -399,12 +421,43 @@ fn static_dir() -> PathBuf {
 static REQUEST_ID: AtomicU64 = AtomicU64::new(1);
 
 async fn daemon_auth_guard(
-    State(api_tokens): State<Arc<Vec<String>>>,
+    State(auth): State<DaemonAuthGate>,
     req: Request<Body>,
     next: Next,
 ) -> Response {
     let path = req.uri().path();
-    if api_tokens.is_empty() {
+    if auth.api_tokens.is_empty() {
+        if daemon_public_path(path) {
+            if daemon_public_auth_path(path)
+                && daemon_is_mutating(&req)
+                && has_browser_request_headers(req.headers())
+                && !csrf_request_allowed(req.headers())
+            {
+                return (
+                    StatusCode::FORBIDDEN,
+                    "cross-origin browser authentication request rejected",
+                )
+                    .into_response();
+            }
+            return next.run(req).await;
+        }
+
+        let local_session_valid = auth
+            .local_webui_session_token
+            .as_ref()
+            .is_some_and(|expected| daemon_local_session_valid(req.headers(), expected));
+        if path == "/api/v1/auth/settings" && !local_session_valid {
+            return daemon_unauthorized();
+        }
+        if has_browser_request_headers(req.headers()) {
+            if !local_session_valid {
+                return daemon_unauthorized();
+            }
+            if daemon_is_mutating(&req) && !csrf_request_allowed(req.headers()) {
+                return (StatusCode::FORBIDDEN, "cross-site cookie mutation rejected")
+                    .into_response();
+            }
+        }
         if daemon_is_mutating(&req)
             && has_browser_request_headers(req.headers())
             && !csrf_request_allowed(req.headers())
@@ -418,7 +471,8 @@ async fn daemon_auth_guard(
         return next.run(req).await;
     }
 
-    if bearer_token(req.headers()).is_some_and(|token| api_token_allowed(&api_tokens, &token)) {
+    if bearer_token(req.headers()).is_some_and(|token| api_token_allowed(&auth.api_tokens, &token))
+    {
         return next.run(req).await;
     }
     if daemon_public_path(path) {
@@ -436,7 +490,7 @@ async fn daemon_auth_guard(
         return next.run(req).await;
     }
     if session_cookie_value(req.headers(), &["tng_session", "SID"])
-        .is_some_and(|token| api_token_allowed(&api_tokens, &token))
+        .is_some_and(|token| api_token_allowed(&auth.api_tokens, &token))
     {
         if daemon_is_mutating(&req) && !csrf_request_allowed(req.headers()) {
             return (StatusCode::FORBIDDEN, "cross-site cookie mutation rejected").into_response();
@@ -444,6 +498,15 @@ async fn daemon_auth_guard(
         return next.run(req).await;
     }
 
+    daemon_unauthorized()
+}
+
+fn daemon_local_session_valid(headers: &HeaderMap, expected: &str) -> bool {
+    session_cookie_value(headers, &["tng_session"])
+        .is_some_and(|token| api_token_allowed(std::slice::from_ref(&expected.to_owned()), &token))
+}
+
+fn daemon_unauthorized() -> Response {
     (
         StatusCode::UNAUTHORIZED,
         [(header::CONTENT_TYPE, "application/json")],
@@ -614,14 +677,60 @@ fn load_config() -> anyhow::Result<Config> {
     Config::load_default().context("loading default config")
 }
 
+fn load_auth_credentials(
+    path: &std::path::Path,
+    configured: &AuthCredentials,
+) -> anyhow::Result<AuthCredentials> {
+    use std::io::Read as _;
+    const MAX_AUTH_SETTINGS_BYTES: usize = 4096;
+    let credentials = match std::fs::File::open(path) {
+        Ok(file) => {
+            let mut bytes = Vec::with_capacity(512);
+            file.take((MAX_AUTH_SETTINGS_BYTES + 1) as u64)
+                .read_to_end(&mut bytes)
+                .with_context(|| format!("reading WebUI auth settings from {}", path.display()))?;
+            anyhow::ensure!(
+                bytes.len() <= MAX_AUTH_SETTINGS_BYTES,
+                "WebUI auth settings in {} exceed {MAX_AUTH_SETTINGS_BYTES} bytes",
+                path.display()
+            );
+            serde_json::from_slice(&bytes)
+                .with_context(|| format!("parsing WebUI auth settings from {}", path.display()))?
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => configured.clone(),
+        Err(error) => Err(error)
+            .with_context(|| format!("reading WebUI auth settings from {}", path.display()))?,
+    };
+    anyhow::ensure!(
+        !credentials.username.trim().is_empty() && credentials.username.len() <= 256,
+        "WebUI username in {} must contain 1-256 bytes",
+        path.display()
+    );
+    anyhow::ensure!(
+        credentials.password.trim().len() >= 8 && credentials.password.len() <= 1024,
+        "WebUI password in {} must contain at least 8 and at most 1024 bytes",
+        path.display()
+    );
+    Ok(credentials)
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        bearer_token, daemon_public_auth_path, daemon_public_path,
+        bearer_token, daemon_auth_guard, daemon_public_auth_path, daemon_public_path,
         install_panic_payload_redacting_hook, request_id, skip_request_log, static_dir,
+        DaemonAuthGate,
     };
-    use axum::http::{header, HeaderMap, HeaderValue};
+    use axum::{
+        body::Body,
+        http::{header, HeaderMap, HeaderValue, Request, StatusCode},
+        middleware,
+        routing::get,
+        Router,
+    };
     use std::process::Command;
+    use std::sync::Arc;
+    use tower::ServiceExt;
 
     #[test]
     fn request_log_skips_health_metrics_ws_and_static_assets() {
@@ -664,6 +773,78 @@ mod tests {
         ] {
             assert!(!daemon_public_path(path), "{path}");
         }
+    }
+
+    #[tokio::test]
+    async fn loopback_default_auth_gates_browser_requests_and_preserves_machine_api_access() {
+        let app = Router::new()
+            .route("/", get(|| async { "webui" }))
+            .route("/api/v1/torrents", get(|| async { "torrents" }))
+            .route("/api/v1/auth/settings", get(|| async { "settings" }))
+            .layer(middleware::from_fn_with_state(
+                DaemonAuthGate {
+                    api_tokens: Arc::new(Vec::new()),
+                    local_webui_session_token: Some("local-session".to_owned()),
+                },
+                daemon_auth_guard,
+            ));
+
+        let webui = app
+            .clone()
+            .oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(webui.status(), StatusCode::OK);
+
+        let machine = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/torrents")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(machine.status(), StatusCode::OK);
+
+        let unauthenticated_browser = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/torrents")
+                    .header("sec-fetch-site", "same-origin")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(unauthenticated_browser.status(), StatusCode::UNAUTHORIZED);
+
+        let settings_without_session = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/auth/settings")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(settings_without_session.status(), StatusCode::UNAUTHORIZED);
+
+        let authenticated_browser = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/torrents")
+                    .header("sec-fetch-site", "same-origin")
+                    .header("cookie", "tng_session=local-session")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(authenticated_browser.status(), StatusCode::OK);
     }
 
     #[test]

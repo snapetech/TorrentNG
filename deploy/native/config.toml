@@ -49,6 +49,11 @@ path = "/var/lib/torrentngd/state.db"
 wal_checkpoint_pages = 1000
 
 [auth]
+# Fresh local installs use torrentng / torrentng. Change this pair before
+# exposing the WebUI beyond loopback. Runtime changes in the WebUI are stored
+# in the session directory and override these config values.
+username = "torrentng"
+password = "torrentng"
 # Compose mounts the one deployment token at this path. For a non-Compose
 # deployment, provide the same newline-delimited secret file or replace this
 # with api_tokens = ["..."] in a private config.

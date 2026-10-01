@@ -178,6 +178,24 @@ async fn main() -> Result<()> {
         );
     }
 
+    let api_addr: std::net::SocketAddr = cfg
+        .listen_addr
+        .parse()
+        .with_context(|| format!("parse listen_addr {}", cfg.listen_addr))?;
+    let public_bind = !api_addr.ip().is_loopback();
+    let configured_auth_credentials = torrentng::auth::AuthCredentials {
+        username: cfg.auth.username.clone(),
+        password: cfg.auth.password.clone(),
+    };
+    let auth_settings_path = cfg.cache_path().with_file_name("auth-settings.json");
+    let auth_credentials =
+        torrentng::auth::load_auth_credentials(&auth_settings_path, &configured_auth_credentials)?;
+    let local_webui_session_token = if cfg.auth.api_tokens.is_empty() {
+        Some(format!("tng-local-{}", uuid::Uuid::new_v4().simple()))
+    } else {
+        None
+    };
+
     let state = AppState {
         cfg: Arc::new(cfg.clone()),
         rt,
@@ -189,6 +207,12 @@ async fn main() -> Result<()> {
         qbit_search_jobs: Arc::new(tokio::sync::RwLock::new(serde_json::Map::new())),
         qbit_next_search_id: Arc::new(std::sync::atomic::AtomicU64::new(1)),
         login_attempt_limiter: torrentng::auth::LoginAttemptLimiter::default(),
+        auth_credentials: Arc::new(tokio::sync::RwLock::new(auth_credentials)),
+        configured_auth_credentials,
+        auth_settings_path,
+        auth_settings_write: Arc::new(tokio::sync::Mutex::new(())),
+        local_webui_session_token,
+        public_bind,
         control_plane_write: Arc::new(tokio::sync::Mutex::new(())),
     };
     let app = build_router(state);

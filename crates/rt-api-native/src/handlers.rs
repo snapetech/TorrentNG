@@ -10,7 +10,10 @@ use std::{
 };
 
 use axum::{
-    extract::{multipart::Field, FromRequest, Multipart, Path, Query, Request, State},
+    extract::{
+        multipart::Field, ConnectInfo, Extension, FromRequest, Multipart, Path, Query, Request,
+        State,
+    },
     http::{header, HeaderMap, HeaderValue, StatusCode},
     response::{
         sse::{Event, KeepAlive, Sse},
@@ -40,10 +43,11 @@ use serde::{
     Deserialize, Deserializer, Serialize,
 };
 use sha2::{Digest, Sha256};
+use subtle::ConstantTimeEq;
 
 use crate::state::{
-    torrent_summary, torrentng_i64, torrentng_usize_i64, AppState, JsonMap, TorrentSnapshot,
-    TorrentSnapshotError, TorrentSnapshotItem,
+    torrent_summary, torrentng_i64, torrentng_usize_i64, AppState, AuthCredentials, JsonMap,
+    TorrentSnapshot, TorrentSnapshotError, TorrentSnapshotItem,
 };
 
 const SSE_INITIAL_BATCH_DEFAULT: usize = 500;
@@ -90,37 +94,74 @@ struct TrackerFilterSnapshot {
 }
 
 /// `POST /api/v1/auth/login` — TorrentNG WebUI session probe.
-pub async fn auth_login(State(state): State<AppState>, body: String) -> impl IntoResponse {
-    let token = auth_form_token(&body);
-    if !state.api_tokens.is_empty() {
-        let Some(token) = token.as_deref() else {
-            return (
-                StatusCode::UNAUTHORIZED,
-                Json(
-                    serde_json::to_value(ApiError::new(
-                        "UNAUTHORIZED",
-                        "missing or invalid API token",
-                    ))
-                    .unwrap(),
-                ),
-            )
-                .into_response();
-        };
-        if !token_allowed(&state, token) {
-            return (
-                StatusCode::UNAUTHORIZED,
-                Json(
-                    serde_json::to_value(ApiError::new(
-                        "UNAUTHORIZED",
-                        "missing or invalid API token",
-                    ))
-                    .unwrap(),
-                ),
-            )
-                .into_response();
-        }
+pub async fn auth_login(
+    State(state): State<AppState>,
+    peer: Option<Extension<ConnectInfo<SocketAddr>>>,
+    body: String,
+) -> impl IntoResponse {
+    let peer_ip = peer.map(|Extension(ConnectInfo(addr))| addr.ip());
+    if let Err(retry_after) = state.login_attempt_limiter.begin_attempt(peer_ip).await {
+        let mut response =
+            (StatusCode::TOO_MANY_REQUESTS, "Too many login attempts.").into_response();
+        response.headers_mut().insert(
+            header::RETRY_AFTER,
+            HeaderValue::from_str(&retry_after.to_string())
+                .expect("integer Retry-After is a valid header value"),
+        );
+        return response;
     }
-    let cookie = token
+
+    let (username, password) = auth_form_credentials(&body);
+    let token = password
+        .as_deref()
+        .filter(|token| !token.is_empty())
+        .filter(|token| token_allowed(&state, token))
+        .or_else(|| {
+            username
+                .as_deref()
+                .filter(|token| !token.is_empty())
+                .filter(|token| token_allowed(&state, token))
+        });
+    let token_valid = token.is_some();
+    let credentials = state.auth_credentials.read().await;
+    let password_valid = password
+        .as_deref()
+        .is_some_and(|candidate| constant_time_secret_eq(&credentials.password, candidate));
+    let credentials_valid = username
+        .as_deref()
+        .is_some_and(|candidate| candidate == credentials.username)
+        && password_valid
+        && (!state.public_bind || credentials.password != "torrentng");
+    drop(credentials);
+
+    let local_no_token_mode = state.api_tokens.is_empty()
+        && !state.public_bind
+        && state.local_webui_session_token.is_none();
+    if !token_valid && !credentials_valid && !local_no_token_mode {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(
+                serde_json::to_value(ApiError::new(
+                    "UNAUTHORIZED",
+                    "invalid username/password or API token",
+                ))
+                .unwrap(),
+            ),
+        )
+            .into_response();
+    }
+    state.login_attempt_limiter.clear(peer_ip).await;
+
+    let session_token = if token_valid {
+        token.map(str::to_owned)
+    } else {
+        state
+            .api_tokens
+            .first()
+            .cloned()
+            .or_else(|| state.local_webui_session_token.clone())
+    };
+    let cookie = session_token
         .filter(|token| !token.is_empty())
         .map(|token| {
             format!(
@@ -135,6 +176,196 @@ pub async fn auth_login(State(state): State<AppState>, body: String) -> impl Int
         "Ok.",
     )
         .into_response()
+}
+
+#[derive(Serialize)]
+struct AuthSettingsResponse {
+    username: String,
+    password_is_default: bool,
+    default_credentials_allowed: bool,
+    api_token_login_enabled: bool,
+}
+
+fn auth_settings_response(state: &AppState, credentials: &AuthCredentials) -> AuthSettingsResponse {
+    let password_is_default = credentials.password == "torrentng";
+    AuthSettingsResponse {
+        username: credentials.username.clone(),
+        password_is_default,
+        default_credentials_allowed: !state.public_bind || !password_is_default,
+        api_token_login_enabled: !state.api_tokens.is_empty(),
+    }
+}
+
+/// `GET /api/v1/auth/settings` — return safe, non-secret WebUI auth settings.
+pub async fn auth_settings(State(state): State<AppState>) -> impl IntoResponse {
+    let credentials = state.auth_credentials.read().await;
+    Json(auth_settings_response(&state, &credentials))
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UpdateAuthSettingsRequest {
+    username: String,
+    password: String,
+}
+
+/// `PUT /api/v1/auth/settings` — persist WebUI username and password.
+pub async fn update_auth_settings(
+    State(state): State<AppState>,
+    Json(request): Json<UpdateAuthSettingsRequest>,
+) -> Response {
+    let username = request.username.trim().to_owned();
+    if username.is_empty() || username.len() > 256 {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(
+                serde_json::to_value(ApiError::bad_request(
+                    "username must contain 1-256 bytes".to_owned(),
+                ))
+                .unwrap(),
+            ),
+        )
+            .into_response();
+    }
+    if request.password.trim().len() < 8 || request.password.len() > 1024 {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(
+                serde_json::to_value(ApiError::bad_request(
+                    "password must contain at least 8 and at most 1024 bytes".to_owned(),
+                ))
+                .unwrap(),
+            ),
+        )
+            .into_response();
+    }
+    if state.public_bind && request.password == "torrentng" {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(
+                serde_json::to_value(ApiError::bad_request(
+                    "the default WebUI password is disabled on public binds".to_owned(),
+                ))
+                .unwrap(),
+            ),
+        )
+            .into_response();
+    }
+    let Some(path) = state.auth_settings_path.as_ref() else {
+        return (
+            StatusCode::NOT_IMPLEMENTED,
+            Json(
+                serde_json::to_value(ApiError::internal(
+                    "authentication settings persistence is unavailable".to_owned(),
+                ))
+                .unwrap(),
+            ),
+        )
+            .into_response();
+    };
+
+    let _guard = state.auth_settings_write.lock().await;
+    let credentials = AuthCredentials {
+        username,
+        password: request.password,
+    };
+    if let Err(error) = persist_auth_credentials(path, &credentials).await {
+        tracing::error!(
+            component = "auth",
+            operation = "settings_persist",
+            error = %error,
+            "failed to persist WebUI authentication settings"
+        );
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(
+                serde_json::to_value(ApiError::internal(
+                    "unable to persist authentication settings".to_owned(),
+                ))
+                .unwrap(),
+            ),
+        )
+            .into_response();
+    }
+    *state.auth_credentials.write().await = credentials.clone();
+    Json(auth_settings_response(&state, &credentials)).into_response()
+}
+
+/// `DELETE /api/v1/auth/settings` — remove the runtime override and use config.toml values.
+pub async fn reset_auth_settings(State(state): State<AppState>) -> Response {
+    let Some(path) = state.auth_settings_path.as_ref() else {
+        return (
+            StatusCode::NOT_IMPLEMENTED,
+            Json(
+                serde_json::to_value(ApiError::internal(
+                    "authentication settings persistence is unavailable".to_owned(),
+                ))
+                .unwrap(),
+            ),
+        )
+            .into_response();
+    };
+
+    let _guard = state.auth_settings_write.lock().await;
+    match tokio::fs::remove_file(path).await {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            tracing::error!(
+                component = "auth",
+                operation = "settings_reset",
+                error = %error,
+                "failed to reset WebUI authentication settings"
+            );
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(
+                    serde_json::to_value(ApiError::internal(
+                        "unable to reset authentication settings".to_owned(),
+                    ))
+                    .unwrap(),
+                ),
+            )
+                .into_response();
+        }
+    }
+    *state.auth_credentials.write().await = state.configured_auth_credentials.clone();
+    Json(auth_settings_response(
+        &state,
+        &state.configured_auth_credentials,
+    ))
+    .into_response()
+}
+
+async fn persist_auth_credentials(
+    path: &std::path::Path,
+    credentials: &AuthCredentials,
+) -> std::io::Result<()> {
+    use tokio::io::AsyncWriteExt;
+    let temporary_path = path.with_extension("json.tmp");
+    match tokio::fs::remove_file(&temporary_path).await {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
+    }
+
+    let mut options = tokio::fs::OpenOptions::new();
+    options.create_new(true).write(true);
+    #[cfg(unix)]
+    {
+        options.mode(0o600);
+    }
+    let mut file = options.open(&temporary_path).await?;
+    let bytes = serde_json::to_vec(credentials)
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+    file.write_all(&bytes).await?;
+    file.sync_all().await?;
+    drop(file);
+    if let Err(error) = tokio::fs::rename(&temporary_path, path).await {
+        let _ = tokio::fs::remove_file(&temporary_path).await;
+        return Err(error);
+    }
+    Ok(())
 }
 
 /// `POST /api/v1/auth/logout` — TorrentNG WebUI logout probe.
@@ -8690,7 +8921,11 @@ fn token_allowed(state: &AppState, token: &str) -> bool {
     api_token_allowed(&state.api_tokens, token)
 }
 
-fn auth_form_token(body: &str) -> Option<String> {
+fn constant_time_secret_eq(expected: &str, candidate: &str) -> bool {
+    expected.as_bytes().ct_eq(candidate.as_bytes()).into()
+}
+
+fn auth_form_credentials(body: &str) -> (Option<String>, Option<String>) {
     let mut username = None;
     let mut password = None;
     for pair in body.split('&') {
@@ -8703,7 +8938,7 @@ fn auth_form_token(body: &str) -> Option<String> {
             _ => {}
         }
     }
-    password.or(username)
+    (username, password)
 }
 
 fn form_component_decode(input: &str) -> Option<String> {
@@ -10665,6 +10900,326 @@ mod tests {
             .and_then(|value| value.to_str().ok())
             .unwrap();
         assert!(cookie.starts_with("tng_session=secret%20token;"));
+    }
+
+    #[tokio::test]
+    async fn torrentng_login_accepts_default_credentials_and_api_tokens_in_either_field() {
+        let app = build_router(AppState::with_tokens(None, vec!["secret-token".to_owned()]));
+        for body in [
+            "username=torrentng&password=torrentng",
+            "username=secret-token&password=",
+            "username=secret-token&password=ignored",
+            "username=operator&password=secret-token",
+        ] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/api/v1/auth/login")
+                        .header("content-type", "application/x-www-form-urlencoded")
+                        .body(Body::from(body))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK, "{body}");
+            let cookie = response
+                .headers()
+                .get(header::SET_COOKIE)
+                .and_then(|value| value.to_str().ok())
+                .unwrap();
+            assert!(cookie.starts_with("tng_session=secret-token;"), "{body}");
+        }
+    }
+
+    #[tokio::test]
+    async fn public_bind_rejects_the_unchanged_default_password_but_keeps_token_login() {
+        let mut state = AppState::with_tokens(None, vec!["secret-token".to_owned()]);
+        state.public_bind = true;
+        let app = build_router(state);
+        let default_login = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/auth/login")
+                    .header("content-type", "application/x-www-form-urlencoded")
+                    .body(Body::from("username=torrentng&password=torrentng"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(default_login.status(), StatusCode::UNAUTHORIZED);
+
+        let token_login = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/auth/login")
+                    .header("content-type", "application/x-www-form-urlencoded")
+                    .body(Body::from("username=torrentng&password=secret-token"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(token_login.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn public_bind_rejects_default_password_even_when_username_is_customized() {
+        let mut state = AppState::with_tokens(None, vec!["secret-token".to_owned()]);
+        state.public_bind = true;
+        state.auth_credentials.write().await.username = "operator".to_owned();
+        let app = build_router(state);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/auth/login")
+                    .header("content-type", "application/x-www-form-urlencoded")
+                    .body(Body::from("username=operator&password=torrentng"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn public_bind_custom_credentials_without_api_tokens_create_a_webui_session() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut state = AppState::with_tokens(None, Vec::new());
+        state.configure_auth_credentials(
+            AuthCredentials {
+                username: "operator".to_owned(),
+                password: "custom-password".to_owned(),
+            },
+            AuthCredentials {
+                username: "operator".to_owned(),
+                password: "custom-password".to_owned(),
+            },
+            directory.path().join("auth-settings.json"),
+            true,
+            Some("public-webui-session".to_owned()),
+        );
+        let app = build_router(state);
+        let login = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/auth/login")
+                    .header("content-type", "application/x-www-form-urlencoded")
+                    .body(Body::from("username=operator&password=custom-password"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(login.status(), StatusCode::OK);
+        let cookie = login
+            .headers()
+            .get(header::SET_COOKIE)
+            .and_then(|value| value.to_str().ok())
+            .unwrap();
+        assert!(cookie.starts_with("tng_session=public-webui-session;"));
+
+        let api = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/torrents")
+                    .header("cookie", "tng_session=public-webui-session")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(api.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn public_bind_cannot_save_the_default_password() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("auth-settings.json");
+        let mut state = AppState::with_tokens(None, vec!["secret-token".to_owned()]);
+        state.public_bind = true;
+        state.auth_settings_path = Some(path.clone());
+        let app = build_router(state);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/api/v1/auth/settings")
+                    .header("cookie", "tng_session=secret-token")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"username":"operator","password":"torrentng"}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert!(!path.exists());
+    }
+
+    #[tokio::test]
+    async fn loopback_default_credentials_gate_browser_api_and_leave_machine_calls_unchanged() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut state = AppState::with_tokens(None, Vec::new());
+        state.configure_auth_credentials(
+            AuthCredentials {
+                username: "torrentng".to_owned(),
+                password: "torrentng".to_owned(),
+            },
+            AuthCredentials {
+                username: "torrentng".to_owned(),
+                password: "torrentng".to_owned(),
+            },
+            directory.path().join("auth-settings.json"),
+            false,
+            Some("local-webui-session".to_owned()),
+        );
+        let app = build_router(state);
+
+        let browser_without_login = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/torrents")
+                    .header("sec-fetch-site", "same-origin")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(browser_without_login.status(), StatusCode::UNAUTHORIZED);
+
+        let machine_client = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/torrents")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(machine_client.status(), StatusCode::OK);
+
+        let login = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/auth/login")
+                    .header("content-type", "application/x-www-form-urlencoded")
+                    .body(Body::from("username=torrentng&password=torrentng"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(login.status(), StatusCode::OK);
+        let cookie = login
+            .headers()
+            .get(header::SET_COOKIE)
+            .and_then(|value| value.to_str().ok())
+            .unwrap();
+        assert!(cookie.starts_with("tng_session=local-webui-session;"));
+
+        let browser_after_login = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/torrents")
+                    .header("cookie", "tng_session=local-webui-session")
+                    .header("sec-fetch-site", "same-origin")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(browser_after_login.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn auth_settings_are_protected_persisted_and_reset_to_config() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("auth-settings.json");
+        let mut state = AppState::with_tokens(None, vec!["secret-token".to_owned()]);
+        state.configure_auth_credentials(
+            AuthCredentials {
+                username: "torrentng".to_owned(),
+                password: "torrentng".to_owned(),
+            },
+            AuthCredentials {
+                username: "torrentng".to_owned(),
+                password: "torrentng".to_owned(),
+            },
+            path.clone(),
+            false,
+            None,
+        );
+        let app = build_router(state.clone());
+
+        let unauthorized = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/auth/settings")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(unauthorized.status(), StatusCode::UNAUTHORIZED);
+
+        let saved = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/api/v1/auth/settings")
+                    .header("cookie", "tng_session=secret-token")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"username":"keith","password":"torrentng"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(saved.status(), StatusCode::OK);
+        let saved_body = axum::body::to_bytes(saved.into_body(), 4096).await.unwrap();
+        let saved_json: serde_json::Value = serde_json::from_slice(&saved_body).unwrap();
+        assert_eq!(saved_json["username"], "keith");
+        assert_eq!(saved_json["password_is_default"], true);
+        assert!(saved_json.get("password").is_none());
+        let credentials_file: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(credentials_file["username"], "keith");
+        assert_eq!(credentials_file["password"], "torrentng");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+        assert_eq!(state.auth_credentials.read().await.username, "keith");
+
+        let reset = app
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri("/api/v1/auth/settings")
+                    .header("cookie", "tng_session=secret-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(reset.status(), StatusCode::OK);
+        assert!(!path.exists());
+        assert_eq!(state.auth_credentials.read().await.username, "torrentng");
     }
 
     #[tokio::test]

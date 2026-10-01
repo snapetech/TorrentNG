@@ -24,9 +24,17 @@ real-device, or long-soak certificate.
 
 - Put the session DB and torrent metadata on durable local storage.
 - Put payload data on mounted storage roots with stable paths.
+- Set a WebUI login with `[auth].username` and `[auth].password`; fresh
+  loopback installs default to `torrentng` / `torrentng`. The password must be
+  at least eight characters. Change it in Settings -> Security after login,
+  or edit `config.toml` directly.
 - Set TorrentNG API tokens in `[auth].api_tokens` or a protected
   `[auth].api_tokens_file`; public binds reject missing, short, or placeholder
   tokens at startup.
+- API tokens remain valid for bearer authentication and WebUI login. At the
+  login screen, a token may be entered in either the username or password
+  field. Public binds reject the default `torrentng` password even if the
+  username is changed; use the API token to sign in and set a unique password.
 - Bind the TorrentNG API behind TLS or a trusted reverse proxy.
 - Keep mutating endpoints token-protected.
 - Enable scripts only with a root-owned allowlist directory.
@@ -49,8 +57,17 @@ session_dir = "/var/lib/torrentngd"
 download_dir = "/data"
 
 [auth]
+username = "torrentng"
+password = "torrentng"
 api_tokens = ["REPLACE_WITH_A_RANDOM_TOKEN_OF_AT_LEAST_16_CHARACTERS"]
 ```
+
+The login screen points to the token source: `auth.api_tokens` or
+`auth.api_tokens_file`. Runtime username/password changes are saved as
+`auth-settings.json` in `daemon.session_dir`, with mode `0600`; this runtime
+override takes precedence over the config file until **Restore config.toml
+credentials** is selected in Settings -> Security. Include that file with the
+state directory in backups.
 
 The daemon stores SQLite state at `session_dir/state.db` unless `[db].path` is
 set explicitly. See [CONFIGURATION.md](CONFIGURATION.md) for the full TorrentNG-client

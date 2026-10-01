@@ -161,6 +161,8 @@ external endpoint.
 
 | Key | Default | Description |
 |---|---|---|
+| `username` | `torrentng` | WebUI login username |
+| `password` | `torrentng` | WebUI login password; must be at least 8 characters |
 | `api_tokens` | `[]` | Pre-shared bearer/session tokens accepted by the TorrentNG API |
 | `api_tokens_file` | unset | Optional newline-delimited token file; loaded in addition to `api_tokens` |
 | `metrics.include_torrent_ids` | `false` | Include raw infohashes in hot-torrent Prometheus labels; disabled by default because labels are high-cardinality identifiers |
@@ -169,6 +171,12 @@ An empty token list is valid only when `[daemon].api_bind` is loopback. A
 non-loopback bind requires at least one real token of 16 or more characters;
 placeholder values such as `change-me` and `REPLACE_WITH_*` are rejected at
 startup. Prefer `api_tokens_file` or a deployment secret over inline tokens.
+For a public bind, the default WebUI password `torrentng` is not accepted,
+even if the configured username differs; use an API token to sign in and set a
+unique password. An API token works in either WebUI login field. Settings ->
+Security can update the username/password at runtime; those values persist in
+`<session_dir>/auth-settings.json` with mode `0600` and take precedence over
+the config file until reset from the WebUI.
 
 ### `[logging]`
 
@@ -198,6 +206,8 @@ session_dir = "/var/lib/torrentngd"
 download_dir = "/data"
 
 [auth]
+username = "torrentng"
+password = "torrentng"
 # Loopback-only TorrentNG-client development mode. Public binds require real tokens.
 api_tokens = []
 # Production alternative: api_tokens_file = "/run/secrets/torrentngd_api_token"
@@ -243,6 +253,8 @@ path = "/var/lib/torrentngd/state.db"
 wal_checkpoint_pages = 1000
 
 [auth]
+username = "torrentng"
+password = "torrentng"
 api_tokens = ["your-automation-token"]
 
 [logging]
@@ -527,14 +539,22 @@ Use these only for lab compatibility testing. Tracker-facing identity is still c
 
 | Key | Default | Env override | Description |
 |---|---|---|---|
+| `username` | `torrentng` | `TNG_USERNAME` / `RTNG_USERNAME` | WebUI login username |
+| `password` | `torrentng` | `TNG_PASSWORD` / `RTNG_PASSWORD` | WebUI login password; 8-1024 bytes |
 | `secret_key` | - | `TNG_SECRET_KEY` | Secret for signing expiring compatibility session cookies. Required for public binds. |
-| `api_tokens` | `[]` | `TNG_API_TOKENS` | Comma-separated pre-shared bearer tokens for automation tools; public binds require tokens of at least 16 characters |
+| `api_tokens` | `[]` | `TNG_API_TOKENS` | Comma-separated pre-shared bearer tokens for automation tools and WebUI login; enter a token in either login field. Public binds require tokens of at least 16 characters |
 | `trust_proxy_header` | `false` | - | Trust a non-empty `X-Remote-User` only on a loopback listener; the proxy must authenticate the request and discard client-supplied copies before setting its own identity (the bundled Nginx config clears this header) |
 | `secure_cookies` | `true` | - | Add `Secure` to issued and cleared session cookies; required for non-loopback listeners. Set `false` only for trusted loopback HTTP setups. |
 
 Requests authenticated by `X-Remote-User` require same-origin evidence for
 browser mutations and WebSocket handshakes. Automation clients should use an
 API-token Bearer credential instead.
+
+Fresh loopback installs accept `torrentng` / `torrentng` on both the native
+and existing-client profiles. Change credentials in **Settings -> Security**
+or in the service `[auth]` config. Runtime changes persist in
+`auth-settings.json` under the service data directory with mode `0600`. Public
+binds require API tokens and reject the default password.
 
 When API tokens are configured, unauthenticated login submissions are limited
 to 10 per TCP peer per 60 seconds. Further attempts receive `429 Too Many

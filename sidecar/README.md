@@ -21,6 +21,15 @@ The selected client owns peer traffic, payload storage, and session state;
 TorrentNG supplies the shared WebUI/API, authentication, cache, workflows,
 metrics, and compatibility projections.
 
+When API-token authentication is enabled, use the configured token in either
+the WebUI username or password field. Tokens come from `[auth].api_tokens` in
+the service config or `TNG_API_TOKENS` / `RTNG_API_TOKENS` in the environment.
+Fresh loopback installs also accept `torrentng` / `torrentng`; configure a
+different WebUI username/password in `[auth]`, `TNG_USERNAME` / `TNG_PASSWORD`,
+or **Settings -> Security**. Public binds reject the default password and
+require an API token for first login. Runtime changes persist in the service
+data directory; API tokens remain enabled for automation.
+
 Use this when you:
 
 - already have a supported torrent client and want a modern WebUI/API without

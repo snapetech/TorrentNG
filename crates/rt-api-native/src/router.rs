@@ -13,19 +13,19 @@ use axum::{
 use crate::{
     handlers::{
         add_torrent, add_torrent_peers, add_torrent_tags, apply_rss_rules, auth_login, auth_logout,
-        bulk_action, cancel_job, categories, create_tag, cross_seed, delete_category,
-        delete_saved_json, delete_tag, delete_torrent, diagnose_torrent, engine_commands,
-        engine_diagnostics, get_torrent, get_user_agent, health, list_json_map,
+        auth_settings, bulk_action, cancel_job, categories, create_tag, cross_seed,
+        delete_category, delete_saved_json, delete_tag, delete_torrent, diagnose_torrent,
+        engine_commands, engine_diagnostics, get_torrent, get_user_agent, health, list_json_map,
         list_session_events, list_torrent_files, list_torrent_trackers, list_torrents,
         list_workflow_runs, live_torrent_stats, logs, metrics, patch_torrent_files,
         patch_torrent_trackers, pause_job, pause_torrent, reannounce_torrent, recheck_torrent,
-        remove_torrent_tags, restart_engine, resume_job, resume_torrent, rtorrent_settings,
-        run_json_workflow, save_rtorrent_settings, session_features, session_settings,
-        set_torrent_category, set_user_agent, sidebar_facets, storage, storage_execute_plan,
-        storage_preview_plan, stream_events, tags, test_rss_rules, torrent_limits, tracker_health,
-        transfer_info, transfer_limits, update_session_features, update_session_settings,
-        update_torrent, update_torrent_limits, update_torrent_queue, update_transfer_limits,
-        upsert_category, upsert_json_map,
+        remove_torrent_tags, reset_auth_settings, restart_engine, resume_job, resume_torrent,
+        rtorrent_settings, run_json_workflow, save_rtorrent_settings, session_features,
+        session_settings, set_torrent_category, set_user_agent, sidebar_facets, storage,
+        storage_execute_plan, storage_preview_plan, stream_events, tags, test_rss_rules,
+        torrent_limits, tracker_health, transfer_info, transfer_limits, update_auth_settings,
+        update_session_features, update_session_settings, update_torrent, update_torrent_limits,
+        update_torrent_queue, update_transfer_limits, upsert_category, upsert_json_map,
     },
     state::AppState,
 };
@@ -51,6 +51,13 @@ pub fn build_router(state: AppState) -> Router {
             post(auth_login).layer(DefaultBodyLimit::max(MAX_NATIVE_AUTH_BODY_BYTES)),
         )
         .route("/api/v1/auth/logout", post(auth_logout))
+        .route(
+            "/api/v1/auth/settings",
+            get(auth_settings)
+                .put(update_auth_settings)
+                .delete(reset_auth_settings)
+                .layer(DefaultBodyLimit::max(MAX_NATIVE_AUTH_BODY_BYTES)),
+        )
         .route(
             "/api/v1/torrents",
                 get(list_torrents)
@@ -361,6 +368,37 @@ async fn torrentng_auth_guard(
     }
 
     if state.api_tokens.is_empty() {
+        if let Some(session_token) = state.local_webui_session_token.as_ref() {
+            let session_valid = torrentng_presented_token(req.headers()).is_some_and(|token| {
+                api_token_allowed(std::slice::from_ref(session_token), &token)
+            });
+            if path == "/api/v1/auth/settings" && !session_valid {
+                return (
+                    StatusCode::UNAUTHORIZED,
+                    [(header::CONTENT_TYPE, "application/json")],
+                    r#"{"code":"UNAUTHORIZED","message":"login required"}"#,
+                )
+                    .into_response();
+            }
+            if has_browser_request_headers(req.headers()) {
+                if !session_valid {
+                    return (
+                        StatusCode::UNAUTHORIZED,
+                        [(header::CONTENT_TYPE, "application/json")],
+                        r#"{"code":"UNAUTHORIZED","message":"login required"}"#,
+                    )
+                        .into_response();
+                }
+                if has_session_cookie(req.headers(), &["tng_session"])
+                    && is_mutating_request(&req)
+                    && !csrf_request_allowed(req.headers())
+                {
+                    return (StatusCode::FORBIDDEN, "cross-site cookie mutation rejected")
+                        .into_response();
+                }
+            }
+            return next.run(req).await;
+        }
         if is_mutating_request(&req)
             && has_browser_request_headers(req.headers())
             && !csrf_request_allowed(req.headers())

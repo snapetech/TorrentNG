@@ -46,6 +46,13 @@ Public endpoints (never require auth): `/health`, the login/logout endpoints,
 and the WebUI/static paths. `/metrics` is protected when API tokens are
 configured; it is not a public exception.
 
+Native loopback installs without API tokens require the configured username
+and password for browser WebUI requests; the fresh-install pair is
+`torrentng` / `torrentng`. Non-browser machine clients retain the existing
+loopback no-token behavior. Configure an API token when automation clients
+need authenticated access. Public binds always require real API tokens and do
+not accept the default WebUI password.
+
 ## Request Correlation
 
 Non-static API responses include an `X-Request-Id` header. If a client supplies a
@@ -108,8 +115,17 @@ required for the TorrentNG client.
 
 | Method | Path | Description |
 |---|---|---|
-| `POST` | `/api/v1/auth/login` | WebUI session login. With `auth.api_tokens`, username or password must match an API token; success returns `Ok.` and a `tng_session` cookie. |
+| `POST` | `/api/v1/auth/login` | WebUI login with configured username/password or API token. Fresh loopback installs on both profiles default to `torrentng` / `torrentng`; an API token can be supplied in either form field. Public binds refuse the default password. Success returns `Ok.` and a `tng_session` cookie. Login allows 10 attempts per TCP peer per 60 seconds, then returns `429` with `Retry-After`. |
 | `POST` | `/api/v1/auth/logout` | WebUI logout probe; expires the `tng_session` cookie. |
+| `GET` | `/api/v1/auth/settings` | Read safe WebUI auth settings (username and status flags only; never returns the password). |
+| `PUT` | `/api/v1/auth/settings` | Set `{ "username": "...", "password": "..." }`; authenticated. Passwords must be at least 8 characters. |
+| `DELETE` | `/api/v1/auth/settings` | Remove the runtime credential override and restore `[auth].username` and `[auth].password` from config.toml. |
+
+Runtime changes persist in `auth-settings.json` under native `daemon.session_dir`
+or the existing-client service data directory, with mode `0600`. They override
+config.toml until reset. API-token bearer
+authentication and API-token login remain available for automation and
+operators.
 
 ### Torrents
 

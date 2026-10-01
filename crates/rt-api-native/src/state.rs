@@ -1,10 +1,13 @@
 use rt_api_model::{
     ApiRuntimeMetrics, ChunkedBitSet, ChunkedVec, IdempotencyStore, TorrentSummary,
 };
+use serde::{Deserialize, Serialize};
 use std::sync::Mutex as StdMutex;
 use std::{
     cmp::Ordering,
     collections::{BTreeMap, HashMap, HashSet, VecDeque},
+    net::IpAddr,
+    path::PathBuf,
     sync::Arc,
     time::{Duration, Instant},
 };
@@ -15,9 +18,89 @@ use rt_session::{RegistryChange, SessionRegistry};
 
 pub type JsonMap = BTreeMap<String, serde_json::Value>;
 
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AuthCredentials {
+    pub username: String,
+    pub password: String,
+}
+
 const TORRENT_SNAPSHOT_CACHE_SIZE: usize = 4;
 const TORRENT_SNAPSHOT_MAX_AGE: Duration = Duration::from_millis(750);
+const LOGIN_ATTEMPT_WINDOW: Duration = Duration::from_secs(60);
+const MAX_LOGIN_ATTEMPTS: u8 = 10;
+const MAX_TRACKED_LOGIN_CLIENTS: usize = 4_096;
 type TorrentOrderCache = StdMutex<HashMap<&'static str, Arc<Vec<usize>>>>;
+
+#[derive(Clone, Default)]
+pub struct LoginAttemptLimiter {
+    state: Arc<Mutex<LoginAttemptState>>,
+}
+
+#[derive(Default)]
+struct LoginAttemptState {
+    clients: HashMap<Option<IpAddr>, LoginAttemptWindow>,
+}
+
+struct LoginAttemptWindow {
+    started: Instant,
+    attempts: u8,
+}
+
+impl LoginAttemptLimiter {
+    pub(crate) async fn begin_attempt(&self, client: Option<IpAddr>) -> Result<(), u64> {
+        let now = Instant::now();
+        let mut state = self.state.lock().await;
+        if let Some(window) = state.clients.get_mut(&client) {
+            let elapsed = now.saturating_duration_since(window.started);
+            if elapsed >= LOGIN_ATTEMPT_WINDOW {
+                *window = LoginAttemptWindow {
+                    started: now,
+                    attempts: 1,
+                };
+                return Ok(());
+            }
+            if window.attempts >= MAX_LOGIN_ATTEMPTS {
+                let remaining = LOGIN_ATTEMPT_WINDOW.saturating_sub(elapsed);
+                let seconds = remaining
+                    .as_secs()
+                    .saturating_add(u64::from(remaining.subsec_nanos() != 0))
+                    .max(1);
+                return Err(seconds);
+            }
+            window.attempts += 1;
+            return Ok(());
+        }
+
+        if state.clients.len() >= MAX_TRACKED_LOGIN_CLIENTS {
+            state.clients.retain(|_, window| {
+                now.saturating_duration_since(window.started) < LOGIN_ATTEMPT_WINDOW
+            });
+            if state.clients.len() >= MAX_TRACKED_LOGIN_CLIENTS {
+                if let Some(oldest) = state
+                    .clients
+                    .iter()
+                    .min_by_key(|(_, window)| window.started)
+                    .map(|(client, _)| *client)
+                {
+                    state.clients.remove(&oldest);
+                }
+            }
+        }
+        state.clients.insert(
+            client,
+            LoginAttemptWindow {
+                started: now,
+                attempts: 1,
+            },
+        );
+        Ok(())
+    }
+
+    pub(crate) async fn clear(&self, client: Option<IpAddr>) {
+        self.state.lock().await.clients.remove(&client);
+    }
+}
 
 fn lock_order_cache(
     cache: &TorrentOrderCache,
@@ -91,6 +174,13 @@ pub struct AppState {
     pub registry: Arc<RwLock<SessionRegistry>>,
     pub engine: Option<EngineHandle>,
     pub api_tokens: Arc<Vec<String>>,
+    pub auth_credentials: Arc<RwLock<AuthCredentials>>,
+    pub configured_auth_credentials: AuthCredentials,
+    pub auth_settings_path: Option<PathBuf>,
+    pub public_bind: bool,
+    pub local_webui_session_token: Option<String>,
+    pub(crate) auth_settings_write: Arc<Mutex<()>>,
+    pub login_attempt_limiter: LoginAttemptLimiter,
     pub metrics_include_torrent_ids: bool,
     pub categories: Arc<RwLock<BTreeMap<String, String>>>,
     pub tags: Arc<RwLock<Vec<String>>>,
@@ -131,6 +221,19 @@ impl AppState {
             registry,
             engine,
             api_tokens: Arc::new(api_tokens),
+            auth_credentials: Arc::new(RwLock::new(AuthCredentials {
+                username: "torrentng".to_owned(),
+                password: "torrentng".to_owned(),
+            })),
+            configured_auth_credentials: AuthCredentials {
+                username: "torrentng".to_owned(),
+                password: "torrentng".to_owned(),
+            },
+            auth_settings_path: None,
+            public_bind: false,
+            local_webui_session_token: None,
+            auth_settings_write: Arc::new(Mutex::new(())),
+            login_attempt_limiter: LoginAttemptLimiter::default(),
             metrics_include_torrent_ids: false,
             categories: Arc::new(RwLock::new(BTreeMap::new())),
             tags: Arc::new(RwLock::new(Vec::new())),
@@ -192,6 +295,21 @@ impl AppState {
         let mut state = Self::from_parts(registry, Some(engine), api_tokens, api_metrics);
         state.metrics_include_torrent_ids = include_torrent_ids;
         state
+    }
+
+    pub fn configure_auth_credentials(
+        &mut self,
+        credentials: AuthCredentials,
+        configured_credentials: AuthCredentials,
+        settings_path: PathBuf,
+        public_bind: bool,
+        local_webui_session_token: Option<String>,
+    ) {
+        self.auth_credentials = Arc::new(RwLock::new(credentials));
+        self.configured_auth_credentials = configured_credentials;
+        self.auth_settings_path = Some(settings_path);
+        self.public_bind = public_bind;
+        self.local_webui_session_token = local_webui_session_token;
     }
 
     /// Return a bounded, immutable summary snapshot for pagination and other
@@ -1003,6 +1121,18 @@ impl Default for AppState {
 mod tests {
     use super::*;
     use rt_session::TorrentEntry;
+
+    #[tokio::test]
+    async fn login_attempt_limiter_bounds_failures_and_clears_after_success() {
+        let limiter = LoginAttemptLimiter::default();
+        let peer = Some("192.0.2.1".parse::<IpAddr>().unwrap());
+        for _ in 0..MAX_LOGIN_ATTEMPTS {
+            assert!(limiter.begin_attempt(peer).await.is_ok());
+        }
+        assert!(limiter.begin_attempt(peer).await.is_err());
+        limiter.clear(peer).await;
+        assert!(limiter.begin_attempt(peer).await.is_ok());
+    }
 
     #[test]
     fn journal_refresh_applies_final_entry_state_without_registry_scan() {

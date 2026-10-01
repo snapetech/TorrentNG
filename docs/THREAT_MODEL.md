@@ -3,7 +3,8 @@
 ## Assets
 
 - Payload files and storage roots.
-- TorrentNG-client session DB, torrent metadata, fastresume state, and API tokens.
+- TorrentNG-client session DB, torrent metadata, fastresume state, API tokens,
+  and WebUI login credentials.
 - Automation integrations such as Sonarr, Radarr, Prowlarr, autobrr, and
   cross-seed.
 
@@ -31,7 +32,15 @@
 - URL torrent add rejects private/local hosts.
 - Bulk import/move/delete has dry-run and explicit apply paths.
 - Tracker scheduling uses jitter and durable state.
-- Mutating TorrentNG endpoints require configured API tokens.
+- Public TorrentNG endpoints require configured API tokens. Native and
+  compatible-client loopback WebUI browser requests require the configured
+  username/password session; unauthenticated machine API calls remain
+  available only on loopback.
+- Public binds reject the unchanged default WebUI password; runtime credentials
+  are written with owner-only file permissions and are never returned by the
+  authentication-settings API.
+- API tokens remain valid for machine clients and may be submitted in either
+  WebUI login field.
 - Script execution requires opt-in and explicit allowlisted directories.
 - SQLite state is backed up before migration and import.
 

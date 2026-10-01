@@ -16,6 +16,13 @@ export class AuthError extends Error {
   }
 }
 
+export interface AuthSettings {
+  username: string
+  password_is_default: boolean
+  default_credentials_allowed: boolean
+  api_token_login_enabled: boolean
+}
+
 export interface TorrentSummary {
   hash: string
   name: string
@@ -339,7 +346,7 @@ async function login(username: string, password: string): Promise<void> {
     throw new AuthError(message)
   }
   if (!res.ok || text.trim() !== 'Ok.') {
-    throw new AuthError('Invalid username or password')
+    throw new AuthError('Invalid username/password or API token')
   }
 }
 
@@ -807,6 +814,10 @@ export const api = {
   auth: {
     login,
     logout,
+    getSettings: (): Promise<AuthSettings> => get('/auth/settings'),
+    updateSettings: (settings: { username: string; password: string }): Promise<AuthSettings> =>
+      put('/auth/settings', settings),
+    resetSettings: (): Promise<AuthSettings> => delJson('/auth/settings'),
     check: async (): Promise<TorrentListResponse> =>
       normalizeTorrentList(await get<TorrentListResponse | TorrentNgTorrentListResponse | TorrentSummary[] | TorrentNgTorrentSummary[]>('/torrents', { limit: 1 }), { limit: 1 }),
   },

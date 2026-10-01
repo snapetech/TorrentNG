@@ -181,9 +181,11 @@ pub struct RtorrentLogConfig {
     pub read_from_start: bool,
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct AuthConfig {
+    pub username: String,
+    pub password: String,
     pub secret_key: Option<String>,
     pub api_tokens: Vec<String>,
     pub trust_proxy_header: bool,
@@ -193,11 +195,33 @@ pub struct AuthConfig {
 impl Default for AuthConfig {
     fn default() -> Self {
         Self {
+            username: "torrentng".to_owned(),
+            password: "torrentng".to_owned(),
             secret_key: None,
             api_tokens: Vec::new(),
             trust_proxy_header: false,
             secure_cookies: true,
         }
+    }
+}
+
+impl std::fmt::Debug for AuthConfig {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("AuthConfig")
+            .field("username", &self.username)
+            .field("password", &"[REDACTED]")
+            .field(
+                "secret_key",
+                &self.secret_key.as_ref().map(|_| "[REDACTED]"),
+            )
+            .field(
+                "api_tokens",
+                &format_args!("[{} configured]", self.api_tokens.len()),
+            )
+            .field("trust_proxy_header", &self.trust_proxy_header)
+            .field("secure_cookies", &self.secure_cookies)
+            .finish()
     }
 }
 
@@ -578,6 +602,12 @@ impl Config {
         if let Some(v) = env_override("TNG_SECRET_KEY", "RTNG_SECRET_KEY") {
             self.auth.secret_key = Some(v);
         }
+        if let Some(v) = env_override("TNG_USERNAME", "RTNG_USERNAME") {
+            self.auth.username = v;
+        }
+        if let Some(v) = env_override("TNG_PASSWORD", "RTNG_PASSWORD") {
+            self.auth.password = v;
+        }
         if let Some(v) = env_override("TNG_API_TOKENS", "RTNG_API_TOKENS") {
             self.auth.api_tokens = v
                 .split(',')
@@ -655,6 +685,12 @@ impl Config {
         }
         if self.workflows.allow_scripts && self.workflows.allowed_script_dirs.is_empty() {
             bail!("workflows: allowed_script_dirs must be non-empty when allow_scripts is enabled");
+        }
+        if self.auth.username.trim().is_empty() || self.auth.username.len() > 256 {
+            bail!("auth.username must contain 1-256 bytes");
+        }
+        if self.auth.password.trim().len() < 8 || self.auth.password.len() > 1024 {
+            bail!("auth.password must contain at least 8 and at most 1024 bytes");
         }
         for token in &self.auth.api_tokens {
             if token.trim().is_empty() {
@@ -784,20 +820,30 @@ mod tests {
         let _guard = ENV_LOCK.lock().expect("env lock poisoned");
         let old_secret = std::env::var("TNG_SECRET_KEY").ok();
         let old_tokens = std::env::var("TNG_API_TOKENS").ok();
+        let old_username = std::env::var("TNG_USERNAME").ok();
+        let old_password = std::env::var("TNG_PASSWORD").ok();
 
         std::env::set_var("TNG_SECRET_KEY", "runtime-secret");
         std::env::set_var("TNG_API_TOKENS", "alpha, beta ,,gamma");
+        std::env::set_var("TNG_USERNAME", "runtime-user");
+        std::env::set_var("TNG_PASSWORD", "runtime-password");
 
         let mut cfg = Config::test_default();
         cfg.auth.secret_key = Some("file-secret".to_owned());
         cfg.auth.api_tokens = vec!["file-token".to_owned()];
+        cfg.auth.username = "file-user".to_owned();
+        cfg.auth.password = "file-password".to_owned();
         cfg.apply_env();
 
         assert_eq!(cfg.auth.secret_key.as_deref(), Some("runtime-secret"));
         assert_eq!(cfg.auth.api_tokens, ["alpha", "beta", "gamma"]);
+        assert_eq!(cfg.auth.username, "runtime-user");
+        assert_eq!(cfg.auth.password, "runtime-password");
 
         restore_env("TNG_SECRET_KEY", old_secret);
         restore_env("TNG_API_TOKENS", old_tokens);
+        restore_env("TNG_USERNAME", old_username);
+        restore_env("TNG_PASSWORD", old_password);
     }
 
     #[test]
@@ -1122,6 +1168,10 @@ scgi_socket = "/tmp/rtorrent.sock"
             "RTNG_DATA_DIR",
             "TNG_SECRET_KEY",
             "RTNG_SECRET_KEY",
+            "TNG_USERNAME",
+            "RTNG_USERNAME",
+            "TNG_PASSWORD",
+            "RTNG_PASSWORD",
             "TNG_API_TOKENS",
             "RTNG_API_TOKENS",
             "TNG_USER_AGENT",
@@ -1151,6 +1201,8 @@ scgi_socket = "/tmp/rtorrent.sock"
         assert_eq!(cfg.data_dir, Some(PathBuf::from("/legacy-data")));
         assert_eq!(cfg.auth.secret_key.as_deref(), Some("legacy-secret"));
         assert_eq!(cfg.auth.api_tokens, ["legacy-one", "legacy-two"]);
+        assert_eq!(cfg.auth.username, "torrentng");
+        assert_eq!(cfg.auth.password, "torrentng");
         assert_eq!(cfg.rtorrent.user_agent, "legacy-agent");
         assert_eq!(cfg.identity.qbittorrent_version, "legacy-qbit");
 

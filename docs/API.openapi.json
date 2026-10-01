@@ -15,10 +15,15 @@
       "get": {"operationId": "metrics", "responses": {"200": {"description": "Prometheus text exposition", "content": {"text/plain": {"schema": {"type": "string"}}}}, "401": {"$ref": "#/components/responses/Unauthorized"}}}
     },
     "/api/v1/auth/login": {
-      "post": {"operationId": "authLogin", "security": [], "requestBody": {"$ref": "#/components/requestBodies/JsonObject"}, "responses": {"200": {"$ref": "#/components/responses/JsonOk"}, "401": {"$ref": "#/components/responses/Unauthorized"}}}
+      "post": {"operationId": "authLogin", "security": [], "requestBody": {"$ref": "#/components/requestBodies/AuthLoginForm"}, "responses": {"200": {"description": "Login accepted; sets the tng_session cookie", "content": {"text/plain": {"schema": {"type": "string", "enum": ["Ok."]}}}}, "401": {"$ref": "#/components/responses/Unauthorized"}, "429": {"description": "Login rate limit reached; response includes Retry-After"}}}
     },
     "/api/v1/auth/logout": {
       "post": {"operationId": "authLogout", "security": [], "responses": {"200": {"$ref": "#/components/responses/JsonOk"}}}
+    },
+    "/api/v1/auth/settings": {
+      "get": {"operationId": "getAuthSettings", "responses": {"200": {"description": "Current safe authentication settings; does not return the password", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/AuthSettings"}}}}, "401": {"$ref": "#/components/responses/Unauthorized"}}},
+      "put": {"operationId": "updateAuthSettings", "parameters": [{"$ref": "#/components/parameters/IdempotencyKey"}], "requestBody": {"$ref": "#/components/requestBodies/UpdateAuthSettings"}, "responses": {"200": {"description": "Updated safe authentication settings", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/AuthSettings"}}}}, "400": {"$ref": "#/components/responses/JsonError"}, "401": {"$ref": "#/components/responses/Unauthorized"}}},
+      "delete": {"operationId": "resetAuthSettings", "parameters": [{"$ref": "#/components/parameters/IdempotencyKey"}], "responses": {"200": {"description": "Config-file authentication settings restored", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/AuthSettings"}}}}, "401": {"$ref": "#/components/responses/Unauthorized"}}}
     },
     "/api/v1/torrents": {
       "get": {"operationId": "listTorrents", "parameters": [{"$ref": "#/components/parameters/Limit"}, {"$ref": "#/components/parameters/Offset"}, {"$ref": "#/components/parameters/Snapshot"}, {"$ref": "#/components/parameters/Filter"}], "responses": {"200": {"$ref": "#/components/responses/JsonOk"}, "401": {"$ref": "#/components/responses/Unauthorized"}}},
@@ -138,6 +143,8 @@
       "IdempotencyKey": {"name": "Idempotency-Key", "in": "header", "required": false, "description": "Printable ASCII key, max 128 bytes. Successful responses are replayable for the retention window; reuse with a different request is rejected.", "schema": {"type": "string", "minLength": 1, "maxLength": 128}}
     },
     "requestBodies": {
+      "AuthLoginForm": {"required": true, "description": "Supply configured username/password or an API token in either field.", "content": {"application/x-www-form-urlencoded": {"schema": {"type": "object", "properties": {"username": {"type": "string"}, "password": {"type": "string", "format": "password"}}}}}},
+      "UpdateAuthSettings": {"required": true, "content": {"application/json": {"schema": {"$ref": "#/components/schemas/UpdateAuthSettings"}}}},
       "JsonObject": {"required": true, "content": {"application/json": {"schema": {"$ref": "#/components/schemas/JsonObject"}}}},
       "CategoryUpsert": {"required": true, "content": {"application/json": {"schema": {"$ref": "#/components/schemas/CategoryUpsert"}}}},
       "TagCreate": {"required": true, "content": {"application/json": {"schema": {"$ref": "#/components/schemas/TagCreate"}}}},
@@ -160,6 +167,8 @@
     "schemas": {
       "JsonValue": {},
       "JsonObject": {"type": "object", "additionalProperties": true},
+      "AuthSettings": {"type": "object", "required": ["username", "password_is_default", "default_credentials_allowed", "api_token_login_enabled"], "properties": {"username": {"type": "string"}, "password_is_default": {"type": "boolean"}, "default_credentials_allowed": {"type": "boolean"}, "api_token_login_enabled": {"type": "boolean"}}, "additionalProperties": false},
+      "UpdateAuthSettings": {"type": "object", "required": ["username", "password"], "properties": {"username": {"type": "string", "minLength": 1, "maxLength": 256}, "password": {"type": "string", "minLength": 8, "maxLength": 1024}}, "additionalProperties": false},
       "CategoryUpsert": {"type": "object", "required": ["name"], "properties": {"name": {"type": "string", "minLength": 1, "x-maxUtf8Bytes": 256}, "save_path": {"type": ["string", "null"], "x-maxUtf8Bytes": 4096}}, "additionalProperties": true},
       "TagCreate": {"type": "object", "required": ["name"], "properties": {"name": {"type": "string", "minLength": 1, "x-maxUtf8Bytes": 256}}, "additionalProperties": true},
       "SetTorrentCategory": {"type": "object", "properties": {"category": {"type": ["string", "null"], "x-maxUtf8Bytes": 256}}, "additionalProperties": true},

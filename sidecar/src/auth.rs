@@ -1,3 +1,4 @@
+use anyhow::Context;
 use axum::{
     body::Body,
     extract::{ConnectInfo, State},
@@ -7,10 +8,13 @@ use axum::{
 };
 use hmac::{Hmac, KeyInit, Mac};
 use rand::Rng;
+use serde::{Deserialize, Serialize};
 use sha2::Sha256;
 use std::{
     collections::HashMap,
+    io::Read,
     net::{IpAddr, SocketAddr},
+    path::Path,
     sync::Arc,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -24,6 +28,53 @@ const SESSION_TTL_SECS: u64 = 24 * 60 * 60;
 const MAX_LOGIN_ATTEMPTS: u8 = 10;
 const LOGIN_ATTEMPT_WINDOW: Duration = Duration::from_secs(60);
 const MAX_TRACKED_LOGIN_CLIENTS: usize = 4_096;
+
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AuthCredentials {
+    pub username: String,
+    pub password: String,
+}
+
+pub fn load_auth_credentials(
+    path: &Path,
+    configured: &AuthCredentials,
+) -> anyhow::Result<AuthCredentials> {
+    const MAX_AUTH_SETTINGS_BYTES: usize = 4_096;
+    let credentials = match crate::safe_file::open_regular_read_no_follow(path) {
+        Ok(file) => {
+            let mut bytes = Vec::with_capacity(512);
+            file.take((MAX_AUTH_SETTINGS_BYTES + 1) as u64)
+                .read_to_end(&mut bytes)
+                .with_context(|| format!("reading WebUI auth settings from {}", path.display()))?;
+            anyhow::ensure!(
+                bytes.len() <= MAX_AUTH_SETTINGS_BYTES,
+                "WebUI auth settings exceed {MAX_AUTH_SETTINGS_BYTES} bytes"
+            );
+            serde_json::from_slice(&bytes)
+                .with_context(|| format!("parsing WebUI auth settings from {}", path.display()))?
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => configured.clone(),
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("reading WebUI auth settings from {}", path.display()))
+        }
+    };
+    validate_auth_credentials(&credentials)?;
+    Ok(credentials)
+}
+
+pub fn validate_auth_credentials(credentials: &AuthCredentials) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        !credentials.username.trim().is_empty() && credentials.username.len() <= 256,
+        "WebUI username must contain 1-256 bytes"
+    );
+    anyhow::ensure!(
+        credentials.password.trim().len() >= 8 && credentials.password.len() <= 1_024,
+        "WebUI password must contain at least 8 and at most 1024 bytes"
+    );
+    Ok(())
+}
 
 /// Bounds unauthenticated login submissions by the TCP peer address. When
 /// ConnectInfo is absent (for embedded/test routers), those requests share a
@@ -129,14 +180,46 @@ pub async fn require_auth(
     // prevent a hostile website from posting cookie-free forms to localhost,
     // or opening a WebSocket and reading the event stream.
     if state.cfg.auth.api_tokens.is_empty() {
-        if (path == "/ws" || (is_mutating(&req) && has_browser_request_headers(req.headers())))
-            && !csrf_request_allowed(req.headers())
-        {
-            return (
-                StatusCode::FORBIDDEN,
-                "cross-origin browser request rejected",
-            )
-                .into_response();
+        if is_public_auth_path(&path) {
+            if is_mutating(&req)
+                && has_browser_request_headers(req.headers())
+                && !csrf_request_allowed(req.headers())
+            {
+                return (
+                    StatusCode::FORBIDDEN,
+                    "cross-origin browser authentication request rejected",
+                )
+                    .into_response();
+            }
+            if is_public_login_path(&path) && req.method() == Method::POST {
+                let peer_ip = peer_ip(&req);
+                if let Err(retry_after_secs) =
+                    state.login_attempt_limiter.begin_attempt(peer_ip).await
+                {
+                    let mut response = (StatusCode::TOO_MANY_REQUESTS, "Fails.").into_response();
+                    response.headers_mut().insert(
+                        header::RETRY_AFTER,
+                        HeaderValue::from_str(&retry_after_secs.to_string())
+                            .expect("integer Retry-After is a valid header value"),
+                    );
+                    return response;
+                }
+            }
+            return next.run(req).await;
+        }
+
+        let local_session_valid = local_session_cookie_valid(&state, &req);
+        if path == "/api/v1/auth/settings" && !local_session_valid {
+            return (StatusCode::UNAUTHORIZED, "login required").into_response();
+        }
+        if path == "/ws" || has_browser_request_headers(req.headers()) {
+            if !local_session_valid {
+                return (StatusCode::UNAUTHORIZED, "login required").into_response();
+            }
+            if (is_mutating(&req) || path == "/ws") && !csrf_request_allowed(req.headers()) {
+                return (StatusCode::FORBIDDEN, "cross-site cookie mutation rejected")
+                    .into_response();
+            }
         }
         return next.run(req).await;
     }
@@ -305,6 +388,34 @@ fn cookie_token(state: &AppState, req: &Request<Body>) -> Option<String> {
             .iter()
             .find(|token| tokens_match(token, &decoded))
             .cloned()
+    })
+}
+
+fn local_session_cookie_valid(state: &AppState, req: &Request<Body>) -> bool {
+    let Some(expected) = state.local_webui_session_token.as_deref() else {
+        return false;
+    };
+    let Some(cookie) = req
+        .headers()
+        .get("Cookie")
+        .and_then(|value| value.to_str().ok())
+    else {
+        return false;
+    };
+    cookie.split(';').any(|part| {
+        let part = part.trim();
+        let value = part
+            .strip_prefix("tng_session=")
+            .or_else(|| part.strip_prefix("SID="));
+        value
+            .and_then(|value| urlencoding::decode(value).ok())
+            .is_some_and(|value| {
+                if let Some(secret) = state.cfg.auth.secret_key.as_deref() {
+                    verify_signed_session(secret, &[expected.to_owned()], &value).is_some()
+                } else {
+                    tokens_match(expected, &value)
+                }
+            })
     })
 }
 

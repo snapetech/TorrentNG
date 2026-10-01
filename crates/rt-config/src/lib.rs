@@ -212,15 +212,47 @@ pub struct DbConfig {
     pub wal_checkpoint_pages: u32,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct AuthConfig {
+    /// WebUI username. The API token remains accepted separately for API
+    /// clients and can also be entered in either WebUI login field.
+    pub username: String,
+    /// WebUI password. Operators can change this from Settings after login;
+    /// runtime changes are stored in the session directory.
+    pub password: String,
     /// Pre-shared bearer/session tokens accepted by the TorrentNG API.
     pub api_tokens: Vec<String>,
     /// Optional newline-delimited token file. Values are appended to
     /// `api_tokens` while loading a config file, which lets container and
     /// systemd deployments keep secrets out of the main TOML document.
     pub api_tokens_file: Option<PathBuf>,
+}
+
+impl std::fmt::Debug for AuthConfig {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("AuthConfig")
+            .field("username", &self.username)
+            .field("password", &"[REDACTED]")
+            .field(
+                "api_tokens",
+                &format_args!("[{} configured]", self.api_tokens.len()),
+            )
+            .field("api_tokens_file", &self.api_tokens_file)
+            .finish()
+    }
+}
+
+impl Default for AuthConfig {
+    fn default() -> Self {
+        Self {
+            username: "torrentng".to_owned(),
+            password: "torrentng".to_owned(),
+            api_tokens: Vec::new(),
+            api_tokens_file: None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -566,6 +598,14 @@ impl Config {
             self.db.wal_checkpoint_pages > 0,
             "db.wal_checkpoint_pages must be greater than zero",
         )?;
+        require(
+            !self.auth.username.trim().is_empty() && self.auth.username.len() <= 256,
+            "auth.username must contain 1-256 bytes",
+        )?;
+        require(
+            self.auth.password.trim().len() >= 8 && self.auth.password.len() <= 1024,
+            "auth.password must contain at least 8 and at most 1024 bytes",
+        )?;
         for token in &self.auth.api_tokens {
             require(
                 !token.trim().is_empty(),
@@ -745,6 +785,8 @@ mod tests {
         assert!(!c.tracker.allow_link_local_egress);
         assert!(c.auth.api_tokens.is_empty());
         assert!(c.auth.api_tokens_file.is_none());
+        assert_eq!(c.auth.username, "torrentng");
+        assert_eq!(c.auth.password, "torrentng");
         assert_eq!(c.daemon.shutdown_timeout_secs, 10);
         assert_eq!(c.memory.total_cap_mb, 512);
         assert_eq!(c.memory.storage_frame_cap_mb, 128);
@@ -766,6 +808,19 @@ mod tests {
         assert_eq!(c.storage.peer_read_cache_entries, 64);
         assert_eq!(c.storage.peer_read_elevator_budget_ms, 25);
         assert_eq!(c.logging, rt_logging::LoggingConfig::default());
+    }
+
+    #[test]
+    fn auth_config_debug_redacts_password_and_api_tokens() {
+        let mut auth = AuthConfig::default();
+        auth.password = "private-password-value".to_owned();
+        auth.api_tokens = vec!["private-api-token-value".to_owned()];
+
+        let debug = format!("{auth:?}");
+        assert!(!debug.contains("private-password-value"));
+        assert!(!debug.contains("private-api-token-value"));
+        assert!(debug.contains("[REDACTED]"));
+        assert!(debug.contains("[1 configured]"));
     }
 
     #[test]

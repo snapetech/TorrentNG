@@ -235,6 +235,13 @@ least 16 characters. The deployment examples show secret-file configuration,
 storage roots, peer ports, tiering, trackers, DHT, and systemd/Kubernetes
 layouts.
 
+Fresh loopback installs of both TorrentNG profiles use WebUI credentials
+`torrentng` / `torrentng`. Change them in **Settings -> Security** or set
+`[auth].username` and `[auth].password` in config.toml. API tokens remain
+available for automation and also work in either login field. On a public bind
+the default password is disabled; use the configured API token to sign in and
+choose a unique password.
+
 ## Migration
 
 `torrentngd migrate` imports existing-client state into the TorrentNG Engine.

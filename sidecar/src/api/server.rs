@@ -9,6 +9,7 @@ use axum::{
 };
 use std::{
     net::SocketAddr,
+    path::PathBuf,
     sync::{
         atomic::{AtomicU64, Ordering},
         Arc,
@@ -20,7 +21,11 @@ use tower_http::limit::RequestBodyLimitLayer;
 use tower_http::services::{ServeDir, ServeFile};
 
 use crate::{
-    auth::require_auth, backend::TorrentBackend, cache::Db, config::Config, metrics::SharedMetrics,
+    auth::{require_auth, AuthCredentials},
+    backend::TorrentBackend,
+    cache::Db,
+    config::Config,
+    metrics::SharedMetrics,
     rtorrent::Client,
 };
 
@@ -38,6 +43,12 @@ pub struct AppState {
     pub qbit_search_jobs: Arc<RwLock<serde_json::Map<String, serde_json::Value>>>,
     pub qbit_next_search_id: Arc<AtomicU64>,
     pub login_attempt_limiter: crate::auth::LoginAttemptLimiter,
+    pub auth_credentials: Arc<RwLock<AuthCredentials>>,
+    pub configured_auth_credentials: AuthCredentials,
+    pub auth_settings_path: PathBuf,
+    pub auth_settings_write: Arc<Mutex<()>>,
+    pub local_webui_session_token: Option<String>,
+    pub public_bind: bool,
     /// Serializes read-modify-write control-plane records stored as one JSON
     /// value in the cache database. The Db mutex protects individual SQL
     /// statements; this lock protects the multi-statement operation.
@@ -60,6 +71,15 @@ pub fn build_router(state: AppState) -> Router {
             )),
         )
         .route("/api/v1/auth/logout", post(crate::qbcompat::auth_logout))
+        .route(
+            "/api/v1/auth/settings",
+            get(crate::qbcompat::auth_settings)
+                .put(crate::qbcompat::update_auth_settings)
+                .delete(crate::qbcompat::reset_auth_settings)
+                .layer(DefaultBodyLimit::max(
+                    crate::multipart::MAX_AUTH_REQUEST_BODY_BYTES,
+                )),
+        )
         .route(
             "/api/v1/torrents",
             get(handlers::list_torrents)
