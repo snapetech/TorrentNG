@@ -13,10 +13,11 @@ must not install a second torrent engine in existing-client mode.
 ## Build and runtime
 
 - Build one Linux/musl archive per supported YunoHost architecture (`amd64`,
-  `arm64`) from the upstream release tag. Include both Rust executables and
-  the production WebUI assets. Publish checksums with the other release
-  assets. This avoids depending on the host's glibc version or a build toolchain
-  during app installation.
+  `arm64`) from the upstream release commit. Include both Rust executables and
+  the production WebUI assets. Dedicated `yunohost-*` tags publish the first
+  app bundles; normal `main-*` releases also publish updated bundles. Publish
+  SHA256 checksums with both release types. This avoids depending on the host's
+  glibc version or a build toolchain during app installation.
 - Keep app binaries and static assets under `install_dir`; keep engine state,
   sidecar cache, and credentials under `data_dir`.
 - Keep native payloads outside app state in the YunoHost multimedia share.
@@ -56,8 +57,10 @@ Before catalog submission:
 1. Parse/lint the v2 manifest and shell/Python scripts.
 2. Build WebUI and both Rust binaries for amd64 and arm64; inspect the binaries
    to confirm they do not require host glibc.
-3. Exercise both generated TOML configurations and verify each daemon starts,
-   serves `/health`, accepts token login, and serves static assets.
+3. Run `scripts/yunohost_bundle_smoke.sh` against each architecture bundle. It
+   starts the native engine and the existing-client sidecar, connects the
+   sidecar to the engine, and checks health, token login, protected API access,
+   static assets, and the subpath runtime configuration.
 4. Verify root and subpath API, WebSocket, cookie, SSO permission, and native
    peer-firewall behavior on a YunoHost 12 host or official package-check VM.
 5. Run official app package CI for install, backup/restore, upgrade, URL change,
