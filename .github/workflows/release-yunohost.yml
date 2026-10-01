@@ -83,11 +83,14 @@ jobs:
             --target bundle \
             --output "type=local,dest=bundle" \
             .
+          chmod -R a+rX bundle
+          chmod 0755 bundle
           test -x bundle/bin/torrentngd
           test -x bundle/bin/torrentng
           test -s bundle/webui/index.html
           bundle/bin/torrentngd --version
           tar -czf "torrentng-yunohost-${ASSET_VERSION}-${ASSET_SUFFIX}.tar.gz" -C bundle .
+          [[ "$(tar -tvf "torrentng-yunohost-${ASSET_VERSION}-${ASSET_SUFFIX}.tar.gz" | awk 'NR == 1 { print $1 }')" == "drwxr-xr-x" ]]
           bash scripts/yunohost_bundle_smoke.sh bundle
 
       - name: Upload portable bundle artifact
