@@ -1,4 +1,8 @@
-export const appBasePath = (window.__TNG_BASE_PATH__ ?? '').replace(/\/+$/, '')
+export function getAppBasePath(): string {
+  return (window.__TNG_BASE_PATH__ ?? '').replace(/\/+$/, '')
+}
+
+export const appBasePath = getAppBasePath()
 const BASE = `${appBasePath}/api/v1`
 
 function appPath(path: string): string {

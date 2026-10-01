@@ -25,6 +25,7 @@ describe('useWebSocket', () => {
   afterEach(() => {
     MockWebSocket.instances = []
     vi.unstubAllGlobals()
+    delete window.__TNG_BASE_PATH__
   })
 
   it('invalidates cached projections when the event stream requires a resync', () => {
@@ -53,6 +54,24 @@ describe('useWebSocket', () => {
     for (const query of queryClient.getQueryCache().getAll()) {
       expect(query.state.isInvalidated).toBe(true)
     }
+    unmount()
+    queryClient.clear()
+  })
+
+  it('connects to the WebSocket endpoint beneath the configured mount path', async () => {
+    window.__TNG_BASE_PATH__ = '/torrentng/'
+    vi.stubGlobal('WebSocket', MockWebSocket)
+    const queryClient = new QueryClient({
+      defaultOptions: { queries: { retry: false } },
+    })
+    const wrapper = ({ children }: { children: React.ReactNode }) => (
+      <QueryClientProvider client={queryClient}>{children}</QueryClientProvider>
+    )
+
+    const { unmount } = renderHook(() => useWebSocket(undefined, true), { wrapper })
+    const socket = MockWebSocket.instances[0]
+
+    expect(socket.url).toBe(`ws://${location.host}/torrentng/ws`)
     unmount()
     queryClient.clear()
   })

@@ -32,6 +32,7 @@ the separate many-client API run, and the single-torrent soak into one
 | 32 JSON plus 8 slow SSE clients | The 2026-09-04 release binary served 204,936 requests in 30 seconds with zero errors and p99 10.08 ms. The canonical ledger says the corpus was small. The 8 SSE clients each received one event; this did not exercise sustained high-volume event fan-out. | Useful concurrent API responsiveness evidence for that binary and small-corpus mix. It does not combine with the separate 100,000-row run to prove concurrent 100,000-row operation. |
 | 100,000 idle RAM check | `rt-metrics/tests/scale.rs` builds an in-process qBittorrent router with synthetic registry entries. It checks absolute test-process RSS below 2.5 GiB and limits growth to 64 FDs and 8 threads; it does not assert an RSS delta or exercise the native daemon restore path. | A coarse test-process proxy for that API object shape, not a fixed per-torrent RAM budget or engine RSS result. |
 | 1,000 hot memory check | The test builds 1,000 synthetic `TorrentRuntimeStats` rows, then sums only the ten rows retained in `hot_torrent_memory_top` and checks that estimate is below 64 MiB. | A regression for top-ten attribution. It does not measure actual allocations, the governor total, or total memory across 1,000 hot torrents. |
+| “RAM is O(active transfer)” | `STORAGE_NG.md` says the global frame pool makes RAM `O(active transfer)`. That statement describes frame-pool buffers only; registry rows, metadata, piece indexes, runtime tasks, database state, and other allocations also consume memory. | Say that frame-pool memory is capped and follows in-flight I/O. It does not describe the total process memory curve. |
 | Process memory and FD/thread soak | The public 24-hour run completed 1,437 samples and retained the exact completed Debian torrent. However, `soak_certification.sh` reads `/proc/1/status` and `/proc/1/fd`. The native image entrypoint runs Tini as container PID 1, so the reported 1.3 MB RSS, 3 FDs, and 1 thread describe Tini rather than `torrentngd`. | The health, sync, metrics, completed-torrent, and disk-free observations remain useful. The run does not establish daemon RSS, daemon FD/thread ceilings, or a memory-qualified soak. |
 | HDD peer-read elevator | The 2026-09-10 b393 report targets an ext4 filesystem on a rotational LVM device. Across three 128 MiB shuffled-read trials, the median was 5.11x wall-clock improvement; 8,192 peer reads were coalesced to one backend read. | A strong result for this code, host, filesystem, and access pattern. It is not a general torrent throughput claim or deterministic per-drive placement control. |
 | `io_uring` storage | The 2026-09-10 HDD stream measured 209.79 MiB/s read for `pread` and 210.70 MiB/s for `io_uring`; throughput ratios were informational, not a required gate. A later report titled “hardware matrix” ran against tmpfs and inferred `Unknown`; its `io_uring` stream was only 4 MiB and sub-millisecond. | The HDD result shows comparable throughput on one host, not a material `io_uring` speedup. The later tmpfs PASS is capability/smoke evidence only, not hardware or disk-throughput evidence. |
@@ -82,11 +83,12 @@ These outcomes are valuable; their narrow scope is part of the claim.
    for any user-facing latency claim. Include commit, artifact digest, CPU,
    device, filesystem, corpus shape, request concurrency, response rows, and
    whether measurements include body transfer.
-4. **Correct RAM-proxy names and extend coverage only where useful.** Rename
-   the 1,000-hot “memory cap” row to top-ten attribution unless it checks all
-   1,000 rows. Give the 100,000 idle test an explicit RSS delta/per-row bound
-   or call it a permissive test-process ceiling. Keep process RSS and
-   governor-managed bytes as separate measurements.
+4. **Correct RAM-proxy names and extend coverage only where useful.** Qualify
+   “RAM is O(active transfer)” as a frame-pool statement. Rename the 1,000-hot
+   “memory cap” row to top-ten attribution unless it checks all 1,000 rows.
+   Give the 100,000 idle test an explicit RSS delta/per-row bound or call it a
+   permissive test-process ceiling. Keep process RSS and governor-managed
+   bytes as separate measurements.
 5. **Separate count, swarm, and UI claims.** Keep 100,000 mostly-dormant count
    results separate from active-peer count and concurrent clients. Identify
    that the 142 peers came from a five-client public Debian matrix. Improve

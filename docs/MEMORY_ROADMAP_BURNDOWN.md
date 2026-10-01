@@ -26,8 +26,8 @@ evidence rollup and non-claim boundary report.
   - Compatibility `Bytes` returns consume ordinary frame payloads without an extra copy; registered `io_uring` slots still copy on conversion so the slot lease can return to the backend.
 - [x] 10k/100k idle torrent RSS/task/fd evidence proxy.
   - `idle_memory_100k_keeps_fixed_rss_task_fd_budget` checks 100k idle API shape under fixed RSS, task, and fd growth targets.
-- [x] 1k hot seeding memory-cap evidence proxy.
-  - `hot_seeding_1k_memory_attribution_stays_under_cap` checks 1k synthetic hot seeders against the current top-hot attribution cap.
+- [x] 1k synthetic hot-seeding top-ten memory-attribution proxy (not a process memory-cap check).
+  - `hot_seeding_1k_memory_attribution_stays_under_cap` checks the sum of the ten retained synthetic top-hot estimates against 64 MiB; it does not measure total use across 1k hot torrents or process RSS.
 - [x] Slow-disk plus fast-peer backpressure evidence proxy.
   - Storage scale tests exercise queue-full backpressure rather than unbounded queue growth under saturated hash/disk paths.
 - [x] Conservative move/import/delete executor below the storage planner.

@@ -1,6 +1,6 @@
 import { useEffect, useRef } from 'react'
 import { useQueryClient } from '@tanstack/react-query'
-import { appBasePath, type LiveStats } from '../api/client'
+import { getAppBasePath, type LiveStats } from '../api/client'
 
 interface WsEvent {
   type:
@@ -130,7 +130,7 @@ export function useWebSocket(onStats?: (stats: LiveStats) => void, enabled = tru
     }
 
     function connectWebSocket() {
-      const url = `${location.protocol === 'https:' ? 'wss' : 'ws'}://${location.host}${appBasePath}/ws`
+      const url = `${location.protocol === 'https:' ? 'wss' : 'ws'}://${location.host}${getAppBasePath()}/ws`
       const socket = new WebSocket(url)
       ws.current = socket
       socket.onopen = () => {

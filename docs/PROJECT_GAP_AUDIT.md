@@ -2,7 +2,8 @@
 
 Status as of 2026-09-10 on clean `main` at `50e0fc3`; runtime product evidence
 and kspls0 LVM reports are tied to `b393eb0` where stated below, and the clean
-release smoke identifies its own build commit.
+release smoke identifies its own build commit. The 2026-10-01 audit addendum
+invalidates the public soak's daemon RSS/FD/thread figures; see TNG-145 below.
 
 This audit separates local implementation gaps from external evidence gates.
 It is based on the roadmap docs, compatibility matrices, certification status,
@@ -126,7 +127,7 @@ Memory/resource-governor work is locally green:
 - queued-disk leases fail closed before enqueue;
 - storage frames, peer buffers, piece assembly, API snapshots, tracker peers,
   DHT table, metadata, webseed bodies, and queued disk work are accounted;
-- 100k idle and 1k hot-seeding proxy rows pass through the local release report;
+- 100k idle and 1k hot-seeding top-ten attribution proxy rows pass through the local release report; neither is a production RAM-cap result;
 - hash/recheck isolation and peer-read backpressure are covered by scale tests.
 
 Remaining memory work is evidence-bound:

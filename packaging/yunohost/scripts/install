@@ -31,6 +31,10 @@ if [[ "$deployment_mode" == "native" ]]; then
 		/*) ;;
 		*) ynh_die --message="The download directory must be an absolute filesystem path." ;;
 	esac
+	if [[ "$(realpath -m -- "$download_dir")" != "$download_dir" ]] ||
+		[[ "$download_dir" == "/" || "$download_dir" == "/home" || "$download_dir" == "/home/yunohost.multimedia" || "$download_dir" == "/home/yunohost.multimedia/share" ]]; then
+		ynh_die --message="Choose a normalized directory below a storage location, not a shared parent directory."
+	fi
 fi
 
 ynh_script_progression --message="Installing TorrentNG binaries and WebUI..." --weight=3
@@ -39,10 +43,13 @@ install_launch_script
 write_runtime_config "$path"
 
 if [[ "$deployment_mode" == "native" ]]; then
+	ynh_multimedia_build_main_dir
+	ynh_multimedia_addaccess "$app"
 	initialize_multimedia_access
 else
 	ynh_multimedia_build_main_dir
 	ynh_multimedia_addaccess "$app"
+	validate_storage_root
 fi
 
 ynh_script_progression --message="Writing private TorrentNG configuration..." --weight=2
@@ -58,4 +65,9 @@ ensure_native_peer_firewall
 ynh_script_progression --message="Starting TorrentNG..." --weight=1
 ynh_systemctl --service="$app" --action=start
 
-ynh_print_info --message="TorrentNG is installed at https://$domain$path/. Sign in with any username and the API password entered during installation."
+if [[ "$path" == "/" ]]; then
+	install_url="https://$domain/"
+else
+	install_url="https://$domain${path%/}/"
+fi
+ynh_print_info --message="TorrentNG is installed at $install_url Sign in with any username and the API password entered during installation."

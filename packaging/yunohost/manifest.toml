@@ -71,6 +71,7 @@ ram.runtime = "512M"
     help.en = "Use a path visible on this YunoHost server. This enables TorrentNG's storage and file browsing views."
     type = "string"
     default = "/home/yunohost.multimedia/share"
+    optional = true
     visible = "deployment_mode == 'existing'"
 
     [install.qbittorrent_url]

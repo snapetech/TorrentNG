@@ -3,6 +3,7 @@
 Status: **public transfer and service-continuity PASS; daemon resource telemetry invalid**
 Confidence: **high** for the public transfer and 24-hour service/torrent
 continuity; **unknown** for daemon RSS, FD, and thread ceilings.
+Audit addendum: 2026-10-01; see TNG-145 in the backend audit burn-down.
 
 ## Public transfer
 

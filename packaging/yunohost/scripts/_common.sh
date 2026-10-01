@@ -45,9 +45,32 @@ write_app_config() {
 }
 
 initialize_multimedia_access() {
-	ynh_multimedia_build_main_dir
-	ynh_multimedia_addaccess "$app"
-	install -d -o "$app" -g multimedia -m 2775 "$download_dir"
+	if [[ -L "$download_dir" ]]; then
+		ynh_die --message="The download directory must not be a symbolic link."
+	fi
+	if [[ ! -e "$download_dir" ]]; then
+		install -d -o "$app" -g multimedia -m 2775 "$download_dir"
+	elif [[ ! -d "$download_dir" ]]; then
+		ynh_die --message="The download path exists but is not a directory."
+	elif ! ynh_exec_as "$app" test -w "$download_dir"; then
+		ynh_die --message="The existing download directory is not writable by TorrentNG. Set group access for $app or choose another directory."
+	fi
+}
+
+validate_storage_root() {
+	if [[ -z "${storage_root:-}" ]]; then
+		return
+	fi
+	case "$storage_root" in
+		/*) ;;
+		*) ynh_die --message="The storage root must be an absolute filesystem path or empty." ;;
+	esac
+	if [[ ! -d "$storage_root" ]]; then
+		ynh_die --message="The storage root does not exist. Use an existing local path or leave it empty for a remote backend."
+	fi
+	if ! ynh_exec_as "$app" test -r "$storage_root" || ! ynh_exec_as "$app" test -x "$storage_root"; then
+		ynh_die --message="The TorrentNG service user cannot read the storage root. Grant $app read and directory-traversal access or choose another path."
+	fi
 }
 
 install_launch_script() {
