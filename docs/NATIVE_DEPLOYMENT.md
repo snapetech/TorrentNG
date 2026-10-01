@@ -71,6 +71,24 @@ curl -fsS -H "Authorization: Bearer ${TNG_API_TOKEN}" http://127.0.0.1:8080/api/
 curl -fsS -H "Authorization: Bearer ${TNG_API_TOKEN}" http://127.0.0.1:8080/api/qb/v2/torrents/info
 ```
 
+## Ubuntu PPA packages
+
+The Launchpad PPA is configured for Ubuntu Jammy, Noble, and Resolute on amd64
+and arm64. After its first package upload, install TorrentNG with:
+
+```sh
+sudo add-apt-repository ppa:keefshape/torrentng
+sudo apt update
+sudo apt install torrentngd
+sudo systemctl status torrentngd
+```
+
+The package starts a systemd service and keeps its API bound to
+`127.0.0.1:8080` by default. Before changing it to a non-loopback bind, add a
+real API token to `/etc/torrentngd/config.toml`; public binds reject missing or
+placeholder tokens. Persistent state and the default download directory live
+under `/var/lib/torrentngd`.
+
 The repository smoke command can be run against a freshly built binary with
 an isolated authenticated config:
 

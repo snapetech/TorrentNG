@@ -1,0 +1,23 @@
+#!/usr/bin/make -f
+
+export DH_VERBOSE = 1
+
+%:
+	dh $@ --buildsystem=none
+
+override_dh_auto_build:
+	@set -eu; \
+	case "$(DEB_HOST_ARCH)" in \
+	  amd64|arm64) ;; \
+	  *) echo "Unsupported Launchpad architecture: $(DEB_HOST_ARCH)" >&2; exit 1 ;; \
+	esac; \
+	test -x "release-assets/$(DEB_HOST_ARCH)/usr/bin/torrentngd"; \
+	"release-assets/$(DEB_HOST_ARCH)/usr/bin/torrentngd" --version
+
+override_dh_auto_install:
+	@set -eu; \
+	arch="$(DEB_HOST_ARCH)"; \
+	install -D -m 0755 "release-assets/$$arch/usr/bin/torrentngd" "debian/tmp/usr/bin/torrentngd"; \
+	install -d "debian/tmp/usr/share/torrentng/webui"; \
+	cp -a "release-assets/$$arch/usr/share/torrentng/webui/." "debian/tmp/usr/share/torrentng/webui/"; \
+	install -D -m 0644 "debian/config.toml" "debian/tmp/etc/torrentngd/config.toml"

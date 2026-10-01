@@ -1,0 +1,9 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+args=(--batch --yes --pinentry-mode loopback)
+if [[ -n "${LAUNCHPAD_GPG_PASSPHRASE_FILE:-}" ]]; then
+  args+=(--passphrase-file "$LAUNCHPAD_GPG_PASSPHRASE_FILE")
+fi
+
+exec gpg "${args[@]}" "$@"

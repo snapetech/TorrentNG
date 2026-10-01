@@ -1,0 +1,119 @@
+name: Publish Launchpad PPA
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing published release tag to upload, for example main-20260930-4
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  publish-ppa:
+    name: Upload signed source packages to Launchpad
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout trusted main history
+        uses: actions/checkout@v7
+        with:
+          ref: main
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Validate release tag and published release
+        id: tag
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REQUESTED_TAG: ${{ inputs.tag }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag="$REQUESTED_TAG"
+          if [[ ! "$tag" =~ ^main-[A-Za-z0-9][A-Za-z0-9._-]*$ ]] ||
+            [[ "$tag" == *..* ]] || ! git check-ref-format "refs/tags/$tag"; then
+            echo "Invalid release tag: $tag" >&2
+            exit 1
+          fi
+          git fetch --force origin main --tags
+          tag_commit="$(git rev-parse --verify --quiet "refs/tags/$tag^{commit}")"
+          if [[ -z "$tag_commit" ]] || ! git merge-base --is-ancestor "$tag_commit" origin/main; then
+            echo "Tag $tag must point to a commit on origin/main." >&2
+            exit 1
+          fi
+          gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+
+      - name: Install Debian source-package tools
+        run: |
+          sudo apt-get update
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
+            debhelper devscripts dput dpkg-dev fakeroot gnupg
+
+      - name: Import and verify Launchpad upload key
+        env:
+          LAUNCHPAD_GPG_PRIVATE_KEY: ${{ secrets.LAUNCHPAD_GPG_PRIVATE_KEY }}
+          LAUNCHPAD_GPG_PASSPHRASE: ${{ secrets.LAUNCHPAD_GPG_PASSPHRASE }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ -z "${LAUNCHPAD_GPG_PRIVATE_KEY:-}" || -z "${LAUNCHPAD_GPG_PASSPHRASE:-}" ]]; then
+            {
+              echo "## Launchpad PPA upload blocked"
+              echo
+              echo "Configure repository secrets LAUNCHPAD_GPG_PRIVATE_KEY and LAUNCHPAD_GPG_PASSPHRASE."
+              echo "The key must match the Launchpad upload key fingerprint 07E2531E1F470F8008ACFC996A07606FE65392F."
+            } >> "$GITHUB_STEP_SUMMARY"
+            echo "Launchpad signing secrets are missing." >&2
+            exit 1
+          fi
+
+          export GNUPGHOME="$RUNNER_TEMP/launchpad-gnupg"
+          install -d -m 0700 "$GNUPGHOME"
+          printf '%s\n' "$LAUNCHPAD_GPG_PRIVATE_KEY" | gpg --batch --import
+          fingerprint="$(gpg --batch --with-colons --fingerprint --list-secret-keys \
+            | awk -F: '$1 == "fpr" { print $10; exit }')"
+          expected="07E2531E1F470F8008ACFC996A07606FE65392F"
+          if [[ "$fingerprint" != "$expected" ]]; then
+            echo "Imported OpenPGP key does not match the Launchpad upload key." >&2
+            exit 1
+          fi
+
+          passphrase_file="$RUNNER_TEMP/launchpad-gpg-passphrase"
+          printf '%s' "$LAUNCHPAD_GPG_PASSPHRASE" > "$passphrase_file"
+          chmod 0600 "$passphrase_file"
+          {
+            echo "GNUPGHOME=$GNUPGHOME"
+            echo "LAUNCHPAD_GPG_PASSPHRASE_FILE=$passphrase_file"
+          } >> "$GITHUB_ENV"
+
+      - name: Build and upload Jammy, Noble, and Resolute source packages
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ steps.tag.outputs.tag }}
+          LAUNCHPAD_GPG_FINGERPRINT: 07E2531E1F470F8008ACFC996A07606FE65392F
+        shell: bash
+        run: |
+          set -euo pipefail
+          output_dir="$RUNNER_TEMP/launchpad-ppa"
+          mkdir -p "$output_dir"
+          for series in jammy noble resolute; do
+            changes_file="$(scripts/build_launchpad_ppa_source.sh \
+              "$RELEASE_TAG" "$series" "$GITHUB_RUN_ID" \
+              "$GITHUB_RUN_ATTEMPT" "$output_dir")"
+            dput ppa:keefshape/torrentng "$changes_file"
+            echo "Uploaded $series source package: $(basename "$changes_file")"
+          done
+
+          {
+            echo "## Launchpad PPA uploads submitted"
+            echo
+            echo "Release: `$RELEASE_TAG`"
+            echo "PPA: [ppa:keefshape/torrentng](https://launchpad.net/~keefshape/+archive/ubuntu/torrentng)"
+            echo "Series: Jammy, Noble, Resolute; architectures: amd64 and arm64."
+            echo "Launchpad builds the installable packages after the signed source uploads are accepted."
+          } >> "$GITHUB_STEP_SUMMARY"

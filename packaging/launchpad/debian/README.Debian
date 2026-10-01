@@ -1,0 +1,18 @@
+TorrentNG Launchpad PPA package
+===============================
+
+The service starts after installation and listens on 127.0.0.1:8080. Open
+http://127.0.0.1:8080/ locally. The package deliberately keeps the API on
+loopback and uses an empty token list only for that loopback-only default.
+
+Before exposing TorrentNG through a non-loopback bind or reverse proxy, add a
+real API token to /etc/torrentngd/config.toml. Public binds reject missing or
+placeholder tokens. Restart the service after changing configuration:
+
+    sudo systemctl restart torrentngd
+
+Persistent state and the default download directory live under
+/var/lib/torrentngd. The service runs as the unprivileged torrentngd account.
+
+The PPA contains packages for Ubuntu Jammy, Noble, and Resolute on amd64 and
+arm64. Report package issues at https://github.com/snapetech/TorrentNG/issues.

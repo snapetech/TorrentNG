@@ -1,0 +1,3 @@
+usr/bin/torrentngd
+usr/share/torrentng/webui
+etc/torrentngd/config.toml

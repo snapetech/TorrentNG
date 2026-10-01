@@ -345,13 +345,22 @@ install_copr() {
 
 install_ppa() {
   have apt-get || die "apt-get is required for PPA smoke"
+  local package="${PPA_PACKAGE:-$PROJECT}"
   run sudo apt-get update
   run sudo apt-get install -y software-properties-common
   run sudo add-apt-repository -y "$PPA"
   run sudo apt-get update
-  run sudo apt-get install -y "$PROJECT"
-  cleanup_cmds+=("sudo apt-get remove -y '$PROJECT'")
-  smoke_binary "$BINARY"
+  run sudo apt-get install -y "$package"
+  cleanup_cmds+=("sudo apt-get remove -y '$package'")
+  local installed_version expected_version
+  installed_version="$(dpkg-query -W -f='${Version}' "$package")"
+  expected_version="${version#main-}"
+  expected_version="${expected_version#v}"
+  expected_version="${expected_version//-/.}"
+  [[ "$installed_version" == "$expected_version"-* ]] ||
+    die "PPA installed $package version $installed_version, expected release $expected_version"
+  PACKAGE_SMOKE_ALLOW_VERSION_MISMATCH=1 smoke_binary "$BINARY"
+  resolved_version="package=$installed_version; $resolved_version"
   uninstall_status="scheduled apt remove"
 }
 

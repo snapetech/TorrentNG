@@ -1,0 +1,26 @@
+[daemon]
+api_bind = "127.0.0.1:8080"
+session_dir = "/var/lib/torrentngd"
+log_level = "info"
+shutdown_timeout_secs = 10
+
+[network]
+listen_port = 44444
+max_peers = 200
+upload_rate_limit = 0
+download_rate_limit = 0
+
+[storage]
+download_dir = "/var/lib/torrentngd/downloads"
+device_elevator_enabled = true
+
+[auth]
+# The package defaults to loopback-only access. Configure a real token before
+# changing api_bind to a non-loopback address.
+api_tokens = []
+
+[logging]
+format = "json"
+profile = "basic"
+filter = ""
+event_retention = 10000

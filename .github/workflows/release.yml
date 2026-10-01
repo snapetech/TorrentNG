@@ -630,6 +630,13 @@ jobs:
         shell: bash
         run: gh workflow run release-copr.yml --ref main -f "tag=$RELEASE_TAG"
 
+      - name: Dispatch Launchpad PPA publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ needs.validate-release-tag.outputs.tag }}
+        shell: bash
+        run: gh workflow run release-ppa.yml --ref main -f "tag=$RELEASE_TAG"
+
       - name: Check Discord webhook configuration
         id: discord
         env:

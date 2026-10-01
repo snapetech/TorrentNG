@@ -1,0 +1,16 @@
+Source: torrentngd
+Section: net
+Priority: optional
+Maintainer: TorrentNG Maintainers <keith@snape.tech>
+Build-Depends: debhelper-compat (= 13)
+Standards-Version: 4.7.2
+Homepage: https://github.com/snapetech/TorrentNG
+Rules-Requires-Root: no
+
+Package: torrentngd
+Architecture: amd64 arm64
+Depends: ${shlibs:Depends}, ${misc:Depends}, adduser, systemd
+Description: native TorrentNG BitTorrent client and WebUI/API
+ TorrentNG is a native BitTorrent client with a shared WebUI and API. This
+ package installs the release binaries for amd64 and arm64, starts the daemon
+ under a dedicated system account, and binds its API to loopback by default.
