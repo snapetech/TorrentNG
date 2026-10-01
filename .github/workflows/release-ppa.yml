@@ -67,7 +67,7 @@ jobs:
               echo
               echo "Configure repository secret LAUNCHPAD_GPG_PRIVATE_KEY."
               echo "If the key is passphrase-protected, also configure LAUNCHPAD_GPG_PASSPHRASE."
-              echo "The key must match the Launchpad upload key fingerprint 07E2531E1F470F8008ACFC996A07606FE65392F."
+              echo "The key must match the Launchpad upload key fingerprint 07E2531E1F470F8008ACCFC996A07606FE65392F."
             } >> "$GITHUB_STEP_SUMMARY"
             echo "The Launchpad private-key secret is missing." >&2
             exit 1
@@ -78,7 +78,7 @@ jobs:
           printf '%s\n' "$LAUNCHPAD_GPG_PRIVATE_KEY" | gpg --batch --import
           fingerprint="$(gpg --batch --with-colons --fingerprint --list-secret-keys \
             | awk -F: '$1 == "fpr" { print $10; exit }')"
-          expected="07E2531E1F470F8008ACFC996A07606FE65392F"
+          expected="07E2531E1F470F8008ACCFC996A07606FE65392F"
           if [[ "$fingerprint" != "$expected" ]]; then
             echo "Imported OpenPGP key does not match the Launchpad upload key." >&2
             exit 1
@@ -96,7 +96,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           RELEASE_TAG: ${{ steps.tag.outputs.tag }}
-          LAUNCHPAD_GPG_FINGERPRINT: 07E2531E1F470F8008ACFC996A07606FE65392F
+          LAUNCHPAD_GPG_FINGERPRINT: 07E2531E1F470F8008ACCFC996A07606FE65392F
         shell: bash
         run: |
           set -euo pipefail

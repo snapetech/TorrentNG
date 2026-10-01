@@ -3,7 +3,7 @@ set -euo pipefail
 
 readonly REPO="snapetech/TorrentNG"
 readonly WORKFLOW="release-ppa.yml"
-readonly EXPECTED_FINGERPRINT="07E2531E1F470F8008ACFC996A07606FE65392F"
+readonly EXPECTED_FINGERPRINT="07E2531E1F470F8008ACCFC996A07606FE65392F"
 readonly ACTIONS_URL="https://github.com/snapetech/TorrentNG/actions/workflows/release-ppa.yml"
 readonly PPA_PACKAGES_URL="https://launchpad.net/~keefshape/+archive/ubuntu/torrentng/+packages"
 
