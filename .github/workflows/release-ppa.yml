@@ -61,14 +61,15 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          if [[ -z "${LAUNCHPAD_GPG_PRIVATE_KEY:-}" || -z "${LAUNCHPAD_GPG_PASSPHRASE:-}" ]]; then
+          if [[ -z "${LAUNCHPAD_GPG_PRIVATE_KEY:-}" ]]; then
             {
               echo "## Launchpad PPA upload blocked"
               echo
-              echo "Configure repository secrets LAUNCHPAD_GPG_PRIVATE_KEY and LAUNCHPAD_GPG_PASSPHRASE."
+              echo "Configure repository secret LAUNCHPAD_GPG_PRIVATE_KEY."
+              echo "If the key is passphrase-protected, also configure LAUNCHPAD_GPG_PASSPHRASE."
               echo "The key must match the Launchpad upload key fingerprint 07E2531E1F470F8008ACFC996A07606FE65392F."
             } >> "$GITHUB_STEP_SUMMARY"
-            echo "Launchpad signing secrets are missing." >&2
+            echo "The Launchpad private-key secret is missing." >&2
             exit 1
           fi
 
@@ -83,13 +84,13 @@ jobs:
             exit 1
           fi
 
-          passphrase_file="$RUNNER_TEMP/launchpad-gpg-passphrase"
-          printf '%s' "$LAUNCHPAD_GPG_PASSPHRASE" > "$passphrase_file"
-          chmod 0600 "$passphrase_file"
-          {
-            echo "GNUPGHOME=$GNUPGHOME"
-            echo "LAUNCHPAD_GPG_PASSPHRASE_FILE=$passphrase_file"
-          } >> "$GITHUB_ENV"
+          echo "GNUPGHOME=$GNUPGHOME" >> "$GITHUB_ENV"
+          if [[ -n "${LAUNCHPAD_GPG_PASSPHRASE:-}" ]]; then
+            passphrase_file="$RUNNER_TEMP/launchpad-gpg-passphrase"
+            printf '%s' "$LAUNCHPAD_GPG_PASSPHRASE" > "$passphrase_file"
+            chmod 0600 "$passphrase_file"
+            echo "LAUNCHPAD_GPG_PASSPHRASE_FILE=$passphrase_file" >> "$GITHUB_ENV"
+          fi
 
       - name: Build and upload Jammy, Noble, and Resolute source packages
         env:

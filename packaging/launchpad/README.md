@@ -16,26 +16,36 @@ the Rust daemon. This reuses the binaries already built and checked by the
 release workflow. The release job verifies the asset checksums before creating
 any upload.
 
-## Required GitHub Actions secrets
+## First PPA publish
 
-The repository currently has no Launchpad signing secrets. Add these secrets
-to `snapetech/TorrentNG` before dispatching the PPA workflow:
+From an interactive terminal on a machine with `gh` authenticated to
+`snapetech/TorrentNG` and the Launchpad upload private key in its local GPG
+keyring, run:
 
-- `LAUNCHPAD_GPG_PRIVATE_KEY`: ASCII-armored private key associated with the
-  Launchpad upload key `07E2531E1F470F8008ACFC996A07606FE65392F`.
-- `LAUNCHPAD_GPG_PASSPHRASE`: passphrase for that key.
+```sh
+scripts/publish_launchpad_ppa.sh [RELEASE_TAG]
+```
+
+With no tag, the script selects the latest published stable GitHub release. It
+checks the local key fingerprint and signing access, prompts for the passphrase
+without echoing it, writes `LAUNCHPAD_GPG_PRIVATE_KEY` and (when needed)
+`LAUNCHPAD_GPG_PASSPHRASE` to GitHub Actions through stdin, dispatches
+**Publish Launchpad PPA**, and waits for the source uploads to finish. For a
+key without a passphrase, leave both hidden prompts blank; the script removes
+any stale passphrase secret. Launchpad still builds the `.deb` packages after
+the script finishes, so use the [PPA packages page](https://launchpad.net/~keefshape/+archive/ubuntu/torrentng/+packages)
+to track build completion.
 
 The PPA upload key is the OpenPGP key on the Launchpad account profile. It is
 different from the PPA's repository-signing key, which Launchpad manages for
 APT clients. The workflow imports the private key into an ephemeral runner
 keyring, verifies its fingerprint, signs the source package, and uploads it
-with `dput`. Do not commit or paste the private key or passphrase into the
-repository.
+with `dput`. The script validates the export in a private temporary GPG
+keyring, then streams the key from GPG to `gh`. It never writes the passphrase
+to a file. Do not commit or paste either value into the repository.
 
-Once the secrets are configured, dispatch **Publish Launchpad PPA** with an
-already-published tag to publish that release. Later releases dispatch this
-workflow automatically. The workflow fails before uploading if the secrets are
-missing or the key fingerprint does not match.
+Later releases dispatch this workflow automatically. The workflow fails before
+uploading if the private key is missing or its fingerprint does not match.
 
 ## User installation
 
