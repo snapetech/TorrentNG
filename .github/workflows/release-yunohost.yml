@@ -70,9 +70,11 @@ jobs:
         env:
           PLATFORM: ${{ matrix.platform }}
           ASSET_SUFFIX: ${{ matrix.suffix }}
+          ASSET_VERSION: ${{ needs.validate-tag.outputs.tag }}
         shell: bash
         run: |
           set -euo pipefail
+          ASSET_VERSION="${ASSET_VERSION#yunohost-}"
           mkdir -p bundle
           docker buildx build \
             --pull \
@@ -85,14 +87,14 @@ jobs:
           test -x bundle/bin/torrentng
           test -s bundle/webui/index.html
           bundle/bin/torrentngd --version
-          bundle/bin/torrentng --version
-          tar -czf "torrentng-yunohost-${RELEASE_TAG}-${ASSET_SUFFIX}.tar.gz" -C bundle .
+          tar -czf "torrentng-yunohost-${ASSET_VERSION}-${ASSET_SUFFIX}.tar.gz" -C bundle .
+          bash scripts/yunohost_bundle_smoke.sh bundle
 
       - name: Upload portable bundle artifact
         uses: actions/upload-artifact@v7
         with:
           name: yunohost-${{ matrix.suffix }}
-          path: torrentng-yunohost-${{ needs.validate-tag.outputs.tag }}-${{ matrix.suffix }}.tar.gz
+          path: torrentng-yunohost-*-${{ matrix.suffix }}.tar.gz
 
   publish:
     name: Publish YunoHost bundle release

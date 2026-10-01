@@ -115,12 +115,7 @@ pub async fn require_auth(
 
     // Public endpoints — never require auth. The WebUI app shell and assets
     // must be public so the browser can render the login screen.
-    if path == "/"
-        || path == "/index.html"
-        || path == "/favicon.ico"
-        || path == "/health"
-        || path.starts_with("/assets/")
-    {
+    if is_public_webui_path(&path) {
         return next.run(req).await;
     }
 
@@ -439,6 +434,13 @@ fn is_qbit_public_app_probe(path: &str) -> bool {
     )
 }
 
+fn is_public_webui_path(path: &str) -> bool {
+    matches!(
+        path,
+        "/" | "/index.html" | "/favicon.ico" | "/health" | "/runtime-config.js"
+    ) || path.starts_with("/assets/")
+}
+
 fn is_public_auth_path(path: &str) -> bool {
     matches!(
         path,
@@ -566,6 +568,14 @@ mod tests {
         assert!(is_public_login_path("/api/v2/auth/login"));
         assert!(!is_public_login_path("/api/v2/auth/logout"));
         assert!(!is_public_login_path("/api/v2/auth/login/extra"));
+    }
+
+    #[test]
+    fn webui_runtime_config_is_public_but_nearby_paths_are_not() {
+        assert!(is_public_webui_path("/runtime-config.js"));
+        assert!(is_public_webui_path("/assets/index.js"));
+        assert!(!is_public_webui_path("/runtime-config.js/extra"));
+        assert!(!is_public_webui_path("/api/v1/transfer/info"));
     }
 
     #[tokio::test]

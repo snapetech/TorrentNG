@@ -3,7 +3,8 @@ set -eu
 
 case "${TNG_DEPLOYMENT_MODE:-}" in
     native)
-        exec "$TNG_INSTALL_DIR/bin/torrentngd" "$TNG_DATA_DIR/config.toml"
+        export TORRENTNGD_CONFIG="$TNG_DATA_DIR/config.toml"
+        exec "$TNG_INSTALL_DIR/bin/torrentngd"
         ;;
     existing)
         exec "$TNG_INSTALL_DIR/bin/torrentng" "$TNG_DATA_DIR/config.toml"

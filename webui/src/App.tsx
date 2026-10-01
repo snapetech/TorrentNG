@@ -1454,7 +1454,7 @@ function LoginScreen({ message, onLogin }: {
   message: string
   onLogin: (username: string, password: string) => Promise<void>
 }) {
-  const [username, setUsername] = useState('keith')
+  const [username, setUsername] = useState('torrentng')
   const [password, setPassword] = useState('')
   const [error, setError] = useState(message)
   const [busy, setBusy] = useState(false)
@@ -1492,10 +1492,12 @@ function LoginScreen({ message, onLogin }: {
             }} />
             <h1 style={{ margin: 0, fontWeight: 800, fontSize: 18 }}>TorrentNG</h1>
           </div>
-          <div style={{ color: 'var(--faint)', fontSize: 12, marginTop: 4 }}>Sign in to manage torrents</div>
+          <div style={{ color: 'var(--faint)', fontSize: 12, marginTop: 4 }}>
+            Sign in with this server’s API token. The username can be any value.
+          </div>
         </div>
         <label className="tng-form-card" style={{ display: 'flex', flexDirection: 'column', gap: 5, fontSize: 12, color: 'var(--muted)' }}>
-          Username
+          Username (any value)
           <input
             id="tng-login-username"
             name="username"
@@ -1510,7 +1512,7 @@ function LoginScreen({ message, onLogin }: {
           />
         </label>
         <label className="tng-form-card" style={{ display: 'flex', flexDirection: 'column', gap: 5, fontSize: 12, color: 'var(--muted)' }}>
-          Password
+          API token
           <input
             id="tng-login-password"
             name="password"
