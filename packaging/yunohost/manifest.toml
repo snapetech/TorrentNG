@@ -159,10 +159,10 @@ ram.runtime = "512M"
 [resources]
     [resources.sources.main]
     in_subdir = false
-    amd64.url = "https://github.com/snapetech/TorrentNG/releases/download/main-REPLACE/torrentng-yunohost-main-REPLACE-linux-amd64.tar.gz"
-    amd64.sha256 = "REPLACE_WITH_RELEASE_SHA256"
-    arm64.url = "https://github.com/snapetech/TorrentNG/releases/download/main-REPLACE/torrentng-yunohost-main-REPLACE-linux-arm64.tar.gz"
-    arm64.sha256 = "REPLACE_WITH_RELEASE_SHA256"
+    amd64.url = "https://github.com/snapetech/TorrentNG/releases/download/yunohost-0.1.0-1/torrentng-yunohost-0.1.0-1-linux-amd64.tar.gz"
+    amd64.sha256 = "2f8341775be96101cd7adf480f28257f0a1cade893b9e6b68af6315c7a82e6fa"
+    arm64.url = "https://github.com/snapetech/TorrentNG/releases/download/yunohost-0.1.0-1/torrentng-yunohost-0.1.0-1-linux-arm64.tar.gz"
+    arm64.sha256 = "ac1fa1dcf76eda9c5a720e4ae6301a79184d5384a553546edbb8e6903564173c"
 
     [resources.system_user]
 
