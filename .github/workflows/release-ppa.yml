@@ -52,7 +52,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
-            debhelper devscripts dput dpkg-dev fakeroot gnupg
+            build-essential debhelper devscripts dput dpkg-dev fakeroot gnupg
 
       - name: Import and verify Launchpad upload key
         env:

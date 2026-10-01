@@ -85,7 +85,11 @@ gh release download "$release_tag" \
   sha256sum --ignore-missing --check --status "$checksum_file"
 )
 
-source_epoch="$(git show -s --format=%ct "$release_tag")"
+source_epoch="$(git log -1 --format=%ct "$release_tag^{commit}")"
+if [[ ! "$source_epoch" =~ ^[0-9]+$ ]]; then
+  echo "Could not determine the source commit timestamp for $release_tag." >&2
+  exit 1
+fi
 git archive --format=tar "$release_tag" | tar -xf - -C "$source_root"
 
 mkdir -p "$source_root/release-assets/amd64" "$source_root/release-assets/arm64"
