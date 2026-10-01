@@ -57,7 +57,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
-            build-essential debhelper devscripts dput dpkg-dev fakeroot gnupg
+            build-essential curl debhelper devscripts dput dpkg-dev fakeroot gnupg
 
       - name: Import and verify Launchpad upload key
         env:
@@ -108,6 +108,10 @@ jobs:
           set -euo pipefail
           output_dir="$RUNNER_TEMP/launchpad-ppa"
           mkdir -p "$output_dir"
+          upstream_version="${RELEASE_TAG#main-}"
+          upstream_version="${upstream_version#v}"
+          upstream_version="${upstream_version//-/.}"
+          shared_orig=""
           for series in jammy noble resolute; do
             include_orig="$INPUT_INCLUDE_ORIG"
             if [[ "$series" != jammy ]]; then
@@ -115,7 +119,10 @@ jobs:
             fi
             changes_file="$(scripts/build_launchpad_ppa_source.sh \
               "$RELEASE_TAG" "$series" "$GITHUB_RUN_ID" \
-              "$GITHUB_RUN_ATTEMPT" "$output_dir" "$include_orig")"
+              "$GITHUB_RUN_ATTEMPT" "$output_dir" "$include_orig" "$shared_orig")"
+            if [[ "$series" == jammy ]]; then
+              shared_orig="$output_dir/jammy/torrentngd_${upstream_version}.orig.tar.gz"
+            fi
             dput ppa:keefshape/torrentng "$changes_file"
             echo "Uploaded $series source package: $(basename "$changes_file")"
           done

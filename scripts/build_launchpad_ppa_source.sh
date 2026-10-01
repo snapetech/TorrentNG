@@ -3,7 +3,7 @@ set -Eeuo pipefail
 
 usage() {
   cat >&2 <<'USAGE'
-usage: build_launchpad_ppa_source.sh <release-tag> <ubuntu-series> <run-id> <run-attempt> <output-dir> [include-orig]
+usage: build_launchpad_ppa_source.sh <release-tag> <ubuntu-series> <run-id> <run-attempt> <output-dir> [include-orig] [shared-orig]
 
 Builds a signed Launchpad source package containing the matching amd64 and
 arm64 TorrentNG release assets. Requires gh authentication, dpkg packaging
@@ -11,7 +11,7 @@ tools, and the Launchpad-authorized private OpenPGP key in GPG's keyring.
 USAGE
 }
 
-if [[ $# -lt 5 || $# -gt 6 ]]; then
+if [[ $# -lt 5 || $# -gt 7 ]]; then
   usage
   exit 2
 fi
@@ -22,6 +22,7 @@ run_id="$3"
 run_attempt="$4"
 output_dir="$5"
 include_orig="${6:-true}"
+shared_orig="${7:-}"
 
 if [[ "$include_orig" != true && "$include_orig" != false ]]; then
   echo "include-orig must be true or false." >&2
@@ -109,12 +110,33 @@ for architecture in amd64 arm64; do
   test -s "$source_root/release-assets/$architecture/usr/share/torrentng/webui/index.html"
 done
 
-orig_tarball="$output_dir/$series/torrentngd_${upstream_version}.orig.tar.gz"
-if [[ ! -f "$orig_tarball" ]]; then
-  tar --sort=name --mtime="@${source_epoch}" --owner=0 --group=0 --numeric-owner \
-    --format=gnu -cf - -C "$workspace" "torrentngd-${upstream_version}" | gzip -n > "$orig_tarball"
+orig_basename="torrentngd_${upstream_version}.orig.tar.gz"
+orig_tarball="$output_dir/$series/$orig_basename"
+if [[ -n "$shared_orig" ]]; then
+  [[ -s "$shared_orig" ]] || {
+    echo "Shared upstream source archive does not exist: $shared_orig" >&2
+    exit 1
+  }
+  cp -- "$shared_orig" "$orig_tarball"
+elif [[ "$include_orig" == true ]]; then
+  if [[ ! -f "$orig_tarball" ]]; then
+    tar --sort=name --mtime="@${source_epoch}" --owner=0 --group=0 --numeric-owner \
+      --format=gnu -cf - -C "$workspace" "torrentngd-${upstream_version}" | gzip -n > "$orig_tarball"
+  fi
+else
+  orig_url="https://launchpad.net/~keefshape/+archive/ubuntu/torrentng/+files/$orig_basename"
+  curl --fail --silent --show-error --location --retry 3 --max-time 120 \
+    "$orig_url" --output "$orig_tarball" || {
+    echo "Could not retrieve the existing Launchpad source archive: $orig_basename" >&2
+    exit 1
+  }
+  gzip --test "$orig_tarball" || {
+    rm -f -- "$orig_tarball"
+    echo "Launchpad returned an invalid source archive: $orig_basename" >&2
+    exit 1
+  }
 fi
-cp "$orig_tarball" "$workspace/"
+cp -- "$orig_tarball" "$workspace/"
 
 cp -a "$repo_root/packaging/launchpad/debian" "$source_root/debian"
 source_date="$(date -Ru)"
