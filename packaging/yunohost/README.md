@@ -10,8 +10,9 @@ The package uses YunoHost packaging format 2. It supports YunoHost 12 on
 not depend on the host glibc version. The WebUI supports root and subpath
 installs, and the package keeps its state separate from downloaded payloads.
 
-The upstream release workflow builds the architecture-specific bundles named
-in `manifest.toml`. The app catalog is a separate YunoHost repository; the
+Create a `yunohost-*` tag to publish portable bundles through the dedicated
+YunoHost release workflow. Future `main-*` upstream releases also build
+YunoHost bundles. The app catalog is a separate YunoHost repository; the
 package should be listed there only after the release assets and YunoHost
 package checks are available.
 

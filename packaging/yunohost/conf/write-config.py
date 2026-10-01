@@ -118,7 +118,6 @@ def existing_config() -> str:
             f"secret_key = {toml_string(env('TNG_SESSION_SECRET'))}",
             f"api_tokens = [{toml_string(env('TNG_API_TOKEN'))}]",
             "trust_proxy_header = false",
-            "secure_cookies = false",
             "",
         ]
     )

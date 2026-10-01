@@ -17,8 +17,7 @@ RUN npm ci --ignore-scripts
 COPY webui/ ./
 RUN TNG_WEBUI_OUT_DIR=/src/webui/dist npm run build
 
-FROM alpine:3.22 AS bundle
-WORKDIR /out
-COPY --from=rust-build /src/target/release/torrentngd /out/bin/torrentngd
-COPY --from=rust-build /src/sidecar/target/release/torrentng /out/bin/torrentng
-COPY --from=webui-build /src/webui/dist /out/webui
+FROM scratch AS bundle
+COPY --from=rust-build /src/target/release/torrentngd /bin/torrentngd
+COPY --from=rust-build /src/sidecar/target/release/torrentng /bin/torrentng
+COPY --from=webui-build /src/webui/dist /webui
