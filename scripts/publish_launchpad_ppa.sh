@@ -78,7 +78,7 @@ keyserver_has_key() {
 ensure_additional_key() {
   local fingerprint passphrase pending_passphrase observed_fingerprint
   local attempt registered
-  local encrypted_message="" message_line got_end=false decrypted_message confirmation_url
+  local challenge="" message_line signed_challenge
 
   fingerprint="$(additional_key_fingerprint)"
   if [[ -z "$fingerprint" ]]; then
@@ -177,59 +177,27 @@ ensure_additional_key() {
   fi
   IFS= read -r -p 'Press Enter once the import request is submitted or already pending: ' </dev/tty
 
-  printf '\nLaunchpad sends an encrypted confirmation email. Copy only its complete PGP MESSAGE block.\n'
-  printf 'Paste it here; input ends automatically at -----END PGP MESSAGE-----.\n'
+  printf '\nLaunchpad sends a confirmation link to the new key email address.\n'
+  printf 'Open that link. On the "Confirm sign-only OpenPGP key" page, copy the complete challenge paragraph.\n'
+  printf 'Paste the paragraph here, then press Enter on an empty line to sign it with the additional key.\n'
   while IFS= read -r message_line; do
-    encrypted_message+="$message_line"$'\n'
-    if [[ "${message_line%$'\r'}" == '-----END PGP MESSAGE-----' ]]; then
-      got_end=true
-      break
-    fi
+    [[ -z "$message_line" ]] && break
+    challenge+="$message_line"$'\n'
   done </dev/tty
-  [[ "$got_end" == true && "$encrypted_message" == *'-----BEGIN PGP MESSAGE-----'* ]] ||
-    fail "No complete encrypted Launchpad confirmation message was provided. Rerun the script; the key will be reused."
+  [[ -n "$challenge" ]] ||
+    fail "No Launchpad challenge text was provided. Rerun the script; it will reuse the same key."
 
-  decrypted_message="$(printf '%s' "$encrypted_message" |
-    gpg --batch --pinentry-mode loopback --passphrase-fd 3 --decrypt \
+  signed_challenge="$(printf '%s' "$challenge" |
+    gpg --batch --yes --armor --clearsign --pinentry-mode loopback --passphrase-fd 3 \
+      --local-user "$fingerprint" \
       3< <(secret-tool lookup service "$ADDITIONAL_KEY_SECRET_SERVICE" \
-        fingerprint "$fingerprint"; printf '\n') 2>/dev/null)" ||
-    fail "Could not decrypt Launchpad's message with the additional key."
-  unset encrypted_message
-
-  confirmation_url="$(printf '%s\n' "$decrypted_message" | python3 -c '
-import re
-import sys
-from urllib.parse import urlsplit
-
-text = sys.stdin.read()
-urls = []
-for value in re.findall(r"https://[^\s<>]+", text):
-    value = value.rstrip(".,;)]}" + chr(34))
-    parsed = urlsplit(value)
-    if parsed.hostname == "launchpad.net":
-        urls.append(value)
-        if "confirm" in parsed.path.lower() or "confirm" in parsed.query.lower():
-            print(value)
-            raise SystemExit(0)
-if urls:
-    print(urls[-1])
-')"
-  if [[ -n "$confirmation_url" ]]; then
-    printf 'Opening Launchpad confirmation link...\n'
-    if command -v xdg-open >/dev/null 2>&1 &&
-      [[ -n "${DISPLAY:-}${WAYLAND_DISPLAY:-}" ]]; then
-      xdg-open "$confirmation_url" >/dev/null 2>&1 ||
-        printf 'Open this confirmation URL in your browser:\n%s\n' "$confirmation_url"
-    else
-      printf 'Open this confirmation URL in your browser:\n%s\n' "$confirmation_url"
-    fi
-    unset confirmation_url
-  else
-    printf '%s\n' "$decrypted_message" >&2
-    printf 'Open the Launchpad confirmation link shown above, then return here.\n'
-  fi
-  unset decrypted_message
-  IFS= read -r -p 'Press Enter after confirming the key in Launchpad: ' </dev/tty
+        fingerprint "$fingerprint"; printf '\n'))" ||
+    fail "Could not clear-sign Launchpad's challenge with the additional key."
+  unset challenge
+  printf '\nPaste the complete clear-signed block below into Launchpad and click Continue:\n\n'
+  printf '%s\n' "$signed_challenge"
+  unset signed_challenge
+  IFS= read -r -p 'Press Enter after Launchpad reports that the key was validated: ' </dev/tty
 
   printf 'Waiting for Launchpad to confirm the additional key...\n'
   for attempt in {1..120}; do
