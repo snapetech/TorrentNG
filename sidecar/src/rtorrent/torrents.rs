@@ -38,6 +38,13 @@ const LEGACY_RTORRENT_NONZERO_RATE_PATCH: &str = "rtorrent-0.16.11-multicall-non
 const LEGACY_RTORRENT_LIVE_SUMMARY_PATCH: &str = "rtorrent-0.16.11-tng-live-summary";
 const RTORRENT_DEFAULT_SAVE_PATH: &str = "/downloads/temp";
 
+fn ensure_paged_torrent_capacity(current: usize, additional: usize) -> Result<()> {
+    if current.saturating_add(additional) > MAX_LEGACY_FULL_LIST_ENTRIES {
+        bail!("rTorrent paged response contains more than {MAX_LEGACY_FULL_LIST_ENTRIES} torrents");
+    }
+    Ok(())
+}
+
 #[derive(Debug, Clone)]
 pub struct RawTorrent {
     pub hash: String,
@@ -238,6 +245,7 @@ impl Client {
                 .list_torrents_range(view, offset, MULTICALL_RANGE_PAGE_SIZE)
                 .await?;
             let page_len = i64::try_from(page.len()).context("rTorrent page length exceeds i64")?;
+            ensure_paged_torrent_capacity(torrents.len(), page.len())?;
             torrents.append(&mut page);
             if page_len < MULTICALL_RANGE_PAGE_SIZE {
                 break;
@@ -837,11 +845,19 @@ fn base64_encode(data: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        bounded_range_args, decode_legacy_category, live_summary_args, nonzero_rate_args,
-        normalize_rtorrent_save_path, parse_torrent_rows,
+        bounded_range_args, decode_legacy_category, ensure_paged_torrent_capacity,
+        live_summary_args, nonzero_rate_args, normalize_rtorrent_save_path, parse_torrent_rows,
         rtorrent_patch_manifest_enables_bounded_live, validate_torrent_metrics, TorrentMetrics,
+        MAX_LEGACY_FULL_LIST_ENTRIES,
     };
     use crate::rtorrent::XmlValue;
+
+    #[test]
+    fn paged_torrent_list_stops_at_the_legacy_response_limit() {
+        assert!(ensure_paged_torrent_capacity(MAX_LEGACY_FULL_LIST_ENTRIES - 1, 1).is_ok());
+        assert!(ensure_paged_torrent_capacity(MAX_LEGACY_FULL_LIST_ENTRIES, 1).is_err());
+        assert!(ensure_paged_torrent_capacity(usize::MAX, 1).is_err());
+    }
 
     #[test]
     fn decode_legacy_category_decodes_rutorrent_style_encoding() {
