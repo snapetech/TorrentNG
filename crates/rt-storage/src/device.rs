@@ -3,7 +3,12 @@ use std::fs::File;
 #[cfg(target_os = "linux")]
 use std::io::Read;
 use std::path::Path;
-#[cfg(target_os = "linux")]
+#[cfg(any(
+    target_os = "linux",
+    target_os = "macos",
+    target_os = "freebsd",
+    windows
+))]
 use std::path::PathBuf;
 
 use rt_path::StorageProfile;
