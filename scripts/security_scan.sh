@@ -36,7 +36,11 @@ mark() {
   echo "|---|---|---|"
 } > "$OUT"
 
-if command -v npm >/dev/null 2>&1; then
+if ! command -v npm >/dev/null 2>&1; then
+  mark "npm production audit" "BLOCKED" "npm not installed"
+elif ! command -v jq >/dev/null 2>&1; then
+  mark "npm production audit" "BLOCKED" "jq not installed; cannot parse npm audit JSON"
+else
   (
     cd "$ROOT/webui"
     npm audit --audit-level=high --omit=dev --json > "$TMP_DIR/npm-audit.json"
@@ -48,8 +52,6 @@ if command -v npm >/dev/null 2>&1; then
   else
     mark "npm production audit" "FAIL" "high=$high critical=$critical; see npm audit output"
   fi
-else
-  mark "npm production audit" "BLOCKED" "npm not installed"
 fi
 
 if command -v cargo >/dev/null 2>&1; then

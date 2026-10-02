@@ -3,16 +3,48 @@
 This is the operator sequence for turning the current certification state into a
 strict release-ready state.
 
-The current runtime product revision is `b393eb0`; the evidence reconciliation
-is on `main` at `50e0fc3`. GitHub Actions run `34521941751` passed all ten jobs
-and dynamic CodeQL run `34521941269` passed all four analyses on `196c65a`.
-CI success does not configure branch protection or certify broader
-public-network, target-device, or scale behavior.
+The current worktree qualification is at `1dea3ea`; older runtime product and
+LVM evidence remains tied to the commit recorded by each report. GitHub
+Actions evidence cited below is historical hosted-run evidence; CI success does
+not configure branch protection or certify broader public-network, target-device,
+or scale behavior.
+
+## Current qualification scope — 2026-09-16
+
+Numeric torrent-count capacity proofs, including 10k/100k synthetic or
+hot-set runs, are removed from the required release scope. Existing reports and
+tests remain historical or diagnostic evidence and must not be summarized as a
+capacity certificate. The current qualification also defers the 24-hour soak;
+run the non-soak gates with `TNG_DEFER_24H_SOAK=1` and record the deferral
+explicitly. A later soak must target the then-current artifact before making a
+stability claim.
 
 The concrete failure history and fixes for recent hosted regressions are
 tracked in [`CI_FAILURE_BURN_DOWN.md`](CI_FAILURE_BURN_DOWN.md).
 
-## Current qualification update — 2026-09-10
+## Current qualification update — 2026-09-16
+
+The current qualification is intentionally narrower than a production-scale
+certificate. Numeric torrent-count proofs are out of scope, and the 24-hour
+soak is explicitly deferred with `TNG_DEFER_24H_SOAK=1`.
+
+| Gate | Result | Evidence |
+| --- | --- | --- |
+| Local Docker interoperability | PASS | [`interop-matrix-current-local-20260916.md`](../certification/reports/interop-matrix-current-local-20260916.md); 28/28 rows pass across qBittorrent, Transmission, Deluge, and rTorrent, including protocol and recovery rows |
+| Public Debian transfer | PASS | [`interop-matrix-current-public-debian-20260916.md`](../certification/reports/interop-matrix-current-public-debian-20260916.md); official Debian 13.7 netinst, 792,723,456 bytes, 143 Rust peers observed |
+| Public Ubuntu transfer | FAIL/UNQUALIFIED | [`interop-matrix-current-public-ubuntu-bounded-20260916.md`](../certification/reports/interop-matrix-current-public-ubuntu-bounded-20260916.md); official Ubuntu 26.04.1, bounded at 120 seconds, no completed payload |
+| Public Fedora transfer | FAIL/UNQUALIFIED | [`interop-matrix-current-public-fedora-bounded-20260916.md`](../certification/reports/interop-matrix-current-public-fedora-bounded-20260916.md); official Fedora Server 45 Beta, bounded at 120 seconds, no completed payload |
+| Live fault-containment matrix | PASS | [`backend-burndown-fault-matrix-current-20260916.md`](../certification/reports/backend-burndown-fault-matrix-current-20260916.md); live crash/restart, SQLite failure/recovery, cancellation, and filesystem isolation pass |
+| Storage lab certification | PASS | [`storage-release-certification-lab-current-20260916.md`](../certification/reports/storage-release-certification-lab-current-20260916.md); temporary tmpfs root only, not physical-device evidence |
+| External evidence preflight | PASS_WITH_WARNINGS | [`external-evidence-preflight-current-20260916.md`](../certification/reports/external-evidence-preflight-current-20260916.md); real-device target unavailable, soak informationally deferred |
+| Local release readiness | PASS | [`release-readiness-local-current-20260916.md`](../certification/reports/release-readiness-local-current-20260916.md) |
+| Strict release readiness | FAIL | [`release-readiness-current-20260916.md`](../certification/reports/release-readiness-current-20260916.md); external policy rows remain non-clean |
+
+The 2026-09-16 public failures are recorded as qualification results, not
+capacity proofs. They do not show a TorrentNG protocol failure: neither source
+reached the harness completion/hash gate within the explicit bounded window.
+
+## Historical qualification update — 2026-09-10
 
 The following external gates are now recorded in the repository. The storage
 and current local/public live reports are tied to pushed commit `b393eb0`; the
@@ -23,7 +55,7 @@ report does not record a source commit.
 | --- | --- | --- |
 | Public Debian transfer | PASS | [`interop-matrix-20260910T192200Z.md`](../certification/reports/interop-matrix-20260910T192200Z.md); canonical parent [`universal-compat-b393eb0-all-live.md`](../certification/reports/universal-compat-b393eb0-all-live.md), 142 peers observed |
 | Canonical all-live compatibility | PASS_WITH_SKIPS | [`universal-compat-b393eb0-all-live.md`](../certification/reports/universal-compat-b393eb0-all-live.md); local Docker, mobile, and public Debian pass; the separately certified real-device storage wrapper is skipped |
-| Public Debian 24-hour soak | PASS | [`soak-final-public-debian-20260910.md`](../certification/reports/soak-final-public-debian-20260910.md); 1,437 samples and one exact completed torrent |
+| Public Debian 24-hour soak | DEFERRED | The prior named run remains archival evidence; the current qualification makes no 24-hour stability claim |
 | kspls0 LVM storage release certification | PASS | [`storage-release-certification-kspls0-lvm-20260910-b393eb0.md`](../certification/reports/storage-release-certification-kspls0-lvm-20260910-b393eb0.md); HDD median 5.11x, LVM extent, io_uring, and real-root move/import checks |
 | kspls0 real-device storage matrix | PASS_WITH_SKIPS | [`universal-live-kspls0-lvm-20260910-b393eb0.md`](../certification/reports/universal-live-kspls0-lvm-20260910-b393eb0.md); targeted storage leg passes, unrelated live legs are explicit skips |
 | Strict external preflight | PASS | [`external-evidence-preflight-release-strict-20260910-b393eb0.md`](../certification/reports/external-evidence-preflight-release-strict-20260910-b393eb0.md) |
@@ -34,8 +66,9 @@ report does not record a source commit.
 The storage release report and all current child reports record commit `b393eb0`.
 These results qualify the exercised Debian torrent and kspls0 LVM target; they
 do not turn one public source into universal compatibility or one storage host
-into a fleet-wide capacity claim. The counted soak remains valid evidence for
-the named run, but its raw source predates b393 and is not a b393 release soak.
+into a fleet-wide capacity claim. The prior counted soak remains archival
+evidence for its named run, but its raw source predates b393 and is not a
+current release soak.
 
 The machine-readable final rollup is
 [`certification-status-20260910-50e0fc3.json`](../certification/reports/certification-status-20260910-50e0fc3.json),
@@ -63,8 +96,9 @@ scripts/certification_burndown.sh
 The local release gate may report `PASS_WITH_WARNINGS` while external evidence
 is missing. That is expected before the next sections are complete.
 Use the external preflight report to check whether the current host has Docker,
-public-transfer opt-in, corpus files, a writable storage target, and an active
-24h soak before launching long gates.
+public-transfer opt-in, corpus files, and a writable storage target before
+launching live gates. The current qualification deliberately omits the long
+soak; set `TNG_DEFER_24H_SOAK=1` so the report records that policy.
 For CI or release-blocking host validation, promote preflight warnings to
 failures:
 
@@ -127,9 +161,9 @@ INTEROP_KEEP_PUBLIC_DATA=1 \
 scripts/interop_matrix.sh --public
 ```
 
-The named Debian transfer and soak are already complete. Use the reports in the
-current qualification update above as the release evidence; rerun the commands
-only when a new artifact or materially different configuration needs fresh
+The named Debian transfer is complete. Use the transfer report in the current
+qualification update above as evidence; the prior soak is archival. Rerun the
+commands when a new artifact or materially different configuration needs fresh
 qualification.
 
 Run real-device storage evidence on target hardware:
@@ -142,13 +176,13 @@ scripts/universal_live_certification.sh
 
 ## 24h Soak
 
-The named Debian run completed successfully. Its live source report is
+The named Debian run completed successfully in an earlier qualification. Its live source report is
 [`soak-24h-public-debian-20260905-v3.md`](../.run/soak-24h-public-debian-20260905-v3.md),
 and its finalization is
 [`soak-final-public-debian-20260910.md`](../certification/reports/soak-final-public-debian-20260910.md).
 The finalizer accepted 1,437 samples, one matching completed torrent, healthy
-HTTP/dependency responses, and the configured resource ceilings. The collected
-systemd unit is absent by design after completion.
+HTTP/dependency responses, and the configured resource ceilings. That result is
+retained as archival evidence; it is not a current-artifact release soak.
 
 Start the long soak:
 
@@ -176,9 +210,9 @@ scripts/soak_status.sh
 ```
 
 The soak runner records health and qBit sync HTTP status plus process RSS. A
-passing report is required for a strict production-readiness claim; a short
-local run is useful for smoke coverage but cannot substitute for the configured
-24-hour sample window or target-device evidence.
+passing report is required before making a strict production-readiness or
+stability claim. A short local run is useful for smoke coverage but cannot
+substitute for the configured 24-hour sample window or target-device evidence.
 
 Finalize it after completion:
 

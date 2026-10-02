@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
+# This is a literal Markdown instruction; backticks must not be shell-expanded.
+# shellcheck disable=SC2016
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 REPORT_DIR="${TNG_STORAGE_REPORT_DIR:-$ROOT/certification/reports}"
@@ -89,6 +91,8 @@ run_gate() {
   append_log "$name" "$log"
 }
 
+# Called indirectly through run_gate; ShellCheck cannot resolve that dispatch.
+# shellcheck disable=SC2329
 storage_child() {
   local exports=()
   while [[ "$#" -gt 0 && "$1" == *=* ]]; do
@@ -154,7 +158,9 @@ run_gate "storage certification index" storage_child \
   echo
   echo "- This script runs destructive-safe fixtures only; it creates and removes its own test files under the selected roots."
   echo "- Physical PV affinity remains evidence-only because ordinary LV path writes do not select a specific PV."
-  echo "- `TNG_STORAGE_SKIP_URING=1` and `TNG_STORAGE_SKIP_MOVE_IMPORT=1` fail release reports unless `TNG_STORAGE_ALLOW_RELEASE_SKIP=1` is also set for an explicit dry run."
+  # Literal Markdown instructions intentionally contain backticks.
+  # shellcheck disable=SC2016
+  echo '- `TNG_STORAGE_SKIP_URING=1` and `TNG_STORAGE_SKIP_MOVE_IMPORT=1` fail release reports unless `TNG_STORAGE_ALLOW_RELEASE_SKIP=1` is also set for an explicit dry run.'
   echo
   if [[ "$overall" -eq 0 ]]; then
     echo "Overall status: PASS"

@@ -2,7 +2,7 @@
 # Must track the compatible-client service Cargo.toml rust-version (verified against the
 # locked dependency graph -- see docs/BACKEND_AUDIT_BURN_DOWN.md TNG-028).
 # libsqlite3-sys's build script uses cfg_select!, requiring 1.97+.
-FROM rust:1.97-alpine AS torrentng-service-build
+FROM rust:1.97-alpine@sha256:3c38f3f82c2f3d73da3b38e18d279393a04cb43ddded0e35088a8c3324d40900 AS torrentng-service-build
 RUN apk add --no-cache musl-dev pkgconf openssl-dev openssl-libs-static
 WORKDIR /src
 RUN printf '%s\n' \
@@ -34,7 +34,7 @@ COPY sidecar/src ./src
 RUN touch src/lib.rs src/main.rs && cargo build --release
 
 # Stage 2: Build WebUI
-FROM node:22-bookworm-slim AS webui-build
+FROM node:22-bookworm-slim@sha256:48e4b67d85f87bd551df43704e24d252f56cc5f8e9718841aace50f19948f0f9 AS webui-build
 WORKDIR /src
 COPY webui/package.json webui/package-lock.json ./
 RUN npm ci --ignore-scripts
@@ -43,15 +43,25 @@ RUN npm run build
 
 # Stage 3: Build modern rTorrent/libtorrent.
 # The patches expose tracker identity controls used by the compatible-client service.
-FROM alpine:3.20 AS rtorrent-build
-ARG RTORRENT_VERSION=0.16.11
-ARG LIBTORRENT_VERSION=0.16.11
+# These commits are the v0.16.11 source revisions. Fetch by object ID rather
+# than by a mutable tag so a retagged upstream release cannot change the image.
+FROM alpine:3.20@sha256:d9e853e87e55526f6b2917df91a2115c36dd7c696a35be12163d44e6e2a4b6bc AS rtorrent-build
+ARG RTORRENT_COMMIT=2700b3141f966d8533a6153491e1c76b3cf5c2b9
+ARG LIBTORRENT_COMMIT=dafcba711114af2274a45ca55a7bcd4abdf5ca9a
 RUN apk add --no-cache \
     autoconf automake build-base cmake curl-dev git libtool linux-headers \
     ncurses-dev ninja openssl-dev pkgconf tinyxml2-dev zlib-dev
 WORKDIR /src
-RUN git clone --depth=1 --branch "v${LIBTORRENT_VERSION}" https://github.com/rakshasa/libtorrent.git && \
-    git clone --depth=1 --branch "v${RTORRENT_VERSION}" https://github.com/rakshasa/rtorrent.git
+RUN git init libtorrent && \
+    git -C libtorrent remote add origin https://github.com/rakshasa/libtorrent.git && \
+    git -C libtorrent fetch --depth=1 origin "$LIBTORRENT_COMMIT" && \
+    git -C libtorrent checkout --detach FETCH_HEAD && \
+    test "$(git -C libtorrent rev-parse HEAD)" = "$LIBTORRENT_COMMIT" && \
+    git init rtorrent && \
+    git -C rtorrent remote add origin https://github.com/rakshasa/rtorrent.git && \
+    git -C rtorrent fetch --depth=1 origin "$RTORRENT_COMMIT" && \
+    git -C rtorrent checkout --detach FETCH_HEAD && \
+    test "$(git -C rtorrent rev-parse HEAD)" = "$RTORRENT_COMMIT"
 COPY deploy/docker/patches/rtorrent-0.16.11-user-agent-command.patch /tmp/rtorrent-user-agent-command.patch
 COPY deploy/docker/patches/rtorrent-0.16.11-local-id-command.patch /tmp/rtorrent-local-id-command.patch
 COPY deploy/docker/patches/rtorrent-0.16.11-multicall-range.patch /tmp/rtorrent-multicall-range.patch

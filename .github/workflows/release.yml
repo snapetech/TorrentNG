@@ -120,14 +120,14 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           fetch-depth: 0
           ref: ${{ needs.validate-release-tag.outputs.tag }}
           persist-credentials: false
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
 
       - name: Check formatting
         run: cargo fmt --all -- --check
@@ -159,13 +159,13 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           ref: ${{ needs.validate-release-tag.outputs.tag }}
           persist-credentials: false
 
       - name: Install Rust 1.88.0
-        uses: dtolnay/rust-toolchain@1.88.0
+        uses: dtolnay/rust-toolchain@688313b0823df1393bcebb1b4add0438a6d36884 # 1.88.0
 
       - name: Build TorrentNG client workspace at declared MSRV
         run: cargo build --workspace --all-targets --locked
@@ -179,13 +179,13 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           ref: ${{ needs.validate-release-tag.outputs.tag }}
           persist-credentials: false
 
       - name: Install Rust 1.97.0
-        uses: dtolnay/rust-toolchain@1.97.0
+        uses: dtolnay/rust-toolchain@86e7197484018ef6aaa9255d186f6ce1754276dd # 1.97.0
 
       - name: Build compatible-client service at declared MSRV
         run: cargo build --locked --manifest-path sidecar/Cargo.toml
@@ -200,13 +200,13 @@ jobs:
     timeout-minutes: 30
     steps:
       - name: Checkout
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           ref: ${{ needs.validate-release-tag.outputs.tag }}
           persist-credentials: false
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
 
       - name: Install cargo-audit
         run: cargo install cargo-audit --locked
@@ -217,8 +217,12 @@ jobs:
           cargo audit --file sidecar/Cargo.lock
           cargo audit --file fuzz/Cargo.lock
 
+      - name: Audit compatible-client service Rust dependencies
+        working-directory: sidecar
+        run: cargo audit
+
       - name: Setup Node
-        uses: actions/setup-node@v7
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
         with:
           node-version: "22"
 
@@ -234,13 +238,13 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           ref: ${{ needs.validate-release-tag.outputs.tag }}
           persist-credentials: false
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
 
       - name: Build native release binary
         run: cargo build --release --locked -p torrentngd
@@ -260,7 +264,7 @@ jobs:
 
       - name: Upload native release smoke evidence
         if: always()
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: native-release-smoke-${{ github.run_id }}
           path: |
@@ -298,17 +302,17 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - name: Checkout
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           fetch-depth: 0
           ref: ${{ needs.validate-release-tag.outputs.tag }}
           persist-credentials: false
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
 
       - name: Setup Node
-        uses: actions/setup-node@v7
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
         with:
           node-version: "22"
 
@@ -325,29 +329,38 @@ jobs:
         run: cargo build --release --locked -p torrentngd
 
       - name: Smoke TorrentNG client daemon version
+        env:
+          RELEASE_BINARY: ${{ matrix.binary }}
         shell: bash
         run: |
           set -euo pipefail
-          "target/release/${{ matrix.binary }}" --version
+          "target/release/$RELEASE_BINARY" --version
 
       - name: Package TorrentNG client assets
+        env:
+          RELEASE_ARCHIVE: ${{ matrix.archive }}
+          RELEASE_BINARY: ${{ matrix.binary }}
+          RELEASE_TAG: ${{ steps.tag.outputs.tag }}
+          RELEASE_SUFFIX: ${{ matrix.suffix }}
         shell: bash
         run: |
           set -euo pipefail
           tag="$RELEASE_TAG"
           suffix="${{ matrix.suffix }}"
           mkdir -p dist native/usr/bin native/usr/share/torrentng/webui
-          cp "target/release/${{ matrix.binary }}" "dist/torrentngd-${suffix}${{ matrix.binary == 'torrentngd.exe' && '.exe' || '' }}"
-          cp "target/release/${{ matrix.binary }}" "native/usr/bin/${{ matrix.binary }}"
+          artifact_suffix=""
+          [[ "$binary" == "torrentngd.exe" ]] && artifact_suffix=".exe"
+          cp "target/release/$binary" "dist/torrentngd-${suffix}${artifact_suffix}"
+          cp "target/release/$binary" "native/usr/bin/$binary"
           cp -a webui/dist/. native/usr/share/torrentng/webui/
-          if [[ "${{ matrix.archive }}" == "zip" ]]; then
+          if [[ "$RELEASE_ARCHIVE" == "zip" ]]; then
             powershell -NoProfile -Command "Compress-Archive -Path native/* -DestinationPath dist/torrentngd-native-${tag}-${suffix}.zip -Force"
           else
             tar -czf "dist/torrentngd-native-${tag}-${suffix}.tar.gz" -C native .
           fi
 
       - name: Upload TorrentNG client artifacts
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: native-${{ matrix.suffix }}
           path: dist/*
@@ -363,14 +376,14 @@ jobs:
     runs-on: [self-hosted, Linux, X64]
     steps:
       - name: Checkout
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           fetch-depth: 1
           ref: ${{ needs.validate-release-tag.outputs.tag }}
           persist-credentials: false
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
 
       - name: Build compatible-client service
         run: cargo build --release --locked --manifest-path sidecar/Cargo.toml
@@ -379,7 +392,7 @@ jobs:
         run: cargo test --locked --manifest-path sidecar/Cargo.toml
 
       - name: Setup Node
-        uses: actions/setup-node@v7
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
         with:
           node-version: "22"
 
@@ -563,7 +576,7 @@ jobs:
           tar -czf "dist/torrentng-deploy-${tag}.tar.gz" deploy docs README.md LICENSE
 
       - name: Upload shared artifacts
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: shared-linux-assets
           path: dist/*
@@ -640,12 +653,14 @@ jobs:
       actions: write
     steps:
       - name: Download release artifacts
-        uses: actions/download-artifact@v8
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
           path: dist
           merge-multiple: true
 
       - name: Generate checksums
+        env:
+          RELEASE_TAG: ${{ steps.tag.outputs.tag }}
         shell: bash
         run: |
           set -euo pipefail

@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
+# The nested bash snippets intentionally expand variables in their child shell.
+# shellcheck disable=SC2016
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
@@ -12,6 +14,8 @@ run_gate() {
 }
 
 run_gate "format" cargo fmt --check
+# The nested bash expands its own variables at runtime.
+# shellcheck disable=SC2016
 run_gate "owned-read adoption guard" bash -c '
   offenders="$(grep -RIn --include='*.rs' -E "scheduled_read\\(" crates \
     | grep -v "crates/rt-storage/src/scheduler.rs" || true)"
@@ -29,6 +33,8 @@ run_gate "engine storage/resource consumers" cargo test -p rt-engine
 run_gate "TorrentNG API metrics projection" cargo test -p rt-api-native
 
 if [[ "${STORAGE_NG_REAL_DEVICE:-0}" == "1" ]]; then
+  # The nested bash expands its positional path at runtime.
+  # shellcheck disable=SC2016
   run_gate "real-device storage probes" \
     bash -c 'STORAGE_PHASE_B_REAL_DEVICE=1 "$1"' _ "$ROOT/scripts/storage_phase_b_matrix.sh"
 fi

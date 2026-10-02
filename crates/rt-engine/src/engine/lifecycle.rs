@@ -938,6 +938,7 @@ impl Engine {
         )
         .await;
         task.attach_torrent_metadata_memory_lease(torrent_metadata_memory_lease);
+        task.attach_crash_safety(Arc::clone(&self.services.crash_safety));
         let handle = tokio::spawn(task.run());
         let tier_key = info_hash_hex.clone();
         self.runtime
@@ -1024,7 +1025,7 @@ impl Engine {
         torrent_metadata_memory_lease: MemoryLease,
     ) -> mpsc::Sender<TorrentCmd> {
         let (cmd_tx, cmd_rx) = mpsc::channel::<TorrentCmd>(32);
-        let task = V2TorrentTask::new(
+        let mut task = V2TorrentTask::new(
             meta,
             save,
             paused,
@@ -1049,6 +1050,7 @@ impl Engine {
             Some(torrent_metadata_memory_lease),
         )
         .await;
+        task.attach_crash_safety(Arc::clone(&self.services.crash_safety));
         let handle = tokio::spawn(task.run());
         let tier_key = info_hash_hex.clone();
         self.runtime
@@ -1699,7 +1701,7 @@ impl Engine {
         }
     }
 
-    pub(super) async fn shutdown_torrent_tasks(&mut self) {
+    pub(super) async fn shutdown_torrent_tasks(&mut self) -> bool {
         let task_count = self.runtime.torrent_chans.len();
         let timeout_secs = self.config.daemon.shutdown_timeout_secs.max(1);
         let timeout_budget = Duration::from_secs(timeout_secs);
@@ -1803,6 +1805,24 @@ impl Engine {
                 "torrent tasks stopped cleanly"
             );
         }
+        !timed_out
+    }
+
+    /// Close the run marker only when every torrent task saved its final
+    /// state. A task aborted at the deadline may have died mid-save, so the
+    /// next start must treat this run as unclean.
+    pub(super) async fn mark_run_finished(&self, tasks_stopped_cleanly: bool) {
+        if !tasks_stopped_cleanly {
+            warn!(
+                component = "crash_safety",
+                operation = "end_run",
+                result = "skipped",
+                "torrent tasks did not all stop cleanly; leaving the run marker unclean"
+            );
+            return;
+        }
+        let runtime = Arc::clone(&self.services.crash_safety);
+        let _ = tokio::task::spawn_blocking(move || runtime.end_run_gracefully()).await;
     }
 
     /// Promote dormant torrents whose persisted tracker deadlines are due.

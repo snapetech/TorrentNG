@@ -63,6 +63,25 @@ pub(crate) async fn download_remote_torrent(url: &str) -> Result<Vec<u8>> {
     Ok(body)
 }
 
+pub(crate) fn is_magnet_url(url: &str) -> bool {
+    url.get(.."magnet:".len())
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("magnet:"))
+}
+
+pub(crate) fn parse_backend_url(raw: &str, context: &str) -> Result<Url> {
+    let parsed = Url::parse(raw.trim()).with_context(|| format!("parse {context}"))?;
+    if !matches!(parsed.scheme(), "http" | "https") {
+        bail!("{context} must use http or https");
+    }
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        bail!("{context} credentials are not allowed; configure them in the dedicated fields");
+    }
+    if parsed.host_str().map(str::is_empty).unwrap_or(true) {
+        bail!("{context} has no host");
+    }
+    Ok(parsed)
+}
+
 /// POST a workflow webhook through the same address-pinned, no-redirect
 /// egress boundary as remote torrent downloads. Private destinations are only
 /// available when an operator explicitly enables them in configuration.
@@ -408,6 +427,18 @@ pub(crate) fn validate_qbit_mutation_body(body: &[u8], context: &str) -> Result<
 }
 
 pub(crate) const MAX_BACKEND_JSON_BYTES: usize = MAX_BACKEND_RESPONSE_BYTES;
+/// A bounded JSON body can still contain millions of tiny array/object
+/// entries. Keep deserialized backend collections aligned with the database
+/// result ceiling so an upstream cannot turn a valid response into an
+/// allocation storm.
+pub(crate) const MAX_BACKEND_COLLECTION_ITEMS: usize = 100_000;
+
+pub(crate) fn ensure_backend_collection_bound(count: usize, label: &str) -> Result<()> {
+    if count > MAX_BACKEND_COLLECTION_ITEMS {
+        bail!("{label} contains {count} items; maximum is {MAX_BACKEND_COLLECTION_ITEMS}");
+    }
+    Ok(())
+}
 
 /// Convert an externally supplied floating-point ratio into the fixed-point
 /// representation used by the compatibility model. Malformed or negative
@@ -434,7 +465,8 @@ pub(crate) fn checked_backend_file_index(file_index: usize, backend: &str) -> Re
 mod tests {
     use super::{
         bounded_remote_client, bounded_remote_dns_addresses, checked_backend_file_index,
-        is_public_unicast, is_valid_unicast, ratio_milli, MAX_REMOTE_DNS_ADDRESSES,
+        is_magnet_url, is_public_unicast, is_valid_unicast, parse_backend_url, ratio_milli,
+        MAX_REMOTE_DNS_ADDRESSES,
     };
     use std::{
         net::{IpAddr, SocketAddr},
@@ -716,12 +748,33 @@ mod tests {
     }
 
     #[test]
+    fn configured_backend_urls_are_http_only_and_credential_free() {
+        assert_eq!(
+            parse_backend_url(" HTTPS://backend.example.test/rpc ", "backend.url")
+                .unwrap()
+                .scheme(),
+            "https"
+        );
+        assert!(parse_backend_url("file:///tmp/backend", "backend.url").is_err());
+        assert!(parse_backend_url("http://user:pass@backend.test", "backend.url").is_err());
+        assert!(parse_backend_url("http://", "backend.url").is_err());
+    }
+
+    #[test]
     fn ratio_conversion_rejects_garbage_and_saturates_huge_values() {
         assert_eq!(ratio_milli(Some(1.25)), 1_250);
         assert_eq!(ratio_milli(None), 0);
         assert_eq!(ratio_milli(Some(-1.0)), 0);
         assert_eq!(ratio_milli(Some(f64::NAN)), 0);
         assert_eq!(ratio_milli(Some(f64::MAX)), i64::MAX);
+    }
+
+    #[test]
+    fn magnet_scheme_matching_is_case_insensitive_and_exact() {
+        assert!(is_magnet_url("magnet:?xt=urn:btih:abc"));
+        assert!(is_magnet_url("MAGNET:?xt=urn:btih:abc"));
+        assert!(!is_magnet_url("magnetized://example.test"));
+        assert!(!is_magnet_url("https://example.test/file.torrent"));
     }
 }
 
@@ -839,7 +892,7 @@ pub trait TorrentBackend: Send + Sync {
         )
     }
     async fn add_url(&self, url: &str, save_path: &str, category: &str, start: bool) -> Result<()> {
-        if url.starts_with("magnet:") {
+        if is_magnet_url(url) {
             return self.add_magnet(url, save_path, category, start).await;
         }
         let data = download_remote_torrent(url).await?;
@@ -1173,6 +1226,7 @@ pub(crate) fn parse_qbit_peer_response(response: &serde_json::Value) -> Result<V
         .get("peers")
         .and_then(serde_json::Value::as_object)
         .ok_or_else(|| anyhow::anyhow!("qBittorrent peer response has no peers object"))?;
+    ensure_backend_collection_bound(peers.len(), "qBittorrent peer response")?;
     peers
         .iter()
         .map(|(key, peer)| parse_qbit_peer(key, peer))
@@ -1200,6 +1254,9 @@ fn parse_qbit_peer(key: &str, peer: &serde_json::Value) -> Result<BackendPeer> {
         key.parse::<SocketAddr>()
             .with_context(|| format!("parse qBittorrent peer address {key:?}"))?
     };
+    if addr.port() == 0 {
+        bail!("qBittorrent peer {key:?} has an invalid port");
+    }
     let client = peer_object
         .get("client")
         .or_else(|| peer_object.get("peer_id_client"))

@@ -17,7 +17,7 @@ use axum::{
     http::{header, HeaderMap, HeaderValue, StatusCode},
     response::{
         sse::{Event, KeepAlive, Sse},
-        IntoResponse, Response,
+        AppendHeaders, IntoResponse, Response,
     },
     Json,
 };
@@ -26,12 +26,17 @@ use rt_api_model::{
     api_token_allowed, bearer_token, AddTorrentRequest, AddTorrentResponse, ApiError,
     ApiRuntimeMetricsSnapshot, ApiSseClientGuard, FileInfo, TorrentDetail, TorrentSummary,
 };
+use rt_db::MAX_TORRENT_FILE_PATH_BYTES;
 use rt_engine::{
     EngineDatabaseWorkerStats, EngineGlobalLimits, EngineHandle, EngineJob, EngineNetworkFeatures,
     EngineStorageRoot, EngineSubsystemHealth, EngineTorrentLimits, PeerIngressStats, QueueMove,
-    TorrentLiveStats, MAX_MANUAL_PEER_ADDRESSES,
+    TorrentLiveStats, MAX_ENGINE_CATEGORY_BYTES, MAX_ENGINE_INFO_HASH_BYTES,
+    MAX_ENGINE_INFO_HASH_LIST_BYTES, MAX_ENGINE_LABEL_BYTES, MAX_ENGINE_NAME_BYTES,
+    MAX_ENGINE_SAVE_PATH_BYTES, MAX_ENGINE_STORAGE_PLAN_PATH_BYTES,
+    MAX_ENGINE_STORAGE_PLAN_TOTAL_PATH_BYTES, MAX_ENGINE_TRACKER_BYTES, MAX_MANUAL_PEER_ADDRESSES,
+    MAX_STORAGE_PLAN_AFFECTED_TORRENTS, MAX_TRACKER_URL_BYTES,
 };
-use rt_metainfo::parse_magnet;
+use rt_metainfo::{parse_magnet, MAX_MAGNET_BYTES};
 use rt_metrics::{MemoryClass, MemoryLease};
 use rt_session::TorrentState;
 use rt_storage::{
@@ -78,6 +83,173 @@ const MAX_NATIVE_MULTIPART_TORRENT_BYTES: usize = 64 * 1024 * 1024;
 const MAX_NATIVE_MULTIPART_FIELDS: usize = 5;
 const MAX_NATIVE_LABEL_ITEMS: usize = 16_384;
 const MAX_NATIVE_LABEL_BYTES: usize = 4 * 1024 * 1024;
+const MAX_NATIVE_PEER_TEXT_BYTES: usize = 256;
+const MAX_NATIVE_PEER_LIST_BYTES: usize = 1024 * 1024;
+const MAX_NATIVE_RSS_TITLE_BYTES: usize = 64 * 1024;
+const MAX_NATIVE_JSON_TEXT_BYTES: usize = 64 * 1024;
+const MAX_NATIVE_USER_AGENT_BYTES: usize = 256;
+
+fn native_payload_too_large(error: String) -> Response {
+    (
+        StatusCode::PAYLOAD_TOO_LARGE,
+        Json(serde_json::to_value(ApiError::bad_request(error)).unwrap()),
+    )
+        .into_response()
+}
+
+fn validate_native_text(value: &str, maximum: usize, field: &str) -> Result<(), String> {
+    if value.len() > maximum {
+        return Err(format!(
+            "{field} contains {} bytes; maximum is {maximum}",
+            value.len()
+        ));
+    }
+    Ok(())
+}
+
+fn validate_native_text_list(
+    values: &[String],
+    item_maximum: usize,
+    aggregate_maximum: usize,
+    field: &str,
+) -> Result<(), String> {
+    let mut bytes = 0usize;
+    for (index, value) in values.iter().enumerate() {
+        validate_native_text(
+            value,
+            item_maximum,
+            &format!("{field} item at index {index}"),
+        )?;
+        bytes = bytes.saturating_add(value.len());
+        if bytes > aggregate_maximum {
+            return Err(format!(
+                "{field} contains {bytes} bytes; maximum is {aggregate_maximum}"
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_native_hash_list(values: &[String], field: &str) -> Result<(), String> {
+    validate_native_text_list(
+        values,
+        MAX_ENGINE_INFO_HASH_BYTES,
+        MAX_ENGINE_INFO_HASH_LIST_BYTES,
+        field,
+    )
+}
+
+fn validate_native_tracker_patch(req: &PatchTrackersRequest) -> Result<(), String> {
+    let mut bytes = 0usize;
+    let mut add = |value: &str, field: &str| {
+        validate_native_text(value, MAX_TRACKER_URL_BYTES, field)?;
+        bytes = bytes.saturating_add(value.len());
+        if bytes > MAX_ENGINE_TRACKER_BYTES {
+            return Err(format!(
+                "tracker patch contains {bytes} bytes; maximum is {MAX_ENGINE_TRACKER_BYTES}"
+            ));
+        }
+        Ok(())
+    };
+
+    for (index, value) in req.add.iter().enumerate() {
+        add(value, &format!("tracker add item at index {index}"))?;
+    }
+    for (index, value) in req.remove.iter().enumerate() {
+        add(value, &format!("tracker removal item at index {index}"))?;
+    }
+    for (index, edit) in req.edit.iter().enumerate() {
+        add(
+            &edit.orig_url,
+            &format!("tracker edit original URL at index {index}"),
+        )?;
+        add(
+            &edit.new_url,
+            &format!("tracker edit replacement URL at index {index}"),
+        )?;
+    }
+    Ok(())
+}
+
+fn validate_native_add_request(req: &AddTorrentRequest) -> Result<(), String> {
+    validate_native_text(&req.save_path, MAX_ENGINE_SAVE_PATH_BYTES, "save path")?;
+    if let Some(category) = req.category.as_deref() {
+        validate_native_text(category, MAX_ENGINE_CATEGORY_BYTES, "category")?;
+    }
+    if let Some(tags) = req.tags.as_deref() {
+        validate_native_text_list(tags, MAX_ENGINE_LABEL_BYTES, MAX_ENGINE_LABEL_BYTES, "tags")?;
+    }
+    if let Some(magnet) = req.magnet.as_deref() {
+        validate_native_text(magnet, MAX_MAGNET_BYTES, "magnet")?;
+    }
+    Ok(())
+}
+
+fn validate_native_rss_request(req: &RssSampleRequest) -> Result<(), String> {
+    validate_native_text(&req.title, MAX_NATIVE_RSS_TITLE_BYTES, "RSS title")?;
+    if let Some(link) = req.link.as_deref() {
+        validate_native_text(link, MAX_MAGNET_BYTES, "RSS link")?;
+    }
+    Ok(())
+}
+
+fn validate_native_storage_request(req: &StoragePlanRequest) -> Result<(), String> {
+    validate_native_text(&req.operation, 16, "storage operation")?;
+    let mut path_bytes = 0usize;
+    for (field, path) in [
+        ("source", req.source.as_ref()),
+        ("destination", req.destination.as_ref()),
+        ("target", req.target.as_ref()),
+    ] {
+        let Some(path) = path else {
+            continue;
+        };
+        let path = path.to_string_lossy();
+        validate_native_text(&path, MAX_ENGINE_STORAGE_PLAN_PATH_BYTES, field)?;
+        path_bytes = path_bytes.saturating_add(path.len());
+        if path_bytes > MAX_ENGINE_STORAGE_PLAN_TOTAL_PATH_BYTES {
+            return Err(format!(
+                "storage plan paths contain {path_bytes} bytes; maximum is {MAX_ENGINE_STORAGE_PLAN_TOTAL_PATH_BYTES}"
+            ));
+        }
+    }
+    if let Some(roots) = req.roots.as_deref() {
+        for (index, path) in roots.iter().enumerate() {
+            let path = path.to_string_lossy();
+            validate_native_text(
+                &path,
+                MAX_ENGINE_STORAGE_PLAN_PATH_BYTES,
+                &format!("storage root at index {index}"),
+            )?;
+            path_bytes = path_bytes.saturating_add(path.len());
+            if path_bytes > MAX_ENGINE_STORAGE_PLAN_TOTAL_PATH_BYTES {
+                return Err(format!(
+                    "storage plan paths contain {path_bytes} bytes; maximum is {MAX_ENGINE_STORAGE_PLAN_TOTAL_PATH_BYTES}"
+                ));
+            }
+        }
+    }
+    if let Some(affected_torrents) = req.affected_torrents.as_deref() {
+        if affected_torrents.len() > MAX_STORAGE_PLAN_AFFECTED_TORRENTS {
+            return Err(format!(
+                "storage plan torrent list exceeds the maximum of {MAX_STORAGE_PLAN_AFFECTED_TORRENTS} items"
+            ));
+        }
+        validate_native_hash_list(affected_torrents, "storage plan torrent list")?;
+    }
+    Ok(())
+}
+
+fn validate_native_info_hash(info_hash: &str) -> Result<(), String> {
+    if info_hash.is_empty() {
+        return Err("info hash must not be empty".to_owned());
+    }
+    validate_native_text(info_hash, MAX_ENGINE_INFO_HASH_BYTES, "info hash")
+}
+
+fn native_info_hash_is_bounded(info_hash: &str) -> bool {
+    validate_native_info_hash(info_hash).is_ok()
+}
 
 #[derive(Debug, Clone, Copy, Default)]
 struct MetricsHealth {
@@ -111,7 +283,7 @@ pub async fn auth_login(
         return response;
     }
 
-    let (username, password) = auth_form_credentials(&body);
+    let (username, password) = auth_form_credentials(&body).unwrap_or_default();
     let token = password
         .as_deref()
         .filter(|token| !token.is_empty())
@@ -131,7 +303,7 @@ pub async fn auth_login(
         .as_deref()
         .is_some_and(|candidate| candidate == credentials.username)
         && password_valid
-        && (!state.public_bind || credentials.password != "torrentng");
+        && (!state.public_bind || credentials.password.trim().len() >= 16);
     drop(credentials);
 
     let local_no_token_mode = state.api_tokens.is_empty()
@@ -181,17 +353,12 @@ pub async fn auth_login(
 #[derive(Serialize)]
 struct AuthSettingsResponse {
     username: String,
-    password_is_default: bool,
-    default_credentials_allowed: bool,
     api_token_login_enabled: bool,
 }
 
 fn auth_settings_response(state: &AppState, credentials: &AuthCredentials) -> AuthSettingsResponse {
-    let password_is_default = credentials.password == "torrentng";
     AuthSettingsResponse {
         username: credentials.username.clone(),
-        password_is_default,
-        default_credentials_allowed: !state.public_bind || !password_is_default,
         api_token_login_enabled: !state.api_tokens.is_empty(),
     }
 }
@@ -239,12 +406,12 @@ pub async fn update_auth_settings(
         )
             .into_response();
     }
-    if state.public_bind && request.password == "torrentng" {
+    if state.public_bind && request.password.trim().len() < 16 {
         return (
             StatusCode::BAD_REQUEST,
             Json(
                 serde_json::to_value(ApiError::bad_request(
-                    "the default WebUI password is disabled on public binds".to_owned(),
+                    "public binds require a WebUI password of at least 16 bytes".to_owned(),
                 ))
                 .unwrap(),
             ),
@@ -371,11 +538,17 @@ async fn persist_auth_credentials(
 /// `POST /api/v1/auth/logout` — TorrentNG WebUI logout probe.
 pub async fn auth_logout() -> impl IntoResponse {
     (
+        AppendHeaders([
+            (
+                header::SET_COOKIE,
+                "tng_session=; Max-Age=0; HttpOnly; SameSite=Lax; Path=/",
+            ),
+            (
+                header::SET_COOKIE,
+                "SID=; Max-Age=0; HttpOnly; SameSite=Lax; Path=/",
+            ),
+        ]),
         StatusCode::OK,
-        [(
-            header::SET_COOKIE,
-            HeaderValue::from_static("tng_session=; Max-Age=0; HttpOnly; SameSite=Lax; Path=/"),
-        )],
     )
 }
 
@@ -435,6 +608,11 @@ fn parse_torrent_live_hashes(raw: Option<&str>) -> Result<Vec<String>, String> {
         .map(str::trim)
         .filter(|value| !value.is_empty())
     {
+        if hashes.len() >= MAX_TORRENT_LIVE_STATS {
+            return Err(format!(
+                "at most {MAX_TORRENT_LIVE_STATS} hashes may be requested"
+            ));
+        }
         if !matches!(value.len(), 40 | 64) || !value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
             return Err(
                 "hashes must contain 40- or 64-character hexadecimal info hashes".to_owned(),
@@ -447,11 +625,6 @@ fn parse_torrent_live_hashes(raw: Option<&str>) -> Result<Vec<String>, String> {
     }
     if hashes.is_empty() {
         return Err("hashes must contain at least one info hash".to_owned());
-    }
-    if hashes.len() > MAX_TORRENT_LIVE_STATS {
-        return Err(format!(
-            "at most {MAX_TORRENT_LIVE_STATS} hashes may be requested"
-        ));
     }
     Ok(hashes)
 }
@@ -853,7 +1026,9 @@ fn torrent_matches_summary(item: &TorrentSnapshotItem, query: &TorrentListQuery)
 
 fn torrentng_summary_flags(entry: &TorrentSummary, amount_left: u64) -> (bool, bool, bool) {
     let state = entry.state.as_str();
-    let complete = state == "seeding" || (entry.total_length > 0 && amount_left == 0);
+    // `amount_left` is the live completion invariant. A stale persisted
+    // lifecycle state must not make a rechecked torrent appear complete.
+    let complete = entry.total_length > 0 && amount_left == 0;
     let active = matches!(state, "downloading" | "seeding" | "checking");
     let open = matches!(
         state,
@@ -964,6 +1139,8 @@ fn decode_native_torrent_base64(
 fn native_torrent_add_input_from_json(
     request: AddTorrentRequest,
 ) -> Result<NativeTorrentAddInput, NativeTorrentAddError> {
+    validate_native_add_request(&request)
+        .map_err(|error| Box::new(native_payload_too_large(error)))?;
     if request.magnet.is_some() && request.torrent_b64.is_some() {
         return Err(native_torrent_add_bad_request(
             "provide exactly one of magnet or torrent_b64",
@@ -1219,6 +1396,9 @@ pub async fn get_torrent(
     State(state): State<AppState>,
     Path(info_hash): Path<String>,
 ) -> impl IntoResponse {
+    if let Err(error) = validate_native_info_hash(&info_hash) {
+        return native_payload_too_large(error);
+    }
     let summary = {
         let reg = state.registry.read().await;
         match reg.get(&info_hash) {
@@ -1311,6 +1491,20 @@ pub async fn update_torrent(
     if let Some(response) = require_mutation_auth(&state, &headers) {
         return response;
     }
+    if let Err(error) = validate_native_info_hash(&info_hash) {
+        return native_payload_too_large(error);
+    }
+    if let Some(name) = req.name.as_deref() {
+        if let Err(error) = validate_native_text(name, MAX_ENGINE_NAME_BYTES, "torrent name") {
+            return native_payload_too_large(error);
+        }
+    }
+    if let Some(save_path) = req.save_path.as_deref() {
+        if let Err(error) = validate_native_text(save_path, MAX_ENGINE_SAVE_PATH_BYTES, "save path")
+        {
+            return native_payload_too_large(error);
+        }
+    }
     if !torrent_exists(&state, &info_hash).await {
         return not_found(info_hash);
     }
@@ -1385,6 +1579,9 @@ pub async fn delete_torrent(
 ) -> impl IntoResponse {
     if let Some(response) = require_mutation_auth(&state, &headers) {
         return response;
+    }
+    if let Err(error) = validate_native_info_hash(&info_hash) {
+        return native_payload_too_large(error);
     }
     if !torrent_exists(&state, &info_hash).await {
         return not_found(info_hash);
@@ -2120,6 +2317,9 @@ pub async fn torrent_limits(
     State(state): State<AppState>,
     Path(info_hash): Path<String>,
 ) -> impl IntoResponse {
+    if let Err(error) = validate_native_info_hash(&info_hash) {
+        return native_payload_too_large(error);
+    }
     if !torrent_exists(&state, &info_hash).await {
         return not_found(info_hash);
     }
@@ -2152,6 +2352,9 @@ pub async fn update_torrent_limits(
 ) -> impl IntoResponse {
     if let Some(response) = require_mutation_auth(&state, &headers) {
         return response;
+    }
+    if let Err(error) = validate_native_info_hash(&info_hash) {
+        return native_payload_too_large(error);
     }
     if !torrent_exists(&state, &info_hash).await {
         return not_found(info_hash);
@@ -2218,6 +2421,17 @@ pub async fn add_torrent_peers(
     if let Some(response) = require_mutation_auth(&state, &headers) {
         return response;
     }
+    if let Err(error) = validate_native_info_hash(&info_hash) {
+        return native_payload_too_large(error);
+    }
+    if let Err(error) = validate_native_text_list(
+        &req.peers,
+        MAX_NATIVE_PEER_TEXT_BYTES,
+        MAX_NATIVE_PEER_LIST_BYTES,
+        "peer list",
+    ) {
+        return native_payload_too_large(error);
+    }
     if !torrent_exists(&state, &info_hash).await {
         return not_found(info_hash);
     }
@@ -2227,7 +2441,7 @@ pub async fn add_torrent_peers(
         .map(|peer| peer.trim().parse::<SocketAddr>())
         .collect::<Result<Vec<_>, _>>()
     {
-        Ok(peers) if !peers.is_empty() => peers,
+        Ok(peers) if !peers.is_empty() && peers.iter().all(|peer| peer.port() != 0) => peers,
         Ok(_) => {
             return (
                 StatusCode::BAD_REQUEST,
@@ -2276,6 +2490,12 @@ pub async fn update_torrent_queue(
 ) -> impl IntoResponse {
     if let Some(response) = require_mutation_auth(&state, &headers) {
         return response;
+    }
+    if let Err(error) = validate_native_text(&req.queue_move, 16, "queue move") {
+        return native_payload_too_large(error);
+    }
+    if let Err(error) = validate_native_hash_list(&req.hashes, "torrent hash list") {
+        return native_payload_too_large(error);
     }
     let queue_move = match req.queue_move.trim().to_ascii_lowercase().as_str() {
         "up" => QueueMove::Up,
@@ -2432,17 +2652,17 @@ pub async fn patch_torrent_tags(
 
     let mut reg = state.registry.write().await;
     let response = match reg.get_mut(&info_hash) {
-        Some(mut entry) => {
-            for tag in add_tags {
-                if !entry.tags.contains(&tag) {
-                    entry.tags.push(tag);
-                }
+        Some(mut entry) => match merged_registry_tags(&entry.tags, &add_tags, &remove_tags) {
+            Ok(tags) => {
+                entry.tags = tags;
+                StatusCode::NO_CONTENT.into_response()
             }
-            if !remove_tags.is_empty() {
-                entry.tags.retain(|tag| !remove_tags.contains(tag));
-            }
-            StatusCode::NO_CONTENT.into_response()
-        }
+            Err(error) => (
+                StatusCode::TOO_MANY_REQUESTS,
+                Json(serde_json::to_value(ApiError::bad_request(error)).unwrap()),
+            )
+                .into_response(),
+        },
         None => not_found(info_hash),
     };
     drop(reg);
@@ -2456,6 +2676,17 @@ pub async fn add_torrent_tags(
     Path(info_hash): Path<String>,
     Json(req): Json<TagsRequest>,
 ) -> impl IntoResponse {
+    if let Some(response) = require_mutation_auth(&state, &headers) {
+        return response;
+    }
+    if let Err(error) = validate_native_text_list(
+        &req.tags,
+        MAX_ENGINE_LABEL_BYTES,
+        MAX_ENGINE_LABEL_BYTES,
+        "tag list",
+    ) {
+        return native_payload_too_large(error);
+    }
     patch_torrent_tags(
         State(state),
         headers,
@@ -2476,6 +2707,17 @@ pub async fn remove_torrent_tags(
     Path(info_hash): Path<String>,
     Json(req): Json<TagsRequest>,
 ) -> impl IntoResponse {
+    if let Some(response) = require_mutation_auth(&state, &headers) {
+        return response;
+    }
+    if let Err(error) = validate_native_text_list(
+        &req.tags,
+        MAX_ENGINE_LABEL_BYTES,
+        MAX_ENGINE_LABEL_BYTES,
+        "tag list",
+    ) {
+        return native_payload_too_large(error);
+    }
     patch_torrent_tags(
         State(state),
         headers,
@@ -2499,6 +2741,60 @@ fn normalize_tags(tags: Vec<String>) -> Vec<String> {
         }
     }
     normalized
+}
+
+fn validate_registry_tags(tags: &[String]) -> Result<(), String> {
+    if tags.len() > MAX_NATIVE_LABEL_ITEMS {
+        return Err(format!(
+            "torrent labels contain more than {MAX_NATIVE_LABEL_ITEMS} items"
+        ));
+    }
+    validate_native_text_list(
+        tags,
+        MAX_ENGINE_LABEL_BYTES,
+        MAX_ENGINE_LABEL_BYTES,
+        "torrent labels",
+    )
+}
+
+fn merged_registry_tags(
+    current: &[String],
+    add: &[String],
+    remove: &[String],
+) -> Result<Vec<String>, String> {
+    let mut tags = current.to_vec();
+    for tag in add {
+        if !tags.contains(tag) {
+            tags.push(tag.clone());
+        }
+    }
+    if !remove.is_empty() {
+        tags.retain(|tag| !remove.contains(tag));
+    }
+    validate_registry_tags(&tags)?;
+    Ok(tags)
+}
+
+fn insert_native_global_tag(tags: &mut Vec<String>, tag: &str) -> Result<(), String> {
+    if tags.iter().any(|existing| existing == tag) {
+        return Ok(());
+    }
+    if tags.len() >= MAX_NATIVE_LABEL_ITEMS {
+        return Err(format!(
+            "global tags contain more than {MAX_NATIVE_LABEL_ITEMS} items"
+        ));
+    }
+    let bytes = tags
+        .iter()
+        .fold(tag.len(), |total, value| total.saturating_add(value.len()));
+    if bytes > MAX_NATIVE_LABEL_BYTES {
+        return Err(format!(
+            "global tags contain {bytes} bytes; maximum is {MAX_NATIVE_LABEL_BYTES}"
+        ));
+    }
+    tags.push(tag.to_owned());
+    tags.sort();
+    Ok(())
 }
 
 /// `GET /api/v1/torrents/{hash}/files` — list files for one torrent.
@@ -2573,6 +2869,20 @@ pub async fn patch_torrent_files(
 ) -> impl IntoResponse {
     if let Some(response) = require_mutation_auth(&state, &headers) {
         return response;
+    }
+    if let Err(error) = validate_native_info_hash(&info_hash) {
+        return native_payload_too_large(error);
+    }
+    for (index, item) in req.files.iter().enumerate() {
+        if let Some(path) = item.path.as_deref() {
+            if let Err(error) = validate_native_text(
+                path,
+                MAX_TORRENT_FILE_PATH_BYTES,
+                &format!("file path at index {index}"),
+            ) {
+                return native_payload_too_large(error);
+            }
+        }
     }
     if req.files.is_empty() {
         return (
@@ -2766,6 +3076,12 @@ pub async fn patch_torrent_trackers(
 ) -> impl IntoResponse {
     if let Some(response) = require_mutation_auth(&state, &headers) {
         return response;
+    }
+    if let Err(error) = validate_native_info_hash(&info_hash) {
+        return native_payload_too_large(error);
+    }
+    if let Err(error) = validate_native_tracker_patch(&req) {
+        return native_payload_too_large(error);
     }
     if !torrent_exists(&state, &info_hash).await {
         return not_found(info_hash);
@@ -3170,6 +3486,27 @@ fn validate_json_map(map: &JsonMap, label: &str, kind: &str) -> Result<(), Strin
     Ok(())
 }
 
+fn validate_json_value_size(value: &serde_json::Value, label: &str) -> Result<(), String> {
+    let encoded =
+        serde_json::to_vec(value).map_err(|error| format!("encoding {label}: {error}"))?;
+    if encoded.len() > MAX_NATIVE_JSON_BYTES {
+        return Err(format!(
+            "{label} exceeds the {MAX_NATIVE_JSON_BYTES} byte compatibility limit"
+        ));
+    }
+    if let Some(object) = value.as_object() {
+        if object.len() > MAX_NATIVE_JSON_ENTRIES {
+            return Err(format!(
+                "{label} contains more than {MAX_NATIVE_JSON_ENTRIES} fields"
+            ));
+        }
+        if object.keys().any(|key| key.len() > 256) {
+            return Err(format!("{label} contains a key that is too long"));
+        }
+    }
+    Ok(())
+}
+
 fn validate_json_item(value: &serde_json::Value, key: &str, kind: &str) -> Result<(), String> {
     let object = value
         .as_object()
@@ -3181,9 +3518,10 @@ fn validate_json_item(value: &serde_json::Value, key: &str, kind: &str) -> Resul
     }
     for field in ["id", "name"] {
         if let Some(value) = object.get(field) {
-            if value.as_str().is_none() {
-                return Err(format!("{kind} {key:?} field {field:?} must be a string"));
-            }
+            let value = value
+                .as_str()
+                .ok_or_else(|| format!("{kind} {key:?} field {field:?} must be a string"))?;
+            validate_native_text(value, 256, &format!("{kind} {key:?} field {field:?}"))?;
         }
     }
     for field in ["enabled", "start"] {
@@ -3212,21 +3550,46 @@ fn validate_json_item(value: &serde_json::Value, key: &str, kind: &str) -> Resul
         "url",
     ] {
         if let Some(value) = object.get(field) {
-            if !(value.is_null() || value.is_string()) {
-                return Err(format!(
-                    "{kind} {key:?} field {field:?} must be a string or null"
-                ));
+            if value.is_null() {
+                continue;
             }
+            let value = value.as_str().ok_or_else(|| {
+                format!("{kind} {key:?} field {field:?} must be a string or null")
+            })?;
+            let maximum = match field {
+                "save_path" | "target_path" => MAX_ENGINE_SAVE_PATH_BYTES,
+                "category" => MAX_ENGINE_CATEGORY_BYTES,
+                "tracker" => MAX_TRACKER_URL_BYTES,
+                _ => MAX_NATIVE_JSON_TEXT_BYTES,
+            };
+            validate_native_text(value, maximum, &format!("{kind} {key:?} field {field:?}"))?;
         }
     }
     if let Some(tags) = object.get("tags") {
         let tags = tags
             .as_array()
             .ok_or_else(|| format!("{kind} {key:?} field \"tags\" must be an array"))?;
-        if tags.iter().any(|tag| tag.as_str().is_none()) {
+        if tags.len() > MAX_NATIVE_MUTATION_ITEMS {
             return Err(format!(
-                "{kind} {key:?} field \"tags\" must contain only strings"
+                "{kind} {key:?} field \"tags\" exceeds the maximum of {MAX_NATIVE_MUTATION_ITEMS} items"
             ));
+        }
+        let mut tag_bytes = 0usize;
+        for (index, tag) in tags.iter().enumerate() {
+            let tag = tag.as_str().ok_or_else(|| {
+                format!("{kind} {key:?} field \"tags\" must contain only strings")
+            })?;
+            validate_native_text(
+                tag,
+                MAX_ENGINE_LABEL_BYTES,
+                &format!("{kind} {key:?} tag at index {index}"),
+            )?;
+            tag_bytes = tag_bytes.saturating_add(tag.len());
+            if tag_bytes > MAX_ENGINE_LABEL_BYTES {
+                return Err(format!(
+                    "{kind} {key:?} tags contain {tag_bytes} bytes; maximum is {MAX_ENGINE_LABEL_BYTES}"
+                ));
+            }
         }
     }
     if kind == "saved_view" {
@@ -3626,7 +3989,7 @@ fn json_item_id(value: &serde_json::Value) -> Option<String> {
             .get(field)
             .and_then(serde_json::Value::as_str)
             .map(str::trim)
-            .filter(|id| !id.is_empty())
+            .filter(|id| !id.is_empty() && id.len() <= 256)
             .map(str::to_owned)
     })
 }
@@ -3649,6 +4012,9 @@ pub async fn upsert_json_map<S: JsonStore>(
 ) -> impl IntoResponse {
     if let Some(response) = require_mutation_auth(&state, &headers) {
         return response;
+    }
+    if let Err(error) = validate_json_value_size(&value, S::setting_key()) {
+        return native_payload_too_large(error);
     }
     let _write = state.json_store_write.lock().await;
     let Some(id) = json_item_id(&value) else {
@@ -3942,6 +4308,9 @@ pub async fn test_rss_rules(
     State(state): State<AppState>,
     Json(req): Json<RssSampleRequest>,
 ) -> impl IntoResponse {
+    if let Err(error) = validate_native_rss_request(&req) {
+        return native_payload_too_large(error);
+    }
     let title = req.title.trim();
     if title.is_empty() {
         return (
@@ -4346,9 +4715,12 @@ pub async fn create_tag(
         }
     } else {
         let mut tags = state.tags.write().await;
-        if !tags.iter().any(|tag| tag == name) {
-            tags.push(name.to_owned());
-            tags.sort();
+        if let Err(error) = insert_native_global_tag(&mut tags, name) {
+            return (
+                StatusCode::TOO_MANY_REQUESTS,
+                Json(serde_json::to_value(ApiError::bad_request(error)).unwrap()),
+            )
+                .into_response();
         }
     }
     StatusCode::NO_CONTENT.into_response()
@@ -4513,6 +4885,17 @@ pub async fn cross_seed(
 ) -> impl IntoResponse {
     if let Some(response) = require_mutation_auth(&state, &headers) {
         return response;
+    }
+    if let Err(error) = validate_native_hash_list(&req.hashes, "torrent hash list") {
+        return native_payload_too_large(error);
+    }
+    if let Err(error) = validate_native_text_list(
+        &req.trackers,
+        MAX_TRACKER_URL_BYTES,
+        MAX_ENGINE_TRACKER_BYTES,
+        "tracker list",
+    ) {
+        return native_payload_too_large(error);
     }
     let dry_run = req.dry_run.unwrap_or(true);
     let hashes = match resolve_hashes(&state, &req.hashes).await {
@@ -4863,6 +5246,11 @@ pub async fn set_user_agent(
     if let Some(response) = require_mutation_auth(&state, &headers) {
         return response;
     }
+    if let Err(error) =
+        validate_native_text(&req.user_agent, MAX_NATIVE_USER_AGENT_BYTES, "user agent")
+    {
+        return native_payload_too_large(error);
+    }
     let Some(engine) = &state.engine else {
         return (
             StatusCode::SERVICE_UNAVAILABLE,
@@ -4882,6 +5270,246 @@ pub async fn set_user_agent(
     }
     *state.user_agent.write().await = req.user_agent;
     StatusCode::NO_CONTENT.into_response()
+}
+
+/// `GET /api/v1/settings/crash-safety` — effective crash-safety settings, the
+/// config-file defaults, whether a runtime override is active, how the previous
+/// run ended, per-mount durability trust, counters and platform support.
+pub async fn get_crash_safety(State(state): State<AppState>) -> impl IntoResponse {
+    let Some(engine) = &state.engine else {
+        return crash_safety_unavailable();
+    };
+    match engine.crash_safety().await {
+        Ok(view) => (StatusCode::OK, Json(view)).into_response(),
+        Err(error) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::to_value(ApiError::internal(error)).unwrap()),
+        )
+            .into_response(),
+    }
+}
+
+/// `PUT /api/v1/settings/crash-safety` — replace the crash-safety settings.
+/// The body is the full settings object; omitted fields take the built-in
+/// defaults and unknown keys are rejected. The change is persisted and applied
+/// immediately, and survives restarts until reset.
+pub async fn put_crash_safety(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(settings): Json<rt_engine::CrashSafetyConfig>,
+) -> impl IntoResponse {
+    if let Some(response) = require_mutation_auth(&state, &headers) {
+        return response;
+    }
+    let Some(engine) = &state.engine else {
+        return crash_safety_unavailable();
+    };
+    match engine.set_crash_safety(Some(settings)).await {
+        Ok(view) => (StatusCode::OK, Json(view)).into_response(),
+        Err(error) => (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::to_value(ApiError::bad_request(error)).unwrap()),
+        )
+            .into_response(),
+    }
+}
+
+/// `DELETE /api/v1/settings/crash-safety` — drop the runtime override and
+/// return to the config-file values.
+pub async fn reset_crash_safety(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    if let Some(response) = require_mutation_auth(&state, &headers) {
+        return response;
+    }
+    let Some(engine) = &state.engine else {
+        return crash_safety_unavailable();
+    };
+    match engine.set_crash_safety(None).await {
+        Ok(view) => (StatusCode::OK, Json(view)).into_response(),
+        Err(error) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::to_value(ApiError::internal(error)).unwrap()),
+        )
+            .into_response(),
+    }
+}
+
+#[derive(Debug, serde::Deserialize)]
+pub struct CrashSafetyPathQuery {
+    path: Option<String>,
+}
+
+/// `GET /api/v1/settings/crash-safety/path?path=/abs/dir` — what a save
+/// location would get: the per-location policy that matches it, the effective
+/// settings, the mount's durability rating and the recovery it would receive
+/// after a host crash. The path need not exist, and inspecting it does not add
+/// it to the tracked mounts.
+pub async fn describe_crash_safety_path(
+    State(state): State<AppState>,
+    Query(query): Query<CrashSafetyPathQuery>,
+) -> impl IntoResponse {
+    let Some(engine) = &state.engine else {
+        return crash_safety_unavailable();
+    };
+    let path = query.path.unwrap_or_default();
+    if path.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::to_value(ApiError::bad_request("path is required")).unwrap()),
+        )
+            .into_response();
+    }
+    match engine
+        .describe_crash_safety_path(std::path::PathBuf::from(path))
+        .await
+    {
+        Ok(report) => (StatusCode::OK, Json(report)).into_response(),
+        Err(error) => (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::to_value(ApiError::bad_request(error)).unwrap()),
+        )
+            .into_response(),
+    }
+}
+
+fn crash_safety_unavailable() -> axum::response::Response {
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        Json(
+            serde_json::to_value(ApiError::internal("TorrentNG client is not available")).unwrap(),
+        ),
+    )
+        .into_response()
+}
+
+/// Prometheus text for the crash-safety subsystem, appended to `/metrics`.
+fn render_crash_safety_metrics(view: &rt_engine::CrashSafetyView) -> String {
+    use std::fmt::Write as _;
+    let c = &view.report.counters;
+    let mut out = String::new();
+    let mut family = |name: &str, kind: &str, help: &str, samples: &[(String, u64)]| {
+        let _ = writeln!(out, "# HELP {name} {help}");
+        let _ = writeln!(out, "# TYPE {name} {kind}");
+        for (labels, value) in samples {
+            let _ = writeln!(out, "{name}{labels} {value}");
+        }
+    };
+    let unclean = u64::from(view.report.previous_run.verdict.was_unclean());
+    family(
+        "torrentng_crash_safety_previous_run_unclean",
+        "gauge",
+        "1 when the previous daemon run did not shut down cleanly.",
+        &[(
+            format!(
+                "{{verdict=\"{}\"}}",
+                view.report.previous_run.verdict.as_str()
+            ),
+            unclean,
+        )],
+    );
+    family(
+        "torrentng_crash_recovery_rechecks_total",
+        "counter",
+        "Torrents whose resume state was discarded after a possible host crash, by reason.",
+        &[
+            (
+                "{reason=\"unsynced_state\"}".to_owned(),
+                c.rechecks_unsynced_state,
+            ),
+            (
+                "{reason=\"full_policy\"}".to_owned(),
+                c.rechecks_full_policy,
+            ),
+            (
+                "{reason=\"recent_write\"}".to_owned(),
+                c.rechecks_recent_write,
+            ),
+            ("{reason=\"weak_mount\"}".to_owned(), c.rechecks_weak_mount),
+            (
+                "{reason=\"unknown_mount\"}".to_owned(),
+                c.rechecks_unknown_mount,
+            ),
+        ],
+    );
+    for (name, kind, help, value) in [
+        (
+            "torrentng_allocation_audit_pieces_downgraded_total",
+            "counter",
+            "Valid pieces downgraded for re-verification because they overlapped a hole or unwritten extent.",
+            c.audit_pieces_downgraded,
+        ),
+        (
+            "torrentng_completions_gated_total",
+            "counter",
+            "Finished downloads held by the completion gate until their data was durable.",
+            c.completions_gated,
+        ),
+        (
+            "torrentng_completions_pending",
+            "gauge",
+            "Finished downloads currently held by the completion gate.",
+            c.completions_pending,
+        ),
+        (
+            "torrentng_completions_released_total",
+            "counter",
+            "Completions released after the durability barrier succeeded.",
+            c.completions_released,
+        ),
+        (
+            "torrentng_completion_gate_retries_total",
+            "counter",
+            "Completion-gate barrier attempts that had to be retried.",
+            c.completion_gate_retries,
+        ),
+        (
+            "torrentng_completion_verify_pieces_total",
+            "counter",
+            "Pieces re-read from disk by completion verification.",
+            c.completion_verify_pieces,
+        ),
+        (
+            "torrentng_completion_verify_failures_total",
+            "counter",
+            "Pieces that failed completion verification.",
+            c.completion_verify_failures,
+        ),
+        (
+            "torrentng_integrity_regressions_total",
+            "counter",
+            "Torrents already reported complete whose pieces later failed verification.",
+            c.integrity_regressions,
+        ),
+        (
+            "torrentng_fsync_unsupported_total",
+            "counter",
+            "Times a filesystem reported that fsync is unsupported.",
+            c.completion_sync_unsupported,
+        ),
+    ] {
+        family(name, kind, help, &[(String::new(), value)]);
+    }
+    let mut by_trust = [0u64; 3];
+    for mount in &view.report.mounts {
+        by_trust[match mount.trust {
+            rt_storage::DurabilityTrust::Strong => 0,
+            rt_storage::DurabilityTrust::Unknown => 1,
+            rt_storage::DurabilityTrust::Weak => 2,
+        }] += 1;
+    }
+    family(
+        "torrentng_storage_mounts",
+        "gauge",
+        "Save-path mounts seen by the durability probe, by trust classification.",
+        &[
+            ("{trust=\"strong\"}".to_owned(), by_trust[0]),
+            ("{trust=\"unknown\"}".to_owned(), by_trust[1]),
+            ("{trust=\"weak\"}".to_owned(), by_trust[2]),
+        ],
+    );
+    out
 }
 
 /// `GET /api/v1/engine` — TorrentNG-client diagnostics for the WebUI.
@@ -5008,6 +5636,23 @@ pub async fn save_rtorrent_settings(
     if let Some(response) = require_mutation_auth(&state, &headers) {
         return response;
     }
+    if let Err(error) = validate_json_value_size(&req, "rTorrent settings") {
+        return native_payload_too_large(error);
+    }
+    let settings = req.get("settings").unwrap_or(&req);
+    if let Some(settings) = settings.as_object() {
+        if settings.len() > MAX_NATIVE_JSON_ENTRIES {
+            return native_payload_too_large(format!(
+                "rTorrent settings contains more than {MAX_NATIVE_JSON_ENTRIES} fields"
+            ));
+        }
+        if let Some(key) = settings.keys().find(|key| key.len() > 256) {
+            return native_payload_too_large(format!(
+                "rTorrent setting key contains {} bytes; maximum is 256",
+                key.len()
+            ));
+        }
+    }
     let user_agent = req
         .get("settings")
         .and_then(|settings| settings.get("system.user_agent"))
@@ -5016,6 +5661,13 @@ pub async fn save_rtorrent_settings(
             req.get("system.user_agent")
                 .and_then(serde_json::Value::as_str)
         });
+    if let Some(user_agent) = user_agent {
+        if let Err(error) =
+            validate_native_text(user_agent, MAX_NATIVE_USER_AGENT_BYTES, "user agent")
+        {
+            return native_payload_too_large(error);
+        }
+    }
     let unsupported = rtorrent_setting_keys(&req)
         .into_iter()
         .filter(|key| key != "system.user_agent")
@@ -5109,6 +5761,9 @@ pub async fn storage_preview_plan(
     if let Some(response) = require_mutation_auth(&state, &headers) {
         return response;
     }
+    if let Err(error) = validate_native_storage_request(&req) {
+        return native_payload_too_large(error);
+    }
     if let Err(error) = validate_client_completed_steps(req.completed_steps.as_deref()) {
         return (
             StatusCode::BAD_REQUEST,
@@ -5169,6 +5824,9 @@ pub async fn storage_execute_plan(
 ) -> impl IntoResponse {
     if let Some(response) = require_mutation_auth(&state, &headers) {
         return response;
+    }
+    if let Err(error) = validate_native_storage_request(&req) {
+        return native_payload_too_large(error);
     }
     if let Err(error) = validate_client_completed_steps(req.completed_steps.as_deref()) {
         return (
@@ -5681,6 +6339,9 @@ pub async fn diagnose_torrent(
     State(state): State<AppState>,
     Path(info_hash): Path<String>,
 ) -> impl IntoResponse {
+    if let Err(error) = validate_native_info_hash(&info_hash) {
+        return native_payload_too_large(error);
+    }
     let Some(engine) = &state.engine else {
         return (
             StatusCode::SERVICE_UNAVAILABLE,
@@ -5963,6 +6624,7 @@ fn torrentng_client_webui_capabilities() -> serde_json::Value {
         "supports_torrent_rename": true,
         "supports_file_rename": true,
         "supports_runtime_user_agent": true,
+        "supports_crash_safety": true,
         "supports_config_overlay": false,
         "supports_restart": false,
     })
@@ -6043,12 +6705,18 @@ pub async fn metrics(State(state): State<AppState>) -> impl IntoResponse {
                     header::CONTENT_TYPE,
                     HeaderValue::from_static("text/plain; version=0.0.4"),
                 )],
-                render_metrics_with_health(
-                    &stats,
-                    state.api_metrics.snapshot(),
-                    state.metrics_include_torrent_ids,
-                    health,
-                ),
+                {
+                    let mut text = render_metrics_with_health(
+                        &stats,
+                        state.api_metrics.snapshot(),
+                        state.metrics_include_torrent_ids,
+                        health,
+                    );
+                    if let Ok(view) = engine.crash_safety().await {
+                        text.push_str(&render_crash_safety_metrics(&view));
+                    }
+                    text
+                },
             )
         }
         Err(e) => (
@@ -8271,6 +8939,12 @@ async fn resolve_hashes(state: &AppState, hashes: &[String]) -> Result<Vec<Strin
         }
         return Ok(reg.iter().map(|entry| entry.info_hash.clone()).collect());
     }
+    if hashes
+        .iter()
+        .any(|hash| hash.trim().eq_ignore_ascii_case("all"))
+    {
+        return Err("'all' must be the only torrent selection".to_owned());
+    }
     let canonical = reg
         .iter()
         .map(|entry| {
@@ -8280,15 +8954,15 @@ async fn resolve_hashes(state: &AppState, hashes: &[String]) -> Result<Vec<Strin
             )
         })
         .collect::<HashMap<_, _>>();
+    let mut seen = HashSet::new();
     Ok(hashes
         .iter()
         .map(|hash| hash.trim())
         .filter(|hash| !hash.is_empty())
-        .map(|hash| {
-            canonical
-                .get(&hash.to_ascii_lowercase())
-                .cloned()
-                .unwrap_or_else(|| hash.to_ascii_lowercase())
+        .filter_map(|hash| {
+            let key = hash.to_ascii_lowercase();
+            seen.insert(key.clone())
+                .then(|| canonical.get(&key).cloned().unwrap_or(key))
         })
         .collect())
 }
@@ -8306,11 +8980,21 @@ async fn preview_hashes(state: &AppState, hashes: &[String]) -> Result<Vec<Strin
             .map(|entry| entry.info_hash.clone())
             .collect());
     }
+    if hashes
+        .iter()
+        .any(|hash| hash.trim().eq_ignore_ascii_case("all"))
+    {
+        return Err("'all' must be the only torrent selection".to_owned());
+    }
+    let mut seen = HashSet::new();
     Ok(hashes
         .iter()
         .map(|hash| hash.trim())
         .filter(|hash| !hash.is_empty())
-        .map(ToOwned::to_owned)
+        .filter_map(|hash| {
+            let hash = hash.to_owned();
+            seen.insert(hash.to_ascii_lowercase()).then_some(hash)
+        })
         .collect())
 }
 
@@ -8710,7 +9394,9 @@ async fn set_registry_tags(state: &AppState, hash: &str, tags: Vec<String>) -> R
     let mut entry = reg
         .get_mut(hash)
         .ok_or_else(|| "torrent not found".to_owned())?;
-    entry.tags = normalize_tags(tags);
+    let tags = normalize_tags(tags);
+    validate_registry_tags(&tags)?;
+    entry.tags = tags;
     Ok(())
 }
 
@@ -8925,20 +9611,27 @@ fn constant_time_secret_eq(expected: &str, candidate: &str) -> bool {
     expected.as_bytes().ct_eq(candidate.as_bytes()).into()
 }
 
-fn auth_form_credentials(body: &str) -> (Option<String>, Option<String>) {
+fn auth_form_credentials(body: &str) -> Option<(Option<String>, Option<String>)> {
     let mut username = None;
     let mut password = None;
     for pair in body.split('&') {
         let Some((key, value)) = pair.split_once('=') else {
             continue;
         };
-        match form_component_decode(key).as_deref() {
-            Some("username") => username = form_component_decode(value),
-            Some("password") => password = form_component_decode(value),
-            _ => {}
+        let Some(key) = form_component_decode(key) else {
+            continue;
+        };
+        let slot = match key.as_str() {
+            "username" => &mut username,
+            "password" => &mut password,
+            _ => continue,
+        };
+        if slot.is_some() {
+            return None;
         }
+        *slot = Some(form_component_decode(value)?);
     }
-    (username, password)
+    Some((username, password))
 }
 
 fn form_component_decode(input: &str) -> Option<String> {
@@ -9034,6 +9727,9 @@ fn extract_session_cookie(cookie: &str) -> Option<String> {
 }
 
 async fn torrent_exists(state: &AppState, info_hash: &str) -> bool {
+    if !native_info_hash_is_bounded(info_hash) {
+        return false;
+    }
     state.registry.read().await.get(info_hash).is_some()
 }
 
@@ -9131,6 +9827,149 @@ mod tests {
         );
         assert!(parse_torrent_live_hashes(Some("not-a-hash")).is_err());
         assert!(parse_torrent_live_hashes(None).is_err());
+        let oversized = (0..=MAX_TORRENT_LIVE_STATS)
+            .map(|index| format!("{index:040x}"))
+            .collect::<Vec<_>>()
+            .join(",");
+        assert!(parse_torrent_live_hashes(Some(&oversized)).is_err());
+    }
+
+    #[test]
+    fn native_mutation_text_validators_reject_oversized_inputs_before_dispatch() {
+        assert!(validate_native_info_hash(&"a".repeat(MAX_ENGINE_INFO_HASH_BYTES + 1)).is_err());
+        assert!(validate_native_text(
+            &"n".repeat(MAX_ENGINE_NAME_BYTES + 1),
+            MAX_ENGINE_NAME_BYTES,
+            "torrent name"
+        )
+        .is_err());
+        assert!(validate_native_text_list(
+            &["t".repeat(MAX_ENGINE_LABEL_BYTES + 1)],
+            MAX_ENGINE_LABEL_BYTES,
+            MAX_ENGINE_LABEL_BYTES,
+            "tag list"
+        )
+        .is_err());
+        assert!(validate_native_hash_list(
+            &["h".repeat(MAX_ENGINE_INFO_HASH_BYTES + 1)],
+            "torrent hash list"
+        )
+        .is_err());
+
+        let storage = StoragePlanRequest {
+            operation: "x".repeat(17),
+            source: Some(PathBuf::from("/source")),
+            destination: Some(PathBuf::from("/destination")),
+            target: None,
+            bytes: Some(1),
+            available_bytes: Some(1),
+            hardlink_or_copy: None,
+            dry_run: Some(true),
+            dry_run_approved: None,
+            affected_torrents: None,
+            roots: None,
+            completed_steps: None,
+        };
+        assert!(validate_native_storage_request(&storage).is_err());
+    }
+
+    #[test]
+    fn native_registry_label_merges_fail_closed_without_partial_growth() {
+        let current = (0..MAX_NATIVE_LABEL_ITEMS)
+            .map(|index| format!("tag-{index}"))
+            .collect::<Vec<_>>();
+        assert!(merged_registry_tags(&current, &["new".to_owned()], &[]).is_err());
+        assert_eq!(current.len(), MAX_NATIVE_LABEL_ITEMS);
+
+        let oversized = "x".repeat(MAX_NATIVE_LABEL_BYTES);
+        assert!(merged_registry_tags(&[], &[oversized], &[]).is_err());
+
+        let mut global = (0..MAX_NATIVE_LABEL_ITEMS - 1)
+            .map(|index| format!("tag-{index}"))
+            .collect::<Vec<_>>();
+        assert!(insert_native_global_tag(&mut global, "last").is_ok());
+        assert!(insert_native_global_tag(&mut global, "overflow").is_err());
+        assert_eq!(global.len(), MAX_NATIVE_LABEL_ITEMS);
+    }
+
+    #[test]
+    fn native_tracker_patch_validator_bounds_every_url_and_the_request() {
+        let oversized = PatchTrackersRequest {
+            add: vec!["u".repeat(MAX_TRACKER_URL_BYTES + 1)],
+            remove: Vec::new(),
+            edit: Vec::new(),
+        };
+        assert!(validate_native_tracker_patch(&oversized).is_err());
+
+        let aggregate = PatchTrackersRequest {
+            add: vec!["u".repeat(MAX_TRACKER_URL_BYTES); 513],
+            remove: Vec::new(),
+            edit: Vec::new(),
+        };
+        assert!(validate_native_tracker_patch(&aggregate).is_err());
+    }
+
+    #[test]
+    fn native_add_and_rss_validators_bound_large_alternative_inputs() {
+        let add = AddTorrentRequest {
+            torrent_b64: None,
+            magnet: Some("m".repeat(MAX_MAGNET_BYTES + 1)),
+            save_path: String::new(),
+            category: None,
+            tags: None,
+            start: None,
+        };
+        assert!(validate_native_add_request(&add).is_err());
+
+        let rss = RssSampleRequest {
+            title: "t".repeat(MAX_NATIVE_RSS_TITLE_BYTES + 1),
+            link: None,
+            dry_run: None,
+        };
+        assert!(validate_native_rss_request(&rss).is_err());
+    }
+
+    #[tokio::test]
+    async fn native_torrent_route_rejects_oversized_hashes_before_lookup() {
+        let response = build_router(AppState::new())
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri(format!(
+                        "/api/v1/torrents/{}",
+                        "a".repeat(MAX_ENGINE_INFO_HASH_BYTES + 1)
+                    ))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
+    #[tokio::test]
+    async fn logout_clears_native_and_qbit_session_cookies() {
+        let response = build_router(AppState::new())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/auth/logout")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let cookies = response
+            .headers()
+            .get_all(header::SET_COOKIE)
+            .iter()
+            .filter_map(|value| value.to_str().ok())
+            .collect::<Vec<_>>();
+        assert_eq!(cookies.len(), 2);
+        assert!(cookies
+            .iter()
+            .any(|cookie| cookie.starts_with("tng_session=")));
+        assert!(cookies.iter().any(|cookie| cookie.starts_with("SID=")));
     }
 
     #[tokio::test]
@@ -10271,6 +11110,111 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn crash_safety_routes_report_unavailable_without_engine() {
+        let app = build_router(AppState::new());
+        for (method, body) in [
+            ("GET", Body::empty()),
+            ("PUT", Body::from("{}")),
+            ("DELETE", Body::empty()),
+        ] {
+            let resp = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method(method)
+                        .uri("/api/v1/settings/crash-safety")
+                        .header("content-type", "application/json")
+                        .body(body)
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE, "{method}");
+        }
+    }
+
+    #[tokio::test]
+    async fn crash_safety_put_rejects_unknown_keys_before_reaching_the_engine() {
+        let app = build_router(AppState::new());
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/api/v1/settings/crash-safety")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"host_crash_recovry":"full"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert!(
+            resp.status().is_client_error(),
+            "a typo'd key must be refused, got {}",
+            resp.status()
+        );
+    }
+
+    #[tokio::test]
+    async fn crash_safety_path_route_needs_an_engine_and_a_path() {
+        let app = build_router(AppState::new());
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/settings/crash-safety/path?path=/data")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[test]
+    fn finalizing_is_projected_only_when_true() {
+        let mut entry =
+            rt_session::TorrentEntry::new("f".repeat(40), "held".to_owned(), "/data".to_owned());
+        entry.total_length = 100;
+        entry.amount_left = 1;
+        let plain = serde_json::to_value(crate::state::torrent_summary(&entry)).unwrap();
+        assert!(plain.get("finalizing").is_none(), "absent when false");
+
+        entry.finalizing = true;
+        let held = serde_json::to_value(crate::state::torrent_summary(&entry)).unwrap();
+        assert_eq!(held["finalizing"], true);
+        assert_eq!(held["amount_left"], 1);
+    }
+
+    #[test]
+    fn crash_safety_metrics_render_valid_prometheus_families() {
+        let runtime = rt_engine::CrashSafetyRuntime::inert();
+        runtime.record_gate_started();
+        let text = render_crash_safety_metrics(&runtime.view());
+        for family in [
+            "torrentng_crash_safety_previous_run_unclean",
+            "torrentng_crash_recovery_rechecks_total",
+            "torrentng_completions_gated_total",
+            "torrentng_completions_pending",
+            "torrentng_integrity_regressions_total",
+            "torrentng_storage_mounts",
+        ] {
+            assert!(
+                text.contains(&format!("# TYPE {family} ")),
+                "missing {family}"
+            );
+        }
+        assert!(text.contains("torrentng_completions_pending 1"));
+        assert!(text.contains("torrentng_crash_recovery_rechecks_total{reason=\"recent_write\"} 0"));
+        // Every non-comment line is `name[{labels}] value`.
+        for line in text.lines().filter(|l| !l.starts_with('#')) {
+            let (name, value) = line.rsplit_once(' ').expect(line);
+            assert!(
+                !name.is_empty() && value.parse::<u64>().is_ok(),
+                "bad line: {line}"
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn list_torrents_with_entry() {
         let (app, hash) = setup_app_with_torrent().await;
         let resp = app
@@ -10422,6 +11366,31 @@ mod tests {
         // advanced to "seeding". Exact bucket predicates must still see it.
         assert!(indexed_status_states(Some("seeding")).is_empty());
         assert!(indexed_status_states(Some("downloading")).is_empty());
+    }
+
+    #[test]
+    fn stale_seeding_state_does_not_override_live_amount_left() {
+        let entry = TorrentSummary {
+            info_hash: "s".repeat(40),
+            name: "stale seeding".to_owned(),
+            state: "seeding".to_owned(),
+            total_length: 100,
+            downloaded: 100,
+            amount_left: 25,
+            uploaded: 0,
+            ratio: 0.0,
+            save_path: "/data".to_owned(),
+            category: None,
+            tags: Vec::new(),
+            added_at: 0,
+            completed_at: Some(10),
+            num_peers: 0,
+            num_seeds: 0,
+            tracker_message: None,
+            finalizing: false,
+        };
+
+        assert_eq!(torrentng_summary_flags(&entry, 25), (false, true, true));
     }
 
     #[tokio::test]
@@ -10903,13 +11872,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn torrentng_login_accepts_default_credentials_and_api_tokens_in_either_field() {
-        let app = build_router(AppState::with_tokens(None, vec!["secret-token".to_owned()]));
+    async fn torrentng_login_accepts_generated_credentials_and_api_tokens_in_either_field() {
+        let state = AppState::with_tokens(None, vec!["secret-token".to_owned()]);
+        let configured = state.auth_credentials.read().await.clone();
+        let app = build_router(state);
         for body in [
-            "username=torrentng&password=torrentng",
-            "username=secret-token&password=",
-            "username=secret-token&password=ignored",
-            "username=operator&password=secret-token",
+            format!(
+                "username={}&password={}",
+                configured.username, configured.password
+            ),
+            "username=secret-token&password=".to_owned(),
+            "username=secret-token&password=ignored".to_owned(),
+            "username=operator&password=secret-token".to_owned(),
         ] {
             let response = app
                 .clone()
@@ -10918,7 +11892,7 @@ mod tests {
                         .method("POST")
                         .uri("/api/v1/auth/login")
                         .header("content-type", "application/x-www-form-urlencoded")
-                        .body(Body::from(body))
+                        .body(Body::from(body.clone()))
                         .unwrap(),
                 )
                 .await
@@ -10934,23 +11908,24 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn public_bind_rejects_the_unchanged_default_password_but_keeps_token_login() {
+    async fn public_bind_rejects_a_short_password_but_keeps_token_login() {
         let mut state = AppState::with_tokens(None, vec!["secret-token".to_owned()]);
         state.public_bind = true;
+        state.auth_credentials.write().await.password = "short-pass".to_owned();
         let app = build_router(state);
-        let default_login = app
+        let short_password_login = app
             .clone()
             .oneshot(
                 Request::builder()
                     .method("POST")
                     .uri("/api/v1/auth/login")
                     .header("content-type", "application/x-www-form-urlencoded")
-                    .body(Body::from("username=torrentng&password=torrentng"))
+                    .body(Body::from("username=torrentng&password=short-pass"))
                     .unwrap(),
             )
             .await
             .unwrap();
-        assert_eq!(default_login.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(short_password_login.status(), StatusCode::UNAUTHORIZED);
 
         let token_login = app
             .oneshot(
@@ -10967,10 +11942,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn public_bind_rejects_default_password_even_when_username_is_customized() {
+    async fn public_bind_rejects_a_short_password_even_when_username_is_customized() {
         let mut state = AppState::with_tokens(None, vec!["secret-token".to_owned()]);
         state.public_bind = true;
         state.auth_credentials.write().await.username = "operator".to_owned();
+        state.auth_credentials.write().await.password = "short-pass".to_owned();
         let app = build_router(state);
         let response = app
             .oneshot(
@@ -10978,7 +11954,7 @@ mod tests {
                     .method("POST")
                     .uri("/api/v1/auth/login")
                     .header("content-type", "application/x-www-form-urlencoded")
-                    .body(Body::from("username=operator&password=torrentng"))
+                    .body(Body::from("username=operator&password=short-pass"))
                     .unwrap(),
             )
             .await
@@ -10990,14 +11966,15 @@ mod tests {
     async fn public_bind_custom_credentials_without_api_tokens_create_a_webui_session() {
         let directory = tempfile::tempdir().unwrap();
         let mut state = AppState::with_tokens(None, Vec::new());
+        let password = uuid::Uuid::new_v4().simple().to_string();
         state.configure_auth_credentials(
             AuthCredentials {
                 username: "operator".to_owned(),
-                password: "custom-password".to_owned(),
+                password: password.clone(),
             },
             AuthCredentials {
                 username: "operator".to_owned(),
-                password: "custom-password".to_owned(),
+                password: password.clone(),
             },
             directory.path().join("auth-settings.json"),
             true,
@@ -11011,7 +11988,7 @@ mod tests {
                     .method("POST")
                     .uri("/api/v1/auth/login")
                     .header("content-type", "application/x-www-form-urlencoded")
-                    .body(Body::from("username=operator&password=custom-password"))
+                    .body(Body::from(format!("username=operator&password={password}")))
                     .unwrap(),
             )
             .await
@@ -11038,7 +12015,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn public_bind_cannot_save_the_default_password() {
+    async fn public_bind_cannot_save_a_short_password() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("auth-settings.json");
         let mut state = AppState::with_tokens(None, vec!["secret-token".to_owned()]);
@@ -11050,6 +12027,8 @@ mod tests {
                 Request::builder()
                     .method("PUT")
                     .uri("/api/v1/auth/settings")
+                    .header("host", "torrentng.local")
+                    .header("origin", "http://torrentng.local")
                     .header("cookie", "tng_session=secret-token")
                     .header("content-type", "application/json")
                     .body(Body::from(
@@ -11064,18 +12043,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn loopback_default_credentials_gate_browser_api_and_leave_machine_calls_unchanged() {
+    async fn loopback_generated_credentials_gate_browser_api_and_leave_machine_calls_unchanged() {
         let directory = tempfile::tempdir().unwrap();
         let mut state = AppState::with_tokens(None, Vec::new());
+        let configured = state.auth_credentials.read().await.clone();
         state.configure_auth_credentials(
-            AuthCredentials {
-                username: "torrentng".to_owned(),
-                password: "torrentng".to_owned(),
-            },
-            AuthCredentials {
-                username: "torrentng".to_owned(),
-                password: "torrentng".to_owned(),
-            },
+            configured.clone(),
+            configured.clone(),
             directory.path().join("auth-settings.json"),
             false,
             Some("local-webui-session".to_owned()),
@@ -11114,7 +12088,10 @@ mod tests {
                     .method("POST")
                     .uri("/api/v1/auth/login")
                     .header("content-type", "application/x-www-form-urlencoded")
-                    .body(Body::from("username=torrentng&password=torrentng"))
+                    .body(Body::from(format!(
+                        "username={}&password={}",
+                        configured.username, configured.password
+                    )))
                     .unwrap(),
             )
             .await
@@ -11146,15 +12123,10 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("auth-settings.json");
         let mut state = AppState::with_tokens(None, vec!["secret-token".to_owned()]);
+        let configured = state.auth_credentials.read().await.clone();
         state.configure_auth_credentials(
-            AuthCredentials {
-                username: "torrentng".to_owned(),
-                password: "torrentng".to_owned(),
-            },
-            AuthCredentials {
-                username: "torrentng".to_owned(),
-                password: "torrentng".to_owned(),
-            },
+            configured.clone(),
+            configured.clone(),
             path.clone(),
             false,
             None,
@@ -11179,9 +12151,17 @@ mod tests {
                 Request::builder()
                     .method("PUT")
                     .uri("/api/v1/auth/settings")
+                    .header("host", "torrentng.local")
+                    .header("origin", "http://torrentng.local")
                     .header("cookie", "tng_session=secret-token")
                     .header("content-type", "application/json")
-                    .body(Body::from(r#"{"username":"keith","password":"torrentng"}"#))
+                    .body(Body::from(
+                        serde_json::json!({
+                            "username": "keith",
+                            "password": "new-private-password-2026"
+                        })
+                        .to_string(),
+                    ))
                     .unwrap(),
             )
             .await
@@ -11190,12 +12170,13 @@ mod tests {
         let saved_body = axum::body::to_bytes(saved.into_body(), 4096).await.unwrap();
         let saved_json: serde_json::Value = serde_json::from_slice(&saved_body).unwrap();
         assert_eq!(saved_json["username"], "keith");
-        assert_eq!(saved_json["password_is_default"], true);
+        assert_eq!(saved_json["api_token_login_enabled"], true);
+        assert!(saved_json.get("password_is_default").is_none());
         assert!(saved_json.get("password").is_none());
         let credentials_file: serde_json::Value =
             serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
         assert_eq!(credentials_file["username"], "keith");
-        assert_eq!(credentials_file["password"], "torrentng");
+        assert_eq!(credentials_file["password"], "new-private-password-2026");
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -11211,6 +12192,8 @@ mod tests {
                 Request::builder()
                     .method("DELETE")
                     .uri("/api/v1/auth/settings")
+                    .header("host", "torrentng.local")
+                    .header("origin", "http://torrentng.local")
                     .header("cookie", "tng_session=secret-token")
                     .body(Body::empty())
                     .unwrap(),
@@ -11219,7 +12202,10 @@ mod tests {
             .unwrap();
         assert_eq!(reset.status(), StatusCode::OK);
         assert!(!path.exists());
-        assert_eq!(state.auth_credentials.read().await.username, "torrentng");
+        assert_eq!(
+            state.auth_credentials.read().await.username,
+            configured.username
+        );
     }
 
     #[tokio::test]
@@ -11389,6 +12375,7 @@ mod tests {
                     .method("DELETE")
                     .uri(format!("/api/v1/torrents/{hash}"))
                     .header(header::COOKIE, "other=1; tng_session=secret-token")
+                    .header(header::HOST, "localhost")
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -11932,6 +12919,7 @@ mod tests {
             num_peers: 0,
             num_seeds: 0,
             tracker_message: None,
+            finalizing: false,
         };
         let small_meta = rt_engine::EngineTorrentMetadata {
             piece_length: 16 * 1024,
@@ -11948,6 +12936,8 @@ mod tests {
                 index: 0,
                 path: "detail.bin".to_owned(),
                 length: 1024,
+                offset: 0,
+                piece_offset: 0,
                 priority: 1,
                 wanted: true,
             }],
@@ -11959,6 +12949,8 @@ mod tests {
                 index: idx + 1,
                 path: format!("dir/{idx}/large-detail-file-{idx}.bin"),
                 length: 1024,
+                offset: (idx as u64 + 1) * 1024,
+                piece_offset: (idx as u64 + 1) * 1024,
                 priority: 1,
                 wanted: true,
             }));
@@ -12016,6 +13008,30 @@ mod tests {
             serde_json::json!({ "id": "workflow", "enabled": "yes" }),
         );
         assert!(validate_json_map(&workflow, "native.workflows", "workflow").is_err());
+    }
+
+    #[test]
+    fn json_store_validation_bounds_rule_fields_before_matching() {
+        let mut rss = JsonMap::new();
+        rss.insert(
+            "rule".to_owned(),
+            serde_json::json!({
+                "id": "rule",
+                "include": "x".repeat(MAX_NATIVE_JSON_TEXT_BYTES + 1)
+            }),
+        );
+        assert!(validate_json_map(&rss, "native.rss_rules", "rss_rule").is_err());
+
+        let oversized_value = serde_json::json!({
+            "id": "rule",
+            "include": "x".repeat(MAX_NATIVE_JSON_BYTES)
+        });
+        assert!(validate_json_value_size(&oversized_value, "native.rss_rules").is_err());
+
+        let oversized_id = serde_json::json!({
+            "id": "x".repeat(257)
+        });
+        assert!(json_item_id(&oversized_id).is_none());
     }
 
     #[test]
@@ -12077,19 +13093,16 @@ mod tests {
     #[tokio::test]
     async fn json_store_upsert_returns_payload_too_large_without_replacing_state() {
         let state = AppState::new();
-        let empty_record = serde_json::json!({ "id": "old", "name": "" });
-        let mut baseline = JsonMap::new();
-        baseline.insert("old".to_owned(), empty_record.clone());
-        let baseline_len = serde_json::to_vec(&baseline).unwrap().len();
-        let mut record = empty_record;
-        record["name"] =
-            serde_json::Value::String("x".repeat(MAX_NATIVE_JSON_BYTES - baseline_len));
         let mut persisted = JsonMap::new();
-        persisted.insert("old".to_owned(), record);
-        assert_eq!(
-            serde_json::to_vec(&persisted).unwrap().len(),
-            MAX_NATIVE_JSON_BYTES
+        persisted.insert(
+            "old".to_owned(),
+            serde_json::json!({ "id": "old", "params": { "payload": "" } }),
         );
+        let baseline_len = serde_json::to_vec(&persisted).unwrap().len();
+        let target_len = MAX_NATIVE_JSON_BYTES - 16;
+        persisted.get_mut("old").unwrap()["params"]["payload"] =
+            serde_json::Value::String("x".repeat(target_len - baseline_len));
+        assert_eq!(serde_json::to_vec(&persisted).unwrap().len(), target_len);
         *state.saved_views.write().await = persisted.clone();
         let saved_views = state.saved_views.clone();
         let app = build_router(state);
@@ -12750,7 +13763,18 @@ mod tests {
         let resolved = resolve_hashes(&state, &[known.to_ascii_uppercase(), "b".repeat(40)])
             .await
             .unwrap();
-        assert_eq!(resolved, vec![known, "b".repeat(40)]);
+        assert_eq!(resolved, vec![known.clone(), "b".repeat(40)]);
+
+        let duplicate = resolve_hashes(
+            &state,
+            &[known.to_ascii_uppercase(), known.clone(), "all".to_owned()],
+        )
+        .await;
+        assert!(duplicate.is_err());
+        let duplicate = resolve_hashes(&state, &[known.to_ascii_uppercase(), known.clone()])
+            .await
+            .unwrap();
+        assert_eq!(duplicate, vec![known]);
     }
 
     #[tokio::test]
@@ -12771,5 +13795,10 @@ mod tests {
 
         assert!(resolve_hashes(&state, &["all".to_owned()]).await.is_err());
         assert!(preview_hashes(&state, &["all".to_owned()]).await.is_err());
+        assert!(
+            matching_hashes_for_json_rule(&state, &serde_json::json!({}))
+                .await
+                .is_err()
+        );
     }
 }

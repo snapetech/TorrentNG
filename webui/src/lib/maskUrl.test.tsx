@@ -35,4 +35,15 @@ describe('maskAnnounceUrl', () => {
     expect(redactUrlForDisplay('not a URL with credential=secret')).toBe('[redacted URL]')
     expect(redactUrlForDisplay('ftp://files.example/private')).toBe('[redacted URL]')
   })
+
+  it('redacts arbitrary webhook and feed URL details', () => {
+    const redacted = maskAnnounceUrl(
+      'https://hooks.example/notify?api_key=secret-value&source=torrentng',
+    )
+
+    expect(redacted).toBe('https://hooks.example/…')
+    expect(redacted).not.toContain('api_key')
+    expect(redacted).not.toContain('secret-value')
+    expect(redacted).not.toContain('source=torrentng')
+  })
 })

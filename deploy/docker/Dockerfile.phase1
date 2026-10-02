@@ -3,7 +3,7 @@
 # rTorrent 0.16.11, libtorrent 0.16.11, ruTorrent 5.3.1,
 # tinyxml2 XMLRPC backend, nginx proxy.
 
-FROM alpine:3.20 AS base
+FROM alpine:3.20@sha256:d9e853e87e55526f6b2917df91a2115c36dd7c696a35be12163d44e6e2a4b6bc AS base
 
 # Build rTorrent with tinyxml2 (avoids xmlrpc-c erratic behavior, rtorrent#1636)
 # and expose the libtorrent HTTP user-agent getter/setter over XMLRPC.
@@ -15,11 +15,21 @@ RUN apk add --no-cache \
     ncurses-dev tinyxml2-dev \
     linux-headers
 
+# These commits are the v0.16.11 source revisions. Fetch by object ID rather
+# than by a mutable tag so a retagged upstream release cannot change the image.
 WORKDIR /src
-ARG RTORRENT_VERSION=0.16.11
-ARG LIBTORRENT_VERSION=0.16.11
-RUN git clone --depth=1 --branch "v${RTORRENT_VERSION}" https://github.com/rakshasa/rtorrent.git && \
-    git clone --depth=1 --branch "v${LIBTORRENT_VERSION}" https://github.com/rakshasa/libtorrent.git
+ARG RTORRENT_COMMIT=2700b3141f966d8533a6153491e1c76b3cf5c2b9
+ARG LIBTORRENT_COMMIT=dafcba711114af2274a45ca55a7bcd4abdf5ca9a
+RUN git init rtorrent && \
+    git -C rtorrent remote add origin https://github.com/rakshasa/rtorrent.git && \
+    git -C rtorrent fetch --depth=1 origin "$RTORRENT_COMMIT" && \
+    git -C rtorrent checkout --detach FETCH_HEAD && \
+    test "$(git -C rtorrent rev-parse HEAD)" = "$RTORRENT_COMMIT" && \
+    git init libtorrent && \
+    git -C libtorrent remote add origin https://github.com/rakshasa/libtorrent.git && \
+    git -C libtorrent fetch --depth=1 origin "$LIBTORRENT_COMMIT" && \
+    git -C libtorrent checkout --detach FETCH_HEAD && \
+    test "$(git -C libtorrent rev-parse HEAD)" = "$LIBTORRENT_COMMIT"
 COPY deploy/docker/patches/rtorrent-0.16.11-user-agent-command.patch /tmp/rtorrent-user-agent-command.patch
 RUN cd rtorrent && git apply /tmp/rtorrent-user-agent-command.patch
 
@@ -57,10 +67,15 @@ ENV TNG_RTORRENT_PATCHES=rtorrent-0.16.11-user-agent-command
 LABEL org.opencontainers.image.title="TorrentNG Phase 1" \
       org.opencontainers.image.description="TorrentNG Phase 1 rTorrent/ruTorrent deployment bundle for compatibility testing."
 
-# ruTorrent 5.3.1
+# ruTorrent 5.3.1. Verify the archive before unpacking it.
+ARG RUTORRENT_SHA256=338d89c7842381b350e359f63d6595aa36d2472b22d8b6f02294d6ddcfd9ecb1
 RUN mkdir -p /var/www/rutorrent && \
-    wget -qO- https://github.com/Novik/ruTorrent/archive/refs/tags/v5.3.1.tar.gz | \
-    tar -xz -C /var/www/rutorrent --strip-components=1
+    curl --fail --location --silent --show-error \
+      --output /tmp/rutorrent.tar.gz \
+      https://github.com/Novik/ruTorrent/archive/refs/tags/v5.3.1.tar.gz && \
+    printf '%s  %s\n' "$RUTORRENT_SHA256" /tmp/rutorrent.tar.gz | sha256sum -c - && \
+    tar -xzf /tmp/rutorrent.tar.gz -C /var/www/rutorrent --strip-components=1 && \
+    rm -f /tmp/rutorrent.tar.gz
 
 COPY deploy/docker/rtorrent.rc      /etc/rtorrent/rtorrent.rc
 COPY engine-profile/rtorrent.rc     /etc/rtorrent/profile.rc

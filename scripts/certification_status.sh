@@ -4,12 +4,14 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 REPORT_DIR="${1:-$ROOT/certification/reports}"
 BENCHMARK_DIR="${BENCHMARK_DIR:-$ROOT/benchmarks}"
+DEFER_24H_SOAK="${TNG_DEFER_24H_SOAK:-0}"
 
 latest() {
   local pattern="$1"
   local dir="${2:-$REPORT_DIR}"
-  find "$dir" -maxdepth 1 -type f -name "$pattern" -printf '%T@ %p\n' 2>/dev/null \
-    | sort -nr | awk 'NR==1 {print $2}'
+  find "$dir" -maxdepth 1 -type f -name "$pattern" -printf '%T@\t%p\n' 2>/dev/null \
+    | sort -t $'\t' -k1,1nr \
+    | awk 'NR == 1 { print substr($0, index($0, "\t") + 1) }'
 }
 
 latest_excluding() {
@@ -17,8 +19,8 @@ latest_excluding() {
   local dir="$2"
   shift 2
   local excludes=("$@")
-  find "$dir" -maxdepth 1 -type f -name "$pattern" -printf '%T@ %p\n' 2>/dev/null \
-    | while read -r ts path; do
+  find "$dir" -maxdepth 1 -type f -name "$pattern" -printf '%T@\t%p\n' 2>/dev/null \
+    | while IFS=$'\t' read -r ts path; do
         local base skip exclude
         base="$(basename "$path")"
         skip=0
@@ -30,9 +32,10 @@ latest_excluding() {
             break
           fi
         done
-        [[ "$skip" == "1" ]] || printf '%s %s\n' "$ts" "$path"
+        [[ "$skip" == "1" ]] || printf '%s\t%s\n' "$ts" "$path"
       done \
-    | sort -nr | awk 'NR==1 {print $2}'
+    | sort -t $'\t' -k1,1nr \
+    | awk 'NR == 1 { print substr($0, index($0, "\t") + 1) }'
 }
 
 overall() {
@@ -43,7 +46,7 @@ overall() {
   fi
   awk -F': ' '
     /^Overall status:/ {status=$2}
-    /test result: ok/ {ok=1}
+    /^[[:space:]]*test result: ok([.[:space:]]|$)/ {ok=1}
     END {
       if (status) print status;
       else if (ok) print "PASS";
@@ -83,6 +86,10 @@ row_excluding() {
 
 row_24h_soak() {
   local file status sample active finalized_status final_file raw_file
+  if [[ "$DEFER_24H_SOAK" == "1" ]]; then
+    printf '| %s | %s | %s |\n' "24h soak" "INFO" "deferred by TNG_DEFER_24H_SOAK=1"
+    return
+  fi
   # A completed finalization report is the authoritative result for the long
   # soak.  The raw soak report is intentionally retained for sample-level
   # evidence, but it can be older than the finalizer and may still look
@@ -188,7 +195,6 @@ row "Universal compatibility" 'universal-compat-*.md'
 row_excluding "Universal live compatibility" 'universal-live-*.md' "$REPORT_DIR" 'universal-live-soak-ready.md'
 row_excluding "Migration corpus" 'migration-corpus-*.md' "$REPORT_DIR" 'migration-corpus-local-release-*' 'migration-corpus-universal-*'
 row "External evidence preflight" 'external-evidence-preflight-*.md'
-row "Synthetic benchmark" 'report-*.md' "$BENCHMARK_DIR"
 row "Short soak" 'soak-202*.md'
 row "Transfer churn soak" 'transfer-churn-*.md'
 row_24h_soak

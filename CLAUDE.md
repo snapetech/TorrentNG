@@ -88,6 +88,34 @@ report fidelity buckets. Source code: `crates/torrentngd/src/{migrate,export}.rs
 Certification: `crates/rt-migrate/tests/round_trip_matrix.rs` (all clients ×
 import/export/round-trip) plus `scripts/migration_corpus_certification.sh`.
 
+## Crash safety (torrentngd)
+
+Full guide: `docs/CRASH_SAFETY.md`. The invariant to preserve in any storage,
+fastresume or completion change: **never persist a claim (resume record,
+`completed_at`, `Seeding`, tracker `completed`) before the data it describes is
+durable.**
+
+- Fastresume is written only after the payload barrier (`save_fastresume_with` in
+  `crates/rt-engine/src/torrent_task.rs`); a record saved without a data sync is
+  `durability.synced = false` and is discarded after a host crash.
+- A finished download is held (`CompletionGate`, reported as `amount_left = 1`)
+  until a forced barrier succeeds; do not add code paths that reach `Seeding`
+  around it. Pure-v2 tasks have their own barrier in `torrent_task_v2.rs`.
+- Never preallocate by writing zeros (`posix_fallocate` emulates that); use
+  native `fallocate` or a sparse length so unwritten space stays visible to the
+  allocation audit (`rt-storage::alloc_audit`).
+- Host crash vs process crash is decided from `run_marker.json` plus the OS boot
+  identity (`rt-fastresume::run_marker`, `rt-storage::boot`); the pure recovery
+  decision is `rt-fastresume::recovery::decide_recovery`.
+- Settings live under `[crash_safety]`, are runtime-editable
+  (`/api/v1/settings/crash-safety`, WebUI Settings → Backend), and unknown keys are
+  rejected. OS-specific probes must degrade to "unsupported", never fail startup.
+- Per-torrent decisions (gate, recovery, audit, read-back) must go through
+  `CrashSafetyRuntime::for_location(save_root)` so `[[crash_safety.path_policies]]`
+  applies; reading the global fields directly bypasses per-location overrides.
+- The power-cut model tests (`power_cut_*` in `torrent_task.rs`) must keep failing
+  for the unprotected configuration; that is what proves the harness has teeth.
+
 ## torrentng — compatible-client WebUI/API service
 
 **Entry:** `sidecar/src/main.rs` (the source path is retained for compatibility)
@@ -115,11 +143,15 @@ import/export/round-trip) plus `scripts/migration_corpus_certification.sh`.
 
 **Entry:** `webui/src/main.tsx`
 **Key constraints:**
-- Virtualized torrent table (TanStack Virtual or similar) — must handle 100k rows
+- Virtualized torrent table (TanStack Virtual or similar) — keep rendering and
+  client-side state bounded
 - Server-side sort/filter via TorrentNG or compatible-client API — never load all torrents to browser
 - No right-click dependency for mobile support
 - Delta sync via WebSocket — no full-refresh polling loops
 - Settings view includes `UserAgentPanel` component for live user-agent management
+- Settings → Backend also includes `CrashSafetyPanel` (native client only, gated
+  on the `supports_crash_safety` capability); torrents held by the completion gate
+  show as **Finalizing** (`isFinalizing` in `api/client.ts`)
 
 ## qBittorrent API compatibility targets
 
@@ -143,15 +175,12 @@ Must pass *arr/autobrr integration tests:
 - `GET  /api/qb/v2/sync/maindata`
 - `GET  /api/qb/v2/transfer/info`
 
-## Benchmark targets (in benchmarks/)
+## Performance diagnostics (non-release)
 
-Every release must pass:
-- 1k torrents: UI first paint < 1s, filter < 100ms
-- 10k torrents: UI first paint < 2s, filter < 200ms
-- 15k torrents: UI first paint < 3s, filter < 500ms
-- 50k synthetic: compatibility API `/torrents/info` < 500ms
-- `/sync/maindata` delta < 50ms under normal churn
-- TorrentNG-client/integration-service memory within release target at 15k torrents after 24h
+The optional checks in `benchmarks/` exercise API latency, delta sync, and
+resource regressions with host-selected fixtures. They are diagnostic only;
+numeric torrent-count capacity proofs and 24-hour stability are not current
+release gates.
 
 ## Historical development tracks
 
@@ -175,7 +204,7 @@ transfer path. See `docs/ENGINE_REWRITE.md` and `docs/ENGINE.md`.
 
 ### Track 2 phases (summary)
 
-0. Research/design lock → 1. Foundation crates (bencode/metainfo/hash/piece-map) → 2. Storage + recheck client → 3. Tracker client → 4. TCP seeding MVP → 5. Session daemon → 6. qBit API compat v1 → 7. Downloading → 8. Scale hardening (15k/200TB) → 9. Web UI → 10. DHT/PEX/uTP → 11. BEP 52/v2 → 12. Production 1.0
+0. Research/design lock → 1. Foundation crates (bencode/metainfo/hash/piece-map) → 2. Storage + recheck client → 3. Tracker client → 4. TCP seeding MVP → 5. Session daemon → 6. qBit API compat v1 → 7. Downloading → 8. Runtime/resource hardening → 9. Web UI → 10. DHT/PEX/uTP → 11. BEP 52/v2 → 12. Production 1.0
 
 ## Conventions
 

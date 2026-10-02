@@ -3,6 +3,8 @@ use serde::Serialize;
 
 use super::client::{Client, XmlValue};
 
+const MAX_TRACKER_ROWS: usize = 16_384;
+
 #[derive(Debug, Clone, Serialize)]
 pub struct RawTracker {
     pub url: String,
@@ -77,6 +79,9 @@ impl Client {
 }
 
 fn parse_tracker_rows(rows: Vec<XmlValue>) -> Result<Vec<RawTracker>> {
+    if rows.len() > MAX_TRACKER_ROWS {
+        bail!("rTorrent tracker response contains more than {MAX_TRACKER_ROWS} rows");
+    }
     let mut out = Vec::with_capacity(rows.len());
     for (idx, row) in rows.into_iter().enumerate() {
         let f = row.try_into_array()?;
@@ -85,8 +90,8 @@ fn parse_tracker_rows(rows: Vec<XmlValue>) -> Result<Vec<RawTracker>> {
         }
         out.push(RawTracker {
             url: required_url(&f, 0)?,
-            id: required_i64(&f, 1, "t.id")?,
-            group: required_i64(&f, 2, "t.group")?,
+            id: required_nonnegative_i64(&f, 1, "t.id")?,
+            group: required_nonnegative_i64(&f, 2, "t.group")?,
             group_index: idx as i64,
             is_enabled: required_bool(&f, 3, "t.is_enabled")?,
             is_open: required_bool(&f, 4, "t.is_open")?,
@@ -95,11 +100,11 @@ fn parse_tracker_rows(rows: Vec<XmlValue>) -> Result<Vec<RawTracker>> {
             activity_time_next: required_i64(&f, 7, "t.activity_time_next")?,
             min_interval: required_i64(&f, 8, "t.min_interval")?,
             normal_interval: required_i64(&f, 9, "t.normal_interval")?,
-            failed_counter: required_i64(&f, 10, "t.failed_counter")?,
-            success_counter: required_i64(&f, 11, "t.success_counter")?,
-            scrape_incomplete: required_i64(&f, 12, "t.scrape_incomplete")?,
-            scrape_complete: required_i64(&f, 13, "t.scrape_complete")?,
-            scrape_downloaded: required_i64(&f, 14, "t.scrape_downloaded")?,
+            failed_counter: required_nonnegative_i64(&f, 10, "t.failed_counter")?,
+            success_counter: required_nonnegative_i64(&f, 11, "t.success_counter")?,
+            scrape_incomplete: required_nonnegative_i64(&f, 12, "t.scrape_incomplete")?,
+            scrape_complete: required_nonnegative_i64(&f, 13, "t.scrape_complete")?,
+            scrape_downloaded: required_nonnegative_i64(&f, 14, "t.scrape_downloaded")?,
             message: String::new(),
         });
     }
@@ -122,6 +127,14 @@ fn required_i64(fields: &[XmlValue], index: usize, name: &str) -> Result<i64> {
         .ok_or_else(|| anyhow!("rTorrent response omitted valid {name}"))
 }
 
+fn required_nonnegative_i64(fields: &[XmlValue], index: usize, name: &str) -> Result<i64> {
+    let value = required_i64(fields, index, name)?;
+    if value < 0 {
+        bail!("rTorrent response contains negative {name}: {value}");
+    }
+    Ok(value)
+}
+
 fn required_bool(fields: &[XmlValue], index: usize, name: &str) -> Result<bool> {
     fields
         .get(index)
@@ -131,7 +144,8 @@ fn required_bool(fields: &[XmlValue], index: usize, name: &str) -> Result<bool> 
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::{parse_tracker_rows, MAX_TRACKER_ROWS};
+    use crate::rtorrent::XmlValue;
 
     #[test]
     fn parse_tracker_rows_accepts_requested_field_count() {
@@ -175,5 +189,43 @@ mod tests {
         ])]);
 
         assert!(parsed.is_err());
+    }
+
+    #[test]
+    fn parse_tracker_rows_rejects_negative_identity_and_counters() {
+        for field in [1, 2, 10, 11, 12, 13, 14] {
+            let mut row = vec![
+                "udp://tracker.example/announce".into(),
+                7_i64.into(),
+                1_i64.into(),
+                true.into(),
+                false.into(),
+                true.into(),
+                10_i64.into(),
+                20_i64.into(),
+                30_i64.into(),
+                40_i64.into(),
+                3_i64.into(),
+                4_i64.into(),
+                5_i64.into(),
+                6_i64.into(),
+                7_i64.into(),
+            ];
+            row[field] = (-1_i64).into();
+
+            assert!(
+                parse_tracker_rows(vec![XmlValue::Array(row)]).is_err(),
+                "field index {field} should reject a negative value"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_tracker_rows_rejects_oversized_result_before_output_allocation() {
+        let rows = (0..=MAX_TRACKER_ROWS)
+            .map(|_| XmlValue::Array(Vec::new()))
+            .collect();
+
+        assert!(parse_tracker_rows(rows).is_err());
     }
 }

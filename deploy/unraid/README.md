@@ -20,14 +20,14 @@ shows on the Add Container page.
 
 ## WebUI login
 
-Both TorrentNG profiles default to `torrentng` / `torrentng` on loopback
-installs. The Unraid templates publish on a public container bind, so their
-default password is disabled: use the template's **API Token** or **API
-Tokens** value in either the username or password field. After signing in,
-open **Settings -> Security** to set a unique username and password. API
-tokens remain available for automation. You can also configure credentials in
-`[auth].username` and `[auth].password`; runtime changes persist in the
-profile's state directory until restored from config.toml.
+Each install generates a unique WebUI password in its state directory. The
+templates publish on a public container bind, so first sign in with the
+template's **API Token** or **API Tokens** value; the same token can be entered
+in either login field. Retrieve the generated login from the container console
+with `torrentngd auth-token` (native) or `torrentng auth-token` (WebUI service).
+Then open **Settings -> Security** to choose a username and password of at
+least 16 characters. API tokens remain available for automation. Runtime
+changes persist in the profile's state directory.
 
 ## Native torrentng behind Gluetun
 

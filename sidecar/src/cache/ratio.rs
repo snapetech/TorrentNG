@@ -1,10 +1,16 @@
-use anyhow::Result;
+use anyhow::{bail, Result};
 use rusqlite::{params, types::Value, OptionalExtension, Transaction};
 use serde::{Deserialize, Serialize};
 
-use super::{db::Db, AutomationStateCapacityError, MAX_AUTOMATION_STATE_JSON_BYTES};
+use super::{
+    db::{kv_value_bounded, Db, MAX_KV_VALUE_BYTES},
+    AutomationStateCapacityError, MAX_AUTOMATION_STATE_JSON_BYTES,
+};
 
 const KEY: &str = "ratio_groups";
+pub(crate) const MAX_RATIO_GROUPS: usize = 512;
+const MAX_RATIO_TARGETS: usize = 16_384;
+const MAX_RATIO_GROUP_TEXT_BYTES: usize = 64 * 1024;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct RatioGroup {
@@ -28,11 +34,16 @@ impl Db {
             Some(raw) => serde_json::from_str(&raw)?,
             None => Vec::new(),
         };
+        ensure_count(groups.len(), MAX_RATIO_GROUPS, "ratio groups")?;
+        for group in &groups {
+            validate_ratio_group(group)?;
+        }
         groups.sort_by_key(|a| a.name.to_lowercase());
         Ok(groups)
     }
 
     pub fn upsert_ratio_group(&self, group: RatioGroup) -> Result<Vec<RatioGroup>> {
+        validate_ratio_group(&group)?;
         let name = group.name.clone();
         self.update_ratio_groups(|groups| {
             groups.retain(|existing| existing.name != name);
@@ -77,6 +88,7 @@ impl Db {
         let rows = stmt
             .query_map(rusqlite::params_from_iter(args.iter()), |r| r.get(0))?
             .collect::<rusqlite::Result<Vec<String>>>()?;
+        ensure_count(rows.len(), MAX_RATIO_TARGETS, "ratio-group targets")?;
         Ok(rows)
     }
 
@@ -92,22 +104,58 @@ impl Db {
     {
         let mut conn = self.conn()?;
         let tx = conn.transaction()?;
-        let raw: Option<String> = tx
-            .query_row("SELECT value FROM kv WHERE key=?1", params![KEY], |r| {
-                r.get(0)
-            })
-            .optional()?;
+        let raw = kv_value_bounded(&tx, KEY, MAX_KV_VALUE_BYTES, "ratio groups")?;
         let mut groups: Vec<RatioGroup> = match raw {
             Some(raw) => serde_json::from_str(&raw)?,
             None => Vec::new(),
         };
+        for group in &groups {
+            validate_ratio_group(group)?;
+        }
         update(&mut groups);
+        ensure_count(groups.len(), MAX_RATIO_GROUPS, "ratio groups")?;
+        for group in &groups {
+            validate_ratio_group(group)?;
+        }
         groups.sort_by_key(|group| group.name.to_lowercase());
         let raw = serde_json::to_string(&groups)?;
         write_ratio_groups(&tx, &raw)?;
         tx.commit()?;
         Ok(groups)
     }
+}
+
+fn ensure_count(count: usize, maximum: usize, label: &str) -> Result<()> {
+    if count > maximum {
+        bail!("{label} exceed the maximum of {maximum}");
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_ratio_group(group: &RatioGroup) -> Result<()> {
+    validate_ratio_group_text("ratio group name", &group.name)?;
+    for (label, value) in [
+        ("ratio group category", group.category.as_deref()),
+        ("ratio group tracker", group.tracker.as_deref()),
+    ] {
+        if let Some(value) = value {
+            validate_ratio_group_text(label, value)?;
+        }
+    }
+    if !group.ratio_limit.is_finite() || group.ratio_limit < 0.0 {
+        bail!("ratio group ratio_limit is invalid");
+    }
+    if group.seeding_time_limit < -1 {
+        bail!("ratio group seeding_time_limit is invalid");
+    }
+    Ok(())
+}
+
+fn validate_ratio_group_text(label: &str, value: &str) -> Result<()> {
+    if value.len() > MAX_RATIO_GROUP_TEXT_BYTES {
+        bail!("{label} exceeds the maximum of {MAX_RATIO_GROUP_TEXT_BYTES} bytes");
+    }
+    Ok(())
 }
 
 fn write_ratio_groups(tx: &Transaction<'_>, raw: &str) -> Result<()> {

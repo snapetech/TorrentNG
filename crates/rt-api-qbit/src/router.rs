@@ -12,16 +12,24 @@ use axum::{
 
 use crate::{handlers::*, state::AppState};
 use rt_api_model::{
-    api_token_allowed, bearer_token, csrf_request_allowed, has_browser_request_headers,
-    has_session_cookie, request_fingerprint, valid_idempotency_key, CachedResponse,
-    IdempotencyClaim, MAX_IDEMPOTENCY_BODY_BYTES,
+    api_token_allowed, api_uri_is_bounded, bearer_token, cached_response_headers,
+    csrf_request_allowed, has_browser_request_headers, has_session_cookie,
+    is_replayable_response_header, request_fingerprint, single_header_value, valid_idempotency_key,
+    CachedResponse, IdempotencyClaim, MAX_IDEMPOTENCY_BODY_BYTES,
 };
 use tower::limit::GlobalConcurrencyLimitLayer;
 
 const MAX_QBIT_LARGE_BODY_REQUESTS: usize = 4;
-const MAX_QBIT_DEFAULT_BODY_BYTES: usize = 8 * 1024 * 1024;
+// Form mutations carry only bounded compatibility text. Keep their admission
+// limit close to the field contract so an idle connection cannot reserve an
+// 8 MiB body buffer for a request that will be rejected later.
+const MAX_QBIT_DEFAULT_BODY_BYTES: usize = 256 * 1024;
 const MAX_QBIT_TORRENT_BODY_BYTES: usize = 64 * 1024 * 1024;
 const MAX_QBIT_AUTH_BODY_BYTES: usize = 16 * 1024;
+
+fn is_qbit_large_upload_path(path: &str) -> bool {
+    path.ends_with("/torrents/add")
+}
 
 pub fn build_qbit_router(state: AppState) -> Router {
     let large_body_limit = GlobalConcurrencyLimitLayer::new(MAX_QBIT_LARGE_BODY_REQUESTS);
@@ -34,7 +42,19 @@ pub fn build_qbit_router(state: AppState) -> Router {
             "/api/v2",
             protected_qbit_routes(state.clone(), large_body_limit),
         )
+        .layer(middleware::from_fn(qbit_request_uri_guard))
         .with_state(state)
+}
+
+async fn qbit_request_uri_guard(req: Request<Body>, next: Next) -> Response {
+    if !api_uri_is_bounded(req.uri()) {
+        return (
+            StatusCode::URI_TOO_LONG,
+            "request URI exceeds the maximum length",
+        )
+            .into_response();
+    }
+    next.run(req).await
 }
 
 fn protected_qbit_routes(
@@ -42,8 +62,8 @@ fn protected_qbit_routes(
     large_body_limit: GlobalConcurrencyLimitLayer,
 ) -> Router<AppState> {
     qbit_routes(large_body_limit)
-        // Keep ordinary qBit form endpoints at 8 MiB. `/torrents/add` installs
-        // its route-local 64 MiB total limit below.
+        // Keep ordinary qBit form endpoints at 256 KiB. Preference/cookie JSON
+        // and `/torrents/add` install their larger route-local limits below.
         .layer(DefaultBodyLimit::max(MAX_QBIT_DEFAULT_BODY_BYTES))
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
@@ -64,16 +84,23 @@ async fn qbit_idempotency_guard(
             | &axum::http::Method::PATCH
             | &axum::http::Method::DELETE
     ) || qbit_public_path(req.uri().path())
+        || is_qbit_large_upload_path(req.uri().path())
     {
+        // Multipart torrent uploads have a larger route-local limit and a
+        // separate concurrency budget. Do not buffer them in this small
+        // idempotency middleware before those guards can run.
         return next.run(req).await;
     }
-    let Some(key) = req
-        .headers()
-        .get("idempotency-key")
-        .and_then(|value| value.to_str().ok())
-        .map(str::to_owned)
-    else {
-        return next.run(req).await;
+    let key = match single_header_value(req.headers(), "idempotency-key") {
+        Ok(Some(value)) => value.to_owned(),
+        Ok(None) => return next.run(req).await,
+        Err(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                "duplicate Idempotency-Key headers are not accepted",
+            )
+                .into_response();
+        }
     };
     if !valid_idempotency_key(&key) {
         return (StatusCode::BAD_REQUEST, "invalid Idempotency-Key").into_response();
@@ -123,11 +150,7 @@ async fn qbit_idempotency_guard(
     };
     let response = Response::from_parts(parts.clone(), Body::from(body.clone()));
     if parts.status.is_success() {
-        let headers = parts
-            .headers
-            .iter()
-            .map(|(name, value)| (name.to_string(), value.as_bytes().to_vec()))
-            .collect();
+        let headers = cached_response_headers(&parts.headers);
         execution.complete(CachedResponse {
             status: parts.status.as_u16(),
             headers,
@@ -152,8 +175,18 @@ fn replay_response(cached: CachedResponse) -> Response {
             .into_response();
     }
     let mut response = Response::new(Body::from(cached.body));
-    *response.status_mut() = StatusCode::from_u16(cached.status).unwrap_or(StatusCode::OK);
+    let Ok(status) = StatusCode::from_u16(cached.status) else {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "cached idempotency response had an invalid status",
+        )
+            .into_response();
+    };
+    *response.status_mut() = status;
     for (name, value) in cached.headers {
+        if !is_replayable_response_header(&name) {
+            continue;
+        }
         let Ok(name) = axum::http::HeaderName::from_bytes(name.as_bytes()) else {
             continue;
         };
@@ -308,14 +341,24 @@ fn qbit_routes(large_body_limit: GlobalConcurrencyLimitLayer) -> Router<AppState
         .route("/app/webapiVersion", get(app_webapi_version))
         .route("/app/buildInfo", get(app_build_info))
         .route("/app/preferences", get(app_preferences))
-        .route("/app/setPreferences", post(app_set_preferences))
+        .route(
+            "/app/setPreferences",
+            post(app_set_preferences).layer(DefaultBodyLimit::max(
+                crate::handlers::MAX_QBIT_PREFERENCE_BYTES,
+            )),
+        )
         .route("/app/shutdown", post(app_shutdown))
         .route(
             "/app/sendTestEmail",
             get(app_send_test_email).post(app_send_test_email),
         )
         .route("/app/getCookies", get(app_get_cookies))
-        .route("/app/setCookies", post(app_set_cookies))
+        .route(
+            "/app/setCookies",
+            post(app_set_cookies).layer(DefaultBodyLimit::max(
+                crate::handlers::MAX_QBIT_PREFERENCE_BYTES,
+            )),
+        )
         .route("/app/rotateAPIKey", post(app_rotate_api_key))
         .route("/app/deleteAPIKey", post(app_delete_api_key))
         .route("/app/networkInterfaceList", get(app_network_interface_list))

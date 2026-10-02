@@ -1,12 +1,16 @@
-use anyhow::Result;
-use rusqlite::{params, params_from_iter, types::Type, OptionalExtension};
+use anyhow::{bail, Result};
+use rusqlite::{params, params_from_iter, types::Type};
 use serde::Deserialize;
 
 use super::categories::{
-    check_tag_assignment_projection_capacity, CategoryTagCapacityError,
-    MAX_CACHED_LABEL_NAME_BYTES, MAX_CACHED_TAGS_PER_MUTATION,
+    bounded_text_from_sql, check_tag_assignment_projection_capacity, CategoryTagCapacityError,
+    MAX_CACHED_LABEL_NAME_BYTES, MAX_CACHED_TAGS_PER_MUTATION, MAX_TORRENT_LOCATION_TEXT_BYTES,
 };
-use super::db::{current_revision_locked, Db, TorrentRow, CACHE_REVISION_FLOOR_KEY};
+use super::db::{
+    current_revision_locked, kv_value_bounded, sql_limit_with_sentinel, Db, TorrentRow,
+    CACHE_REVISION_FLOOR_KEY, MAX_TORRENT_HASH_BYTES, MAX_TORRENT_MESSAGE_BYTES,
+    MAX_TORRENT_NAME_BYTES, MAX_TORRENT_TRACKER_URL_BYTES,
+};
 
 /// Maximum rows materialized by a public compatible-client service page endpoint. Compatibility
 /// protocols without paging use a separate, stricter whole-response policy.
@@ -14,6 +18,11 @@ pub const MAX_API_PAGE_ENTRIES: i64 = 5_000;
 /// Prevent a client from turning SQL OFFSET into an arbitrary skip scan. The
 /// TorrentNG-client snapshot API is the path for deep, cursor-pinned exports.
 pub const MAX_API_PAGE_OFFSET: i64 = 1_000_000;
+/// The tracker-health endpoint has no pagination contract, so reject a
+/// projection that would exceed a bounded response rather than silently
+/// returning only the first page.
+pub const MAX_TRACKER_HEALTH_ENTRIES: usize = 5_000;
+const MAX_CACHE_DELTA_ROWS: usize = 100_000;
 
 // Keep cache filtering and ordering consistent with the qBittorrent wire
 // projection in qbcompat::handlers::current_row_rates(). A rate older than
@@ -125,14 +134,11 @@ pub struct TorrentLiveRow {
 impl Db {
     pub fn get(&self, hash: &str) -> Result<Option<TorrentRow>> {
         let conn = self.read()?;
+        let projection = torrent_projection_columns();
         let tags_aggregate_sql = tags_aggregate_sql();
         let tags_overflow_sql = tags_overflow_sql();
         let sql = format!(
-            "SELECT t.hash, t.name, t.size_bytes, t.bytes_done, t.down_rate, t.up_rate,
-                    t.up_total, t.down_total, t.ratio, t.is_active, t.is_open, t.complete,
-                    t.state, t.priority, t.category, t.base_path, t.directory, t.creation_date,
-                    t.timestamp_finished, t.tracker_focus, t.peers_connected, t.peers_complete,
-                    t.message, t.tracker_url,
+            "SELECT {projection},
                     {tags_aggregate_sql} AS tags,
                     {tags_overflow_sql} AS tags_overflow,
                     t.updated_at
@@ -158,7 +164,8 @@ impl Db {
             .collect::<Vec<_>>()
             .join(", ");
         let sql = format!(
-            "SELECT hash, size_bytes, bytes_done, down_rate, up_rate, updated_at
+            "SELECT length(CAST(hash AS BLOB)), hash,
+                    size_bytes, bytes_done, down_rate, up_rate, updated_at
              FROM torrents
              WHERE hash COLLATE NOCASE IN ({placeholders})"
         );
@@ -166,12 +173,12 @@ impl Db {
         let mut stmt = conn.prepare(&sql)?;
         let rows = stmt.query_map(params_from_iter(hashes.iter()), |row| {
             Ok(TorrentLiveRow {
-                hash: row.get(0)?,
-                size_bytes: row.get(1)?,
-                bytes_done: row.get(2)?,
-                down_rate: row.get(3)?,
-                up_rate: row.get(4)?,
-                updated_at: row.get(5)?,
+                hash: bounded_text_from_sql(row, 0, 1, MAX_TORRENT_HASH_BYTES, "torrent hash")?,
+                size_bytes: row.get(2)?,
+                bytes_done: row.get(3)?,
+                down_rate: row.get(4)?,
+                up_rate: row.get(5)?,
+                updated_at: row.get(6)?,
             })
         })?;
         Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
@@ -187,6 +194,7 @@ impl Db {
     /// projection. The cursor is a durable logical revision; wall-clock
     /// seconds are not used because multiple updates can happen in one second.
     pub fn list_since_bounded(&self, since: i64, max_rows: usize) -> Result<Option<TorrentDelta>> {
+        let max_rows = max_rows.min(MAX_CACHE_DELTA_ROWS);
         if max_rows == 0 {
             return Ok(None);
         }
@@ -196,14 +204,8 @@ impl Db {
         if since < 0 || since > revision {
             return Ok(None);
         }
-        let floor: i64 = conn
-            .query_row(
-                "SELECT value FROM kv WHERE key=?1",
-                params![CACHE_REVISION_FLOOR_KEY],
-                |r| r.get(0),
-            )
-            .optional()?
-            .map(|value: String| value.parse::<i64>())
+        let floor = kv_value_bounded(&conn, CACHE_REVISION_FLOOR_KEY, 64, "cache revision floor")?
+            .map(|value| value.parse::<i64>())
             .transpose()
             .map_err(|error| anyhow::anyhow!("parse cache revision floor: {error}"))?
             .unwrap_or(0);
@@ -213,12 +215,9 @@ impl Db {
 
         let tags_aggregate_sql = tags_aggregate_sql();
         let tags_overflow_sql = tags_overflow_sql();
+        let projection = torrent_projection_columns();
         let sql = format!(
-            "SELECT t.hash, t.name, t.size_bytes, t.bytes_done, t.down_rate, t.up_rate,
-                    t.up_total, t.down_total, t.ratio, t.is_active, t.is_open, t.complete,
-                    t.state, t.priority, t.category, t.base_path, t.directory, t.creation_date,
-                    t.timestamp_finished, t.tracker_focus, t.peers_connected, t.peers_complete,
-                    t.message, t.tracker_url,
+            "SELECT {projection},
                     {tags_aggregate_sql} AS tags,
                     {tags_overflow_sql} AS tags_overflow,
                     t.updated_at, t.revision
@@ -236,14 +235,14 @@ impl Db {
             .collect::<rusqlite::Result<Vec<_>>>()?;
 
         let mut removed_stmt = conn.prepare(
-            "SELECT hash FROM removed_torrents
+            "SELECT length(CAST(hash AS BLOB)), hash FROM removed_torrents
              WHERE revision > ?1
              ORDER BY revision ASC, hash COLLATE NOCASE ASC
              LIMIT ?2",
         )?;
         let removed = removed_stmt
-            .query_map(params![since, max_rows.saturating_add(1) as i64], |row| {
-                row.get(0)
+            .query_map(params![since, sql_limit_with_sentinel(max_rows)], |row| {
+                bounded_text_from_sql(row, 0, 1, MAX_TORRENT_HASH_BYTES, "tombstone hash")
             })?
             .collect::<rusqlite::Result<Vec<String>>>()?;
 
@@ -260,7 +259,7 @@ impl Db {
     pub fn list(&self, p: &ListParams) -> Result<(Vec<TorrentRow>, i64)> {
         let (where_sql, args) = build_where(p);
         let order = order_clause(p.sort.as_deref(), p.dir.as_deref());
-        let limit = p.limit.unwrap_or(200).clamp(1, 50000);
+        let limit = bounded_page_limit(p.limit).unwrap_or(200);
         let offset = validate_page_offset(p.offset)?;
 
         let conn = self.read()?;
@@ -282,15 +281,16 @@ impl Db {
     pub fn list_page(&self, p: &ListParams) -> Result<Vec<TorrentRow>> {
         let (where_sql, args) = build_where(p);
         let order = order_clause(p.sort.as_deref(), p.dir.as_deref());
-        let limit = p.limit.unwrap_or(200).clamp(1, 50000);
+        let limit = bounded_page_limit(p.limit).unwrap_or(200);
         let offset = validate_page_offset(p.offset)?;
         let conn = self.read()?;
         query_torrent_rows(&conn, &where_sql, &args, &order, limit, offset)
     }
 
     pub fn tracker_health(&self) -> Result<Vec<TrackerHealthRow>> {
+        let maximum = MAX_TRACKER_HEALTH_ENTRIES;
         let conn = self.read()?;
-        let mut stmt = conn.prepare(
+        let mut stmt = conn.prepare(&format!(
             "SELECT tracker_url,
                     COUNT(*) AS torrent_count,
                     SUM(CASE WHEN is_active != 0 THEN 1 ELSE 0 END) AS active_count,
@@ -301,11 +301,13 @@ impl Db {
                     MAX(updated_at) AS last_updated
              FROM torrents
              WHERE tracker_url != ''
+               AND length(CAST(tracker_url AS BLOB)) <= {MAX_TORRENT_TRACKER_URL_BYTES}
              GROUP BY tracker_url
-             ORDER BY error_count DESC, torrent_count DESC, tracker_url COLLATE NOCASE",
-        )?;
+             ORDER BY error_count DESC, torrent_count DESC, tracker_url COLLATE NOCASE
+             LIMIT ?1"
+        ))?;
         let rows = stmt
-            .query_map([], |r| {
+            .query_map([sql_limit_with_sentinel(maximum)], |r| {
                 Ok(TrackerHealthRow {
                     tracker: r.get(0)?,
                     torrent_count: r.get(1)?,
@@ -318,6 +320,11 @@ impl Db {
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
+        if rows.len() > maximum {
+            bail!(
+                "tracker health projection exceeds {maximum} entries; use a filtered or paged view"
+            );
+        }
         Ok(rows)
     }
 
@@ -444,12 +451,9 @@ fn query_torrent_rows(
     check_tag_assignment_projection_capacity(conn)?;
     let tags_aggregate_sql = tags_aggregate_sql();
     let tags_overflow_sql = tags_overflow_sql();
+    let projection = torrent_projection_columns();
     let sql = format!(
-        "SELECT t.hash, t.name, t.size_bytes, t.bytes_done, t.down_rate, t.up_rate,
-                t.up_total, t.down_total, t.ratio, t.is_active, t.is_open, t.complete,
-                t.state, t.priority, t.category, t.base_path, t.directory, t.creation_date,
-                t.timestamp_finished, t.tracker_focus, t.peers_connected, t.peers_complete,
-                t.message, t.tracker_url,
+        "SELECT {projection},
                 {tags_aggregate_sql} AS tags,
                 {tags_overflow_sql} AS tags_overflow,
                 t.updated_at
@@ -479,8 +483,8 @@ fn torrent_row_from_sql(r: &rusqlite::Row<'_>) -> rusqlite::Result<TorrentRow> {
         ));
     }
     Ok(TorrentRow {
-        hash: r.get(0)?,
-        name: r.get(1)?,
+        hash: required_text_from_sql(r, 0, "torrent hash")?,
+        name: required_text_from_sql(r, 1, "torrent name")?,
         size_bytes: r.get(2)?,
         bytes_done: r.get(3)?,
         down_rate: r.get(4)?,
@@ -493,9 +497,9 @@ fn torrent_row_from_sql(r: &rusqlite::Row<'_>) -> rusqlite::Result<TorrentRow> {
         complete: r.get::<_, i64>(11)? != 0,
         state: r.get(12)?,
         priority: r.get(13)?,
-        category: r.get(14)?,
-        base_path: r.get(15)?,
-        directory: r.get(16)?,
+        category: required_text_from_sql(r, 14, "torrent category")?,
+        base_path: required_text_from_sql(r, 15, "torrent base path")?,
+        directory: required_text_from_sql(r, 16, "torrent directory")?,
         creation_date: r.get(17)?,
         timestamp_finished: r.get(18)?,
         tracker_focus: r.get(19)?,
@@ -503,9 +507,61 @@ fn torrent_row_from_sql(r: &rusqlite::Row<'_>) -> rusqlite::Result<TorrentRow> {
         peers_complete: r.get(21)?,
         message: crate::url_redaction::redact_sensitive_text(&r.get::<_, String>(22)?),
         tracker_url: r.get(23)?,
-        tags: r.get(24)?,
+        tags: bounded_tags_from_sql(r, 24)?,
         updated_at: r.get(26)?,
     })
+}
+
+fn required_text_from_sql(
+    row: &rusqlite::Row<'_>,
+    index: usize,
+    field: &'static str,
+) -> rusqlite::Result<String> {
+    row.get::<_, Option<String>>(index)?.ok_or_else(|| {
+        rusqlite::Error::FromSqlConversionFailure(
+            index,
+            rusqlite::types::Type::Text,
+            Box::new(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("{field} exceeds configured limits"),
+            )),
+        )
+    })
+}
+
+fn bounded_tags_from_sql(row: &rusqlite::Row<'_>, index: usize) -> rusqlite::Result<String> {
+    row.get::<_, Option<String>>(index)?.ok_or_else(|| {
+        rusqlite::Error::FromSqlConversionFailure(
+            index,
+            rusqlite::types::Type::Text,
+            Box::new(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "torrent tag projection exceeds configured limits",
+            )),
+        )
+    })
+}
+
+fn torrent_projection_columns() -> String {
+    let bounded = |column: &str, maximum: usize| {
+        format!("CASE WHEN length(CAST({column} AS BLOB)) <= {maximum} THEN {column} ELSE NULL END")
+    };
+    format!(
+        "{} AS hash, {} AS name,
+         t.size_bytes, t.bytes_done, t.down_rate, t.up_rate, t.up_total, t.down_total,
+         t.ratio, t.is_active, t.is_open, t.complete, t.state, t.priority,
+         {} AS category, {} AS base_path, {} AS directory,
+         t.creation_date, t.timestamp_finished, t.tracker_focus,
+         t.peers_connected, t.peers_complete,
+         {} AS message, {} AS tracker_url",
+        bounded("t.hash", MAX_TORRENT_HASH_BYTES),
+        bounded("t.name", MAX_TORRENT_NAME_BYTES),
+        bounded("t.category", MAX_TORRENT_LOCATION_TEXT_BYTES),
+        bounded("t.base_path", MAX_TORRENT_LOCATION_TEXT_BYTES),
+        bounded("t.directory", MAX_TORRENT_LOCATION_TEXT_BYTES),
+        bounded("t.message", MAX_TORRENT_MESSAGE_BYTES),
+        bounded("t.tracker_url", MAX_TORRENT_TRACKER_URL_BYTES),
+    )
 }
 
 fn escape_like_pattern(value: &str) -> String {
@@ -637,8 +693,12 @@ fn normalized_token(value: Option<&str>) -> Option<String> {
 
 #[cfg(test)]
 mod tracker_error_integration_tests {
+    use rusqlite::params;
+
     use super::{bounded_page_limit, Db, ListParams, MAX_API_PAGE_ENTRIES};
-    use crate::cache::db::TorrentRow;
+    use crate::cache::db::{
+        TorrentRow, MAX_TORRENT_HASH_BYTES, MAX_TORRENT_NAME_BYTES, MAX_TORRENT_TAG_BYTES,
+    };
 
     fn row(hash: &str, is_active: bool, message: &str) -> TorrentRow {
         TorrentRow {
@@ -669,6 +729,53 @@ mod tracker_error_integration_tests {
             tags: String::new(),
             updated_at: 0,
         }
+    }
+
+    #[test]
+    fn legacy_oversized_tag_projection_fails_before_group_concat_exposure() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("cache.db")).unwrap();
+        db.upsert(&row("legacy", false, "")).unwrap();
+        let tags = (0..18)
+            .map(|index| format!("{index:02}{}", "x".repeat(15 * 1024)))
+            .collect::<Vec<_>>();
+        {
+            let conn = db.conn().expect("healthy test writer");
+            for tag in &tags {
+                conn.execute("INSERT INTO tags(name) VALUES(?1)", params![tag])
+                    .unwrap();
+                conn.execute(
+                    "INSERT INTO torrent_tags(hash, tag) VALUES(?1, ?2)",
+                    params!["legacy", tag],
+                )
+                .unwrap();
+            }
+        }
+        assert!(MAX_TORRENT_TAG_BYTES < tags.iter().map(String::len).sum::<usize>());
+        assert!(db.get("legacy").is_err());
+        assert!(db.list_page(&ListParams::default()).is_err());
+        let since = db.current_revision().unwrap();
+        db.set_torrent_runtime_state("legacy", 1, false, false)
+            .unwrap();
+        assert!(db.list_since_bounded(since, 10).is_err());
+    }
+
+    #[test]
+    fn legacy_oversized_torrent_text_fails_closed_before_string_conversion() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("cache.db")).unwrap();
+        db.upsert(&row("legacy-text", false, "")).unwrap();
+        {
+            let conn = db.conn().expect("healthy test writer");
+            conn.execute(
+                "UPDATE torrents SET name=?1 WHERE hash=?2",
+                params!["n".repeat(MAX_TORRENT_NAME_BYTES + 1), "legacy-text"],
+            )
+            .unwrap();
+        }
+
+        assert!(db.get("legacy-text").is_err());
+        assert!(db.list_page(&ListParams::default()).is_err());
     }
 
     /// TNG-webui: a torrent can be actively seeding fine while its
@@ -805,6 +912,26 @@ mod tracker_error_integration_tests {
         assert_eq!(rows[0].size_bytes - rows[0].bytes_done, 60);
         assert_eq!(rows[0].down_rate, 12_345);
         assert_eq!(rows[0].up_rate, 678);
+    }
+
+    #[test]
+    fn legacy_oversized_hash_live_stats_fail_before_string_conversion() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("cache.db")).unwrap();
+        db.upsert(&row("legacy-live", true, "")).unwrap();
+        let huge_hash = "h".repeat(MAX_TORRENT_HASH_BYTES + 1);
+        {
+            let conn = db.conn().expect("healthy test writer");
+            conn.execute(
+                "UPDATE torrents SET hash=?1 WHERE hash=?2",
+                params![huge_hash, "legacy-live"],
+            )
+            .unwrap();
+        }
+
+        assert!(db
+            .live_stats(&["h".repeat(MAX_TORRENT_HASH_BYTES + 1)])
+            .is_err());
     }
 
     #[test]

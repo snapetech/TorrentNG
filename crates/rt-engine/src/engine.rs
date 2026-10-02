@@ -100,6 +100,8 @@ use crate::torrent_task_v2::{
 };
 
 const EVENT_ENGINE_STARTED: &str = "engine_started";
+const EVENT_CRASH_SAFETY_UPDATED: &str = "crash_safety_updated";
+const EVENT_CRASH_RECOVERY: &str = "crash_recovery";
 const EVENT_TORRENT_ADDED: &str = "torrent_added";
 const EVENT_MAGNET_ADDED: &str = "magnet_added";
 const EVENT_METADATA_RESOLVED: &str = "metadata_resolved";
@@ -147,11 +149,13 @@ const ENGINE_DETACHED_COMMAND_DELIVERY_DEADLINE: Duration = Duration::from_secs(
 const MAX_ENGINE_LIVE_STATS: usize = 128;
 const TASK_ABORT_GRACE: Duration = Duration::from_millis(100);
 const MAGNET_METADATA_STORAGE_RETRY_DELAY: Duration = Duration::from_millis(250);
-const MAX_STORAGE_PLAN_AFFECTED_TORRENTS: usize = 256;
+pub const MAX_STORAGE_PLAN_AFFECTED_TORRENTS: usize = 256;
 const MAX_ENGINE_MUTATION_ITEMS: usize = 16_384;
-const MAX_ENGINE_LABEL_BYTES: usize = 64 * 1024;
-const MAX_ENGINE_INFO_HASH_BYTES: usize = 64;
-const MAX_ENGINE_INFO_HASH_LIST_BYTES: usize = 1024 * 1024;
+pub const MAX_ENGINE_LABEL_BYTES: usize = 64 * 1024;
+pub const MAX_ENGINE_INFO_HASH_BYTES: usize = 64;
+/// Longest path accepted by the crash-safety "check a location" query.
+pub const MAX_CRASH_SAFETY_QUERY_PATH_BYTES: usize = 4096;
+pub const MAX_ENGINE_INFO_HASH_LIST_BYTES: usize = 1024 * 1024;
 const MAX_SESSION_EVENT_INDEX_ITEMS: usize = 4_096;
 const MAX_ENGINE_JOB_ID_BYTES: usize = 256;
 const MAX_ENGINE_EVENT_FILTER_ITEMS: usize = 64;
@@ -160,7 +164,7 @@ const MAX_ENGINE_EVENT_FILTER_BYTES: usize = 16 * 1024;
 // Metainfo names are capped at 4 KiB. Keep API-renamed names at the same
 // bound, and keep user-controlled category/path fields bounded before they
 // are copied into the registry, event log, and SQLite projections.
-const MAX_ENGINE_NAME_BYTES: usize = 4 * 1024;
+pub const MAX_ENGINE_NAME_BYTES: usize = 4 * 1024;
 const MAX_ENGINE_METADATA_TEXT_BYTES: usize = 256 * 1024;
 const MAX_ENGINE_META_FILES: usize = rt_db::MAX_TORRENT_FILE_RESULT_ITEMS;
 const MAX_ENGINE_META_PIECES: usize = 16_000_000;
@@ -170,23 +174,23 @@ const MAX_ENGINE_META_WEBSEED_BYTES: usize = 32 * 1024 * 1024;
 const MAX_ENGINE_META_PATH_BYTES: usize = rt_db::MAX_TORRENT_FILE_PATH_BYTES;
 const MAX_ENGINE_META_PATH_TOTAL_BYTES: usize = rt_db::MAX_TORRENT_FILE_RESULT_BYTES;
 const MAX_ENGINE_MAGNET_PEERS: usize = 256;
-const MAX_ENGINE_CATEGORY_BYTES: usize = MAX_ENGINE_LABEL_BYTES;
-const MAX_ENGINE_SAVE_PATH_BYTES: usize = 16 * 1024;
+pub const MAX_ENGINE_CATEGORY_BYTES: usize = MAX_ENGINE_LABEL_BYTES;
+pub const MAX_ENGINE_SAVE_PATH_BYTES: usize = 16 * 1024;
 const MAX_ENGINE_STORAGE_OPERATION_BYTES: usize = 16;
 // Storage plans are persisted in the first durable job event. Bound the
 // structure before it enters the engine mailbox so a caller cannot retain a
 // huge step/path graph or defer an oversized JSON serialization until after
 // torrents have been quiesced.
 const MAX_ENGINE_STORAGE_PLAN_ITEMS: usize = MAX_ENGINE_MUTATION_ITEMS;
-const MAX_ENGINE_STORAGE_PLAN_PATH_BYTES: usize = 32 * 1024;
-const MAX_ENGINE_STORAGE_PLAN_TOTAL_PATH_BYTES: usize = 128 * 1024;
+pub const MAX_ENGINE_STORAGE_PLAN_PATH_BYTES: usize = 32 * 1024;
+pub const MAX_ENGINE_STORAGE_PLAN_TOTAL_PATH_BYTES: usize = 128 * 1024;
 const MAX_ENGINE_STORAGE_PLAN_SERIALIZED_BYTES: usize =
     rt_db::MAX_JOB_EVENT_PAYLOAD_BYTES - 128 * 1024;
 // Keep API tracker overrides within the same per-URL bound as parsed
 // metainfo, and cap their aggregate text before it is cloned into an event,
 // SQLite rows, and a live torrent actor.
 pub const MAX_TRACKER_URL_BYTES: usize = 8 * 1024;
-const MAX_ENGINE_TRACKER_BYTES: usize = 4 * 1024 * 1024;
+pub const MAX_ENGINE_TRACKER_BYTES: usize = 4 * 1024 * 1024;
 // Full tracker rows contain optional failure text and opaque tracker IDs in
 // addition to the URL. Keep every engine caller on the same fail-closed
 // boundary so a damaged database cannot turn one compatibility request or
@@ -2019,6 +2023,18 @@ impl Engine {
         conn.execute_batch("PRAGMA synchronous = NORMAL;")
             .context("configuring database synchronous mode")?;
         register_configured_storage(&conn, &config).context("registering configured storage")?;
+        // Read the persisted runtime override *before* deciding whether to keep
+        // a run marker, so a toggle made in the UI survives a restart. This
+        // also records the start of this run and classifies how the previous
+        // one ended.
+        let (crash_safety_settings, crash_safety_overridden) =
+            crate::crash_safety::load_persisted_settings(&conn, &config.crash_safety);
+        let crash_safety = crate::crash_safety::CrashSafetyRuntime::start(
+            &config.daemon.session_dir,
+            config.crash_safety.clone(),
+            crash_safety_settings,
+            crash_safety_overridden,
+        );
         let db = Arc::new(Mutex::new(conn));
         let storage_jobs = StorageJobDispatcher::new(&config.db_path())
             .context("opening storage worker database")?;
@@ -2057,6 +2073,7 @@ impl Engine {
             #[cfg(not(test))]
             session_event_writer: Some(session_event_writer),
         };
+        engine.services.crash_safety = Arc::clone(&crash_safety);
         macro_rules! startup_try {
             ($result:expr) => {
                 match $result {
@@ -2167,6 +2184,27 @@ impl Engine {
                 "dht_enabled": dht_enabled,
             }),
         );
+        {
+            let assessment = crash_safety.assessment();
+            if assessment.verdict.was_unclean() {
+                let settings = crash_safety.settings();
+                engine.append_session_event(
+                    None,
+                    EVENT_CRASH_RECOVERY,
+                    Some("the previous run did not shut down cleanly"),
+                    serde_json::json!({
+                        "level": "warn",
+                        "previous_run": assessment.verdict.as_str(),
+                        "previous_boot_id": assessment.previous_boot_id,
+                        "current_boot_id": assessment.current_boot_id,
+                        "crash_reference_unix": assessment.crash_reference_unix,
+                        "host_crash_recovery": settings.host_crash_recovery,
+                        "recent_write_window_secs": settings.recent_write_window_secs,
+                        "structural_audit": settings.structural_audit,
+                    }),
+                );
+            }
+        }
         startup_try!(engine
             .recover_interrupted_jobs_async()
             .await
@@ -2289,7 +2327,8 @@ impl Engine {
     /// without a bounded shutdown protocol.
     async fn shutdown_after_start_failure(mut self) {
         let timeout_budget = Duration::from_secs(self.config.daemon.shutdown_timeout_secs.max(1));
-        self.shutdown_torrent_tasks().await;
+        let tasks_stopped_cleanly = self.shutdown_torrent_tasks().await;
+        self.mark_run_finished(tasks_stopped_cleanly).await;
         self.services.storage_jobs.shutdown(timeout_budget).await;
         if let Some(tx) = self.services.dht_tx.take() {
             shutdown_dht_task(tx, self.take_dht_task(), timeout_budget).await;
@@ -2305,6 +2344,9 @@ impl Engine {
     async fn run(mut self, peer_listener_stop: watch::Sender<bool>) {
         let mut tier_tick = tokio::time::interval(Duration::from_secs(5));
         let mut task_health_tick = tokio::time::interval(Duration::from_secs(1));
+        let mut heartbeat_tick = tokio::time::interval(Duration::from_secs(
+            crate::crash_safety::HEARTBEAT_INTERVAL_SECS,
+        ));
         loop {
             tokio::select! {
                 command = self.cmd_rx.recv() => {
@@ -2335,6 +2377,11 @@ impl Engine {
                 _ = task_health_tick.tick() => {
                     self.reap_finished_torrent_tasks().await;
                 }
+                _ = heartbeat_tick.tick() => {
+                    // The marker write is a small fsync; keep it off the actor.
+                    let runtime = Arc::clone(&self.services.crash_safety);
+                    tokio::task::spawn_blocking(move || runtime.heartbeat());
+                }
             }
         }
         // A move being planned has already durably paused its torrent, but it
@@ -2346,7 +2393,8 @@ impl Engine {
         self.resume_pending_storage_moves_on_shutdown().await;
         discard_pending_engine_commands(&mut self.cmd_rx);
         let _ = peer_listener_stop.send(true);
-        self.shutdown_torrent_tasks().await;
+        let tasks_stopped_cleanly = self.shutdown_torrent_tasks().await;
+        self.mark_run_finished(tasks_stopped_cleanly).await;
         self.services
             .storage_jobs
             .shutdown(Duration::from_secs(
@@ -2894,7 +2942,7 @@ impl Engine {
 
             EngineCmd::BanPeers { peers, reply } => {
                 if let Err(error) =
-                    validate_peer_command_len(peers.len(), MAX_BANNED_PEERS, "peer ban list")
+                    validate_peer_addresses(&peers, MAX_BANNED_PEERS, "peer ban list")
                 {
                     let _ = reply.send(Err(error));
                     return true;
@@ -4225,6 +4273,23 @@ impl Engine {
                 let result = self.set_user_agent_inner(user_agent).await;
                 let _ = reply.send(result);
             }
+            EngineCmd::GetCrashSafety { reply } => {
+                let _ = reply.send(Ok(self.services.crash_safety.view()));
+            }
+            EngineCmd::SetCrashSafety { settings, reply } => {
+                let result = self.set_crash_safety_inner(settings).await;
+                let _ = reply.send(result);
+            }
+            EngineCmd::DescribeCrashSafetyPath { path, reply } => {
+                // The mount probe reads /proc and statfs: keep it off the actor.
+                let runtime = Arc::clone(&self.services.crash_safety);
+                tokio::spawn(async move {
+                    let result = tokio::task::spawn_blocking(move || runtime.describe_path(&path))
+                        .await
+                        .map_err(|error| format!("crash-safety path worker failed: {error}"));
+                    let _ = reply.send(result);
+                });
+            }
             EngineCmd::GetQueuePriority { info_hash, reply } => {
                 let db = self.db_executor();
                 spawn_engine_query(reply, async move {
@@ -4869,7 +4934,7 @@ impl Engine {
         reply: oneshot::Sender<CmdResult<()>>,
     ) {
         if let Err(error) =
-            validate_peer_command_len(peers.len(), MAX_MANUAL_PEER_ADDRESSES, "manual peer list")
+            validate_peer_addresses(&peers, MAX_MANUAL_PEER_ADDRESSES, "manual peer list")
         {
             let _ = reply.send(Err(error));
             return;
@@ -4966,7 +5031,7 @@ impl Engine {
 
     #[cfg(test)]
     async fn add_peers_inner(&mut self, info_hash: &str, peers: Vec<SocketAddr>) -> CmdResult<()> {
-        validate_peer_command_len(peers.len(), MAX_MANUAL_PEER_ADDRESSES, "manual peer list")?;
+        validate_peer_addresses(&peers, MAX_MANUAL_PEER_ADDRESSES, "manual peer list")?;
         self.ensure_torrent_storage_idle(info_hash).await?;
         if peers.is_empty() {
             return Ok(());
@@ -5703,6 +5768,55 @@ impl Engine {
         })
         .await?;
         crate::peer_id::set_user_agent(user_agent)
+    }
+
+    async fn set_crash_safety_inner(
+        &self,
+        settings: Option<rt_config::CrashSafetyConfig>,
+    ) -> CmdResult<crate::crash_safety::CrashSafetyView> {
+        let runtime = Arc::clone(&self.services.crash_safety);
+        match settings {
+            Some(settings) => {
+                settings.validate().map_err(|error| error.to_string())?;
+                let json = serde_json::to_string(&settings)
+                    .map_err(|error| format!("encoding crash-safety settings: {error}"))?;
+                self.run_db("set_crash_safety", move |db| {
+                    rt_db::set_setting(
+                        db,
+                        crate::crash_safety::SETTING_CRASH_SAFETY,
+                        &json,
+                        unix_now_i64(),
+                    )
+                    .map_err(|error| error.to_string())
+                })
+                .await?;
+                // Applying may write or remove the run marker (blocking I/O).
+                let applying = Arc::clone(&runtime);
+                tokio::task::spawn_blocking(move || applying.apply_settings(settings, true))
+                    .await
+                    .map_err(|error| format!("crash-safety settings worker failed: {error}"))?;
+            }
+            None => {
+                self.run_db("reset_crash_safety", |db| {
+                    rt_db::delete_setting(db, crate::crash_safety::SETTING_CRASH_SAFETY)
+                        .map(|_| ())
+                        .map_err(|error| error.to_string())
+                })
+                .await?;
+                let defaults = runtime.defaults().clone();
+                let applying = Arc::clone(&runtime);
+                tokio::task::spawn_blocking(move || applying.apply_settings(defaults, false))
+                    .await
+                    .map_err(|error| format!("crash-safety settings worker failed: {error}"))?;
+            }
+        }
+        self.append_session_event(
+            None,
+            EVENT_CRASH_SAFETY_UPDATED,
+            Some("crash-safety settings changed"),
+            serde_json::json!({ "overridden": runtime.is_overridden() }),
+        );
+        Ok(runtime.view())
     }
 
     async fn peer_exchange_enabled(&self) -> bool {
@@ -9602,6 +9716,7 @@ fn entry_from_row(row: &TorrentRow) -> TorrentEntry {
         tags: row.tags.clone(),
         error_message: None,
         tracker_message: None,
+        finalizing: false,
     }
 }
 
@@ -9837,6 +9952,26 @@ fn meta_total_length(meta: &TorrentMeta) -> u64 {
     }
 }
 
+fn meta_file_is_padding(meta: &TorrentMeta, file_index: u32) -> bool {
+    match meta {
+        TorrentMeta::V1(meta) => meta
+            .files
+            .iter()
+            .find(|file| file.index == file_index)
+            .is_some_and(|file| file.pad),
+        TorrentMeta::Hybrid(meta, _) => meta
+            .files
+            .iter()
+            .find(|file| file.index == file_index)
+            .is_some_and(|file| file.pad),
+        TorrentMeta::V2(meta) => meta
+            .files
+            .iter()
+            .find(|file| file.index == file_index)
+            .is_some_and(|file| file.pad),
+    }
+}
+
 #[cfg(test)]
 fn meta_piece_length(meta: &TorrentMeta) -> u64 {
     match meta {
@@ -9894,8 +10029,8 @@ fn meta_file_rows(info_hash: &str, meta: &TorrentMeta) -> Vec<rt_db::TorrentFile
                 path: file.path.as_display(),
                 length: db_i64(file.length),
                 offset: db_i64(file.offset),
-                priority: 1,
-                wanted: true,
+                priority: if file.pad { 0 } else { 1 },
+                wanted: !file.pad,
                 completed_bytes: 0,
             })
             .collect(),
@@ -9909,8 +10044,8 @@ fn meta_file_rows(info_hash: &str, meta: &TorrentMeta) -> Vec<rt_db::TorrentFile
                 path: file.path.as_display(),
                 length: db_i64(file.length),
                 offset: db_i64(file.offset),
-                priority: 1,
-                wanted: true,
+                priority: if file.pad { 0 } else { 1 },
+                wanted: !file.pad,
                 completed_bytes: 0,
             })
             .collect(),
@@ -9924,8 +10059,8 @@ fn meta_file_rows(info_hash: &str, meta: &TorrentMeta) -> Vec<rt_db::TorrentFile
                 path: file.path.as_display(),
                 length: db_i64(file.length),
                 offset: db_i64(file.offset),
-                priority: 1,
-                wanted: true,
+                priority: if file.pad { 0 } else { 1 },
+                wanted: !file.pad,
                 completed_bytes: 0,
             })
             .collect(),
@@ -10514,9 +10649,10 @@ fn load_torrent_metadata_from_sources(
             .collect::<anyhow::Result<HashMap<_, _>>>()?;
         for file in &mut metadata.files {
             if let Some((path, priority, wanted)) = policy.get(&file.index) {
+                let is_padding = meta_file_is_padding(&meta, file.index);
                 file.path = path.clone();
-                file.priority = *priority;
-                file.wanted = *wanted;
+                file.priority = if is_padding { 0 } else { *priority };
+                file.wanted = *wanted && !is_padding;
             }
         }
     }
@@ -11048,8 +11184,10 @@ fn metadata_from_meta(meta: &TorrentMeta) -> EngineTorrentMetadata {
                     index: file.index,
                     path: file.path.as_display(),
                     length: file.length,
-                    priority: 1,
-                    wanted: true,
+                    offset: file.offset,
+                    piece_offset: file.offset,
+                    priority: if file.pad { 0 } else { 1 },
+                    wanted: !file.pad,
                 })
                 .collect(),
         },
@@ -11071,8 +11209,10 @@ fn metadata_from_meta(meta: &TorrentMeta) -> EngineTorrentMetadata {
                     index: file.index,
                     path: file.path.as_display(),
                     length: file.length,
-                    priority: 1,
-                    wanted: true,
+                    offset: file.offset,
+                    piece_offset: file.offset,
+                    priority: if file.pad { 0 } else { 1 },
+                    wanted: !file.pad,
                 })
                 .collect(),
         },
@@ -11101,8 +11241,10 @@ fn metadata_from_meta(meta: &TorrentMeta) -> EngineTorrentMetadata {
                         index: file.index,
                         path: file.path.as_display(),
                         length: file.length,
-                        priority: 1,
-                        wanted: true,
+                        offset: file.offset,
+                        piece_offset: file.piece_offset,
+                        priority: if file.pad { 0 } else { 1 },
+                        wanted: !file.pad,
                     })
                     .collect(),
             }
@@ -11681,6 +11823,18 @@ mod tests {
             validate_peer_command_len(MAX_BANNED_PEERS + 1, MAX_BANNED_PEERS, "peer ban list")
                 .is_err()
         );
+
+        let zero_port = "127.0.0.1:0".parse::<SocketAddr>().unwrap();
+        let peer_error =
+            validate_peer_addresses(&[zero_port], MAX_MANUAL_PEER_ADDRESSES, "manual peer list")
+                .unwrap_err();
+        assert!(peer_error.contains("index 0") && peer_error.contains("zero port"));
+        assert!(validate_peer_addresses(
+            &["127.0.0.1:6881".parse().unwrap()],
+            MAX_MANUAL_PEER_ADDRESSES,
+            "manual peer list"
+        )
+        .is_ok());
 
         assert!(validate_command_item_len(
             MAX_ENGINE_MUTATION_ITEMS,
@@ -12519,6 +12673,7 @@ mod tests {
                 network_budget: GlobalNetworkBudget::unlimited(),
                 storage_jobs: StorageJobDispatcher::for_tests(),
                 stats_cache: None,
+                crash_safety: crate::crash_safety::CrashSafetyRuntime::inert(),
             },
             pending_storage_moves: HashMap::new(),
             shutdown_reply: None,
@@ -12590,6 +12745,7 @@ mod tests {
                 network_budget: GlobalNetworkBudget::unlimited(),
                 storage_jobs: StorageJobDispatcher::for_tests(),
                 stats_cache: None,
+                crash_safety: crate::crash_safety::CrashSafetyRuntime::inert(),
             },
             pending_storage_moves: HashMap::new(),
             shutdown_reply: None,
@@ -12769,6 +12925,7 @@ mod tests {
                 network_budget: GlobalNetworkBudget::unlimited(),
                 storage_jobs: StorageJobDispatcher::for_tests(),
                 stats_cache: None,
+                crash_safety: crate::crash_safety::CrashSafetyRuntime::inert(),
             },
             pending_storage_moves: HashMap::new(),
             shutdown_reply: None,
@@ -12902,6 +13059,7 @@ mod tests {
                 network_budget: GlobalNetworkBudget::unlimited(),
                 storage_jobs: StorageJobDispatcher::for_tests(),
                 stats_cache: None,
+                crash_safety: crate::crash_safety::CrashSafetyRuntime::inert(),
             },
             pending_storage_moves: HashMap::new(),
             shutdown_reply: None,
@@ -12986,6 +13144,7 @@ mod tests {
                 network_budget: GlobalNetworkBudget::unlimited(),
                 storage_jobs: StorageJobDispatcher::for_tests(),
                 stats_cache: None,
+                crash_safety: crate::crash_safety::CrashSafetyRuntime::inert(),
             },
             pending_storage_moves: HashMap::new(),
             shutdown_reply: None,
@@ -13141,6 +13300,7 @@ mod tests {
                 resources: test_resource_governor(),
                 network_budget: GlobalNetworkBudget::unlimited(),
                 storage_jobs: StorageJobDispatcher::for_tests(),
+                crash_safety: crate::crash_safety::CrashSafetyRuntime::inert(),
                 stats_cache: None,
             },
             pending_storage_moves: HashMap::from([(
@@ -13301,6 +13461,7 @@ mod tests {
                 network_budget: GlobalNetworkBudget::unlimited(),
                 storage_jobs: StorageJobDispatcher::with_limits(Arc::clone(&db), 1, 2),
                 stats_cache: None,
+                crash_safety: crate::crash_safety::CrashSafetyRuntime::inert(),
             },
             pending_storage_moves: HashMap::new(),
             shutdown_reply: None,
@@ -13455,6 +13616,7 @@ mod tests {
                 network_budget: GlobalNetworkBudget::unlimited(),
                 storage_jobs: StorageJobDispatcher::with_limits(Arc::clone(&db), 1, 2),
                 stats_cache: None,
+                crash_safety: crate::crash_safety::CrashSafetyRuntime::inert(),
             },
             pending_storage_moves: HashMap::new(),
             shutdown_reply: None,
@@ -13536,6 +13698,7 @@ mod tests {
                 network_budget: GlobalNetworkBudget::unlimited(),
                 storage_jobs: StorageJobDispatcher::for_tests(),
                 stats_cache: None,
+                crash_safety: crate::crash_safety::CrashSafetyRuntime::inert(),
             },
             pending_storage_moves: HashMap::new(),
             shutdown_reply: None,
@@ -13615,6 +13778,7 @@ mod tests {
                 network_budget: GlobalNetworkBudget::unlimited(),
                 storage_jobs: StorageJobDispatcher::for_tests(),
                 stats_cache: None,
+                crash_safety: crate::crash_safety::CrashSafetyRuntime::inert(),
             },
             pending_storage_moves: HashMap::new(),
             shutdown_reply: None,
@@ -13752,6 +13916,7 @@ mod tests {
                 network_budget: GlobalNetworkBudget::unlimited(),
                 storage_jobs: StorageJobDispatcher::for_tests(),
                 stats_cache: None,
+                crash_safety: crate::crash_safety::CrashSafetyRuntime::inert(),
             },
             pending_storage_moves: HashMap::new(),
             shutdown_reply: None,
@@ -13850,6 +14015,7 @@ mod tests {
                 network_budget: GlobalNetworkBudget::unlimited(),
                 storage_jobs: StorageJobDispatcher::for_tests(),
                 stats_cache: None,
+                crash_safety: crate::crash_safety::CrashSafetyRuntime::inert(),
             },
             pending_storage_moves: HashMap::new(),
             shutdown_reply: None,
@@ -14190,6 +14356,41 @@ mod tests {
         assert_eq!(projected.files[0].index, 7);
         assert_eq!(projected.files[0].path, "dir/file.bin");
         assert_eq!(projected.files[0].length, 42);
+        assert_eq!(projected.files[0].offset, 0);
+        assert_eq!(projected.files[0].piece_offset, 0);
+    }
+
+    #[test]
+    fn padding_files_are_not_projected_as_wanted_content() {
+        let mut meta = meta();
+        meta.files = vec![
+            TorrentFileV1 {
+                index: 0,
+                length: 42,
+                path: SafeRelPath::from_name("payload.bin", false).unwrap(),
+                offset: 0,
+                pad: false,
+            },
+            TorrentFileV1 {
+                index: 1,
+                length: 6,
+                path: SafeRelPath::from_components(&[".pad", "6"], false).unwrap(),
+                offset: 42,
+                pad: true,
+            },
+        ];
+        let torrent = TorrentMeta::V1(meta.clone());
+
+        let rows = meta_file_rows("a".repeat(40).as_str(), &torrent);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].priority, 1);
+        assert!(rows[0].wanted);
+
+        let projected = metadata_from_meta(&torrent);
+        assert_eq!(projected.files[0].priority, 1);
+        assert!(projected.files[0].wanted);
+        assert_eq!(projected.files[1].priority, 0);
+        assert!(!projected.files[1].wanted);
     }
 
     #[test]
@@ -14313,6 +14514,7 @@ mod tests {
                 network_budget: GlobalNetworkBudget::unlimited(),
                 storage_jobs: StorageJobDispatcher::for_tests(),
                 stats_cache: None,
+                crash_safety: crate::crash_safety::CrashSafetyRuntime::inert(),
             },
             pending_storage_moves: HashMap::new(),
             shutdown_reply: None,
@@ -14416,6 +14618,7 @@ mod tests {
                 network_budget: GlobalNetworkBudget::unlimited(),
                 storage_jobs: StorageJobDispatcher::for_tests(),
                 stats_cache: None,
+                crash_safety: crate::crash_safety::CrashSafetyRuntime::inert(),
             },
             pending_storage_moves: HashMap::new(),
             shutdown_reply: None,
@@ -14862,6 +15065,7 @@ mod tests {
                 network_budget: GlobalNetworkBudget::unlimited(),
                 storage_jobs: StorageJobDispatcher::for_tests(),
                 stats_cache: None,
+                crash_safety: crate::crash_safety::CrashSafetyRuntime::inert(),
             },
             pending_storage_moves: HashMap::new(),
             shutdown_reply: None,
@@ -14937,6 +15141,7 @@ mod tests {
                 network_budget: GlobalNetworkBudget::unlimited(),
                 storage_jobs: StorageJobDispatcher::for_tests(),
                 stats_cache: None,
+                crash_safety: crate::crash_safety::CrashSafetyRuntime::inert(),
             },
             pending_storage_moves: HashMap::new(),
             shutdown_reply: None,
@@ -15030,6 +15235,7 @@ mod tests {
                 network_budget: GlobalNetworkBudget::unlimited(),
                 storage_jobs: StorageJobDispatcher::for_tests(),
                 stats_cache: None,
+                crash_safety: crate::crash_safety::CrashSafetyRuntime::inert(),
             },
             pending_storage_moves: HashMap::new(),
             shutdown_reply: None,
@@ -15090,6 +15296,7 @@ mod tests {
                 network_budget: GlobalNetworkBudget::unlimited(),
                 storage_jobs: StorageJobDispatcher::for_tests(),
                 stats_cache: None,
+                crash_safety: crate::crash_safety::CrashSafetyRuntime::inert(),
             },
             pending_storage_moves: HashMap::new(),
             shutdown_reply: None,
@@ -15278,6 +15485,7 @@ mod tests {
                 network_budget: GlobalNetworkBudget::unlimited(),
                 storage_jobs: StorageJobDispatcher::for_tests(),
                 stats_cache: None,
+                crash_safety: crate::crash_safety::CrashSafetyRuntime::inert(),
             },
             pending_storage_moves: HashMap::new(),
             shutdown_reply: None,
@@ -15507,6 +15715,7 @@ mod tests {
                 network_budget: GlobalNetworkBudget::unlimited(),
                 storage_jobs: StorageJobDispatcher::for_tests(),
                 stats_cache: None,
+                crash_safety: crate::crash_safety::CrashSafetyRuntime::inert(),
             },
             pending_storage_moves: HashMap::new(),
             shutdown_reply: None,
@@ -15592,6 +15801,7 @@ mod tests {
                 network_budget: GlobalNetworkBudget::unlimited(),
                 storage_jobs: StorageJobDispatcher::for_tests(),
                 stats_cache: None,
+                crash_safety: crate::crash_safety::CrashSafetyRuntime::inert(),
             },
             pending_storage_moves: HashMap::new(),
             shutdown_reply: None,
@@ -15664,6 +15874,7 @@ mod tests {
                 network_budget: GlobalNetworkBudget::unlimited(),
                 storage_jobs: StorageJobDispatcher::for_tests(),
                 stats_cache: None,
+                crash_safety: crate::crash_safety::CrashSafetyRuntime::inert(),
             },
             pending_storage_moves: HashMap::new(),
             shutdown_reply: None,
@@ -15812,6 +16023,7 @@ mod tests {
                 network_budget: GlobalNetworkBudget::unlimited(),
                 storage_jobs: StorageJobDispatcher::for_tests(),
                 stats_cache: None,
+                crash_safety: crate::crash_safety::CrashSafetyRuntime::inert(),
             },
             pending_storage_moves: HashMap::new(),
             shutdown_reply: None,
@@ -15962,6 +16174,7 @@ mod tests {
                 network_budget: GlobalNetworkBudget::unlimited(),
                 storage_jobs: StorageJobDispatcher::for_tests(),
                 stats_cache: None,
+                crash_safety: crate::crash_safety::CrashSafetyRuntime::inert(),
             },
             pending_storage_moves: HashMap::new(),
             shutdown_reply: None,
@@ -16204,6 +16417,7 @@ mod tests {
                 network_budget: GlobalNetworkBudget::unlimited(),
                 storage_jobs: StorageJobDispatcher::for_tests(),
                 stats_cache: None,
+                crash_safety: crate::crash_safety::CrashSafetyRuntime::inert(),
             },
             pending_storage_moves: HashMap::new(),
             shutdown_reply: None,
@@ -16250,6 +16464,7 @@ mod tests {
                 network_budget: GlobalNetworkBudget::unlimited(),
                 storage_jobs: StorageJobDispatcher::for_tests(),
                 stats_cache: None,
+                crash_safety: crate::crash_safety::CrashSafetyRuntime::inert(),
             },
             pending_storage_moves: HashMap::new(),
             shutdown_reply: None,
@@ -16302,6 +16517,7 @@ mod tests {
                 network_budget: GlobalNetworkBudget::unlimited(),
                 storage_jobs: StorageJobDispatcher::for_tests(),
                 stats_cache: None,
+                crash_safety: crate::crash_safety::CrashSafetyRuntime::inert(),
             },
             pending_storage_moves: HashMap::new(),
             shutdown_reply: None,
@@ -16440,6 +16656,7 @@ mod tests {
                 network_budget: GlobalNetworkBudget::unlimited(),
                 storage_jobs: StorageJobDispatcher::for_tests(),
                 stats_cache: None,
+                crash_safety: crate::crash_safety::CrashSafetyRuntime::inert(),
             },
             pending_storage_moves: HashMap::new(),
             shutdown_reply: None,
@@ -16499,6 +16716,7 @@ mod tests {
                 network_budget: GlobalNetworkBudget::unlimited(),
                 storage_jobs: StorageJobDispatcher::for_tests(),
                 stats_cache: None,
+                crash_safety: crate::crash_safety::CrashSafetyRuntime::inert(),
             },
             pending_storage_moves: HashMap::new(),
             shutdown_reply: None,
@@ -16574,6 +16792,7 @@ mod tests {
                 network_budget: GlobalNetworkBudget::unlimited(),
                 storage_jobs: StorageJobDispatcher::for_tests(),
                 stats_cache: None,
+                crash_safety: crate::crash_safety::CrashSafetyRuntime::inert(),
             },
             pending_storage_moves: HashMap::new(),
             shutdown_reply: None,
@@ -16672,6 +16891,7 @@ mod tests {
                 network_budget: GlobalNetworkBudget::unlimited(),
                 storage_jobs: StorageJobDispatcher::for_tests(),
                 stats_cache: None,
+                crash_safety: crate::crash_safety::CrashSafetyRuntime::inert(),
             },
             pending_storage_moves: HashMap::new(),
             shutdown_reply: None,
@@ -16713,6 +16933,7 @@ mod tests {
                 network_budget: GlobalNetworkBudget::unlimited(),
                 storage_jobs: StorageJobDispatcher::for_tests(),
                 stats_cache: None,
+                crash_safety: crate::crash_safety::CrashSafetyRuntime::inert(),
             },
             pending_storage_moves: HashMap::new(),
             shutdown_reply: None,
@@ -16766,6 +16987,7 @@ mod tests {
                 network_budget: GlobalNetworkBudget::unlimited(),
                 storage_jobs: StorageJobDispatcher::for_tests(),
                 stats_cache: None,
+                crash_safety: crate::crash_safety::CrashSafetyRuntime::inert(),
             },
             pending_storage_moves: HashMap::new(),
             shutdown_reply: None,
@@ -16807,6 +17029,7 @@ mod tests {
                 network_budget: GlobalNetworkBudget::unlimited(),
                 storage_jobs: StorageJobDispatcher::for_tests(),
                 stats_cache: None,
+                crash_safety: crate::crash_safety::CrashSafetyRuntime::inert(),
             },
             pending_storage_moves: HashMap::new(),
             shutdown_reply: None,
@@ -16855,6 +17078,7 @@ mod tests {
                 network_budget: GlobalNetworkBudget::unlimited(),
                 storage_jobs: StorageJobDispatcher::for_tests(),
                 stats_cache: None,
+                crash_safety: crate::crash_safety::CrashSafetyRuntime::inert(),
             },
             pending_storage_moves: HashMap::new(),
             shutdown_reply: None,
@@ -16910,6 +17134,7 @@ mod tests {
                 network_budget: GlobalNetworkBudget::unlimited(),
                 storage_jobs: StorageJobDispatcher::for_tests(),
                 stats_cache: None,
+                crash_safety: crate::crash_safety::CrashSafetyRuntime::inert(),
             },
             pending_storage_moves: HashMap::new(),
             shutdown_reply: None,
@@ -16990,6 +17215,7 @@ mod tests {
                 network_budget: GlobalNetworkBudget::unlimited(),
                 storage_jobs: StorageJobDispatcher::for_tests(),
                 stats_cache: None,
+                crash_safety: crate::crash_safety::CrashSafetyRuntime::inert(),
             },
             pending_storage_moves: HashMap::new(),
             shutdown_reply: None,
@@ -17083,6 +17309,7 @@ mod tests {
                 network_budget: GlobalNetworkBudget::unlimited(),
                 storage_jobs: StorageJobDispatcher::for_tests(),
                 stats_cache: None,
+                crash_safety: crate::crash_safety::CrashSafetyRuntime::inert(),
             },
             pending_storage_moves: HashMap::new(),
             shutdown_reply: None,
@@ -17176,6 +17403,7 @@ mod tests {
                 network_budget: GlobalNetworkBudget::unlimited(),
                 storage_jobs: StorageJobDispatcher::for_tests(),
                 stats_cache: None,
+                crash_safety: crate::crash_safety::CrashSafetyRuntime::inert(),
             },
             pending_storage_moves: HashMap::new(),
             shutdown_reply: None,
@@ -17257,6 +17485,7 @@ mod tests {
                 network_budget: GlobalNetworkBudget::unlimited(),
                 storage_jobs: StorageJobDispatcher::for_tests(),
                 stats_cache: None,
+                crash_safety: crate::crash_safety::CrashSafetyRuntime::inert(),
             },
             pending_storage_moves: HashMap::new(),
             shutdown_reply: None,
@@ -17342,6 +17571,7 @@ mod tests {
                 network_budget: GlobalNetworkBudget::unlimited(),
                 storage_jobs: StorageJobDispatcher::for_tests(),
                 stats_cache: None,
+                crash_safety: crate::crash_safety::CrashSafetyRuntime::inert(),
             },
             pending_storage_moves: HashMap::new(),
             shutdown_reply: None,
@@ -17412,6 +17642,7 @@ mod tests {
                 network_budget: GlobalNetworkBudget::unlimited(),
                 storage_jobs: StorageJobDispatcher::for_tests(),
                 stats_cache: None,
+                crash_safety: crate::crash_safety::CrashSafetyRuntime::inert(),
             },
             pending_storage_moves: HashMap::new(),
             shutdown_reply: None,
@@ -17484,6 +17715,7 @@ mod tests {
                 network_budget: GlobalNetworkBudget::unlimited(),
                 storage_jobs: StorageJobDispatcher::for_tests(),
                 stats_cache: None,
+                crash_safety: crate::crash_safety::CrashSafetyRuntime::inert(),
             },
             pending_storage_moves: HashMap::new(),
             shutdown_reply: None,
@@ -17543,6 +17775,7 @@ mod tests {
                 network_budget: GlobalNetworkBudget::unlimited(),
                 storage_jobs: StorageJobDispatcher::for_tests(),
                 stats_cache: None,
+                crash_safety: crate::crash_safety::CrashSafetyRuntime::inert(),
             },
             pending_storage_moves: HashMap::new(),
             shutdown_reply: None,
@@ -17613,6 +17846,7 @@ mod tests {
                 network_budget: GlobalNetworkBudget::unlimited(),
                 storage_jobs: StorageJobDispatcher::for_tests(),
                 stats_cache: None,
+                crash_safety: crate::crash_safety::CrashSafetyRuntime::inert(),
             },
             pending_storage_moves: HashMap::new(),
             shutdown_reply: None,
@@ -17686,6 +17920,7 @@ mod tests {
                 network_budget: GlobalNetworkBudget::unlimited(),
                 storage_jobs: StorageJobDispatcher::for_tests(),
                 stats_cache: None,
+                crash_safety: crate::crash_safety::CrashSafetyRuntime::inert(),
             },
             pending_storage_moves: HashMap::new(),
             shutdown_reply: None,
@@ -17827,6 +18062,7 @@ mod tests {
                 network_budget: GlobalNetworkBudget::unlimited(),
                 storage_jobs: StorageJobDispatcher::for_tests(),
                 stats_cache: None,
+                crash_safety: crate::crash_safety::CrashSafetyRuntime::inert(),
             },
             pending_storage_moves: HashMap::new(),
             shutdown_reply: None,
@@ -18001,6 +18237,7 @@ mod tests {
                 network_budget: GlobalNetworkBudget::unlimited(),
                 storage_jobs: StorageJobDispatcher::for_tests(),
                 stats_cache: None,
+                crash_safety: crate::crash_safety::CrashSafetyRuntime::inert(),
             },
             pending_storage_moves: HashMap::new(),
             shutdown_reply: None,
@@ -18047,6 +18284,7 @@ mod tests {
                 network_budget: GlobalNetworkBudget::unlimited(),
                 storage_jobs: StorageJobDispatcher::for_tests(),
                 stats_cache: None,
+                crash_safety: crate::crash_safety::CrashSafetyRuntime::inert(),
             },
             pending_storage_moves: HashMap::new(),
             shutdown_reply: None,
@@ -18380,6 +18618,7 @@ mod tests {
                 network_budget: GlobalNetworkBudget::unlimited(),
                 storage_jobs: StorageJobDispatcher::for_tests(),
                 stats_cache: None,
+                crash_safety: crate::crash_safety::CrashSafetyRuntime::inert(),
             },
             pending_storage_moves: HashMap::new(),
             shutdown_reply: None,
@@ -18606,6 +18845,7 @@ mod tests {
                 network_budget: GlobalNetworkBudget::unlimited(),
                 storage_jobs,
                 stats_cache: None,
+                crash_safety: crate::crash_safety::CrashSafetyRuntime::inert(),
             },
             pending_storage_moves: HashMap::new(),
             shutdown_reply: None,
@@ -18745,6 +18985,7 @@ mod tests {
                 network_budget: GlobalNetworkBudget::unlimited(),
                 storage_jobs: StorageJobDispatcher::for_tests(),
                 stats_cache: None,
+                crash_safety: crate::crash_safety::CrashSafetyRuntime::inert(),
             },
             pending_storage_moves: HashMap::new(),
             shutdown_reply: None,
@@ -18835,6 +19076,7 @@ mod tests {
                 network_budget: GlobalNetworkBudget::unlimited(),
                 storage_jobs: StorageJobDispatcher::for_tests(),
                 stats_cache: None,
+                crash_safety: crate::crash_safety::CrashSafetyRuntime::inert(),
             },
             pending_storage_moves: HashMap::new(),
             shutdown_reply: None,
@@ -18881,6 +19123,7 @@ mod tests {
                 network_budget: GlobalNetworkBudget::unlimited(),
                 storage_jobs: StorageJobDispatcher::for_tests(),
                 stats_cache: None,
+                crash_safety: crate::crash_safety::CrashSafetyRuntime::inert(),
             },
             pending_storage_moves: HashMap::new(),
             shutdown_reply: None,
@@ -19019,6 +19262,7 @@ mod tests {
                 network_budget: GlobalNetworkBudget::unlimited(),
                 storage_jobs: StorageJobDispatcher::for_tests(),
                 stats_cache: None,
+                crash_safety: crate::crash_safety::CrashSafetyRuntime::inert(),
             },
             pending_storage_moves: HashMap::new(),
             shutdown_reply: None,
@@ -19143,6 +19387,7 @@ mod tests {
                 network_budget: GlobalNetworkBudget::unlimited(),
                 storage_jobs: StorageJobDispatcher::for_tests(),
                 stats_cache: None,
+                crash_safety: crate::crash_safety::CrashSafetyRuntime::inert(),
             },
             pending_storage_moves: HashMap::new(),
             shutdown_reply: None,
@@ -19264,6 +19509,7 @@ mod tests {
                 network_budget: GlobalNetworkBudget::unlimited(),
                 storage_jobs: StorageJobDispatcher::for_tests(),
                 stats_cache: None,
+                crash_safety: crate::crash_safety::CrashSafetyRuntime::inert(),
             },
             pending_storage_moves: HashMap::new(),
             shutdown_reply: None,
@@ -19371,6 +19617,7 @@ mod tests {
                 network_budget: GlobalNetworkBudget::unlimited(),
                 storage_jobs: StorageJobDispatcher::for_tests(),
                 stats_cache: None,
+                crash_safety: crate::crash_safety::CrashSafetyRuntime::inert(),
             },
             pending_storage_moves: HashMap::new(),
             shutdown_reply: None,
@@ -19524,6 +19771,7 @@ mod tests {
                 network_budget: GlobalNetworkBudget::unlimited(),
                 storage_jobs: StorageJobDispatcher::for_tests(),
                 stats_cache: None,
+                crash_safety: crate::crash_safety::CrashSafetyRuntime::inert(),
             },
             pending_storage_moves: HashMap::new(),
             shutdown_reply: None,
@@ -19628,6 +19876,7 @@ mod tests {
                 network_budget: GlobalNetworkBudget::unlimited(),
                 storage_jobs: StorageJobDispatcher::for_tests(),
                 stats_cache: None,
+                crash_safety: crate::crash_safety::CrashSafetyRuntime::inert(),
             },
             pending_storage_moves: HashMap::new(),
             shutdown_reply: None,
@@ -19709,6 +19958,7 @@ mod tests {
                 network_budget: GlobalNetworkBudget::unlimited(),
                 storage_jobs,
                 stats_cache: None,
+                crash_safety: crate::crash_safety::CrashSafetyRuntime::inert(),
             },
             pending_storage_moves: HashMap::new(),
             shutdown_reply: None,
@@ -19856,6 +20106,7 @@ mod tests {
                 network_budget: GlobalNetworkBudget::unlimited(),
                 storage_jobs,
                 stats_cache: None,
+                crash_safety: crate::crash_safety::CrashSafetyRuntime::inert(),
             },
             pending_storage_moves: HashMap::new(),
             shutdown_reply: None,
@@ -19994,6 +20245,7 @@ mod tests {
                 network_budget: GlobalNetworkBudget::unlimited(),
                 storage_jobs,
                 stats_cache: None,
+                crash_safety: crate::crash_safety::CrashSafetyRuntime::inert(),
             },
             pending_storage_moves: HashMap::new(),
             shutdown_reply: None,
@@ -20228,6 +20480,7 @@ mod tests {
                 network_budget: GlobalNetworkBudget::unlimited(),
                 storage_jobs: StorageJobDispatcher::for_tests(),
                 stats_cache: None,
+                crash_safety: crate::crash_safety::CrashSafetyRuntime::inert(),
             },
             pending_storage_moves: HashMap::new(),
             shutdown_reply: None,
@@ -20368,6 +20621,7 @@ mod tests {
                 network_budget: GlobalNetworkBudget::unlimited(),
                 storage_jobs: StorageJobDispatcher::for_tests(),
                 stats_cache: None,
+                crash_safety: crate::crash_safety::CrashSafetyRuntime::inert(),
             },
             pending_storage_moves: HashMap::new(),
             shutdown_reply: None,
@@ -20461,6 +20715,7 @@ mod tests {
                 network_budget: GlobalNetworkBudget::unlimited(),
                 storage_jobs: StorageJobDispatcher::for_tests(),
                 stats_cache: None,
+                crash_safety: crate::crash_safety::CrashSafetyRuntime::inert(),
             },
             pending_storage_moves: HashMap::new(),
             shutdown_reply: None,
@@ -20577,6 +20832,7 @@ mod tests {
                 network_budget: GlobalNetworkBudget::unlimited(),
                 storage_jobs: StorageJobDispatcher::for_tests(),
                 stats_cache: None,
+                crash_safety: crate::crash_safety::CrashSafetyRuntime::inert(),
             },
             pending_storage_moves: HashMap::new(),
             shutdown_reply: None,
@@ -20663,6 +20919,7 @@ mod tests {
                 network_budget: GlobalNetworkBudget::unlimited(),
                 storage_jobs: StorageJobDispatcher::for_tests(),
                 stats_cache: None,
+                crash_safety: crate::crash_safety::CrashSafetyRuntime::inert(),
             },
             pending_storage_moves: HashMap::new(),
             shutdown_reply: None,
@@ -20809,6 +21066,7 @@ mod tests {
                 network_budget: GlobalNetworkBudget::unlimited(),
                 storage_jobs: StorageJobDispatcher::for_tests(),
                 stats_cache: None,
+                crash_safety: crate::crash_safety::CrashSafetyRuntime::inert(),
             },
             pending_storage_moves: HashMap::new(),
             shutdown_reply: None,
@@ -20907,6 +21165,7 @@ mod tests {
                 network_budget: GlobalNetworkBudget::unlimited(),
                 storage_jobs: StorageJobDispatcher::for_tests(),
                 stats_cache: None,
+                crash_safety: crate::crash_safety::CrashSafetyRuntime::inert(),
             },
             pending_storage_moves: HashMap::new(),
             shutdown_reply: None,
@@ -21007,6 +21266,7 @@ mod tests {
                 network_budget: GlobalNetworkBudget::unlimited(),
                 storage_jobs: StorageJobDispatcher::for_tests(),
                 stats_cache: None,
+                crash_safety: crate::crash_safety::CrashSafetyRuntime::inert(),
             },
             pending_storage_moves: HashMap::new(),
             shutdown_reply: None,
@@ -21157,6 +21417,7 @@ mod tests {
                 network_budget: GlobalNetworkBudget::unlimited(),
                 storage_jobs: StorageJobDispatcher::for_tests(),
                 stats_cache: None,
+                crash_safety: crate::crash_safety::CrashSafetyRuntime::inert(),
             },
             pending_storage_moves: HashMap::new(),
             shutdown_reply: None,
@@ -21296,6 +21557,7 @@ mod tests {
                 network_budget: GlobalNetworkBudget::unlimited(),
                 storage_jobs: StorageJobDispatcher::for_tests(),
                 stats_cache: None,
+                crash_safety: crate::crash_safety::CrashSafetyRuntime::inert(),
             },
             pending_storage_moves: HashMap::new(),
             shutdown_reply: None,
@@ -21397,6 +21659,7 @@ mod tests {
                 network_budget: GlobalNetworkBudget::unlimited(),
                 storage_jobs: StorageJobDispatcher::for_tests(),
                 stats_cache: None,
+                crash_safety: crate::crash_safety::CrashSafetyRuntime::inert(),
             },
             pending_storage_moves: HashMap::new(),
             shutdown_reply: None,
@@ -21494,6 +21757,7 @@ mod tests {
                 network_budget: GlobalNetworkBudget::unlimited(),
                 storage_jobs: StorageJobDispatcher::for_tests(),
                 stats_cache: None,
+                crash_safety: crate::crash_safety::CrashSafetyRuntime::inert(),
             },
             pending_storage_moves: HashMap::new(),
             shutdown_reply: None,
@@ -21572,6 +21836,7 @@ mod tests {
                 network_budget: GlobalNetworkBudget::unlimited(),
                 storage_jobs: StorageJobDispatcher::for_tests(),
                 stats_cache: None,
+                crash_safety: crate::crash_safety::CrashSafetyRuntime::inert(),
             },
             pending_storage_moves: HashMap::new(),
             shutdown_reply: None,
@@ -21648,6 +21913,265 @@ mod tests {
         config.network.listen_port = u16::MAX;
         assert_eq!(resolve_dht_bind_port(&config, true).unwrap(), 0);
     }
+
+    // ---- crash safety: engine lifecycle -------------------------------------
+
+    fn crash_engine_config(temp: &std::path::Path) -> Config {
+        let mut config = Config::default();
+        config.daemon.session_dir = temp.join("session");
+        config.storage.download_dir = temp.join("downloads");
+        config.db.path = temp.join("state.db");
+        config.network.listen_port = 0;
+        config.dht.enabled = false;
+        config.daemon.shutdown_timeout_secs = 2;
+        config
+    }
+
+    #[tokio::test]
+    async fn run_marker_records_clean_and_unclean_shutdowns_across_restarts() {
+        let temp = tempfile::tempdir().unwrap();
+        let config = crash_engine_config(temp.path());
+        let marker_path = config
+            .daemon
+            .session_dir
+            .join(rt_fastresume::RUN_MARKER_FILE);
+
+        // First start: nothing to compare with, marker written and open.
+        let engine = Engine::start(
+            Arc::new(config.clone()),
+            Arc::new(RwLock::new(SessionRegistry::new())),
+        )
+        .await
+        .unwrap();
+        let view = engine.crash_safety().await.unwrap();
+        assert!(view.report.detection_active);
+        assert_eq!(
+            view.report.previous_run.verdict,
+            rt_fastresume::PreviousRun::NoRecord
+        );
+        let open = match rt_fastresume::RunMarkerStore::new(&config.daemon.session_dir).read() {
+            rt_fastresume::MarkerRead::Present(marker) => marker,
+            other => panic!("expected an open marker, got {other:?}"),
+        };
+        assert!(!open.graceful);
+
+        // Orderly shutdown closes it.
+        engine.shutdown().await;
+        match rt_fastresume::RunMarkerStore::new(&config.daemon.session_dir).read() {
+            rt_fastresume::MarkerRead::Present(marker) => assert!(marker.graceful),
+            other => panic!("expected a closed marker, got {other:?}"),
+        }
+
+        // Second start sees a clean previous run.
+        let engine = Engine::start(
+            Arc::new(config.clone()),
+            Arc::new(RwLock::new(SessionRegistry::new())),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            engine
+                .crash_safety()
+                .await
+                .unwrap()
+                .report
+                .previous_run
+                .verdict,
+            rt_fastresume::PreviousRun::Clean
+        );
+        engine.shutdown().await;
+
+        // Simulate power loss: the marker was left open by a different boot.
+        let store = rt_fastresume::RunMarkerStore::new(&config.daemon.session_dir);
+        std::fs::remove_file(&marker_path).unwrap();
+        store
+            .begin_run(
+                Some("boot-that-no-longer-exists"),
+                1,
+                1,
+                unix_now_i64() as u64 - 30,
+            )
+            .unwrap();
+        let engine = Engine::start(
+            Arc::new(config.clone()),
+            Arc::new(RwLock::new(SessionRegistry::new())),
+        )
+        .await
+        .unwrap();
+        let view = engine.crash_safety().await.unwrap();
+        if rt_storage::current_boot_identity().is_some() {
+            assert_eq!(
+                view.report.previous_run.verdict,
+                rt_fastresume::PreviousRun::HostCrash
+            );
+        } else {
+            assert_eq!(
+                view.report.previous_run.verdict,
+                rt_fastresume::PreviousRun::UncleanUnknownCause
+            );
+        }
+        engine.shutdown().await;
+
+        // The recovery was recorded for operators.
+        let conn = Connection::open(config.db_path()).unwrap();
+        let kind: String = conn
+            .query_row(
+                "SELECT kind FROM session_events WHERE kind = 'crash_recovery'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("an unclean previous run must leave a crash_recovery event");
+        assert_eq!(kind, "crash_recovery");
+    }
+
+    #[tokio::test]
+    async fn crash_safety_settings_persist_across_restart_and_reset_to_config() {
+        let temp = tempfile::tempdir().unwrap();
+        let config = crash_engine_config(temp.path());
+        let start = |config: Config| async move {
+            Engine::start(
+                Arc::new(config),
+                Arc::new(RwLock::new(SessionRegistry::new())),
+            )
+            .await
+            .unwrap()
+        };
+
+        let engine = start(config.clone()).await;
+        let initial = engine.crash_safety().await.unwrap();
+        assert!(!initial.overridden);
+        assert_eq!(initial.settings, rt_config::CrashSafetyConfig::default());
+
+        // Invalid settings are refused and change nothing.
+        let mut invalid = initial.settings.clone();
+        invalid.completion_verify_sample_percent = 0;
+        assert!(engine.set_crash_safety(Some(invalid)).await.is_err());
+        assert!(!engine.crash_safety().await.unwrap().overridden);
+
+        // A location policy must name an absolute directory.
+        let mut relative = initial.settings.clone();
+        relative.path_policies = vec![rt_config::PathPolicy {
+            path: std::path::PathBuf::from("relative/dir"),
+            ..rt_config::PathPolicy::default()
+        }];
+        assert!(engine.set_crash_safety(Some(relative)).await.is_err());
+        assert!(!engine.crash_safety().await.unwrap().overridden);
+
+        let mut chosen = initial.settings.clone();
+        chosen.completion_verify = rt_config::CompletionVerifyMode::Full;
+        chosen.host_crash_recovery = rt_config::HostCrashRecovery::Full;
+        chosen.structural_audit = rt_config::StructuralAuditMode::Always;
+        chosen.path_policies = vec![rt_config::PathPolicy {
+            path: temp.path().join("media"),
+            completion_gate: Some(false),
+            completion_verify_sample_percent: Some(5),
+            ..rt_config::PathPolicy::default()
+        }];
+        let applied = engine.set_crash_safety(Some(chosen.clone())).await.unwrap();
+        assert!(applied.overridden);
+        assert_eq!(applied.settings, chosen);
+        assert_eq!(applied.defaults, rt_config::CrashSafetyConfig::default());
+        engine.shutdown().await;
+
+        // A restart keeps the runtime override over the config file.
+        let engine = start(config.clone()).await;
+        let after_restart = engine.crash_safety().await.unwrap();
+        assert!(after_restart.overridden);
+        assert_eq!(after_restart.settings, chosen);
+
+        // Reset returns to the config file and forgets the override.
+        let reset = engine.set_crash_safety(None).await.unwrap();
+        assert!(!reset.overridden);
+        assert_eq!(reset.settings, rt_config::CrashSafetyConfig::default());
+        engine.shutdown().await;
+        let engine = start(config).await;
+        let final_view = engine.crash_safety().await.unwrap();
+        assert!(!final_view.overridden);
+        assert_eq!(final_view.settings, rt_config::CrashSafetyConfig::default());
+        engine.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn describing_a_path_reports_the_matching_location_policy() {
+        let temp = tempfile::tempdir().unwrap();
+        let config = crash_engine_config(temp.path());
+        let engine = Engine::start(
+            Arc::new(config),
+            Arc::new(RwLock::new(SessionRegistry::new())),
+        )
+        .await
+        .unwrap();
+
+        let media = temp.path().join("media");
+        let mut settings = engine.crash_safety().await.unwrap().settings;
+        settings.path_policies = vec![rt_config::PathPolicy {
+            path: media.clone(),
+            completion_verify: Some(rt_config::CompletionVerifyMode::Full),
+            ..rt_config::PathPolicy::default()
+        }];
+        engine.set_crash_safety(Some(settings)).await.unwrap();
+
+        let inside = engine
+            .describe_crash_safety_path(media.join("tv"))
+            .await
+            .unwrap();
+        assert_eq!(
+            inside.matched_policy.as_deref(),
+            Some(media.display().to_string().as_str())
+        );
+        assert_eq!(
+            inside.completion_verify,
+            rt_config::CompletionVerifyMode::Full
+        );
+
+        let outside = engine
+            .describe_crash_safety_path(temp.path().join("other"))
+            .await
+            .unwrap();
+        assert_eq!(outside.matched_policy, None);
+
+        // Inspecting paths does not register them as save roots.
+        assert!(engine
+            .crash_safety()
+            .await
+            .unwrap()
+            .report
+            .mounts
+            .is_empty());
+
+        assert!(engine
+            .describe_crash_safety_path(std::path::PathBuf::from("relative"))
+            .await
+            .is_err());
+        assert!(engine
+            .describe_crash_safety_path(std::path::PathBuf::from(format!(
+                "/{}",
+                "a".repeat(MAX_CRASH_SAFETY_QUERY_PATH_BYTES)
+            )))
+            .await
+            .is_err());
+        engine.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn disabling_detection_in_the_config_file_keeps_no_marker() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut config = crash_engine_config(temp.path());
+        config.crash_safety.host_crash_detection = false;
+        let engine = Engine::start(
+            Arc::new(config.clone()),
+            Arc::new(RwLock::new(SessionRegistry::new())),
+        )
+        .await
+        .unwrap();
+        assert!(!engine.crash_safety().await.unwrap().report.detection_active);
+        engine.shutdown().await;
+        assert!(!config
+            .daemon
+            .session_dir
+            .join(rt_fastresume::RUN_MARKER_FILE)
+            .exists());
+    }
 }
 
 fn resolve_incoming_peer_hash_candidates(
@@ -21682,6 +22206,14 @@ fn incoming_utp_enabled() -> bool {
         Ok(value) => parse_incoming_utp_enabled(&value),
         Err(_) => false,
     }
+}
+
+fn validate_peer_addresses(peers: &[SocketAddr], maximum: usize, kind: &str) -> CmdResult<()> {
+    validate_peer_command_len(peers.len(), maximum, kind)?;
+    if let Some((index, _)) = peers.iter().enumerate().find(|(_, peer)| peer.port() == 0) {
+        return Err(format!("{kind} address at index {index} has a zero port"));
+    }
+    Ok(())
 }
 
 fn parse_incoming_utp_enabled(value: &str) -> bool {

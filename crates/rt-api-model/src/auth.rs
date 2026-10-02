@@ -1,19 +1,10 @@
 use http::{header, HeaderMap};
 use subtle::ConstantTimeEq;
 
-/// Parse an HTTP Bearer authorization value. Authentication schemes are
-/// case-insensitive, but the credential itself remains an exact opaque token.
-pub fn bearer_token(headers: &HeaderMap) -> Option<String> {
-    let mut parts = headers
-        .get(header::AUTHORIZATION)
-        .and_then(|value| value.to_str().ok())?
-        .split_whitespace();
-    let scheme = parts.next()?;
-    let token = parts.next()?;
-    if parts.next().is_some() || !scheme.eq_ignore_ascii_case("Bearer") {
-        return None;
-    }
-    Some(token.to_owned())
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HeaderValueError {
+    Duplicate,
+    InvalidUtf8,
 }
 
 /// Compare a presented API token with every configured token without
@@ -24,6 +15,21 @@ pub fn api_token_allowed(api_tokens: &[String], candidate: &str) -> bool {
         matched |= u8::from(bool::from(allowed.as_bytes().ct_eq(candidate.as_bytes())));
     }
     matched != 0
+}
+
+/// Parse an HTTP Bearer credential without making the authentication scheme's
+/// casing significant. RFC 7235 defines the scheme as case-insensitive; keep
+/// exactly one non-empty token and reject extra whitespace-separated fields.
+pub fn bearer_token(headers: &HeaderMap) -> Option<String> {
+    let mut parts = single_header_value(headers, "authorization")
+        .ok()??
+        .split_whitespace();
+    let scheme = parts.next()?;
+    let token = parts.next()?;
+    if parts.next().is_some() || !scheme.eq_ignore_ascii_case("Bearer") {
+        return None;
+    }
+    Some(token.to_owned())
 }
 
 /// Return whether a request carries one of the bearer-backed browser session
@@ -47,27 +53,41 @@ pub fn has_browser_request_headers(headers: &HeaderMap) -> bool {
 /// Decode one of the percent-encoded session-cookie values used by the
 /// compatibility facades.
 pub fn session_cookie_value(headers: &HeaderMap, names: &[&str]) -> Option<String> {
-    let cookie = headers
-        .get(header::COOKIE)
-        .and_then(|value| value.to_str().ok())?;
-    cookie.split(';').find_map(|part| {
-        let (name, value) = part.trim().split_once('=')?;
-        if value.is_empty() || !names.contains(&name) {
+    let cookie = single_header_value(headers, "cookie").ok()??;
+    let mut candidate = None;
+    for part in cookie.split(';') {
+        let part = part.trim();
+        let Some((name, value)) = part.split_once('=') else {
+            // A malformed candidate cookie is not proof of authentication,
+            // but a malformed ordinary cookie should not invalidate an
+            // otherwise valid session either.
+            continue;
+        };
+        if !names.contains(&name) {
+            continue;
+        }
+        if value.is_empty() {
             return None;
         }
-        percent_decode(value)
-    })
+        let decoded = percent_decode(value)?;
+        if candidate.replace(decoded).is_some() {
+            // Reject duplicate aliases (including SID + tng_session) rather
+            // than letting different intermediaries choose different values.
+            return None;
+        }
+    }
+    candidate
 }
 
 /// Reject browser cookie mutations that do not carry positive same-origin
 /// evidence when Fetch Metadata is present.
 ///
-/// API clients using an Authorization header do not need this check.  Missing
-/// browser metadata remains allowed for non-browser clients, while an
-/// explicit Origin/Referer or Fetch-Metadata claim is fail-closed.  Comparing
-/// the origin authority with Host keeps this independent of the deployment's
-/// scheme and works behind TLS-terminating proxies without trusting a proxy
-/// header supplied by the caller.
+/// API clients using an Authorization header do not need this check. Missing
+/// browser metadata remains allowed for non-browser clients, while an absent
+/// Host or an explicit Origin/Referer or Fetch-Metadata claim is fail-closed.
+/// Comparing the origin authority with Host keeps this independent of the
+/// deployment's scheme and works behind TLS-terminating proxies without
+/// trusting a proxy header supplied by the caller.
 pub fn csrf_request_allowed(headers: &HeaderMap) -> bool {
     if let Some(value) = headers.get("sec-fetch-site") {
         // `same-site` is still cross-origin, and `none`/unknown values do not
@@ -82,15 +102,15 @@ pub fn csrf_request_allowed(headers: &HeaderMap) -> bool {
         }
     }
 
-    let Some(host) = headers
-        .get(header::HOST)
-        .and_then(|value| value.to_str().ok())
-    else {
-        return headers.get(header::ORIGIN).is_none() && headers.get(header::REFERER).is_none();
+    let Ok(Some(host)) = single_header_value(headers, "host") else {
+        return false;
     };
 
-    for (name, require_origin_scheme) in [(header::ORIGIN, true), (header::REFERER, false)] {
-        let Some(value) = headers.get(name).and_then(|value| value.to_str().ok()) else {
+    for (name, require_origin_scheme) in [("origin", true), ("referer", false)] {
+        let Ok(value) = single_header_value(headers, name) else {
+            return false;
+        };
+        let Some(value) = value else {
             continue;
         };
         if !same_origin_authority(value, host, require_origin_scheme) {
@@ -98,6 +118,26 @@ pub fn csrf_request_allowed(headers: &HeaderMap) -> bool {
         }
     }
     true
+}
+
+/// Return one valid UTF-8 header value, rejecting duplicates. Security
+/// decisions must not inspect only the first value when an intermediary may
+/// combine or interpret repeated headers differently.
+pub fn single_header_value<'a>(
+    headers: &'a HeaderMap,
+    name: &str,
+) -> Result<Option<&'a str>, HeaderValueError> {
+    let mut values = headers.get_all(name).iter();
+    let Some(value) = values.next() else {
+        return Ok(None);
+    };
+    if values.next().is_some() {
+        return Err(HeaderValueError::Duplicate);
+    }
+    value
+        .to_str()
+        .map(Some)
+        .map_err(|_| HeaderValueError::InvalidUtf8)
 }
 
 fn same_origin_authority(value: &str, host: &str, require_scheme: bool) -> bool {
@@ -120,6 +160,9 @@ fn same_origin_authority(value: &str, host: &str, require_scheme: bool) -> bool 
         return false;
     }
     let scheme = value[..scheme_end].to_ascii_lowercase();
+    if !matches!(scheme.as_str(), "http" | "https") {
+        return false;
+    }
     normalize_authority(authority, &scheme) == normalize_authority(host.trim(), &scheme)
 }
 
@@ -211,6 +254,15 @@ mod tests {
     }
 
     #[test]
+    fn session_cookie_detection_rejects_duplicate_cookie_headers() {
+        let mut headers = HeaderMap::new();
+        headers.append(header::COOKIE, "SID=first".parse().unwrap());
+        headers.append(header::COOKIE, "SID=second".parse().unwrap());
+        assert!(!has_session_cookie(&headers, &["SID"]));
+        assert!(session_cookie_value(&headers, &["SID"]).is_none());
+    }
+
+    #[test]
     fn csrf_rejects_cross_site_and_mismatched_origins() {
         let mut headers = HeaderMap::new();
         headers.insert(header::HOST, "torrentng.example".parse().unwrap());
@@ -248,5 +300,60 @@ mod tests {
         assert!(csrf_request_allowed(&headers));
         headers.remove(header::ORIGIN);
         assert!(csrf_request_allowed(&headers));
+    }
+
+    #[test]
+    fn csrf_rejects_cookie_mutations_without_host_context() {
+        let headers = HeaderMap::new();
+        assert!(!csrf_request_allowed(&headers));
+    }
+
+    #[test]
+    fn csrf_rejects_non_http_origin_even_when_authority_matches() {
+        let mut headers = HeaderMap::new();
+        headers.insert(header::HOST, "torrentng.example".parse().unwrap());
+        headers.insert(header::ORIGIN, "ftp://torrentng.example".parse().unwrap());
+        assert!(!csrf_request_allowed(&headers));
+    }
+
+    #[test]
+    fn security_headers_reject_duplicates() {
+        let mut headers = HeaderMap::new();
+        headers.insert(header::HOST, "torrentng.example".parse().unwrap());
+        headers.append(header::ORIGIN, "https://torrentng.example".parse().unwrap());
+        headers.append(header::ORIGIN, "https://attacker.example".parse().unwrap());
+        assert!(!csrf_request_allowed(&headers));
+
+        headers.remove(header::ORIGIN);
+        headers.append(header::AUTHORIZATION, "Bearer one".parse().unwrap());
+        headers.append(header::AUTHORIZATION, "Bearer two".parse().unwrap());
+        assert!(bearer_token(&headers).is_none());
+    }
+
+    #[test]
+    fn single_header_value_rejects_duplicate_idempotency_keys() {
+        let mut headers = HeaderMap::new();
+        headers.append("idempotency-key", "request-a".parse().unwrap());
+        headers.append("idempotency-key", "request-b".parse().unwrap());
+        assert_eq!(
+            single_header_value(&headers, "idempotency-key"),
+            Err(HeaderValueError::Duplicate)
+        );
+    }
+
+    #[test]
+    fn session_cookie_value_rejects_duplicate_candidate_cookies() {
+        let mut headers = HeaderMap::new();
+        headers.insert(header::COOKIE, "SID=first; SID=second".parse().unwrap());
+        assert!(session_cookie_value(&headers, &["SID"]).is_none());
+
+        headers.insert(
+            header::COOKIE,
+            "SID=first; tng_session=second".parse().unwrap(),
+        );
+        assert!(session_cookie_value(&headers, &["SID", "tng_session"]).is_none());
+
+        headers.insert(header::COOKIE, "SID=; other=valid".parse().unwrap());
+        assert!(session_cookie_value(&headers, &["SID"]).is_none());
     }
 }

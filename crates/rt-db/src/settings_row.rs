@@ -70,6 +70,13 @@ pub fn set_setting_in_tx(
     Ok(())
 }
 
+/// Remove a setting. Returns whether a row existed.
+pub fn delete_setting(conn: &Connection, key: &str) -> Result<bool, DbError> {
+    validate_setting(key, None)?;
+    let removed = conn.execute("DELETE FROM settings WHERE key = ?1", params![key])?;
+    Ok(removed > 0)
+}
+
 pub fn get_setting(conn: &Connection, key: &str) -> Result<String, DbError> {
     validate_setting(key, None)?;
     let value_bytes: i64 = conn
@@ -106,6 +113,19 @@ mod tests {
     use super::*;
     use crate::schema::migrate;
     use rusqlite::Connection;
+
+    #[test]
+    fn delete_setting_removes_the_row_and_reports_whether_it_existed() {
+        let conn = Connection::open_in_memory().unwrap();
+        migrate(&conn).unwrap();
+        set_setting(&conn, "crash_safety.v1", "{}", 10).unwrap();
+        assert!(delete_setting(&conn, "crash_safety.v1").unwrap());
+        assert!(matches!(
+            get_setting(&conn, "crash_safety.v1"),
+            Err(DbError::NotFound(_))
+        ));
+        assert!(!delete_setting(&conn, "crash_safety.v1").unwrap());
+    }
 
     #[test]
     fn setting_round_trip() {

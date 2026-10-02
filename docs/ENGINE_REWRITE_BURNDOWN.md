@@ -95,13 +95,15 @@ supported backend arrangement alongside this client.
 - [x] Add dry-run migration reports.
 - [x] Add rollback/backup docs.
 
-## 9. Scale Certification
+## 9. Scale Diagnostics (non-release)
 
-- [x] Generate synthetic 1k, 5k, 10k, 15k, 50k datasets.
-- [x] Cold-start benchmark with DB load and API readiness.
-- [x] Idle memory benchmark at 15k torrents.
-- [x] API list/filter/sort latency benchmark.
-- [x] Tracker restart storm benchmark.
+- [x] Keep bounded synthetic fixtures for cold-start, memory, API, and tracker
+  regression diagnosis.
+- [x] Keep optimized-build diagnostics with host-selected fixture sizes.
+
+Numeric torrent-count capacity proofs are intentionally removed from the
+release checklist. The retained diagnostics do not certify a production
+capacity or fleet-size claim.
 - [x] Recheck-vs-seeding starvation benchmark.
 - [x] Publish certification report.
 
@@ -139,7 +141,8 @@ shippable and benchmarkable.
 - [x] Add global `FramePool` (size classes, hard byte cap, backpressure → `QueueFull`).
 - [x] Call `create_dir_all` once per file at allocation, not per block.
 - [x] Keep `scheduled_read`/`scheduled_write`/`PieceVerifier` signatures stable.
-- [x] Bench/proxy: real-device file-pool run shows 100k hot reads with one open miss and 99,999 cache hits.
+- [x] Bench/proxy: real-device file-pool run shows hot-read reuse with one
+  open miss and subsequent cache hits; numeric capacity is not asserted.
 
 ### Phase B — per-device elevator + topology
 
@@ -157,11 +160,12 @@ shippable and benchmarkable.
 - [x] Introduce Dormant/Warm/Hot tiers orthogonal to `TorrentState`.
 - [x] Integrate restore, lifecycle/inbound promotion, idle demotion, stats, and shutdown behind `runtime.torrent_tiers_enabled`.
 - [x] Shared timer-wheel reactor for dormant runtime state; activity and persisted tracker-deadline promotion use bounded deadline wheels, and dormant registry rows retain only compact `DormantTorrent` state until promotion.
-- [x] 100k proxy implementation: controller/registry tests cover 100,000 rows with 2,000 hot entries and the two-percent/one-task policy. Release-artifact capacity measurement is tracked separately as an external evidence gate.
+- [x] Large dormant-registry proxy implementation: controller/registry tests
+  cover compact dormant rows and hot-entry admission. Numeric release-artifact
+  capacity measurement is intentionally not a required evidence gate.
 
-The implementation checklist is complete. This does not turn the synthetic
-100k proxy into a production-capacity claim; release-binary RSS/fd/thread/task
-and restart measurements remain explicitly external evidence.
+The implementation checklist is complete. Synthetic proxies and release-binary
+RSS/fd/thread/task diagnostics do not create a production-capacity claim.
 
 ### Phase D — efficiency
 

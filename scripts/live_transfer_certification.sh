@@ -64,6 +64,15 @@ FIXTURE_DOWNLOAD_DIR="cert-fixture-$FIXTURE_ID"
 LOCAL_CATEGORY="cert-local-fixture-$FIXTURE_ID"
 PUBLIC_CATEGORY="cert-public-$FIXTURE_ID"
 
+if ! [[ "$FIXTURE_ID" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$ ]]; then
+  echo "CERT_FIXTURE_ID must contain only bounded shell-safe identifier characters" >&2
+  exit 2
+fi
+if ! [[ "$FIXTURE_BYTES" =~ ^[1-9][0-9]{0,8}$ ]] || (( FIXTURE_BYTES > 268435456 )); then
+  echo "CERT_FIXTURE_BYTES must be between 1 and 268435456" >&2
+  exit 2
+fi
+
 TRACKER_NAME="tng-cert-tracker-$FIXTURE_ID"
 SEEDER_NAME="tng-cert-seeder-$FIXTURE_ID"
 FILESERVER_NAME="tng-cert-files-$FIXTURE_ID"

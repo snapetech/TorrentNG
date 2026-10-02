@@ -1,8 +1,11 @@
-use anyhow::Result;
+use anyhow::{bail, Result};
 use rusqlite::{params, types::Value, Connection, OptionalExtension, Transaction};
 use serde::{Deserialize, Serialize};
 
-use super::{db::Db, AutomationStateCapacityError, MAX_AUTOMATION_STATE_JSON_BYTES};
+use super::{
+    db::{kv_value_bounded, Db, MAX_KV_VALUE_BYTES},
+    AutomationStateCapacityError, MAX_AUTOMATION_STATE_JSON_BYTES,
+};
 
 const KEY: &str = "workflow_rules";
 const RUNS_KEY: &str = "workflow_runs";
@@ -19,6 +22,13 @@ const MAX_WORKFLOW_RUN_ACTION_BYTES: usize = 64;
 const MAX_WORKFLOW_RUN_ITEM_BYTES: usize = 256;
 const MAX_WORKFLOW_RUN_ERROR_BYTES: usize = 512;
 const MAX_RSS_RULES: usize = 1_024;
+pub(crate) const MAX_WORKFLOW_RULES: usize = 512;
+const MAX_WORKFLOW_TARGETS: usize = 16_384;
+const MAX_WORKFLOW_RULE_TEXT_BYTES: usize = 64 * 1024;
+const MAX_RSS_RULE_TAGS: usize = 1_024;
+const MAX_RSS_RULE_TEXT_BYTES: usize = 64 * 1024;
+const MAX_RSS_RULE_TAG_BYTES: usize = 4 * 1024;
+const MAX_RSS_RULE_TAG_TOTAL_BYTES: usize = 4 * 1024 * 1024;
 
 #[derive(Debug, thiserror::Error)]
 #[error("qBittorrent RSS item state exceeds the configured byte limit")]
@@ -110,6 +120,7 @@ impl Db {
         if rule.id.trim().is_empty() {
             rule.id = uuid::Uuid::new_v4().to_string();
         }
+        validate_workflow_rule(&rule)?;
         let id = rule.id.clone();
         self.update_workflow_rules(|rules| {
             rules.retain(|existing| existing.id != id);
@@ -160,6 +171,7 @@ impl Db {
         let rows = stmt
             .query_map(rusqlite::params_from_iter(args.iter()), |r| r.get(0))?
             .collect::<rusqlite::Result<Vec<String>>>()?;
+        ensure_count("workflow targets", rows.len(), MAX_WORKFLOW_TARGETS)?;
         Ok(rows)
     }
 
@@ -174,6 +186,7 @@ impl Db {
         let mut runs = read_workflow_runs(&conn, false)?;
         for run in &mut runs {
             normalize_workflow_run_totals(run);
+            validate_workflow_run(run)?;
         }
         runs.sort_by_key(|run| {
             (
@@ -187,6 +200,7 @@ impl Db {
 
     pub fn record_workflow_run(&self, mut run: WorkflowRun) -> Result<Vec<WorkflowRun>> {
         bound_workflow_run(&mut run);
+        validate_workflow_run(&run)?;
 
         let mut conn = self.conn()?;
         let tx = conn.transaction()?;
@@ -224,6 +238,10 @@ impl Db {
             Some(raw) => serde_json::from_str(&raw)?,
             None => Vec::new(),
         };
+        ensure_count("RSS rules", rules.len(), MAX_RSS_RULES)?;
+        for rule in &rules {
+            validate_rss_rule(rule)?;
+        }
         rules.sort_by_key(|a| a.name.to_lowercase());
         Ok(rules)
     }
@@ -398,11 +416,7 @@ impl Db {
     {
         let mut conn = self.conn()?;
         let tx = conn.transaction()?;
-        let raw: Option<String> = tx
-            .query_row("SELECT value FROM kv WHERE key=?1", params![KEY], |r| {
-                r.get(0)
-            })
-            .optional()?;
+        let raw = kv_value_bounded(&tx, KEY, MAX_KV_VALUE_BYTES, "workflow rules")?;
         let mut rules: Vec<WorkflowRule> = match raw {
             Some(raw) => serde_json::from_str(&raw)?,
             None => Vec::new(),
@@ -411,6 +425,10 @@ impl Db {
             normalize_legacy_category_target(rule);
         }
         update(&mut rules);
+        ensure_count("workflow rules", rules.len(), MAX_WORKFLOW_RULES)?;
+        for rule in &rules {
+            validate_workflow_rule(rule)?;
+        }
         rules.sort_by_key(|rule| rule.name.to_lowercase());
         write_json_vec(&tx, KEY, &rules)?;
         tx.commit()?;
@@ -423,16 +441,19 @@ impl Db {
     {
         let mut conn = self.conn()?;
         let tx = conn.transaction()?;
-        let raw: Option<String> = tx
-            .query_row("SELECT value FROM kv WHERE key=?1", params![RSS_KEY], |r| {
-                r.get(0)
-            })
-            .optional()?;
+        let raw = kv_value_bounded(&tx, RSS_KEY, MAX_KV_VALUE_BYTES, "RSS rules")?;
         let mut rules: Vec<RssRule> = match raw {
             Some(raw) => serde_json::from_str(&raw)?,
             None => Vec::new(),
         };
+        for rule in &rules {
+            validate_rss_rule(rule)?;
+        }
         update(&mut rules);
+        ensure_count("RSS rules", rules.len(), MAX_RSS_RULES)?;
+        for rule in &rules {
+            validate_rss_rule(rule)?;
+        }
         rules.sort_by_key(|rule| rule.name.to_lowercase());
         write_json_vec(&tx, RSS_KEY, &rules)?;
         tx.commit()?;
@@ -447,6 +468,116 @@ fn normalize_legacy_category_target(rule: &mut WorkflowRule) {
     if rule.action == "set_category" && rule.target_category.is_none() {
         rule.target_category = rule.category.take();
     }
+}
+
+fn ensure_count(label: &str, count: usize, maximum: usize) -> Result<()> {
+    if count > maximum {
+        bail!("{label} exceed the maximum of {maximum}");
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_workflow_rule(rule: &WorkflowRule) -> Result<()> {
+    for (label, value) in [
+        ("workflow rule id", rule.id.as_str()),
+        ("workflow rule name", rule.name.as_str()),
+        ("workflow event", rule.event.as_str()),
+        ("workflow action", rule.action.as_str()),
+    ] {
+        validate_workflow_text(label, value)?;
+    }
+    for (label, value) in [
+        ("workflow category", rule.category.as_deref()),
+        ("workflow target category", rule.target_category.as_deref()),
+        ("workflow tracker", rule.tracker.as_deref()),
+        ("workflow command", rule.command.as_deref()),
+        ("workflow URL", rule.url.as_deref()),
+        ("workflow target path", rule.target_path.as_deref()),
+    ] {
+        if let Some(value) = value {
+            validate_workflow_text(label, value)?;
+        }
+    }
+    Ok(())
+}
+
+fn validate_workflow_run(run: &WorkflowRun) -> Result<()> {
+    for (label, value) in [
+        ("workflow run id", run.id.as_str()),
+        ("workflow run rule id", run.rule_id.as_str()),
+        ("workflow run rule name", run.rule_name.as_str()),
+        ("workflow run action", run.action.as_str()),
+    ] {
+        validate_workflow_text(label, value)?;
+    }
+    let mut total_bytes = 0usize;
+    for (label, values, max_item_bytes) in [
+        (
+            "workflow matched targets",
+            &run.matched,
+            MAX_WORKFLOW_RUN_ITEM_BYTES,
+        ),
+        (
+            "workflow applied targets",
+            &run.applied,
+            MAX_WORKFLOW_RUN_ITEM_BYTES,
+        ),
+        ("workflow errors", &run.errors, MAX_WORKFLOW_RUN_ERROR_BYTES),
+    ] {
+        ensure_count(label, values.len(), MAX_WORKFLOW_TARGETS)?;
+        for value in values {
+            if value.len() > max_item_bytes {
+                bail!("{label} item exceeds the maximum of {max_item_bytes} bytes");
+            }
+            total_bytes = total_bytes.saturating_add(value.len());
+        }
+    }
+    if total_bytes > MAX_WORKFLOW_RUNS_JSON_BYTES {
+        bail!("workflow run values exceed the maximum of {MAX_WORKFLOW_RUNS_JSON_BYTES} bytes");
+    }
+    Ok(())
+}
+
+fn validate_workflow_text(label: &str, value: &str) -> Result<()> {
+    if value.len() > MAX_WORKFLOW_RULE_TEXT_BYTES {
+        bail!("{label} exceeds the maximum of {MAX_WORKFLOW_RULE_TEXT_BYTES} bytes");
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_rss_rule(rule: &RssRule) -> Result<()> {
+    for (label, value) in [
+        ("RSS rule id", rule.id.as_str()),
+        ("RSS rule name", rule.name.as_str()),
+        ("RSS feed URL", rule.feed_url.as_str()),
+        ("RSS include pattern", rule.include.as_str()),
+    ] {
+        if value.len() > MAX_RSS_RULE_TEXT_BYTES {
+            bail!("{label} exceeds the maximum of {MAX_RSS_RULE_TEXT_BYTES} bytes");
+        }
+    }
+    for (label, value) in [
+        ("RSS exclude pattern", rule.exclude.as_deref()),
+        ("RSS category", rule.category.as_deref()),
+        ("RSS save path", rule.save_path.as_deref()),
+    ] {
+        if let Some(value) = value {
+            if value.len() > MAX_RSS_RULE_TEXT_BYTES {
+                bail!("{label} exceeds the maximum of {MAX_RSS_RULE_TEXT_BYTES} bytes");
+            }
+        }
+    }
+    ensure_count("RSS rule tags", rule.tags.len(), MAX_RSS_RULE_TAGS)?;
+    let total_tag_bytes = rule.tags.iter().try_fold(0usize, |total, tag| {
+        if tag.len() > MAX_RSS_RULE_TAG_BYTES {
+            bail!("RSS rule tag exceeds the maximum of {MAX_RSS_RULE_TAG_BYTES} bytes");
+        }
+        Ok(total.saturating_add(tag.len()))
+    })?;
+    if total_tag_bytes > MAX_RSS_RULE_TAG_TOTAL_BYTES {
+        bail!("RSS rule tags exceed the maximum of {MAX_RSS_RULE_TAG_TOTAL_BYTES} bytes");
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

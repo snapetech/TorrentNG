@@ -47,6 +47,7 @@ const MAX_SYNC_PATH_BYTES: usize = 4 * 1024;
 const MAX_SYNC_TRACKER_URL_BYTES: usize = 8 * 1024;
 const MAX_SYNC_MESSAGE_BYTES: usize = 8 * 1024;
 const MAX_SYNC_TAGS_BYTES: usize = 512 * 1024;
+const MAX_SYNC_CACHE_ENTRIES: usize = 100_000;
 
 fn validate_torrent_projection(torrent: &RawTorrent) -> anyhow::Result<()> {
     fn check_field(name: &str, value: &str, maximum: usize) -> anyhow::Result<()> {
@@ -64,6 +65,9 @@ fn validate_torrent_projection(torrent: &RawTorrent) -> anyhow::Result<()> {
 
     if torrent.hash.trim().is_empty() {
         bail!("backend torrent hash must not be empty");
+    }
+    if !is_valid_info_hash(&torrent.hash) {
+        bail!("backend torrent hash must be a valid v1 or v2 info hash");
     }
     check_field("hash", &torrent.hash, MAX_SYNC_HASH_BYTES)?;
     check_field("name", &torrent.name, MAX_SYNC_NAME_BYTES)?;
@@ -329,8 +333,15 @@ async fn tick_full(
 
     if sync_error.is_none() {
         let known = db
-            .run_blocking("sync_all_hashes", |db| db.all_hashes())
+            .run_blocking("sync_all_hashes", |db| {
+                db.all_hashes_bounded(MAX_SYNC_CACHE_ENTRIES)
+            })
             .await?;
+        if known.len() > MAX_SYNC_CACHE_ENTRIES {
+            bail!(
+                "cache contains more than {MAX_SYNC_CACHE_ENTRIES} torrents; refusing unbounded stale-row reconciliation"
+            );
+        }
         for hash in known
             .iter()
             .filter(|hash| !seen.contains(&logical_hash(hash)))
@@ -436,7 +447,7 @@ async fn tick_bounded(
                 error = %chain,
                 "live summary sync failed"
             );
-            sync_error.get_or_insert_with(|| anyhow::anyhow!("live summary sync failed: {chain}"));
+            record_live_summary_error(bounded, &mut sync_error, chain);
         }
     }
 
@@ -511,8 +522,15 @@ async fn tick_bounded(
     if page_len < MULTICALL_RANGE_PAGE_SIZE {
         if !bounded.full_cycle_had_errors {
             let known = db
-                .run_blocking("sync_all_hashes", |db| db.all_hashes())
+                .run_blocking("sync_all_hashes", |db| {
+                    db.all_hashes_bounded(MAX_SYNC_CACHE_ENTRIES)
+                })
                 .await?;
+            if known.len() > MAX_SYNC_CACHE_ENTRIES {
+                bail!(
+                    "cache contains more than {MAX_SYNC_CACHE_ENTRIES} torrents; refusing unbounded stale-row reconciliation"
+                );
+            }
             let known_by_logical = known
                 .iter()
                 .map(|hash| (logical_hash(hash), hash))
@@ -615,6 +633,18 @@ async fn tick_bounded(
     }
 
     sync_error.map_or(Ok(bounded.counts.clone()), Err)
+}
+
+fn record_live_summary_error(
+    bounded: &mut BoundedSyncState,
+    sync_error: &mut Option<anyhow::Error>,
+    chain: String,
+) {
+    // The live-summary and bounded-range reads are both inputs to stale-row
+    // reconciliation. A failed summary can omit a torrent from the current
+    // cycle, so a later short range page must not trigger cleanup.
+    bounded.full_cycle_had_errors = true;
+    sync_error.get_or_insert_with(|| anyhow::anyhow!("live summary sync failed: {chain}"));
 }
 
 struct ResilientFetch {
@@ -823,6 +853,10 @@ async fn upsert_torrent(
     Ok(())
 }
 
+fn is_valid_info_hash(hash: &str) -> bool {
+    matches!(hash.len(), 40 | 64) && hash.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
 /// Older rTorrent rows encode terminal failures in `d.message` while their
 /// lifecycle state remains the ordinary stopped/active 0/1 value. Preserve
 /// that compatibility shape, but do not reinterpret the newer queued state
@@ -1006,7 +1040,7 @@ mod tests {
     fn torrent_projection_rejects_oversized_or_invalid_backend_fields() {
         fn valid_torrent() -> RawTorrent {
             RawTorrent {
-                hash: "valid-hash".to_owned(),
+                hash: "a".repeat(40),
                 name: "valid name".to_owned(),
                 size_bytes: 0,
                 bytes_done: 0,
@@ -1136,5 +1170,23 @@ mod tests {
         assert_eq!(normalized_cache_state(5, false, "tracker failure"), 5);
         assert_eq!(normalized_cache_state(3, true, ""), 3);
         assert_eq!(normalized_cache_state(0, false, ""), 0);
+    }
+
+    #[test]
+    fn live_summary_failure_marks_bounded_cycle_incomplete() {
+        let mut bounded = BoundedSyncState::default();
+        let mut sync_error = None;
+
+        record_live_summary_error(
+            &mut bounded,
+            &mut sync_error,
+            "backend unavailable".to_owned(),
+        );
+
+        assert!(bounded.full_cycle_had_errors);
+        assert_eq!(
+            sync_error.as_ref().map(ToString::to_string).as_deref(),
+            Some("live summary sync failed: backend unavailable")
+        );
     }
 }

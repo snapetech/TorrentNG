@@ -1,5 +1,5 @@
 import { useEffect, useRef } from 'react'
-import type { TorrentSummary } from '../api/client'
+import { isFinalizing, type TorrentSummary } from '../api/client'
 import { useDialogFocus } from '../hooks/useDialogFocus'
 
 export interface ContextMenuState {
@@ -41,6 +41,8 @@ export function TorrentContextMenu({
         ? { label: 'Checking', color: 'var(--warning)' }
         : menu.torrent.state === 4
           ? { label: 'Metadata', color: 'var(--muted)' }
+      : isFinalizing(menu.torrent)
+        ? { label: 'Finalizing', color: 'var(--warning)' }
       : menu.torrent.complete && menu.torrent.is_active
         ? { label: 'Seeding', color: 'var(--success)' }
         : menu.torrent.is_active

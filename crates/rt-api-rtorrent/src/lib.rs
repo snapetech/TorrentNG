@@ -22,10 +22,13 @@ const MAX_LEGACY_FULL_LIST_ENTRIES: usize = 10_000;
 const RTORRENT_RUNTIME_PROJECTION_CONCURRENCY: usize = 64;
 // The library entry point is intentionally usable without an HTTP server, so
 // it needs its own framing limits rather than relying on an outer body limit.
-const MAX_XMLRPC_REQUEST_BYTES: usize = 32 * 1024 * 1024;
-const MAX_XMLRPC_PARAMS: usize = 1_024;
+const MAX_XMLRPC_REQUEST_BYTES: usize = 96 * 1024 * 1024;
+const MAX_XMLRPC_PARAMS: usize = 16_384;
 const MAX_XMLRPC_COLLECTION_ITEMS: usize = 16_384;
+const MAX_XMLRPC_NODES: usize = 32_768;
 const MAX_XMLRPC_VALUE_DEPTH: usize = 64;
+const MAX_XMLRPC_NESTING: usize = MAX_XMLRPC_VALUE_DEPTH;
+const MAX_XMLRPC_TEXT_BYTES: usize = 16 * 1024;
 const MAX_RT_MULTICALL_COMMANDS: usize = 256;
 const MAX_RT_MULTICALL_COMMAND_BYTES: usize = 256;
 const MAX_RT_VIEW_NAME_BYTES: usize = 256;
@@ -110,6 +113,15 @@ fn estimate_rtorrent_tracker_snapshot_bytes(
         + tracker_bytes.saturating_mul(4)
 }
 
+fn ensure_legacy_full_list_count(count: usize) -> Result<(), String> {
+    if count > MAX_LEGACY_FULL_LIST_ENTRIES {
+        return Err(format!(
+            "rTorrent d.multicall full-list response has {count} torrents; maximum is {MAX_LEGACY_FULL_LIST_ENTRIES}; use the paged TorrentNG API"
+        ));
+    }
+    Ok(())
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum RtValue {
     Int(i64),
@@ -120,27 +132,48 @@ pub enum RtValue {
     Nil,
 }
 
+fn rt_value_within_custom_limits(
+    value: &RtValue,
+    depth: usize,
+    bytes: &mut usize,
+    nodes: &mut usize,
+) -> bool {
+    if depth > MAX_XMLRPC_NESTING {
+        return false;
+    }
+    *nodes = nodes.saturating_add(1);
+    if *nodes > MAX_XMLRPC_COLLECTION_ITEMS {
+        return false;
+    }
+    match value {
+        RtValue::String(value) => {
+            *bytes = bytes.saturating_add(value.len());
+            *bytes <= MAX_RT_CUSTOM_VALUE_BYTES
+        }
+        RtValue::Array(values) => {
+            values.len() <= MAX_XMLRPC_COLLECTION_ITEMS
+                && values
+                    .iter()
+                    .all(|value| rt_value_within_custom_limits(value, depth + 1, bytes, nodes))
+        }
+        RtValue::Struct(values) => {
+            values.len() <= MAX_XMLRPC_COLLECTION_ITEMS
+                && values.iter().all(|(key, value)| {
+                    *bytes = bytes.saturating_add(key.len());
+                    *bytes <= MAX_RT_CUSTOM_VALUE_BYTES
+                        && rt_value_within_custom_limits(value, depth + 1, bytes, nodes)
+                })
+        }
+        RtValue::Int(_) | RtValue::Bool(_) | RtValue::Nil => true,
+    }
+}
+
 impl RtValue {
     fn as_str(&self) -> Option<&str> {
         match self {
             RtValue::String(value) => Some(value),
             _ => None,
         }
-    }
-}
-
-fn rt_value_size_bytes(value: &RtValue) -> usize {
-    match value {
-        RtValue::Int(_) | RtValue::Bool(_) | RtValue::Nil => 8,
-        RtValue::String(value) => value.len(),
-        RtValue::Array(values) => values.iter().fold(0usize, |total, value| {
-            total.saturating_add(rt_value_size_bytes(value))
-        }),
-        RtValue::Struct(values) => values.iter().fold(0usize, |total, (key, value)| {
-            total
-                .saturating_add(key.len())
-                .saturating_add(rt_value_size_bytes(value))
-        }),
     }
 }
 
@@ -284,6 +317,11 @@ async fn d_read_or_write(
             .map(str::trim)
             .filter(|key| !key.is_empty())
             .ok_or_else(|| "d.custom.set requires a non-empty field name".to_owned())?;
+        if key.len() > MAX_XMLRPC_TEXT_BYTES {
+            return Err(format!(
+                "d.custom.set field name exceeds the {MAX_XMLRPC_TEXT_BYTES} byte limit"
+            ));
+        }
         let value = params
             .get(2)
             .cloned()
@@ -293,7 +331,9 @@ async fn d_read_or_write(
                 "d.custom.set field name exceeds {MAX_RT_CUSTOM_KEY_BYTES} bytes"
             ));
         }
-        if rt_value_size_bytes(&value) > MAX_RT_CUSTOM_VALUE_BYTES {
+        let mut value_bytes = 0usize;
+        let mut value_nodes = 0usize;
+        if !rt_value_within_custom_limits(&value, 0, &mut value_bytes, &mut value_nodes) {
             return Err(format!(
                 "d.custom.set value exceeds {MAX_RT_CUSTOM_VALUE_BYTES} bytes"
             ));
@@ -382,6 +422,7 @@ async fn d_multicall(state: &AppState, params: &[RtValue]) -> Result<RtValue, St
     let commands = d_multicall_commands(params)?;
     let snapshot = {
         let registry = state.registry.read().await;
+        ensure_legacy_full_list_count(registry.len())?;
         registry
             .snapshot()
             .iter()
@@ -389,12 +430,7 @@ async fn d_multicall(state: &AppState, params: &[RtValue]) -> Result<RtValue, St
             .cloned()
             .collect::<Vec<_>>()
     };
-    if snapshot.len() > MAX_LEGACY_FULL_LIST_ENTRIES {
-        return Err(format!(
-            "rTorrent d.multicall full-list response has {} torrents; maximum is {MAX_LEGACY_FULL_LIST_ENTRIES}; use the paged TorrentNG API",
-            snapshot.len()
-        ));
-    }
+    ensure_legacy_full_list_count(snapshot.len())?;
     let _lease = reserve_rtorrent_api_snapshot(
         state,
         estimate_rtorrent_multicall_snapshot_bytes(snapshot.len(), commands.len()),
@@ -475,7 +511,14 @@ async fn file_multicall(state: &AppState, params: &[RtValue]) -> Result<RtValue,
                 RtValue::Array(
                     commands
                         .iter()
-                        .map(|command| project_file_field(file, command, meta))
+                        .map(|command| {
+                            project_file_field(
+                                file,
+                                command,
+                                meta,
+                                entry.total_length.saturating_sub(entry.amount_left),
+                            )
+                        })
                         .collect(),
                 )
             })
@@ -578,12 +621,11 @@ async fn peer_multicall(state: &AppState, params: &[RtValue]) -> Result<RtValue,
 
 async fn selected_torrent_entry(state: &AppState, params: &[RtValue]) -> Option<TorrentEntry> {
     let registry = state.registry.read().await;
-    let snapshot = registry.snapshot();
     params
         .iter()
         .filter_map(RtValue::as_str)
-        .find_map(|value| snapshot.find(value).cloned())
-        .or_else(|| snapshot.get(0).cloned())
+        .find_map(|value| registry.get(value))
+        .or_else(|| registry.first_entry())
 }
 
 async fn torrent_metadata_snapshot(
@@ -879,6 +921,7 @@ fn project_file_field(
     file: &EngineTorrentFile,
     command: &str,
     meta: &EngineTorrentMetadata,
+    torrent_completed: u64,
 ) -> RtValue {
     match command {
         "" | "f.path" | "f.frozen_path" => RtValue::String(file.path.clone()),
@@ -886,13 +929,11 @@ fn project_file_field(
         "f.priority" => RtValue::Int(file.priority),
         "f.is_created" | "f.is_open" => RtValue::Bool(true),
         "f.is_complete" => RtValue::Bool(file_is_complete(file, meta)),
-        "f.completed_bytes" => {
-            if file_is_complete(file, meta) {
-                RtValue::Int(rt_i64(file.length))
-            } else {
-                RtValue::Int(0)
-            }
-        }
+        "f.completed_bytes" => RtValue::Int(rt_i64(
+            torrent_completed
+                .saturating_sub(file_start_offset(file, meta))
+                .min(file.length),
+        )),
         "f.offset" => RtValue::Int(rt_i64(file_start_offset(file, meta))),
         "f.range_first" => RtValue::Int(rt_usize_i64(file_first_piece(file, meta))),
         "f.range_second" => RtValue::Int(rt_usize_i64(file_last_piece(file, meta))),
@@ -900,19 +941,19 @@ fn project_file_field(
     }
 }
 
-fn file_start_offset(file: &EngineTorrentFile, meta: &EngineTorrentMetadata) -> u64 {
-    meta.files
-        .iter()
-        .filter(|candidate| candidate.index < file.index)
-        .map(|candidate| candidate.length)
-        .fold(0, u64::saturating_add)
+fn file_start_offset(file: &EngineTorrentFile, _meta: &EngineTorrentMetadata) -> u64 {
+    file.offset
+}
+
+fn file_piece_start_offset(file: &EngineTorrentFile) -> u64 {
+    file.piece_offset
 }
 
 fn file_first_piece(file: &EngineTorrentFile, meta: &EngineTorrentMetadata) -> usize {
     if meta.piece_length == 0 {
         return 0;
     }
-    usize::try_from(file_start_offset(file, meta) / meta.piece_length).unwrap_or(usize::MAX)
+    usize::try_from(file_piece_start_offset(file) / meta.piece_length).unwrap_or(usize::MAX)
 }
 
 fn file_last_piece(file: &EngineTorrentFile, meta: &EngineTorrentMetadata) -> usize {
@@ -920,7 +961,7 @@ fn file_last_piece(file: &EngineTorrentFile, meta: &EngineTorrentMetadata) -> us
         return file_first_piece(file, meta);
     }
     usize::try_from(
-        file_start_offset(file, meta)
+        file_piece_start_offset(file)
             .saturating_add(file.length)
             .saturating_sub(1)
             / meta.piece_length,
@@ -929,6 +970,9 @@ fn file_last_piece(file: &EngineTorrentFile, meta: &EngineTorrentMetadata) -> us
 }
 
 fn file_is_complete(file: &EngineTorrentFile, meta: &EngineTorrentMetadata) -> bool {
+    if file.length == 0 {
+        return true;
+    }
     if meta.piece_states.is_empty() {
         return false;
     }
@@ -997,7 +1041,7 @@ async fn load(state: &AppState, method: &str, params: &[RtValue]) -> Result<RtVa
         .and_then(RtValue::as_str)
         .ok_or_else(|| "load requires magnet URI, torrent bytes, or path".to_owned())?;
     let start = method.ends_with("start");
-    if payload.starts_with("magnet:") {
+    if has_url_scheme(payload, "magnet:") {
         let magnet = parse_magnet(payload).map_err(|err| err.to_string())?;
         if let Some(engine) = &state.engine {
             engine
@@ -1058,6 +1102,12 @@ async fn load(state: &AppState, method: &str, params: &[RtValue]) -> Result<RtVa
         .add(entry)
         .map_err(|err| err.to_string())?;
     Ok(RtValue::Int(0))
+}
+
+fn has_url_scheme(value: &str, scheme: &str) -> bool {
+    value
+        .get(..scheme.len())
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case(scheme))
 }
 
 fn load_torrent_bytes(method: &str, payload: &str) -> Result<Vec<u8>, String> {
@@ -1230,63 +1280,111 @@ fn hex_lower<const N: usize>(bytes: [u8; N]) -> String {
 }
 
 fn parse_method_call(xml: &str) -> Result<(String, Vec<RtValue>), String> {
+    if xml.len() > MAX_XMLRPC_REQUEST_BYTES {
+        return Err(format!(
+            "XMLRPC request exceeds the {MAX_XMLRPC_REQUEST_BYTES} byte limit"
+        ));
+    }
     let method = between(xml, "<methodName>", "</methodName>")
         .ok_or_else(|| "XMLRPC request missing methodName".to_owned())?;
+    let method = xml_unescape_bounded(method)?;
+    if method.is_empty() || method.len() > MAX_XMLRPC_TEXT_BYTES {
+        return Err(format!(
+            "XMLRPC method name must be between 1 and {MAX_XMLRPC_TEXT_BYTES} bytes"
+        ));
+    }
     let mut params = Vec::new();
+    let mut nodes = 0;
     let mut rest = xml;
     while let Some(start) = rest.find("<param>") {
         if params.len() >= MAX_XMLRPC_PARAMS {
             return Err(format!(
-                "XMLRPC request exceeds {MAX_XMLRPC_PARAMS} parameters"
+                "XMLRPC request contains more than {MAX_XMLRPC_PARAMS} parameters"
             ));
         }
         rest = &rest[start + "<param>".len()..];
         let Some(end) = rest.find("</param>") else {
             return Err("XMLRPC request contains an unterminated param".to_owned());
         };
-        params.push(parse_value_checked(&rest[..end], 0)?);
+        params.push(parse_value_bounded(&rest[..end], 0, &mut nodes)?);
         rest = &rest[end + "</param>".len()..];
     }
-    Ok((xml_unescape(method), params))
+    Ok((method, params))
 }
 
 #[cfg(test)]
 fn parse_value(xml: &str) -> RtValue {
-    parse_value_checked(xml, 0).unwrap_or(RtValue::Nil)
+    let mut nodes = 0;
+    parse_value_bounded(xml, 0, &mut nodes).unwrap_or(RtValue::Nil)
 }
 
-fn parse_value_checked(xml: &str, depth: usize) -> Result<RtValue, String> {
-    if depth > MAX_XMLRPC_VALUE_DEPTH {
+fn parse_value_bounded(xml: &str, depth: usize, nodes: &mut usize) -> Result<RtValue, String> {
+    if depth > MAX_XMLRPC_NESTING {
         return Err(format!(
-            "XMLRPC value nesting exceeds {MAX_XMLRPC_VALUE_DEPTH} levels"
+            "XMLRPC value nesting exceeds {MAX_XMLRPC_NESTING} levels"
         ));
     }
+    *nodes = nodes.saturating_add(1);
+    if *nodes > MAX_XMLRPC_NODES {
+        return Err(format!(
+            "XMLRPC value contains more than {MAX_XMLRPC_NODES} nodes"
+        ));
+    }
+
     let xml = xml.trim();
-    if xml.starts_with("<value>") && xml.ends_with("</value>") {
-        return parse_value_checked(
-            &xml["<value>".len()..xml.len() - "</value>".len()],
+    if xml.starts_with("<value>") {
+        let (inner, rest) = take_balanced_element(xml, "<value>", "</value>")
+            .ok_or_else(|| "XMLRPC value contains an unterminated value".to_owned())?;
+        if !rest.trim().is_empty() {
+            return Err("XMLRPC value contains trailing data".to_owned());
+        }
+        return parse_value_bounded(inner, depth + 1, nodes);
+    }
+    if xml.starts_with("<array>") {
+        let (inner, rest) = take_balanced_element(xml, "<array>", "</array>")
+            .ok_or_else(|| "XMLRPC value contains an unterminated array".to_owned())?;
+        if !rest.trim().is_empty() {
+            return Err("XMLRPC array contains trailing data".to_owned());
+        }
+        let data = if inner.trim_start().starts_with("<data>") {
+            let (data, rest) = take_balanced_element(inner.trim_start(), "<data>", "</data>")
+                .ok_or_else(|| "XMLRPC array contains an unterminated data element".to_owned())?;
+            if !rest.trim().is_empty() {
+                return Err("XMLRPC array contains trailing data".to_owned());
+            }
+            data
+        } else {
+            inner
+        };
+        return Ok(RtValue::Array(parse_value_nodes_bounded(
+            data,
             depth + 1,
-        );
+            nodes,
+        )?));
     }
-    if let Some(value) = between(xml, "<array>", "</array>") {
-        let data = between(value, "<data>", "</data>").unwrap_or(value);
-        return Ok(RtValue::Array(parse_value_nodes(data, depth + 1)?));
-    }
-    if let Some(value) = between(xml, "<struct>", "</struct>") {
-        return Ok(RtValue::Struct(parse_struct_members(value, depth + 1)?));
+    if xml.starts_with("<struct>") {
+        let (inner, rest) = take_balanced_element(xml, "<struct>", "</struct>")
+            .ok_or_else(|| "XMLRPC value contains an unterminated struct".to_owned())?;
+        if !rest.trim().is_empty() {
+            return Err("XMLRPC struct contains trailing data".to_owned());
+        }
+        return Ok(RtValue::Struct(parse_struct_members_bounded(
+            inner,
+            depth + 1,
+            nodes,
+        )?));
     }
     if let Some(value) = between(xml, "<string>", "</string>") {
-        return Ok(RtValue::String(xml_unescape(value)));
+        return Ok(RtValue::String(xml_unescape_bounded(value)?));
     }
     if let Some(value) = between(xml, "<base64>", "</base64>") {
         return Ok(RtValue::String(value.trim().to_owned()));
     }
     if let Some(value) = between(xml, "<i4>", "</i4>").or_else(|| between(xml, "<int>", "</int>")) {
-        return Ok(value
-            .trim()
-            .parse()
-            .map(RtValue::Int)
-            .unwrap_or_else(|_| RtValue::String(xml_unescape(value.trim()))));
+        return match value.trim().parse() {
+            Ok(value) => Ok(RtValue::Int(value)),
+            Err(_) => Ok(RtValue::String(xml_unescape_bounded(value.trim())?)),
+        };
     }
     if let Some(value) = between(xml, "<boolean>", "</boolean>") {
         return Ok(RtValue::Bool(
@@ -1296,18 +1394,29 @@ fn parse_value_checked(xml: &str, depth: usize) -> Result<RtValue, String> {
     if xml.contains("<nil/>") {
         return Ok(RtValue::Nil);
     }
-    Ok(RtValue::String(xml_unescape(xml)))
+    Ok(RtValue::String(xml_unescape_bounded(xml)?))
 }
 
-fn parse_value_nodes(mut xml: &str, depth: usize) -> Result<Vec<RtValue>, String> {
+fn parse_value_nodes_bounded(
+    mut xml: &str,
+    depth: usize,
+    nodes: &mut usize,
+) -> Result<Vec<RtValue>, String> {
     let mut values = Vec::new();
-    while let Some((value, rest)) = next_value_node(xml) {
+    loop {
+        xml = xml.trim_start();
+        if xml.is_empty() {
+            break;
+        }
         if values.len() >= MAX_XMLRPC_COLLECTION_ITEMS {
             return Err(format!(
-                "XMLRPC array exceeds {MAX_XMLRPC_COLLECTION_ITEMS} items"
+                "XMLRPC collection contains more than {MAX_XMLRPC_COLLECTION_ITEMS} items"
             ));
         }
-        values.push(parse_value_checked(value, depth)?);
+        let Some((value, rest)) = next_value_node(xml) else {
+            return Err("XMLRPC collection contains malformed value data".to_owned());
+        };
+        values.push(parse_value_bounded(value, depth, nodes)?);
         xml = rest;
     }
     Ok(values)
@@ -1325,6 +1434,9 @@ fn next_value_node(xml: &str) -> Option<(&str, &str)> {
         if let Some(next_open) = next_open {
             if next_open < next_close {
                 depth += 1;
+                if depth > MAX_XMLRPC_NESTING {
+                    return None;
+                }
                 pos = next_open + open.len();
                 continue;
             }
@@ -1339,29 +1451,82 @@ fn next_value_node(xml: &str) -> Option<(&str, &str)> {
     None
 }
 
-fn parse_struct_members(mut xml: &str, depth: usize) -> Result<BTreeMap<String, RtValue>, String> {
+fn parse_struct_members_bounded(
+    mut xml: &str,
+    depth: usize,
+    nodes: &mut usize,
+) -> Result<BTreeMap<String, RtValue>, String> {
     let mut values = BTreeMap::new();
-    while let Some(start) = xml.find("<member>") {
-        if values.len() >= MAX_XMLRPC_COLLECTION_ITEMS {
+    let mut member_count = 0;
+    loop {
+        xml = xml.trim_start();
+        if xml.is_empty() {
+            break;
+        }
+        if member_count >= MAX_XMLRPC_COLLECTION_ITEMS {
             return Err(format!(
-                "XMLRPC struct exceeds {MAX_XMLRPC_COLLECTION_ITEMS} members"
+                "XMLRPC struct contains more than {MAX_XMLRPC_COLLECTION_ITEMS} members"
             ));
         }
-        xml = &xml[start + "<member>".len()..];
-        let Some(end) = xml.find("</member>") else {
-            break;
-        };
-        let member = &xml[..end];
-        if let Some(name) = between(member, "<name>", "</name>") {
-            let value = match between(member, "<value>", "</value>") {
-                Some(value) => parse_value_checked(value, depth)?,
-                None => RtValue::Nil,
-            };
-            values.insert(xml_unescape(name), value);
+        if !xml.starts_with("<member>") {
+            return Err("XMLRPC struct contains malformed member data".to_owned());
         }
-        xml = &xml[end + "</member>".len()..];
+        let Some((member, rest)) = take_balanced_element(xml, "<member>", "</member>") else {
+            return Err("XMLRPC struct contains malformed member data".to_owned());
+        };
+        let name = between(member, "<name>", "</name>")
+            .ok_or_else(|| "XMLRPC struct member is missing a name".to_owned())?;
+        let name = xml_unescape_bounded(name)?;
+        if name.is_empty() || name.len() > MAX_XMLRPC_TEXT_BYTES {
+            return Err(format!(
+                "XMLRPC struct member name must be between 1 and {MAX_XMLRPC_TEXT_BYTES} bytes"
+            ));
+        }
+        let name_end = member
+            .find("</name>")
+            .ok_or_else(|| "XMLRPC struct member has an invalid name".to_owned())?
+            + "</name>".len();
+        let value_source = &member[name_end..];
+        let Some((value, value_rest)) = next_value_node(value_source.trim_start()) else {
+            return Err("XMLRPC struct member is missing a value".to_owned());
+        };
+        if !value_rest.trim().is_empty() {
+            return Err("XMLRPC struct member contains trailing data".to_owned());
+        }
+        if values.contains_key(&name) {
+            return Err(format!("XMLRPC struct contains duplicate member `{name}`"));
+        }
+        values.insert(name, parse_value_bounded(value, depth, nodes)?);
+        member_count += 1;
+        xml = rest;
     }
     Ok(values)
+}
+
+fn take_balanced_element<'a>(text: &'a str, open: &str, close: &str) -> Option<(&'a str, &'a str)> {
+    let start = text.find(open)?;
+    let mut depth = 1usize;
+    let mut pos = start + open.len();
+    while depth > 0 {
+        let next_open = text[pos..].find(open).map(|index| pos + index);
+        let next_close = text[pos..].find(close).map(|index| pos + index)?;
+        if let Some(next_open) = next_open {
+            if next_open < next_close {
+                depth = depth.checked_add(1)?;
+                pos = next_open + open.len();
+                continue;
+            }
+        }
+        depth -= 1;
+        if depth == 0 {
+            return Some((
+                &text[start + open.len()..next_close],
+                &text[next_close + close.len()..],
+            ));
+        }
+        pos = next_close + close.len();
+    }
+    None
 }
 
 fn between<'a>(text: &'a str, open: &str, close: &str) -> Option<&'a str> {
@@ -1420,13 +1585,51 @@ fn xml_escape(value: &str) -> String {
         .replace('\'', "&apos;")
 }
 
-fn xml_unescape(value: &str) -> String {
-    value
-        .replace("&lt;", "<")
-        .replace("&gt;", ">")
-        .replace("&quot;", "\"")
-        .replace("&apos;", "'")
-        .replace("&amp;", "&")
+fn xml_unescape_bounded(value: &str) -> Result<String, String> {
+    let mut output = String::with_capacity(value.len().min(MAX_XMLRPC_TEXT_BYTES));
+    let mut rest = value;
+    while let Some(start) = rest.find('&') {
+        let literal = &rest[..start];
+        if output.len().saturating_add(literal.len()) > MAX_XMLRPC_TEXT_BYTES {
+            return Err(format!(
+                "XMLRPC text exceeds the {MAX_XMLRPC_TEXT_BYTES} byte limit"
+            ));
+        }
+        output.push_str(literal);
+        rest = &rest[start..];
+        let Some(end) = rest.find(';') else {
+            if output.len().saturating_add(rest.len()) > MAX_XMLRPC_TEXT_BYTES {
+                return Err(format!(
+                    "XMLRPC text exceeds the {MAX_XMLRPC_TEXT_BYTES} byte limit"
+                ));
+            }
+            output.push_str(rest);
+            return Ok(output);
+        };
+        let entity = &rest[..=end];
+        let replacement = match entity {
+            "&lt;" => "<",
+            "&gt;" => ">",
+            "&quot;" => "\"",
+            "&apos;" => "'",
+            "&amp;" => "&",
+            _ => entity,
+        };
+        if output.len().saturating_add(replacement.len()) > MAX_XMLRPC_TEXT_BYTES {
+            return Err(format!(
+                "XMLRPC text exceeds the {MAX_XMLRPC_TEXT_BYTES} byte limit"
+            ));
+        }
+        output.push_str(replacement);
+        rest = &rest[end + 1..];
+    }
+    if output.len().saturating_add(rest.len()) > MAX_XMLRPC_TEXT_BYTES {
+        return Err(format!(
+            "XMLRPC text exceeds the {MAX_XMLRPC_TEXT_BYTES} byte limit"
+        ));
+    }
+    output.push_str(rest);
+    Ok(output)
 }
 
 pub fn value_to_json(value: &RtValue) -> Value {
@@ -1479,6 +1682,12 @@ mod tests {
             registry.write().await.add(entry).unwrap();
         }
         AppState::new(registry)
+    }
+
+    #[test]
+    fn magnet_scheme_is_matched_case_insensitively() {
+        assert!(has_url_scheme("MAGNET:?xt=urn:btih:test", "magnet:"));
+        assert!(!has_url_scheme("file:///tmp/a", "magnet:"));
     }
 
     #[test]
@@ -1565,11 +1774,13 @@ mod tests {
             index: 0,
             path: "large.bin".to_owned(),
             length: u64::MAX,
+            offset: 0,
+            piece_offset: 0,
             priority: 1,
             wanted: true,
         };
         assert_eq!(
-            project_file_field(&file, "f.size_bytes", &meta),
+            project_file_field(&file, "f.size_bytes", &meta, 0),
             RtValue::Int(i64::MAX)
         );
 
@@ -1595,6 +1806,12 @@ mod tests {
             project_peer_field(&peer, "p.completed_percent"),
             RtValue::Int(0)
         );
+    }
+
+    #[test]
+    fn legacy_full_list_admission_is_bounded_before_snapshot_materialization() {
+        assert!(ensure_legacy_full_list_count(MAX_LEGACY_FULL_LIST_ENTRIES).is_ok());
+        assert!(ensure_legacy_full_list_count(MAX_LEGACY_FULL_LIST_ENTRIES + 1).is_err());
     }
 
     #[tokio::test]
@@ -2095,11 +2312,12 @@ mod tests {
     fn file_tracker_and_peer_projectors_use_native_snapshot_fields() {
         let meta = EngineTorrentMetadata {
             piece_length: 16,
-            piece_count: 3,
+            piece_count: 4,
             piece_hashes: vec![],
             piece_states: vec![
                 EnginePieceState::Complete,
                 EnginePieceState::Complete,
+                EnginePieceState::Missing,
                 EnginePieceState::Missing,
             ],
             is_private: false,
@@ -2113,6 +2331,8 @@ mod tests {
                     index: 0,
                     path: "disc/a.bin".to_owned(),
                     length: 16,
+                    offset: 0,
+                    piece_offset: 0,
                     priority: 2,
                     wanted: true,
                 },
@@ -2120,26 +2340,53 @@ mod tests {
                     index: 1,
                     path: "disc/b.bin".to_owned(),
                     length: 32,
+                    offset: 16,
+                    piece_offset: 48,
                     priority: 1,
                     wanted: true,
                 },
             ],
         };
         assert_eq!(
-            project_file_field(&meta.files[0], "f.path", &meta),
+            project_file_field(&meta.files[0], "f.path", &meta, 16),
             RtValue::String("disc/a.bin".to_owned())
         );
         assert_eq!(
-            project_file_field(&meta.files[0], "f.is_complete", &meta),
+            project_file_field(&meta.files[0], "f.is_complete", &meta, 16),
             RtValue::Bool(true)
         );
         assert_eq!(
-            project_file_field(&meta.files[1], "f.range_first", &meta),
-            RtValue::Int(1)
+            project_file_field(&meta.files[1], "f.range_first", &meta, 16),
+            RtValue::Int(3)
         );
         assert_eq!(
-            project_file_field(&meta.files[1], "f.is_complete", &meta),
+            project_file_field(&meta.files[1], "f.offset", &meta, 16),
+            RtValue::Int(16)
+        );
+        assert_eq!(
+            project_file_field(&meta.files[1], "f.is_complete", &meta, 16),
             RtValue::Bool(false)
+        );
+        assert_eq!(
+            project_file_field(&meta.files[0], "f.completed_bytes", &meta, 24),
+            RtValue::Int(16)
+        );
+        assert_eq!(
+            project_file_field(&meta.files[1], "f.completed_bytes", &meta, 24),
+            RtValue::Int(8)
+        );
+        let empty = EngineTorrentFile {
+            index: 2,
+            path: "disc/empty.bin".to_owned(),
+            length: 0,
+            offset: 48,
+            piece_offset: 48,
+            priority: 1,
+            wanted: true,
+        };
+        assert_eq!(
+            project_file_field(&empty, "f.is_complete", &meta, 24),
+            RtValue::Bool(true)
         );
         assert_eq!(
             project_tracker_field(0, &meta.trackers[0], "t.url"),
@@ -2222,6 +2469,20 @@ mod tests {
         assert_eq!(json[1]["count"], 2);
         assert_eq!(json[1]["raw"], "YWJj");
         assert!(json[1]["empty"].is_null());
+    }
+
+    #[test]
+    fn xml_value_parser_bounds_unescaped_text_before_materializing_it() {
+        let oversized = format!(
+            "<value><string>{}</string></value>",
+            "x".repeat(MAX_XMLRPC_TEXT_BYTES + 1)
+        );
+        let mut nodes = 0;
+        assert!(parse_value_bounded(&oversized, 0, &mut nodes).is_err());
+        assert_eq!(
+            xml_unescape_bounded("alpha&amp;beta").unwrap(),
+            "alpha&beta"
+        );
     }
 
     #[test]

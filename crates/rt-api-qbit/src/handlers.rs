@@ -1,7 +1,7 @@
 use axum::{
     extract::{Multipart, Query, State},
     http::{header, HeaderValue, StatusCode},
-    response::{IntoResponse, Response},
+    response::{AppendHeaders, IntoResponse, Response},
     Json,
 };
 use rt_api_model::api_token_allowed;
@@ -52,6 +52,7 @@ const QBIT_LIST_INITIAL_CAPACITY: usize = 256;
 const QBIT_LIMIT_PROJECTION_CONCURRENCY: usize = 64;
 const QBIT_LIVE_PROJECTION_CONCURRENCY: usize = 64;
 const MAX_QBIT_MUTATION_ITEMS: usize = 16_384;
+const MAX_QBIT_HASH_BYTES: usize = 128;
 const MAX_QBIT_TORRENT_BYTES: usize = 16 * 1024 * 1024;
 const MAX_QBIT_TRACKER_PROJECTION_CACHE: usize = 4_096;
 const QBIT_LIVE_TORRENT_INFO_EXTRA_BYTES: u64 = 64 * 1024;
@@ -59,7 +60,6 @@ const QBIT_LIVE_TORRENT_INFO_EXTRA_BYTES: u64 = 64 * 1024;
 // parser from retaining an attacker-controlled number of distinct fields even
 // when the request body is otherwise within the multipart/body byte limit.
 const MAX_QBIT_FORM_FIELDS: usize = 1_024;
-const MAX_QBIT_SEARCH_JOBS: usize = 256;
 const MAX_QBIT_SEARCH_FIELD_BYTES: usize = 16 * 1024;
 
 // These compatibility settings are deliberately separate from the engine's
@@ -72,12 +72,16 @@ const SETTING_QBIT_API_KEY: &str = "qbit.api_key";
 const SETTING_QBIT_RSS_ITEMS: &str = "qbit.rss_items";
 const SETTING_QBIT_RSS_RULES: &str = "qbit.rss_rules";
 const SETTING_QBIT_SEARCH_PLUGINS: &str = "qbit.search_plugins";
-const MAX_QBIT_PREFERENCE_BYTES: usize = 1024 * 1024;
+pub(crate) const MAX_QBIT_PREFERENCE_BYTES: usize = 1024 * 1024;
 const MAX_QBIT_PREFERENCE_KEYS: usize = 512;
 const MAX_QBIT_COOKIE_COUNT: usize = 4096;
 const MAX_QBIT_RSS_ITEMS: usize = 4096;
 const MAX_QBIT_RSS_RULES: usize = 1024;
 const MAX_QBIT_SEARCH_PLUGINS: usize = 256;
+const MAX_QBIT_SEARCH_JOBS: usize = 512;
+const MAX_QBIT_COMPAT_TEXT_BYTES: usize = 16 * 1024;
+const MAX_QBIT_RSS_RULE_FEEDS: usize = 1024;
+const MAX_QBIT_SEARCH_CATEGORIES: usize = 256;
 const MAX_QBIT_LABEL_ITEMS: usize = 16_384;
 const MAX_QBIT_LABEL_BYTES: usize = 4 * 1024 * 1024;
 
@@ -99,7 +103,17 @@ async fn category_definitions(state: &AppState) -> Result<BTreeMap<String, Strin
 
 /// `POST /api/qb/v2/auth/login` — qBittorrent-compatible session probe.
 pub async fn auth_login(State(state): State<AppState>, body: String) -> Response {
-    let submitted = qbit_form_token(&body);
+    let submitted = match qbit_form_token(&body) {
+        Ok(token) => token,
+        Err(()) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                [(header::CONTENT_TYPE, "text/plain; charset=utf-8")],
+                "Invalid credentials.",
+            )
+                .into_response();
+        }
+    };
     let sid = if state.api_tokens.is_empty() {
         "torrentng".to_owned()
     } else {
@@ -129,7 +143,7 @@ fn token_allowed(state: &AppState, token: &str) -> bool {
     api_token_allowed(&state.api_tokens, token)
 }
 
-fn qbit_form_token(body: &str) -> Option<String> {
+fn qbit_form_token(body: &str) -> Result<Option<String>, ()> {
     let mut username = None;
     let mut password = None;
     for pair in body.split('&') {
@@ -143,20 +157,30 @@ fn qbit_form_token(body: &str) -> Option<String> {
             continue;
         }
         let Some(value) = form_component_decode(value) else {
-            continue;
+            return Err(());
         };
         if key == "password" {
+            if password.is_some() {
+                return Err(());
+            }
             password = Some(value);
         } else {
+            if username.is_some() {
+                return Err(());
+            }
             username = Some(value);
         }
     }
-    password.or(username)
+    Ok(password.or(username))
 }
 
 fn form_component_decode(input: &str) -> Option<String> {
+    form_component_decode_bounded(input, usize::MAX)
+}
+
+fn form_component_decode_bounded(input: &str, max_bytes: usize) -> Option<String> {
     let bytes = input.as_bytes();
-    let mut out = Vec::with_capacity(bytes.len());
+    let mut out = Vec::with_capacity(bytes.len().min(max_bytes.saturating_add(1)));
     let mut index = 0;
     while index < bytes.len() {
         match bytes[index] {
@@ -169,6 +193,9 @@ fn form_component_decode(input: &str) -> Option<String> {
             }
             b'%' => return None,
             byte => out.push(byte),
+        }
+        if out.len() > max_bytes {
+            return None;
         }
         index += 1;
     }
@@ -224,11 +251,17 @@ fn cookie_component_encode(input: &str) -> String {
 
 pub async fn auth_logout() -> impl IntoResponse {
     (
+        AppendHeaders([
+            (
+                header::SET_COOKIE,
+                "SID=; Max-Age=0; HttpOnly; SameSite=Lax; Path=/",
+            ),
+            (
+                header::SET_COOKIE,
+                "tng_session=; Max-Age=0; HttpOnly; SameSite=Lax; Path=/",
+            ),
+        ]),
         StatusCode::OK,
-        [(
-            header::SET_COOKIE,
-            HeaderValue::from_static("SID=; Max-Age=0; HttpOnly; SameSite=Lax; Path=/"),
-        )],
     )
 }
 
@@ -455,6 +488,11 @@ fn validate_qbit_rss_rules(rules: &JsonMap) -> Result<(), String> {
         if name.trim().is_empty() {
             return Err("qBittorrent RSS rules contain an empty name".to_owned());
         }
+        if !qbit_compat_text_is_bounded(name) {
+            return Err(format!(
+                "qBittorrent RSS rule name exceeds the {MAX_QBIT_COMPAT_TEXT_BYTES} byte limit"
+            ));
+        }
         let rule = rule
             .as_object()
             .ok_or_else(|| format!("qBittorrent RSS rule {name:?} must be a JSON object"))?;
@@ -466,9 +504,14 @@ fn validate_qbit_rss_rules(rules: &JsonMap) -> Result<(), String> {
             "tags",
         ] {
             if let Some(value) = rule.get(field) {
-                if !value.is_string() {
+                let Some(value) = value.as_str() else {
                     return Err(format!(
                         "qBittorrent RSS rule {name:?} field {field} must be a string"
+                    ));
+                };
+                if !qbit_compat_text_is_bounded(value) {
+                    return Err(format!(
+                        "qBittorrent RSS rule {name:?} field {field} exceeds the {MAX_QBIT_COMPAT_TEXT_BYTES} byte limit"
                     ));
                 }
             }
@@ -486,10 +529,15 @@ fn validate_qbit_rss_rules(rules: &JsonMap) -> Result<(), String> {
             let feeds = feeds.as_array().ok_or_else(|| {
                 format!("qBittorrent RSS rule {name:?} field affectedFeeds must be an array")
             })?;
-            if feeds
-                .iter()
-                .any(|feed| feed.as_str().is_none_or(|feed| feed.trim().is_empty()))
-            {
+            if feeds.len() > MAX_QBIT_RSS_RULE_FEEDS {
+                return Err(format!(
+                    "qBittorrent RSS rule {name:?} contains more than {MAX_QBIT_RSS_RULE_FEEDS} affected feeds"
+                ));
+            }
+            if feeds.iter().any(|feed| {
+                feed.as_str()
+                    .is_none_or(|feed| feed.trim().is_empty() || !qbit_compat_text_is_bounded(feed))
+            }) {
                 return Err(format!(
                     "qBittorrent RSS rule {name:?} contains an invalid affected feed"
                 ));
@@ -554,9 +602,14 @@ fn validate_qbit_search_plugins(plugins: &JsonMap) -> Result<(), String> {
             .ok_or_else(|| format!("qBittorrent search plugin {name:?} must be a JSON object"))?;
         for field in ["name", "fullName", "version", "url"] {
             if let Some(value) = plugin.get(field) {
-                if !value.is_string() {
+                let Some(value) = value.as_str() else {
                     return Err(format!(
                         "qBittorrent search plugin {name:?} field {field} must be a string"
+                    ));
+                };
+                if !qbit_compat_text_is_bounded(value) {
+                    return Err(format!(
+                        "qBittorrent search plugin {name:?} field {field} exceeds the {MAX_QBIT_COMPAT_TEXT_BYTES} byte limit"
                     ));
                 }
             }
@@ -574,10 +627,15 @@ fn validate_qbit_search_plugins(plugins: &JsonMap) -> Result<(), String> {
                     "qBittorrent search plugin {name:?} field supportedCategories must be an array"
                 )
             })?;
+            if categories.len() > MAX_QBIT_SEARCH_CATEGORIES {
+                return Err(format!(
+                    "qBittorrent search plugin {name:?} contains more than {MAX_QBIT_SEARCH_CATEGORIES} supported categories"
+                ));
+            }
             if categories.iter().any(|category| {
-                category
-                    .as_str()
-                    .is_none_or(|category| category.trim().is_empty())
+                category.as_str().is_none_or(|category| {
+                    category.trim().is_empty() || !qbit_compat_text_is_bounded(category)
+                })
             }) {
                 return Err(format!(
                     "qBittorrent search plugin {name:?} contains an invalid supported category"
@@ -1440,6 +1498,8 @@ pub async fn torrents_add(
     let mut auto_tmm: Option<bool> = None;
     let mut ratio_limit: Option<f64> = None;
     let mut seeding_time_limit: Option<i64> = None;
+    let mut field_count = 0usize;
+    let mut seen_fields = HashSet::new();
 
     loop {
         let Some(field) = (match multipart.next_field().await {
@@ -1454,10 +1514,19 @@ pub async fn torrents_add(
         }) else {
             break;
         };
+        field_count += 1;
+        if field_count > MAX_QBIT_FORM_FIELDS {
+            return StatusCode::PAYLOAD_TOO_LARGE.into_response();
+        }
         let name = field.name().map(str::to_owned);
+        if let Some(key) = name.as_deref().and_then(qbit_single_multipart_field) {
+            if !seen_fields.insert(key) {
+                return (StatusCode::BAD_REQUEST, "duplicate multipart field").into_response();
+            }
+        }
         match name.as_deref() {
             Some("savepath") => {
-                save_path = match field.text().await {
+                save_path = match bounded_multipart_text(field).await {
                     Ok(value) => value,
                     Err(error) => {
                         return (
@@ -1469,7 +1538,7 @@ pub async fn torrents_add(
                 };
             }
             Some("paused") => {
-                paused = match field.text().await {
+                paused = match bounded_multipart_text(field).await {
                     Ok(value) => match parse_qbit_bool(value.trim()) {
                         Some(value) => value,
                         None => return StatusCode::BAD_REQUEST.into_response(),
@@ -1484,7 +1553,7 @@ pub async fn torrents_add(
                 };
             }
             Some("stopped") => {
-                stopped = match field.text().await {
+                stopped = match bounded_multipart_text(field).await {
                     Ok(value) => match parse_qbit_bool(value.trim()) {
                         Some(value) => value,
                         None => return StatusCode::BAD_REQUEST.into_response(),
@@ -1499,7 +1568,7 @@ pub async fn torrents_add(
                 };
             }
             Some("urls") => {
-                urls = match field.text().await {
+                urls = match bounded_multipart_text(field).await {
                     Ok(value) => value,
                     Err(error) => {
                         return (
@@ -1511,7 +1580,7 @@ pub async fn torrents_add(
                 };
             }
             Some("category") => {
-                category = match field.text().await {
+                category = match bounded_multipart_text(field).await {
                     Ok(value) => value,
                     Err(error) => {
                         return (
@@ -1523,7 +1592,7 @@ pub async fn torrents_add(
                 };
             }
             Some("tags") => {
-                let value = match field.text().await {
+                let value = match bounded_multipart_text(field).await {
                     Ok(value) => value,
                     Err(error) => {
                         return (
@@ -1539,7 +1608,7 @@ pub async fn torrents_add(
                 };
             }
             Some("skip_checking") => {
-                skip_checking = match field.text().await {
+                skip_checking = match bounded_multipart_text(field).await {
                     Ok(value) => match parse_qbit_bool(value.trim()) {
                         Some(value) => value,
                         None => return StatusCode::BAD_REQUEST.into_response(),
@@ -1554,7 +1623,7 @@ pub async fn torrents_add(
                 };
             }
             Some("contentLayout") => {
-                content_layout = Some(match field.text().await {
+                content_layout = Some(match bounded_multipart_text(field).await {
                     Ok(value) => value,
                     Err(error) => {
                         return (
@@ -1566,7 +1635,7 @@ pub async fn torrents_add(
                 });
             }
             Some("autoTMM") | Some("useAutoTMM") => {
-                auto_tmm = Some(match field.text().await {
+                auto_tmm = Some(match bounded_multipart_text(field).await {
                     Ok(value) => match parse_qbit_bool(value.trim()) {
                         Some(value) => value,
                         None => return StatusCode::BAD_REQUEST.into_response(),
@@ -1581,7 +1650,7 @@ pub async fn torrents_add(
                 });
             }
             Some("ratioLimit") => {
-                ratio_limit = Some(match field.text().await {
+                ratio_limit = Some(match bounded_multipart_text(field).await {
                     Ok(value) => match value.parse::<f64>() {
                         Ok(value)
                             if value.is_finite()
@@ -1601,7 +1670,7 @@ pub async fn torrents_add(
                 });
             }
             Some("seedingTimeLimit") => {
-                seeding_time_limit = Some(match field.text().await {
+                seeding_time_limit = Some(match bounded_multipart_text(field).await {
                     Ok(value) => match value.parse::<i64>() {
                         Ok(value) if value >= 0 || value == -1 || value == -2 => value,
                         _ => return StatusCode::BAD_REQUEST.into_response(),
@@ -1644,7 +1713,6 @@ pub async fn torrents_add(
                 // Do not silently discard a qBit add option. If it has no
                 // TorrentNG-client contract, accepting the request would create
                 // a torrent with policy different from the caller's request.
-                let _ = field.text().await;
                 tracing::info!(
                     component = "api",
                     operation = "add_torrent",
@@ -1655,7 +1723,6 @@ pub async fn torrents_add(
                 return (StatusCode::NOT_IMPLEMENTED, "Fails.").into_response();
             }
             None => {
-                let _ = field.text().await;
                 return (StatusCode::BAD_REQUEST, "multipart field is missing a name")
                     .into_response();
             }
@@ -2013,13 +2080,10 @@ pub async fn torrents_file_prio(State(state): State<AppState>, body: String) -> 
     };
     let Some(priority) = params
         .get("priority")
-        .and_then(|value| value.parse::<i64>().ok())
+        .and_then(|value| parse_qbit_file_priority(value))
     else {
         return StatusCode::BAD_REQUEST;
     };
-    if !(0..=2).contains(&priority) {
-        return StatusCode::BAD_REQUEST;
-    }
     let Some(engine) = &state.engine else {
         return StatusCode::NOT_IMPLEMENTED;
     };
@@ -2066,6 +2130,14 @@ pub struct HashQuery {
     pub hash: Option<String>,
 }
 
+fn required_bounded_hash_query(value: Option<String>) -> Result<String, StatusCode> {
+    let hash = value.ok_or(StatusCode::BAD_REQUEST)?;
+    if hash.trim().is_empty() || hash.len() > MAX_QBIT_HASH_BYTES {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    Ok(hash)
+}
+
 #[derive(Debug, Deserialize)]
 pub struct HashesQuery {
     pub hashes: Option<String>,
@@ -2076,8 +2148,9 @@ pub async fn torrents_trackers(
     State(state): State<AppState>,
     Query(q): Query<HashQuery>,
 ) -> Response {
-    let Some(hash) = q.hash else {
-        return (StatusCode::BAD_REQUEST, Json(Vec::<QbTrackerInfo>::new())).into_response();
+    let hash = match required_bounded_hash_query(q.hash) {
+        Ok(hash) => hash,
+        Err(status) => return (status, Json(Vec::<QbTrackerInfo>::new())).into_response(),
     };
     let exists = {
         let reg = state.registry.read().await;
@@ -2310,8 +2383,9 @@ pub async fn torrents_files(
     State(state): State<AppState>,
     Query(q): Query<HashQuery>,
 ) -> impl IntoResponse {
-    let Some(hash) = q.hash else {
-        return (StatusCode::BAD_REQUEST, Json(Vec::<QbFileInfo>::new()));
+    let hash = match required_bounded_hash_query(q.hash) {
+        Ok(hash) => hash,
+        Err(status) => return (status, Json(Vec::<QbFileInfo>::new())),
     };
     let exists = {
         let reg = state.registry.read().await;
@@ -2369,8 +2443,9 @@ pub async fn torrents_webseeds(
     State(state): State<AppState>,
     Query(q): Query<HashQuery>,
 ) -> impl IntoResponse {
-    let Some(hash) = q.hash.filter(|hash| !hash.trim().is_empty()) else {
-        return (StatusCode::BAD_REQUEST, Json(Vec::<String>::new()));
+    let hash = match required_bounded_hash_query(q.hash) {
+        Ok(hash) => hash,
+        Err(status) => return (status, Json(Vec::<String>::new())),
     };
     let exists = {
         let reg = state.registry.read().await;
@@ -2408,8 +2483,9 @@ pub async fn torrents_piece_states(
     State(state): State<AppState>,
     Query(q): Query<HashQuery>,
 ) -> impl IntoResponse {
-    let Some(hash) = q.hash.filter(|hash| !hash.trim().is_empty()) else {
-        return (StatusCode::BAD_REQUEST, Json(Vec::<i32>::new()));
+    let hash = match required_bounded_hash_query(q.hash) {
+        Ok(hash) => hash,
+        Err(status) => return (status, Json(Vec::<i32>::new())),
     };
     let entry = {
         let reg = state.registry.read().await;
@@ -2454,8 +2530,9 @@ pub async fn torrents_piece_hashes(
     State(state): State<AppState>,
     Query(q): Query<HashQuery>,
 ) -> impl IntoResponse {
-    let Some(hash) = q.hash.filter(|hash| !hash.trim().is_empty()) else {
-        return (StatusCode::BAD_REQUEST, Json(Vec::<String>::new()));
+    let hash = match required_bounded_hash_query(q.hash) {
+        Ok(hash) => hash,
+        Err(status) => return (status, Json(Vec::<String>::new())),
     };
     let exists = {
         let reg = state.registry.read().await;
@@ -2493,8 +2570,9 @@ pub async fn torrents_export(
     State(state): State<AppState>,
     Query(q): Query<HashQuery>,
 ) -> Response {
-    let Some(hash) = q.hash else {
-        return StatusCode::BAD_REQUEST.into_response();
+    let hash = match required_bounded_hash_query(q.hash) {
+        Ok(hash) => hash,
+        Err(status) => return status.into_response(),
     };
     let exists = {
         let reg = state.registry.read().await;
@@ -2536,11 +2614,9 @@ pub async fn torrents_properties(
     State(state): State<AppState>,
     Query(q): Query<HashQuery>,
 ) -> impl IntoResponse {
-    let Some(hash) = q.hash else {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(default_torrent_properties(String::new())),
-        );
+    let hash = match required_bounded_hash_query(q.hash) {
+        Ok(hash) => hash,
+        Err(status) => return (status, Json(default_torrent_properties(String::new()))),
     };
 
     let entry = {
@@ -2960,8 +3036,15 @@ pub async fn torrents_create_category(
         {
             return qbit_engine_error_status(error);
         }
+    } else {
+        let mut categories = state.categories.write().await;
+        let mut proposed = categories.clone();
+        proposed.insert(category, save_path);
+        if !qbit_category_map_is_bounded(&proposed) {
+            return StatusCode::TOO_MANY_REQUESTS;
+        }
+        *categories = proposed;
     }
-    state.categories.write().await.insert(category, save_path);
     StatusCode::OK
 }
 
@@ -2994,6 +3077,23 @@ pub async fn torrents_edit_category(
             return qbit_engine_error_status(error);
         }
     } else {
+        let proposed_categories = {
+            let categories = state.categories.read().await;
+            categories.get(&category).map(|old_save_path| {
+                let mut proposed = categories.clone();
+                proposed.remove(&category);
+                proposed.insert(
+                    new_category.clone(),
+                    save_path.clone().unwrap_or_else(|| old_save_path.clone()),
+                );
+                proposed
+            })
+        };
+        if let Some(proposed) = &proposed_categories {
+            if !qbit_category_map_is_bounded(proposed) {
+                return StatusCode::TOO_MANY_REQUESTS;
+            }
+        }
         let hashes = {
             let reg = state.registry.read().await;
             reg.iter()
@@ -3007,10 +3107,10 @@ pub async fn torrents_edit_category(
                 return status;
             }
         }
-    }
-    let mut categories = state.categories.write().await;
-    if let Some(old_save_path) = categories.remove(&category) {
-        categories.insert(new_category, save_path.unwrap_or(old_save_path));
+        if let Some(proposed) = proposed_categories {
+            let mut categories = state.categories.write().await;
+            *categories = proposed;
+        }
     }
     StatusCode::OK
 }
@@ -3048,10 +3148,10 @@ pub async fn torrents_remove_categories(
                 return status;
             }
         }
-    }
-    let mut stored = state.categories.write().await;
-    for category in categories {
-        stored.remove(&category);
+        let mut stored = state.categories.write().await;
+        for category in categories {
+            stored.remove(&category);
+        }
     }
     StatusCode::OK
 }
@@ -3071,7 +3171,11 @@ pub async fn torrents_create_tags(
             return qbit_engine_error_status(error);
         }
     } else {
-        state.tags.write().await.extend(tags);
+        let mut stored = state.tags.write().await;
+        let Some(proposed) = extended_qbit_global_tags(&stored, &tags) else {
+            return StatusCode::TOO_MANY_REQUESTS;
+        };
+        *stored = proposed;
     }
     StatusCode::OK
 }
@@ -3104,10 +3208,10 @@ pub async fn torrents_delete_tags(
                 return status;
             }
         }
-    }
-    let mut stored = state.tags.write().await;
-    for tag in remove_tags {
-        stored.remove(&tag);
+        let mut stored = state.tags.write().await;
+        for tag in remove_tags {
+            stored.retain(|stored_tag| stored_tag != &tag);
+        }
     }
     StatusCode::OK
 }
@@ -3238,7 +3342,13 @@ pub async fn torrents_set_tags(State(state): State<AppState>, body: String) -> i
             return status;
         }
     }
-    state.tags.write().await.extend(new_tags);
+    if state.engine.is_none() {
+        let mut stored = state.tags.write().await;
+        let Some(proposed) = extended_qbit_global_tags(&stored, &new_tags) else {
+            return StatusCode::TOO_MANY_REQUESTS;
+        };
+        *stored = proposed;
+    }
     StatusCode::OK
 }
 
@@ -3285,10 +3395,12 @@ pub async fn torrents_remove_tags(
             .cloned()
             .collect::<std::collections::BTreeSet<_>>()
     };
-    let mut global = state.tags.write().await;
-    for tag in remove_tags {
-        if !still_used.contains(&tag) {
-            global.remove(&tag);
+    if state.engine.is_none() {
+        let mut global = state.tags.write().await;
+        for tag in remove_tags {
+            if !still_used.contains(&tag) {
+                global.remove(&tag);
+            }
         }
     }
     StatusCode::OK
@@ -3994,6 +4106,9 @@ pub async fn search_install_plugin(State(state): State<AppState>, body: String) 
     };
     for source in sources {
         let name = plugin_name_from_source(&source);
+        if !qbit_compat_text_is_bounded(&source) || !qbit_compat_text_is_bounded(&name) {
+            return StatusCode::PAYLOAD_TOO_LARGE.into_response();
+        }
         plugins.insert(name.clone(), search_plugin_value(&name, &source, true));
     }
     match save_qbit_search_plugins(&state, plugins).await {
@@ -4041,6 +4156,9 @@ pub async fn search_enable_plugin(State(state): State<AppState>, body: String) -
         Err(error) => return qbit_backend_error(error),
     };
     for name in names {
+        if !qbit_compat_text_is_bounded(&name) {
+            return StatusCode::PAYLOAD_TOO_LARGE.into_response();
+        }
         let entry = plugins
             .entry(name.clone())
             .or_insert_with(|| search_plugin_value(&name, "", enabled));
@@ -4072,6 +4190,9 @@ pub async fn search_start(State(state): State<AppState>, body: String) -> Respon
         .get("category")
         .cloned()
         .unwrap_or_else(|| "all".to_owned());
+    if pattern.trim().is_empty() {
+        return StatusCode::BAD_REQUEST.into_response();
+    }
     if [pattern.as_str(), plugins.as_str(), category.as_str()]
         .iter()
         .any(|value| value.len() > MAX_QBIT_SEARCH_FIELD_BYTES)
@@ -4089,6 +4210,10 @@ pub async fn search_start(State(state): State<AppState>, body: String) -> Respon
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     };
     *next_id = next_value;
+
+    if !qbit_state_can_insert(&jobs, &id.to_string(), MAX_QBIT_SEARCH_JOBS) {
+        return StatusCode::TOO_MANY_REQUESTS.into_response();
+    }
 
     let job = serde_json::json!({
         "id": id,
@@ -4210,6 +4335,9 @@ pub async fn rss_add_folder(State(state): State<AppState>, body: String) -> Resp
     let Some(path) = params.get("path").filter(|p| !p.is_empty()) else {
         return StatusCode::BAD_REQUEST.into_response();
     };
+    if !qbit_compat_text_is_bounded(path) {
+        return StatusCode::PAYLOAD_TOO_LARGE.into_response();
+    }
     let _write = state.preference_write.lock().await;
     let mut items = match load_qbit_rss_items(&state).await {
         Ok(items) => items,
@@ -4242,6 +4370,9 @@ pub async fn rss_add_feed(State(state): State<AppState>, body: String) -> Respon
         .filter(|p| !p.is_empty())
         .cloned()
         .unwrap_or_else(|| url.clone());
+    if !qbit_compat_text_is_bounded(url) || !qbit_compat_text_is_bounded(&path) {
+        return StatusCode::PAYLOAD_TOO_LARGE.into_response();
+    }
     let _write = state.preference_write.lock().await;
     let mut items = match load_qbit_rss_items(&state).await {
         Ok(items) => items,
@@ -4290,6 +4421,9 @@ pub async fn rss_move_item(State(state): State<AppState>, body: String) -> Respo
     let Some(dest_path) = params.get("destPath").filter(|path| !path.is_empty()) else {
         return StatusCode::BAD_REQUEST.into_response();
     };
+    if !qbit_compat_text_is_bounded(item_path) || !qbit_compat_text_is_bounded(dest_path) {
+        return StatusCode::PAYLOAD_TOO_LARGE.into_response();
+    }
     let _write = state.preference_write.lock().await;
     let mut items = match load_qbit_rss_items(&state).await {
         Ok(items) => items,
@@ -4449,6 +4583,100 @@ fn search_plugin_value(name: &str, source: &str, enabled: bool) -> serde_json::V
     })
 }
 
+#[cfg(test)]
+fn allocate_qbit_search_id(next_id: &mut i64) -> Option<i64> {
+    let id = *next_id;
+    *next_id = id.checked_add(1)?;
+    Some(id)
+}
+
+fn qbit_state_can_insert(values: &JsonMap, key: &str, maximum: usize) -> bool {
+    values.contains_key(key) || values.len() < maximum
+}
+
+fn qbit_category_map_is_bounded(categories: &std::collections::BTreeMap<String, String>) -> bool {
+    if categories.len() > MAX_QBIT_LABEL_ITEMS {
+        return false;
+    }
+    let bytes = categories.iter().fold(0usize, |total, (name, path)| {
+        total.saturating_add(name.len()).saturating_add(path.len())
+    });
+    bytes <= MAX_QBIT_LABEL_BYTES
+}
+
+fn extended_qbit_global_tags(
+    current: &std::collections::BTreeSet<String>,
+    additions: &[String],
+) -> Option<std::collections::BTreeSet<String>> {
+    let mut proposed = current.clone();
+    proposed.extend(additions.iter().cloned());
+    let bytes = proposed
+        .iter()
+        .fold(0usize, |total, value| total.saturating_add(value.len()));
+    (proposed.len() <= MAX_QBIT_LABEL_ITEMS && bytes <= MAX_QBIT_LABEL_BYTES).then_some(proposed)
+}
+
+fn merged_qbit_registry_tags(
+    current: &[String],
+    additions: &[String],
+    removals: &[String],
+) -> Option<Vec<String>> {
+    let mut tags = current.to_vec();
+    for tag in additions {
+        if !tags.contains(tag) {
+            tags.push(tag.clone());
+        }
+    }
+    if !removals.is_empty() {
+        tags.retain(|tag| !removals.contains(tag));
+    }
+    let bytes = tags
+        .iter()
+        .fold(0usize, |total, value| total.saturating_add(value.len()));
+    (tags.len() <= MAX_QBIT_LABEL_ITEMS && bytes <= MAX_QBIT_LABEL_BYTES).then_some(tags)
+}
+
+async fn bounded_multipart_text(
+    mut field: axum::extract::multipart::Field<'_>,
+) -> Result<String, String> {
+    let mut bytes = Vec::new();
+    while let Some(chunk) = field
+        .chunk()
+        .await
+        .map_err(|error| format!("read multipart field: {error}"))?
+    {
+        if bytes.len().saturating_add(chunk.len()) > MAX_QBIT_COMPAT_TEXT_BYTES {
+            return Err(format!(
+                "multipart text field exceeds the {MAX_QBIT_COMPAT_TEXT_BYTES} byte limit"
+            ));
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    String::from_utf8(bytes).map_err(|_| "multipart text field is not valid UTF-8".to_owned())
+}
+
+fn qbit_compat_text_is_bounded(value: &str) -> bool {
+    value.len() <= MAX_QBIT_COMPAT_TEXT_BYTES
+}
+
+fn qbit_single_multipart_field(name: &str) -> Option<&'static str> {
+    Some(match name {
+        "savepath" => "savepath",
+        "paused" => "paused",
+        "stopped" => "stopped",
+        "urls" => "urls",
+        "category" => "category",
+        "tags" => "tags",
+        "skip_checking" => "skip_checking",
+        "contentLayout" => "contentLayout",
+        "autoTMM" | "useAutoTMM" => "autoTMM",
+        "ratioLimit" => "ratioLimit",
+        "seedingTimeLimit" => "seedingTimeLimit",
+        "torrents" => return None,
+        _ => return None,
+    })
+}
+
 fn plugin_name_from_source(source: &str) -> String {
     source
         .trim_end_matches('/')
@@ -4479,7 +4707,7 @@ fn required_strict_qbit_list(
             return Err(StatusCode::BAD_REQUEST);
         }
         let value = value.trim();
-        if value.is_empty() {
+        if value.is_empty() || !qbit_compat_text_is_bounded(value) {
             return Err(StatusCode::BAD_REQUEST);
         }
         values.push(value.to_owned());
@@ -4518,10 +4746,10 @@ async fn required_resolved_hashes(
 
 fn strict_hashes_from_str(raw: &str) -> Option<Vec<String>> {
     let raw = raw.trim();
-    if raw.is_empty() {
+    if raw.is_empty() || !qbit_compat_text_is_bounded(raw) {
         return None;
     }
-    if raw == "all" {
+    if raw.eq_ignore_ascii_case("all") {
         return Some(vec!["all".to_owned()]);
     }
     let mut hashes = Vec::new();
@@ -4530,7 +4758,8 @@ fn strict_hashes_from_str(raw: &str) -> Option<Vec<String>> {
             return None;
         }
         let hash = hash.trim();
-        if hash.is_empty() || hash == "all" {
+        if hash.is_empty() || !qbit_compat_text_is_bounded(hash) || hash.eq_ignore_ascii_case("all")
+        {
             return None;
         }
         hashes.push(hash.to_ascii_lowercase());
@@ -4546,7 +4775,7 @@ fn required_text_list(params: &QbitFormParams, key: &str) -> Result<Vec<String>,
             return Err(StatusCode::BAD_REQUEST);
         }
         let value = value.trim();
-        if value.is_empty() {
+        if value.is_empty() || !qbit_compat_text_is_bounded(value) {
             return Err(StatusCode::BAD_REQUEST);
         }
         values.push(value.to_owned());
@@ -4567,6 +4796,9 @@ fn required_strict_tag_list(
 }
 
 fn strict_numeric_list(raw: &str) -> Result<Vec<u32>, ()> {
+    if !qbit_compat_text_is_bounded(raw) {
+        return Err(());
+    }
     let mut values = Vec::new();
     for (index, value) in raw.split('|').enumerate() {
         if index >= MAX_QBIT_MUTATION_ITEMS || value.trim().is_empty() {
@@ -4659,7 +4891,7 @@ fn qbit_file_infos(
             index: file.index,
             name: file.path.clone(),
             size: qbit_i64(file.length),
-            priority: file.priority.clamp(0, 2) as u8,
+            priority: qbit_api_file_priority(file.priority),
             progress: qbit_file_progress(file, completed),
         })
         .collect()
@@ -4670,22 +4902,34 @@ fn qbit_file_completed_bytes(
     files: &[EngineTorrentFile],
 ) -> Vec<u64> {
     let done = entry.total_length.saturating_sub(entry.amount_left);
-    let mut offset = 0u64;
     files
         .iter()
-        .map(|file| {
-            let file_start = offset;
-            offset = offset.saturating_add(file.length);
-            done.saturating_sub(file_start).min(file.length)
-        })
+        .map(|file| done.saturating_sub(file.offset).min(file.length))
         .collect()
 }
 
 fn qbit_file_progress(file: &EngineTorrentFile, completed: u64) -> f64 {
-    if file.length == 0 || !file.wanted {
+    if file.length == 0 {
         return 1.0;
     }
     ((completed as f64) / (file.length as f64)).clamp(0.0, 1.0)
+}
+
+fn parse_qbit_file_priority(value: &str) -> Option<i64> {
+    match value.trim() {
+        "0" => Some(0),
+        "1" => Some(1),
+        "6" | "7" => Some(2),
+        _ => None,
+    }
+}
+
+fn qbit_api_file_priority(priority: i64) -> u8 {
+    match priority.clamp(0, 2) {
+        0 => 0,
+        1 => 1,
+        _ => 6,
+    }
 }
 
 async fn torrent_limit_map(
@@ -5628,17 +5872,44 @@ impl QbitFormParams {
     fn contains_key(&self, key: &str) -> bool {
         !self.overflowed && self.values.contains_key(key)
     }
+
+    #[cfg(test)]
+    fn is_overflowed(&self) -> bool {
+        self.overflowed
+    }
 }
 
 fn parse_form_body(body: &str) -> QbitFormParams {
     let mut values = HashMap::with_capacity(MAX_QBIT_FORM_FIELDS.min(body.len()));
     let mut overflowed = false;
-    for (index, (key, value)) in url::form_urlencoded::parse(body.as_bytes()).enumerate() {
+    let mut seen = HashSet::new();
+    for (index, pair) in body.split('&').filter(|pair| !pair.is_empty()).enumerate() {
         if index >= MAX_QBIT_FORM_FIELDS {
             overflowed = true;
             break;
         }
-        values.insert(key.into_owned(), value.into_owned());
+        let (raw_key, raw_value) = pair.split_once('=').unwrap_or((pair, ""));
+        let Some(key) = form_component_decode_bounded(raw_key, MAX_QBIT_COMPAT_TEXT_BYTES) else {
+            overflowed = true;
+            break;
+        };
+        if !seen.insert(key.clone()) {
+            overflowed = true;
+            break;
+        }
+        // Preference and cookie endpoints can carry one JSON envelope under
+        // their larger route-local limit. Every ordinary form field follows
+        // the much smaller compatibility-text contract.
+        let value_limit = if matches!(key.as_str(), "json" | "cookies") {
+            MAX_QBIT_PREFERENCE_BYTES
+        } else {
+            MAX_QBIT_COMPAT_TEXT_BYTES
+        };
+        let Some(value) = form_component_decode_bounded(raw_value, value_limit) else {
+            overflowed = true;
+            break;
+        };
+        values.insert(key, value);
     }
     QbitFormParams { values, overflowed }
 }
@@ -5652,7 +5923,7 @@ fn unix_now() -> i64 {
 }
 
 fn strict_tag_values(tags: &str, allow_empty: bool) -> Result<Vec<String>, ()> {
-    if tags.trim().is_empty() {
+    if !qbit_compat_text_is_bounded(tags) || tags.trim().is_empty() {
         return if allow_empty { Ok(Vec::new()) } else { Err(()) };
     }
     let mut values = Vec::new();
@@ -5661,7 +5932,7 @@ fn strict_tag_values(tags: &str, allow_empty: bool) -> Result<Vec<String>, ()> {
             return Err(());
         }
         let value = value.trim();
-        if value.is_empty() {
+        if value.is_empty() || !qbit_compat_text_is_bounded(value) {
             return Err(());
         }
         values.push(value.to_owned());
@@ -5681,6 +5952,9 @@ fn split_tracker_values(values: &str) -> Vec<String> {
 }
 
 fn strict_tracker_values(values: &str) -> Result<Vec<String>, ()> {
+    if !qbit_compat_text_is_bounded(values) {
+        return Err(());
+    }
     let normalized = values.replace("\r\n", "\n").replace('\r', "\n");
     let mut parsed = Vec::new();
     for line in normalized.split('\n') {
@@ -5689,7 +5963,7 @@ fn strict_tracker_values(values: &str) -> Result<Vec<String>, ()> {
                 return Err(());
             }
             let value = value.trim();
-            if value.is_empty() {
+            if value.is_empty() || !qbit_compat_text_is_bounded(value) {
                 return Err(());
             }
             parsed.push(value.to_owned());
@@ -5727,7 +6001,11 @@ fn strict_peer_addrs(values: &str, maximum: usize) -> Result<Vec<SocketAddr>, ()
         if index >= maximum || value.trim().is_empty() {
             return Err(());
         }
-        peers.push(value.trim().parse::<SocketAddr>().map_err(|_| ())?);
+        let peer = value.trim().parse::<SocketAddr>().map_err(|_| ())?;
+        if peer.port() == 0 {
+            return Err(());
+        }
+        peers.push(peer);
     }
     if peers.is_empty() {
         return Err(());
@@ -5737,7 +6015,7 @@ fn strict_peer_addrs(values: &str, maximum: usize) -> Result<Vec<SocketAddr>, ()
 
 fn normalize_api_text(value: &str) -> Option<String> {
     let value = value.trim();
-    if value.is_empty() {
+    if value.is_empty() || !qbit_compat_text_is_bounded(value) {
         None
     } else {
         Some(value.to_owned())
@@ -5786,14 +6064,10 @@ async fn update_torrent_tags(
     let Some(mut entry) = reg.get_mut(hash) else {
         return StatusCode::NOT_FOUND;
     };
-    for tag in add_tags {
-        if !entry.tags.contains(&tag) {
-            entry.tags.push(tag);
-        }
-    }
-    if !remove_tags.is_empty() {
-        entry.tags.retain(|tag| !remove_tags.contains(tag));
-    }
+    let Some(tags) = merged_qbit_registry_tags(&entry.tags, &add_tags, &remove_tags) else {
+        return StatusCode::TOO_MANY_REQUESTS;
+    };
+    entry.tags = tags;
     StatusCode::OK
 }
 
@@ -5923,12 +6197,17 @@ async fn fetch_torrent_url(
 }
 
 async fn resolve_hashes(state: &AppState, hashes: Vec<String>) -> Result<Vec<String>, StatusCode> {
-    if hashes.len() == 1 && hashes[0] == "all" {
+    if hashes.len() == 1 && hashes[0].trim().eq_ignore_ascii_case("all") {
         let reg = state.registry.read().await;
         if reg.len() > MAX_QBIT_MUTATION_ITEMS {
             return Err(StatusCode::BAD_REQUEST);
         }
         Ok(reg.iter().map(|entry| entry.info_hash.clone()).collect())
+    } else if hashes
+        .iter()
+        .any(|hash| hash.trim().eq_ignore_ascii_case("all"))
+    {
+        Err(StatusCode::BAD_REQUEST)
     } else {
         Ok(hashes)
     }
@@ -5968,7 +6247,7 @@ async fn default_save_path(state: &AppState, preferences: &JsonMap) -> Result<St
 #[cfg(test)]
 mod tests {
     use super::*;
-    use axum::{body::Body, http::Request};
+    use axum::{body::Body, extract::FromRequest, http::Request};
     use rt_config::Config;
     use rt_engine::Engine;
     use rt_session::{SessionRegistry, TorrentEntry};
@@ -6012,6 +6291,93 @@ mod tests {
             resolve_hashes(&state, vec!["all".to_owned()]).await,
             Err(StatusCode::BAD_REQUEST)
         );
+    }
+
+    #[test]
+    fn qbit_search_state_limit_and_id_overflow_fail_closed() {
+        let mut next = i64::MAX;
+        assert_eq!(allocate_qbit_search_id(&mut next), None);
+        assert_eq!(next, i64::MAX);
+
+        let mut values = JsonMap::new();
+        values.insert("existing".to_owned(), serde_json::Value::Null);
+        assert!(qbit_state_can_insert(&values, "existing", 1));
+        assert!(!qbit_state_can_insert(&values, "new", 1));
+        assert!(qbit_state_can_insert(&values, "new", MAX_QBIT_SEARCH_JOBS));
+    }
+
+    #[test]
+    fn qbit_label_fallback_state_rejects_overflow_atomically() {
+        let mut categories = std::collections::BTreeMap::new();
+        categories.insert("category".to_owned(), "/data".to_owned());
+        assert!(qbit_category_map_is_bounded(&categories));
+        categories.insert("oversized".to_owned(), "x".repeat(MAX_QBIT_LABEL_BYTES));
+        assert!(!qbit_category_map_is_bounded(&categories));
+
+        let current = (0..MAX_QBIT_LABEL_ITEMS)
+            .map(|index| format!("tag-{index}"))
+            .collect::<std::collections::BTreeSet<_>>();
+        assert!(extended_qbit_global_tags(&current, &["new".to_owned()]).is_none());
+
+        let current = vec!["keep".to_owned()];
+        assert_eq!(
+            merged_qbit_registry_tags(&current, &["add".to_owned()], &["missing".to_owned()]),
+            Some(vec!["keep".to_owned(), "add".to_owned()])
+        );
+        assert!(
+            merged_qbit_registry_tags(&[], &["x".repeat(MAX_QBIT_LABEL_BYTES + 1)], &[]).is_none()
+        );
+    }
+
+    #[test]
+    fn qbit_compat_payload_text_limits_fail_closed() {
+        let oversized = "x".repeat(MAX_QBIT_COMPAT_TEXT_BYTES + 1);
+        assert!(!qbit_compat_text_is_bounded(&oversized));
+
+        let mut rule = JsonMap::new();
+        rule.insert(
+            "rule".to_owned(),
+            serde_json::json!({"mustContain": oversized}),
+        );
+        assert!(validate_qbit_rss_rules(&rule).is_err());
+
+        let mut plugin = JsonMap::new();
+        plugin.insert(
+            "plugin".to_owned(),
+            serde_json::json!({"url": "x".repeat(MAX_QBIT_COMPAT_TEXT_BYTES + 1)}),
+        );
+        assert!(validate_qbit_search_plugins(&plugin).is_err());
+    }
+
+    #[test]
+    fn qbit_add_multipart_scalar_fields_are_single_valued() {
+        assert_eq!(qbit_single_multipart_field("savepath"), Some("savepath"));
+        assert_eq!(qbit_single_multipart_field("autoTMM"), Some("autoTMM"));
+        assert_eq!(qbit_single_multipart_field("useAutoTMM"), Some("autoTMM"));
+        assert_eq!(qbit_single_multipart_field("torrents"), None);
+        assert_eq!(qbit_single_multipart_field("unknown"), None);
+
+        let mut seen = HashSet::new();
+        assert!(seen.insert(qbit_single_multipart_field("autoTMM").unwrap()));
+        assert!(!seen.insert(qbit_single_multipart_field("useAutoTMM").unwrap()));
+    }
+
+    #[tokio::test]
+    async fn qbit_multipart_text_limit_rejects_oversized_fields() {
+        let body = format!(
+            "--boundary\r\nContent-Disposition: form-data; name=\"savepath\"\r\n\r\n{}\r\n--boundary--\r\n",
+            "x".repeat(MAX_QBIT_COMPAT_TEXT_BYTES + 1)
+        );
+        let request = Request::builder()
+            .header("content-type", "multipart/form-data; boundary=boundary")
+            .body(Body::from(body))
+            .unwrap();
+        let mut multipart = Multipart::from_request(request, &()).await.unwrap();
+        let field = multipart.next_field().await.unwrap().unwrap();
+        let error = bounded_multipart_text(field)
+            .await
+            .expect_err("oversized text field should be rejected");
+        assert!(error.contains("byte limit"), "{error}");
     }
 
     fn qbit_info(hash: &str, tracker: &str, trackers_count: u32) -> QbTorrentInfo {
@@ -6241,6 +6607,31 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn logout_clears_qbit_and_native_session_cookies() {
+        let response = build_qbit_router(AppState::new())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/qb/v2/auth/logout")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let cookies = response
+            .headers()
+            .get_all(header::SET_COOKIE)
+            .iter()
+            .filter_map(|value| value.to_str().ok())
+            .collect::<Vec<_>>();
+        assert_eq!(cookies.len(), 2);
+        assert!(cookies.iter().any(|cookie| cookie.starts_with("SID=")));
+        assert!(cookies
+            .iter()
+            .any(|cookie| cookie.starts_with("tng_session=")));
+    }
+
+    #[tokio::test]
     async fn login_requires_configured_token_and_cookie_auth_round_trips() {
         let mut state = AppState::new();
         state.api_tokens = Arc::new(vec!["secret token".to_owned()]);
@@ -6251,6 +6642,7 @@ mod tests {
                 Request::builder()
                     .method("POST")
                     .uri("/api/qb/v2/auth/login")
+                    .header(header::HOST, "localhost")
                     .header("content-type", "application/x-www-form-urlencoded")
                     .body(Body::from("username=operator&password=wrong"))
                     .unwrap(),
@@ -6265,6 +6657,7 @@ mod tests {
                 Request::builder()
                     .method("POST")
                     .uri("/api/qb/v2/auth/login")
+                    .header(header::HOST, "localhost")
                     .header("content-type", "application/x-www-form-urlencoded")
                     .body(Body::from("username=operator&password=secret+token"))
                     .unwrap(),
@@ -6291,6 +6684,26 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(protected.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn login_rejects_duplicate_credential_fields() {
+        let mut state = AppState::new();
+        state.api_tokens = Arc::new(vec!["secret token".to_owned()]);
+        let response = build_qbit_router(state)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/qb/v2/auth/login")
+                    .header("content-type", "application/x-www-form-urlencoded")
+                    .body(Body::from(
+                        "username=operator&password=wrong&password=secret+token",
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     }
 
     #[tokio::test]
@@ -8238,6 +8651,36 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .method("POST")
+                    .uri("/api/qb/v2/search/start")
+                    .body(Body::from("pattern="))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+        let overflow_body = std::iter::once("pattern=ubuntu".to_owned())
+            .chain((0..MAX_QBIT_FORM_FIELDS).map(|index| format!("extra{index}=x")))
+            .collect::<Vec<_>>()
+            .join("&");
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/qb/v2/search/start")
+                    .body(Body::from(overflow_body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
+
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
                     .uri("/api/qb/v2/search/installPlugin")
                     .body(Body::from("sources=https%3A%2F%2Fexample.test%2Fjackett"))
                     .unwrap(),
@@ -8973,6 +9416,38 @@ mod tests {
     }
 
     #[test]
+    fn parse_form_body_rejects_oversized_decoded_compatibility_fields() {
+        let body = format!("hash={}", "x".repeat(MAX_QBIT_COMPAT_TEXT_BYTES + 1));
+        let params = parse_form_body(&body);
+        assert!(params.is_overflowed());
+        assert!(params.get("hash").is_none());
+    }
+
+    #[test]
+    fn parse_form_body_rejects_duplicate_decoded_keys() {
+        let params = parse_form_body("hashes=first&%68ashes=second");
+        assert!(params.is_overflowed());
+        assert!(params.get("hashes").is_none());
+    }
+
+    #[test]
+    fn parse_form_body_rejects_malformed_percent_encoding_and_utf8() {
+        for body in ["hash=%", "hash=%ZZ", "hash=%FF"] {
+            let params = parse_form_body(body);
+            assert!(params.is_overflowed(), "accepted malformed form {body:?}");
+            assert!(params.get("hash").is_none());
+        }
+    }
+
+    #[test]
+    fn detail_hash_queries_are_bounded_and_nonempty() {
+        assert!(required_bounded_hash_query(Some("a".into())).is_ok());
+        assert!(required_bounded_hash_query(Some(" ".into())).is_err());
+        assert!(required_bounded_hash_query(Some("x".repeat(MAX_QBIT_HASH_BYTES + 1))).is_err());
+        assert!(required_bounded_hash_query(None).is_err());
+    }
+
+    #[test]
     fn split_tracker_values_accepts_qbit_separators_and_dedupes() {
         assert_eq!(
             split_tracker_values("udp://one/announce|udp://two/announce\nudp://one/announce"),
@@ -9032,10 +9507,16 @@ mod tests {
         assert!(strict_hashes_from_str("a||b").is_none());
         assert!(strict_hashes_from_str("all|a").is_none());
         assert_eq!(
+            strict_hashes_from_str("ALL").unwrap(),
+            vec!["all".to_owned()]
+        );
+        assert!(strict_hashes_from_str("ALL|a").is_none());
+        assert_eq!(
             strict_hashes_from_str("ABCD|ef01").unwrap(),
             vec!["abcd".to_owned(), "ef01".to_owned()]
         );
         assert!(strict_peer_addrs("127.0.0.1:6881|bad", MAX_MANUAL_PEER_ADDRESSES).is_err());
+        assert!(strict_peer_addrs("127.0.0.1:0", MAX_MANUAL_PEER_ADDRESSES).is_err());
         assert!(strict_peer_addrs(
             &std::iter::repeat_n("127.0.0.1:6881", MAX_MANUAL_PEER_ADDRESSES + 1)
                 .collect::<Vec<_>>()
@@ -9320,6 +9801,8 @@ mod tests {
                     index: 0,
                     path: "one.bin".to_owned(),
                     length: 100,
+                    offset: 0,
+                    piece_offset: 0,
                     priority: 1,
                     wanted: true,
                 },
@@ -9327,6 +9810,10 @@ mod tests {
                     index: 1,
                     path: "two.bin".to_owned(),
                     length: 200,
+                    // The payload offset and logical piece offset diverge
+                    // when pure-v2 alignment space sits between files.
+                    offset: 100,
+                    piece_offset: 150,
                     priority: 0,
                     wanted: true,
                 },
@@ -9337,5 +9824,26 @@ mod tests {
         assert_eq!(files[0].progress, 1.0);
         assert_eq!(files[1].progress, 0.375);
         assert_eq!(files[1].priority, 0);
+    }
+
+    #[test]
+    fn qbit_file_projection_reports_actual_progress_for_unwanted_files() {
+        let file = EngineTorrentFile {
+            index: 0,
+            path: "skipped.bin".into(),
+            length: 100,
+            offset: 0,
+            piece_offset: 0,
+            priority: 0,
+            wanted: false,
+        };
+
+        assert_eq!(qbit_file_progress(&file, 0), 0.0);
+        assert_eq!(qbit_api_file_priority(2), 6);
+        assert_eq!(parse_qbit_file_priority("0"), Some(0));
+        assert_eq!(parse_qbit_file_priority("1"), Some(1));
+        assert_eq!(parse_qbit_file_priority("6"), Some(2));
+        assert_eq!(parse_qbit_file_priority("7"), Some(2));
+        assert_eq!(parse_qbit_file_priority("2"), None);
     }
 }

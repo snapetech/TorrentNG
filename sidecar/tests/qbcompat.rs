@@ -17,7 +17,7 @@ use std::{
     net::SocketAddr,
     sync::{
         atomic::{AtomicUsize, Ordering},
-        Arc,
+        Arc, OnceLock,
     },
 };
 use tokio::{
@@ -25,6 +25,11 @@ use tokio::{
     sync::{broadcast, mpsc},
 };
 use tower::ServiceExt;
+
+fn test_webui_password() -> &'static str {
+    static PASSWORD: OnceLock<String> = OnceLock::new();
+    PASSWORD.get_or_init(|| uuid::Uuid::new_v4().simple().to_string())
+}
 
 // Re-use internal modules via the binary crate root.
 use torrentng::{
@@ -101,11 +106,14 @@ async fn spawn_server_with_existing_db_and_events(
 }
 
 fn build_test_app_with_existing_db_and_events(
-    cfg: Config,
+    mut cfg: Config,
     rt: Arc<torrentng::rtorrent::Client>,
     backend: Arc<dyn TorrentBackend>,
     db: Arc<Db>,
 ) -> (Router, broadcast::Sender<Event>) {
+    if cfg.auth.password.is_empty() {
+        cfg.auth.password = test_webui_password().to_owned();
+    }
     let configured_auth_credentials = torrentng::auth::AuthCredentials {
         username: cfg.auth.username.clone(),
         password: cfg.auth.password.clone(),
@@ -155,6 +163,9 @@ fn build_test_app_with_existing_db_and_events(
         local_webui_session_token,
         public_bind,
         control_plane_write: Arc::new(tokio::sync::Mutex::new(())),
+        request_concurrency: Arc::new(tokio::sync::Semaphore::new(256)),
+        large_uploads: Arc::new(tokio::sync::Semaphore::new(4)),
+        ws_clients: Arc::new(tokio::sync::Semaphore::new(256)),
     };
     let app: Router = torrentng::api::server::build_router(state);
 
@@ -641,7 +652,7 @@ async fn ratio_and_workflow_rule_fanout_is_rejected_before_backend_mutation() {
 
 #[tokio::test]
 async fn ratio_and_workflow_rule_stores_reject_growth_and_oversized_fields() {
-    const MAX_STORED_RULES: usize = 1_024;
+    const MAX_STORED_RULES: usize = 512;
     let (addr, client, db) = spawn_server_with_db().await;
     let ratio_groups = (0..MAX_STORED_RULES)
         .map(|index| RatioGroup {
@@ -757,7 +768,7 @@ async fn ratio_and_workflow_rule_stores_reject_growth_and_oversized_fields() {
 // --- qBit auth ---
 
 #[tokio::test]
-async fn loopback_login_requires_default_or_configured_credentials() {
+async fn loopback_login_requires_generated_or_configured_credentials() {
     let (addr, client) = spawn_server().await;
     let invalid = client
         .post(url(addr, "/api/qb/v2/auth/login"))
@@ -770,7 +781,10 @@ async fn loopback_login_requires_default_or_configured_credentials() {
 
     let valid = client
         .post(url(addr, "/api/qb/v2/auth/login"))
-        .form(&[("username", "torrentng"), ("password", "torrentng")])
+        .form(&[
+            ("username", "torrentng"),
+            ("password", test_webui_password()),
+        ])
         .send()
         .await
         .unwrap();
@@ -779,7 +793,7 @@ async fn loopback_login_requires_default_or_configured_credentials() {
 }
 
 #[tokio::test]
-async fn public_bind_rejects_default_password_and_allows_api_token_login() {
+async fn public_bind_rejects_short_password_and_allows_api_token_login() {
     let mut cfg = Config::test_default();
     cfg.listen_addr = "0.0.0.0:8080".to_owned();
     cfg.auth.username = "operator".to_owned();
@@ -787,14 +801,14 @@ async fn public_bind_rejects_default_password_and_allows_api_token_login() {
     cfg.auth.secret_key = Some("public-test-session-secret-key-32-bytes".to_owned());
     let (addr, client, _) = spawn_server_with_config(cfg).await;
 
-    let default_password = client
+    let short_password = client
         .post(url(addr, "/api/qb/v2/auth/login"))
-        .form(&[("username", "operator"), ("password", "torrentng")])
+        .form(&[("username", "operator"), ("password", "short-pass")])
         .send()
         .await
         .unwrap();
-    assert_eq!(default_password.status(), StatusCode::OK);
-    assert_eq!(default_password.text().await.unwrap(), "Fails.");
+    assert_eq!(short_password.status(), StatusCode::OK);
+    assert_eq!(short_password.text().await.unwrap(), "Fails.");
 
     let api_token = client
         .post(url(addr, "/api/qb/v2/auth/login"))
@@ -808,14 +822,14 @@ async fn public_bind_rejects_default_password_and_allows_api_token_login() {
     assert_eq!(api_token.status(), StatusCode::OK);
     assert_eq!(api_token.text().await.unwrap(), "Ok.");
 
-    let default_password_update = client
+    let short_password_update = client
         .put(url(addr, "/api/v1/auth/settings"))
         .bearer_auth("public-api-token-0123456789")
-        .json(&serde_json::json!({"username":"operator", "password":"torrentng"}))
+        .json(&serde_json::json!({"username":"operator", "password":"short-pass"}))
         .send()
         .await
         .unwrap();
-    assert_eq!(default_password_update.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(short_password_update.status(), StatusCode::BAD_REQUEST);
 }
 
 #[tokio::test]
@@ -837,7 +851,10 @@ async fn webui_login_and_auth_settings_are_configurable_and_persisted() {
 
     let login = client
         .post(url(addr, "/api/v1/auth/login"))
-        .form(&[("username", "torrentng"), ("password", "torrentng")])
+        .form(&[
+            ("username", "torrentng"),
+            ("password", test_webui_password()),
+        ])
         .send()
         .await
         .unwrap();
@@ -851,12 +868,16 @@ async fn webui_login_and_auth_settings_are_configurable_and_persisted() {
     assert_eq!(settings.status(), 200);
     let settings: serde_json::Value = settings.json().await.unwrap();
     assert_eq!(settings["username"], "torrentng");
-    assert_eq!(settings["password_is_default"], true);
+    assert_eq!(settings["api_token_login_enabled"], false);
+    assert!(settings.get("password_is_default").is_none());
     assert!(settings.get("password").is_none());
 
     let saved = client
         .put(url(addr, "/api/v1/auth/settings"))
-        .json(&serde_json::json!({"username":"keith", "password":"torrentng"}))
+        .json(&serde_json::json!({
+            "username":"keith",
+            "password":"new-private-password-2026"
+        }))
         .send()
         .await
         .unwrap();
@@ -882,12 +903,12 @@ async fn webui_login_and_auth_settings_are_configurable_and_persisted() {
         &settings_path,
         &torrentng::auth::AuthCredentials {
             username: "torrentng".to_owned(),
-            password: "torrentng".to_owned(),
+            password: test_webui_password().to_owned(),
         },
     )
     .unwrap();
     assert_eq!(loaded.username, "keith");
-    assert_eq!(loaded.password, "torrentng");
+    assert_eq!(loaded.password, "new-private-password-2026");
 
     let restored = client
         .delete(url(addr, "/api/v1/auth/settings"))
@@ -1142,6 +1163,26 @@ async fn qb_canonical_api_v2_login_is_public() {
         .unwrap();
     assert_eq!(res.status(), 200);
     assert_eq!(res.text().await.unwrap(), "Ok.");
+}
+
+#[tokio::test]
+async fn qb_login_rejects_oversized_form_bodies_at_the_route_boundary() {
+    let mut cfg = Config::test_default();
+    cfg.auth.api_tokens = vec!["secret-token".to_owned()];
+    let (addr, client, _) = spawn_server_with_config(cfg).await;
+    let body = format!(
+        "username=admin&password={}",
+        "x".repeat(torrentng::api::server::MAX_AUTH_BODY_BYTES)
+    );
+
+    let res = client
+        .post(url(addr, "/api/qb/v2/auth/login"))
+        .header("content-type", "application/x-www-form-urlencoded")
+        .body(body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::PAYLOAD_TOO_LARGE);
 }
 
 #[tokio::test]
@@ -2663,7 +2704,10 @@ async fn cookie_and_proxy_authenticated_websockets_reject_cross_origin_handshake
 
     let login = no_auth_client
         .post(url(addr, "/api/qb/v2/auth/login"))
-        .form(&[("username", "torrentng"), ("password", "torrentng")])
+        .form(&[
+            ("username", "torrentng"),
+            ("password", test_webui_password()),
+        ])
         .send()
         .await
         .unwrap();
@@ -2769,7 +2813,10 @@ async fn loopback_browser_mutations_require_login_and_reject_cross_origin() {
 
     let login = client
         .post(url(addr, "/api/qb/v2/auth/login"))
-        .form(&[("username", "torrentng"), ("password", "torrentng")])
+        .form(&[
+            ("username", "torrentng"),
+            ("password", test_webui_password()),
+        ])
         .send()
         .await
         .unwrap();
@@ -5285,10 +5332,10 @@ async fn qb_search_plugin_capacity_is_bounded_and_updates_are_atomic() {
 }
 
 #[tokio::test]
-async fn qb_search_job_history_is_bounded_and_evicts_oldest_numeric_id() {
+async fn qb_search_job_history_rejects_growth_at_capacity_without_eviction() {
     let (addr, client) = spawn_server().await;
     let mut ids = Vec::new();
-    for index in 1..=257 {
+    for index in 1..=512 {
         let pattern = format!("query-{index}");
         let job: serde_json::Value = client
             .post(url(addr, "/api/qb/v2/search/start"))
@@ -5302,14 +5349,22 @@ async fn qb_search_job_history_is_bounded_and_evicts_oldest_numeric_id() {
         ids.push(job["id"].as_u64().unwrap());
     }
     assert_eq!(ids[0], 1);
-    assert_eq!(ids[256], 257);
+    assert_eq!(ids[511], 512);
 
-    let evicted = client
+    let overflow = client
+        .post(url(addr, "/api/qb/v2/search/start"))
+        .form(&[("pattern", "query-overflow")])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(overflow.status(), StatusCode::TOO_MANY_REQUESTS);
+
+    let oldest = client
         .get(url(addr, "/api/qb/v2/search/results?id=1"))
         .send()
         .await
         .unwrap();
-    assert_eq!(evicted.status(), StatusCode::NOT_FOUND);
+    assert_eq!(oldest.status(), StatusCode::OK);
 
     let latest: serde_json::Value = client
         .get(url(addr, "/api/qb/v2/search/results"))
@@ -5319,8 +5374,8 @@ async fn qb_search_job_history_is_bounded_and_evicts_oldest_numeric_id() {
         .json()
         .await
         .unwrap();
-    assert_eq!(latest["id"], 257);
-    assert_eq!(latest["pattern"], "query-257");
+    assert_eq!(latest["id"], 512);
+    assert_eq!(latest["pattern"], "query-512");
 }
 
 #[tokio::test]
@@ -5328,7 +5383,7 @@ async fn qb_rss_items_are_durable_bounded_and_reject_oversized_keys() {
     let (addr, client, db) = spawn_server_with_db().await;
     db.run_blocking("seed_qbit_rss_items", |db| {
         db.update_qbit_rss_items(|items| {
-            for index in 0..1_024 {
+            for index in 0..4_096 {
                 let path = format!("folder/{index}");
                 items.insert(
                     path.clone(),
@@ -5365,7 +5420,7 @@ async fn qb_rss_items_are_durable_bounded_and_reject_oversized_keys() {
         .json()
         .await
         .unwrap();
-    assert_eq!(items.as_object().unwrap().len(), 1_024);
+    assert_eq!(items.as_object().unwrap().len(), 4_096);
     assert!(items.get("folder/overflow").is_none());
 }
 

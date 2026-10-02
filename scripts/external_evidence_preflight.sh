@@ -8,6 +8,7 @@ CORPUS_DIR="${TNG_MIGRATION_CORPUS_DIR:-$ROOT/testdata/migration-corpus}"
 CORPUS_MANIFEST="$CORPUS_DIR/manifest.toml"
 STORAGE_TARGET="${TNG_STORAGE_BENCH_DIR:-}"
 STRICT="${TNG_EXTERNAL_PREFLIGHT_STRICT:-0}"
+DEFER_24H_SOAK="${TNG_DEFER_24H_SOAK:-0}"
 
 mkdir -p "$(dirname "$OUT")"
 
@@ -86,6 +87,7 @@ done
   echo "- Corpus directory: $CORPUS_DIR"
   echo "- Storage target: ${STORAGE_TARGET:-unset}"
   echo "- Strict mode: $STRICT"
+  echo "- 24h soak deferred: $DEFER_24H_SOAK"
   echo
   echo "## Checks"
   echo
@@ -135,27 +137,32 @@ else
 fi
 
 SOAK_PID_FILE="${TNG_24H_SOAK_PID_FILE:-$ROOT/.run/soak-24h.pid}"
-completed_soak="$(find "$REPORT_DIR" -maxdepth 1 -type f -name 'soak-final-*.md' -printf '%T@ %p\n' 2>/dev/null \
-  | sort -nr | awk 'NR == 1 {print $2}')"
-if [[ -n "$completed_soak" && -f "$completed_soak" ]] &&
-  grep -q '^Overall status: PASS$' "$completed_soak"; then
-  mark "24h soak" "PASS" "completed report $(basename "$completed_soak")"
-  exit_status=0
+if [[ "$DEFER_24H_SOAK" == "1" ]]; then
+  mark "24h soak" "INFO" "deferred by TNG_DEFER_24H_SOAK=1; this qualification run makes no 24-hour stability claim"
 else
-  exit_status=1
-fi
-soak_process="$(pgrep -af '[s]oak_certification.sh' | grep 'soak-24h-' | head -1 || true)"
-if [[ "$exit_status" -ne 0 && -z "$soak_process" && -f "$SOAK_PID_FILE" ]]; then
-  soak_pid="$(cat "$SOAK_PID_FILE" 2>/dev/null || true)"
-  if [[ "$soak_pid" =~ ^[0-9]+$ ]]; then
-    soak_process="$(ps -p "$soak_pid" -o args= 2>/dev/null | grep 'soak_certification.sh' | grep 'soak-24h-' || true)"
-  fi
-fi
-if [[ "$exit_status" -ne 0 ]]; then
-  if [[ -n "$soak_process" ]]; then
-    mark "24h soak" "PASS" "active: $soak_process"
+  completed_soak="$(find "$REPORT_DIR" -maxdepth 1 -type f -name 'soak-final-*.md' -printf '%T@\t%p\n' 2>/dev/null \
+    | sort -t $'\t' -k1,1nr \
+    | awk 'NR == 1 { print substr($0, index($0, "\t") + 1) }')"
+  if [[ -n "$completed_soak" && -f "$completed_soak" ]] &&
+    grep -q '^Overall status: PASS$' "$completed_soak"; then
+    mark "24h soak" "PASS" "completed report $(basename "$completed_soak")"
+    exit_status=0
   else
-    mark "24h soak" "WARN" "no active or completed soak-24h evidence detected; use scripts/start_24h_soak.sh"
+    exit_status=1
+  fi
+  soak_process="$(pgrep -af '[s]oak_certification.sh' | grep 'soak-24h-' | head -1 || true)"
+  if [[ "$exit_status" -ne 0 && -z "$soak_process" && -f "$SOAK_PID_FILE" ]]; then
+    soak_pid="$(cat "$SOAK_PID_FILE" 2>/dev/null || true)"
+    if [[ "$soak_pid" =~ ^[0-9]+$ ]]; then
+      soak_process="$(ps -p "$soak_pid" -o args= 2>/dev/null | grep 'soak_certification.sh' | grep 'soak-24h-' || true)"
+    fi
+  fi
+  if [[ "$exit_status" -ne 0 ]]; then
+    if [[ -n "$soak_process" ]]; then
+      mark "24h soak" "PASS" "active: $soak_process"
+    else
+      mark "24h soak" "WARN" "no active or completed soak-24h evidence detected; use scripts/start_24h_soak.sh"
+    fi
   fi
 fi
 

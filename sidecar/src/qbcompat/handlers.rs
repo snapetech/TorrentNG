@@ -1,6 +1,8 @@
 use axum::{
-    extract::{ConnectInfo, DefaultBodyLimit, Extension, Form, Multipart, Query, State},
-    http::{header, HeaderMap, HeaderValue, StatusCode},
+    body::{to_bytes, Body},
+    extract::{ConnectInfo, DefaultBodyLimit, Extension, Multipart, Query, State},
+    extract::{Form as AxumForm, FromRequest},
+    http::{header, HeaderMap, HeaderValue, Request, StatusCode},
     response::{AppendHeaders, IntoResponse, Response},
     routing::{get, post},
     Json, Router,
@@ -11,7 +13,10 @@ use std::{
     collections::{HashMap, HashSet},
     fmt,
     net::SocketAddr,
-    sync::{atomic::Ordering, Arc},
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc,
+    },
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use tokio::task::JoinSet;
@@ -20,9 +25,14 @@ use tokio::task::JoinSet;
 // its compatibility response bounded and reject an over-limit sync instead
 // of returning a truncated object that claims to be a full update.
 const MAX_QBIT_SYNC_ENTRIES: usize = 10_000;
+const MAX_QBIT_COMPAT_TEXT_BYTES: usize = 16 * 1024;
+const MAX_QBIT_SYNC_TORRENT_BYTES: usize = 48 * 1024 * 1024;
+const MAX_QBIT_SYNC_METADATA_BYTES: usize = 8 * 1024 * 1024;
+const MAX_QBIT_FORM_BODY_BYTES: usize = 1024 * 1024;
+const MAX_QBIT_FORM_FIELDS: usize = 1024;
 const MAX_QBIT_HASH_SELECTIONS: usize = 10_000;
 const MAX_QBIT_BATCH_OPERATIONS: usize = 10_000;
-const MAX_QBIT_HASH_BYTES: usize = 256;
+const MAX_QBIT_HASH_BYTES: usize = 128;
 const MAX_QBIT_MANUAL_PEERS: usize = 4_096;
 const MAX_QBIT_BANNED_PEERS: usize = 65_536;
 const MAX_QBIT_PEER_ADDRESS_BYTES: usize = 128;
@@ -38,10 +48,10 @@ const MAX_QBIT_FILE_ID_BYTES: usize = 20;
 const MAX_QBIT_SEARCH_PLUGINS: usize = 256;
 const MAX_QBIT_SEARCH_PLUGIN_SOURCE_BYTES: usize = 2_048;
 const MAX_QBIT_SEARCH_PLUGIN_NAME_BYTES: usize = 256;
-const MAX_QBIT_SEARCH_JOBS: usize = 256;
+const MAX_QBIT_SEARCH_JOBS: usize = 512;
 const MAX_QBIT_SEARCH_PATTERN_BYTES: usize = 4_096;
 const MAX_QBIT_SEARCH_FILTER_BYTES: usize = 4_096;
-const MAX_QBIT_RSS_ITEMS: usize = 1_024;
+const MAX_QBIT_RSS_ITEMS: usize = 4_096;
 const MAX_QBIT_RSS_ITEM_PATH_BYTES: usize = 8_192;
 const MAX_QBIT_RSS_URL_BYTES: usize = 8_192;
 const MAX_QBIT_RSS_RULE_NAME_BYTES: usize = 256;
@@ -62,10 +72,46 @@ use crate::{
     cache::{
         bounded_page_limit, is_automation_state_capacity_error, is_category_tag_capacity_error,
         is_qbit_rss_item_capacity_error, validate_page_offset, AppEventRow, ListParams, RssRule,
-        RssRuleRenameResult, RssRuleUpsertResult, TorrentRow,
+        RssRuleRenameResult, RssRuleUpsertResult, TorrentRow, MAX_TORRENT_LOCATION_TEXT_BYTES,
     },
     rtorrent::TransferRates,
 };
+
+pub(crate) struct Form<T>(T);
+
+impl<S, T> FromRequest<S> for Form<T>
+where
+    S: Send + Sync,
+    T: serde::de::DeserializeOwned,
+{
+    type Rejection = Response;
+
+    async fn from_request(req: Request<Body>, state: &S) -> Result<Self, Self::Rejection> {
+        let (parts, body) = req.into_parts();
+        let max_body_bytes = if parts.uri.path().ends_with("/auth/login") {
+            crate::multipart::MAX_AUTH_REQUEST_BODY_BYTES
+        } else {
+            MAX_QBIT_FORM_BODY_BYTES
+        };
+        let body = to_bytes(body, max_body_bytes)
+            .await
+            .map_err(|_| StatusCode::PAYLOAD_TOO_LARGE.into_response())?;
+        if !qbit_form_body_is_bounded(&body) {
+            return Err((
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "qBit form exceeds the bounded field or body limit",
+            )
+                .into_response());
+        }
+        let mut parts = parts;
+        parts.headers.remove(header::CONTENT_LENGTH);
+        let req = Request::from_parts(parts, Body::from(body));
+        AxumForm::<T>::from_request(req, state)
+            .await
+            .map(|AxumForm(value)| Self(value))
+            .map_err(IntoResponse::into_response)
+    }
+}
 
 fn backend_error_status(error: &anyhow::Error) -> StatusCode {
     if is_unsupported_error(error) {
@@ -296,17 +342,24 @@ pub fn build_router(_state: AppState) -> Router<AppState> {
 
 // --- Auth ---
 
+#[derive(Deserialize)]
+pub(crate) struct QbitLoginForm {
+    username: Option<String>,
+    password: Option<String>,
+}
+
 pub(crate) async fn auth_login(
     State(s): State<AppState>,
     peer: Option<Extension<ConnectInfo<SocketAddr>>>,
-    Form(f): Form<HashMap<String, String>>,
+    Form(form): Form<QbitLoginForm>,
 ) -> impl IntoResponse {
     let peer_ip = peer.map(|Extension(ConnectInfo(addr))| addr.ip());
+    let username = form.username;
+    let password = form.password;
 
-    let token = [f.get("password"), f.get("username")]
+    let token = [password.as_deref(), username.as_deref()]
         .into_iter()
         .flatten()
-        .map(String::as_str)
         .find(|candidate| {
             s.cfg
                 .auth
@@ -316,14 +369,14 @@ pub(crate) async fn auth_login(
         });
 
     let credentials = s.auth_credentials.read().await;
-    let password_valid = f
-        .get("password")
+    let password_valid = password
+        .as_deref()
         .is_some_and(|candidate| crate::auth::tokens_match(&credentials.password, candidate));
-    let credentials_valid = f
-        .get("username")
-        .is_some_and(|candidate| candidate == &credentials.username)
+    let credentials_valid = username
+        .as_deref()
+        .is_some_and(|candidate| candidate == credentials.username)
         && password_valid
-        && (!s.public_bind || credentials.password != "torrentng");
+        && (!s.public_bind || credentials.password.trim().len() >= 16);
     drop(credentials);
 
     if token.is_none() && !credentials_valid {
@@ -364,11 +417,44 @@ pub(crate) async fn auth_login(
     }
 }
 
+fn form_component_decode(input: &str) -> Option<String> {
+    let mut output = Vec::with_capacity(input.len());
+    let bytes = input.as_bytes();
+    let mut index = 0;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'+' => {
+                output.push(b' ');
+                index += 1;
+            }
+            b'%' if index + 2 < bytes.len() => {
+                let high = hex_value(bytes[index + 1])?;
+                let low = hex_value(bytes[index + 2])?;
+                output.push((high << 4) | low);
+                index += 3;
+            }
+            b'%' => return None,
+            byte => {
+                output.push(byte);
+                index += 1;
+            }
+        }
+    }
+    String::from_utf8(output).ok()
+}
+
+fn hex_value(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
+}
+
 #[derive(Serialize)]
 struct AuthSettingsResponse {
     username: String,
-    password_is_default: bool,
-    default_credentials_allowed: bool,
     api_token_login_enabled: bool,
 }
 
@@ -376,11 +462,8 @@ fn auth_settings_response(
     state: &AppState,
     credentials: &crate::auth::AuthCredentials,
 ) -> AuthSettingsResponse {
-    let password_is_default = credentials.password == "torrentng";
     AuthSettingsResponse {
         username: credentials.username.clone(),
-        password_is_default,
-        default_credentials_allowed: !state.public_bind || !password_is_default,
         api_token_login_enabled: !state.cfg.auth.api_tokens.is_empty(),
     }
 }
@@ -412,12 +495,12 @@ pub(crate) async fn update_auth_settings(
         )
             .into_response();
     }
-    if state.public_bind && credentials.password == "torrentng" {
+    if state.public_bind && credentials.password.trim().len() < 16 {
         return (
             StatusCode::BAD_REQUEST,
             Json(json!({
                 "code": "BAD_REQUEST",
-                "message": "the default WebUI password is disabled on public binds"
+                "message": "public binds require a WebUI password of at least 16 bytes"
             })),
         )
             .into_response();
@@ -828,12 +911,11 @@ async fn search_install_plugin(
         entries.push((name, source));
     }
     let mut plugins = s.qbit_search_plugins.write().await;
-    let new_names = entries
-        .iter()
-        .map(|(name, _)| name)
-        .filter(|name| !plugins.contains_key(*name))
-        .collect::<std::collections::HashSet<_>>();
-    if plugins.len().saturating_add(new_names.len()) > MAX_QBIT_SEARCH_PLUGINS {
+    if !qbit_state_can_insert_many(
+        &plugins,
+        entries.iter().map(|(name, _)| name.as_str()),
+        MAX_QBIT_SEARCH_PLUGINS,
+    ) {
         return StatusCode::TOO_MANY_REQUESTS;
     }
     for (name, source) in entries {
@@ -879,11 +961,11 @@ async fn search_enable_plugin(
         Err(status) => return status,
     };
     let mut plugins = s.qbit_search_plugins.write().await;
-    let new_names = names
-        .iter()
-        .filter(|name| !plugins.contains_key(*name))
-        .collect::<std::collections::HashSet<_>>();
-    if plugins.len().saturating_add(new_names.len()) > MAX_QBIT_SEARCH_PLUGINS {
+    if !qbit_state_can_insert_many(
+        &plugins,
+        names.iter().map(String::as_str),
+        MAX_QBIT_SEARCH_PLUGINS,
+    ) {
         return StatusCode::TOO_MANY_REQUESTS;
     }
     for name in names {
@@ -921,7 +1003,9 @@ async fn search_start(
     {
         return StatusCode::BAD_REQUEST.into_response();
     }
-    let id = s.qbit_next_search_id.fetch_add(1, Ordering::Relaxed);
+    let Some(id) = next_qbit_search_id(&s.qbit_next_search_id) else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
     let job = json!({
         "id": id,
         "pattern": pattern,
@@ -932,16 +1016,11 @@ async fn search_start(
         "results": [],
     });
     let mut jobs = s.qbit_search_jobs.write().await;
-    if jobs.len() >= MAX_QBIT_SEARCH_JOBS {
-        let oldest = jobs
-            .keys()
-            .min_by_key(|key| key.parse::<u64>().unwrap_or(u64::MAX))
-            .cloned();
-        if let Some(oldest) = oldest {
-            jobs.remove(&oldest);
-        }
+    let id_key = id.to_string();
+    if !qbit_state_can_insert(&jobs, &id_key, MAX_QBIT_SEARCH_JOBS) {
+        return StatusCode::TOO_MANY_REQUESTS.into_response();
     }
-    jobs.insert(id.to_string(), job);
+    jobs.insert(id_key, job);
     Json(json!({ "id": id })).into_response()
 }
 
@@ -952,6 +1031,9 @@ async fn search_stop(
     let Some(id) = f.get("id").filter(|id| !id.trim().is_empty()) else {
         return StatusCode::BAD_REQUEST;
     };
+    if !qbit_compat_text_is_bounded(id) {
+        return StatusCode::PAYLOAD_TOO_LARGE;
+    }
     let mut jobs = s.qbit_search_jobs.write().await;
     let Some(job) = jobs.get_mut(id) else {
         return StatusCode::NOT_FOUND;
@@ -1036,6 +1118,9 @@ async fn search_delete(
     let Some(id) = f.get("id").filter(|id| !id.trim().is_empty()) else {
         return StatusCode::BAD_REQUEST;
     };
+    if !qbit_compat_text_is_bounded(id) {
+        return StatusCode::PAYLOAD_TOO_LARGE;
+    }
     if s.qbit_search_jobs.write().await.remove(id).is_none() {
         return StatusCode::NOT_FOUND;
     }
@@ -1094,7 +1179,7 @@ async fn rss_add_folder(
         .db
         .run_blocking("qbit_add_rss_folder", move |db| {
             db.update_qbit_rss_items(|items| {
-                if !items.contains_key(&path) && items.len() >= MAX_QBIT_RSS_ITEMS {
+                if !qbit_state_can_insert(items, &path, MAX_QBIT_RSS_ITEMS) {
                     return QbitRssItemMutation::Capacity;
                 }
                 items.insert(path, item);
@@ -1151,7 +1236,7 @@ async fn rss_add_feed(
         .db
         .run_blocking("qbit_add_rss_feed", move |db| {
             db.update_qbit_rss_items(|items| {
-                if !items.contains_key(&path) && items.len() >= MAX_QBIT_RSS_ITEMS {
+                if !qbit_state_can_insert(items, &path, MAX_QBIT_RSS_ITEMS) {
                     return QbitRssItemMutation::Capacity;
                 }
                 items.insert(path, item);
@@ -1617,6 +1702,9 @@ async fn rss_rename_rule(
     else {
         return StatusCode::BAD_REQUEST;
     };
+    if !qbit_compat_text_is_bounded(old_name) || !qbit_compat_text_is_bounded(new_name) {
+        return StatusCode::PAYLOAD_TOO_LARGE;
+    }
     let old_name_for_db = old_name.to_owned();
     let new_name_for_db = new_name.to_owned();
     match s
@@ -1666,6 +1754,9 @@ async fn rss_remove_rule(
     else {
         return StatusCode::BAD_REQUEST;
     };
+    if !qbit_compat_text_is_bounded(name) {
+        return StatusCode::PAYLOAD_TOO_LARGE;
+    }
     let name_for_db = name.to_owned();
     match s
         .db
@@ -1710,6 +1801,9 @@ async fn rss_matching_articles(
     else {
         return Json(json!([])).into_response();
     };
+    if !qbit_compat_text_is_bounded(title) {
+        return StatusCode::PAYLOAD_TOO_LARGE.into_response();
+    }
     let title = title.to_owned();
     match s
         .db
@@ -1781,6 +1875,9 @@ async fn app_set_preferences(
     let Some(raw_prefs) = f.get("json") else {
         return StatusCode::BAD_REQUEST;
     };
+    if !qbit_compat_text_is_bounded(raw_prefs) {
+        return StatusCode::PAYLOAD_TOO_LARGE;
+    }
     let prefs: serde_json::Value = match serde_json::from_str(raw_prefs) {
         Ok(v) => v,
         Err(e) => {
@@ -2028,6 +2125,9 @@ async fn torrents_properties(
     let Some(hash) = q.hash else {
         return StatusCode::BAD_REQUEST.into_response();
     };
+    if !qbit_hash_is_bounded(&hash) {
+        return StatusCode::BAD_REQUEST.into_response();
+    }
     let lookup_hash = hash.clone();
     match s
         .db
@@ -2093,6 +2193,13 @@ async fn torrents_properties(
 }
 
 async fn torrents_add(State(s): State<AppState>, mut multipart: Multipart) -> impl IntoResponse {
+    let Ok(_large_upload_permit) = s.large_uploads.clone().try_acquire_owned() else {
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
+            "too many concurrent torrent uploads; retry later",
+        )
+            .into_response();
+    };
     // Try multipart first (with .torrent file), fall back to form
     let mut urls: Option<String> = None;
     let mut save_path = String::new();
@@ -2475,6 +2582,10 @@ async fn torrents_add(State(s): State<AppState>, mut multipart: Multipart) -> im
             "qBit torrent add rejected before backend mutation"
         );
         return (metadata_write_status(&error), "Fails.").into_response();
+    }
+
+    if urls.is_some() && torrent_data.is_some() {
+        return (StatusCode::BAD_REQUEST, "Fails.").into_response();
     }
 
     let start = !(paused || stopped);
@@ -3212,7 +3323,37 @@ async fn torrents_add_tags(State(s): State<AppState>, Form(f): Form<TagsForm>) -
     let mut backend_failed = false;
     let mut cache_failed = false;
     let mut cache_capacity_failed = false;
+    let mut eligible_hashes = Vec::with_capacity(hashes.len());
     for hash in hashes {
+        let preflight_hash = hash.clone();
+        let preflight_tags = tag_list
+            .iter()
+            .map(|tag| (*tag).to_owned())
+            .collect::<Vec<_>>();
+        if let Err(e) =
+            s.db.run_blocking("qbit_validate_add_torrent_tags", move |db| {
+                let tag_refs = preflight_tags
+                    .iter()
+                    .map(String::as_str)
+                    .collect::<Vec<_>>();
+                db.validate_add_torrent_tags(&preflight_hash, &tag_refs)
+            })
+            .await
+        {
+            cache_failed = true;
+            tracing::warn!(
+                component = "cache",
+                operation = "validate_add_tags",
+                torrent = %hash,
+                result = "error",
+                error = %e,
+                "cache rejected qBit tag add before backend update"
+            );
+            continue;
+        }
+        eligible_hashes.push(hash);
+    }
+    for hash in eligible_hashes {
         if let Err(e) = s.backend.add_tags(&hash, &tag_list).await {
             backend_failed = true;
             tracing::warn!(
@@ -3854,6 +3995,12 @@ async fn torrents_edit_tracker(
     let Some(new_url) = f.new_url.filter(|url| !url.trim().is_empty()) else {
         return StatusCode::BAD_REQUEST;
     };
+    if let Err(status) = qbit_required_text_status(&orig_url) {
+        return status;
+    }
+    if let Err(status) = qbit_required_text_status(&new_url) {
+        return status;
+    }
     if !s.backend.capabilities().supports_tracker_edit {
         return StatusCode::NOT_IMPLEMENTED;
     }
@@ -3890,6 +4037,9 @@ async fn torrents_rename(State(s): State<AppState>, Form(f): Form<RenameForm>) -
     let Some(name) = f.name else {
         return StatusCode::BAD_REQUEST;
     };
+    if let Err(status) = qbit_required_text_status(&name) {
+        return status;
+    }
     if !s.backend.capabilities().supports_torrent_rename {
         return StatusCode::NOT_IMPLEMENTED;
     }
@@ -3931,6 +4081,9 @@ async fn torrents_rename_file(
     let Some(name) = f.name else {
         return StatusCode::BAD_REQUEST;
     };
+    if let Err(status) = qbit_required_text_status(&name) {
+        return status;
+    }
     if !s.backend.capabilities().supports_file_rename {
         return StatusCode::NOT_IMPLEMENTED;
     }
@@ -4333,6 +4486,9 @@ async fn torrents_set_location(
     if location.is_empty() {
         return StatusCode::BAD_REQUEST;
     }
+    if !qbit_compat_text_is_bounded(location) || location.len() > MAX_TORRENT_LOCATION_TEXT_BYTES {
+        return StatusCode::PAYLOAD_TOO_LARGE;
+    }
     if !s.backend.capabilities().supports_location_update {
         return StatusCode::NOT_IMPLEMENTED;
     }
@@ -4707,7 +4863,7 @@ async fn sync_maindata(
                                     error = %crate::url_redaction::redact_display(&e),
                                     "qBit maindata serialization failed"
                                 );
-                        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+                        return sync_payload_status(&e).into_response();
                     }
                 };
                 Json(json!({
@@ -4751,7 +4907,7 @@ async fn sync_maindata(
                                     error = %crate::url_redaction::redact_display(&e),
                                     "qBit maindata delta serialization failed"
                                 );
-                        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+                        return sync_payload_status(&e).into_response();
                     }
                 };
                 Json(json!({
@@ -4797,14 +4953,36 @@ async fn sync_maindata(
     }
 }
 
+fn sync_payload_status(error: &anyhow::Error) -> StatusCode {
+    if error
+        .chain()
+        .any(|cause| cause.to_string().contains("exceeds the maximum"))
+    {
+        StatusCode::PAYLOAD_TOO_LARGE
+    } else {
+        StatusCode::INTERNAL_SERVER_ERROR
+    }
+}
+
 // --- Transfer ---
 
-fn torrents_map(
-    rows: &[TorrentRow],
-) -> serde_json::Result<serde_json::Map<String, serde_json::Value>> {
-    rows.iter()
-        .map(|t| serde_json::to_value(to_qb_torrent(t)).map(|value| (t.hash.clone(), value)))
-        .collect()
+fn torrents_map(rows: &[TorrentRow]) -> anyhow::Result<serde_json::Map<String, serde_json::Value>> {
+    let mut total_bytes = 2usize;
+    let mut map = serde_json::Map::with_capacity(rows.len());
+    for torrent in rows {
+        let key = serde_json::to_vec(&torrent.hash)?;
+        let value = serde_json::to_value(to_qb_torrent(torrent))?;
+        let value_bytes = serde_json::to_vec(&value)?;
+        total_bytes = total_bytes.saturating_add(key.len());
+        total_bytes = total_bytes.saturating_add(value_bytes.len());
+        if total_bytes > MAX_QBIT_SYNC_TORRENT_BYTES {
+            return Err(anyhow::anyhow!(
+                "qBit sync torrent payload exceeds the maximum of {MAX_QBIT_SYNC_TORRENT_BYTES} bytes"
+            ));
+        }
+        map.insert(torrent.hash.clone(), value);
+    }
+    Ok(map)
 }
 
 async fn sync_metadata(
@@ -4817,13 +4995,32 @@ async fn sync_metadata(
         .await?;
     let categories = categories
         .into_iter()
-        .map(|c| {
-            (
-                c.name.clone(),
-                json!({ "name": c.name, "savePath": c.save_path }),
-            )
-        })
-        .collect();
+        .try_fold(
+            (serde_json::Map::new(), 2usize),
+            |(mut map, mut total_bytes), c| -> anyhow::Result<_> {
+                let value = json!({ "name": c.name, "savePath": c.save_path });
+                let key_bytes = serde_json::to_vec(&c.name)?.len();
+                let value_bytes = serde_json::to_vec(&value)?.len();
+                total_bytes = total_bytes
+                    .saturating_add(key_bytes)
+                    .saturating_add(value_bytes);
+                if total_bytes > MAX_QBIT_SYNC_METADATA_BYTES {
+                    return Err(anyhow::anyhow!(
+                        "qBit sync metadata exceeds the maximum of {MAX_QBIT_SYNC_METADATA_BYTES} bytes"
+                    ));
+                }
+                map.insert(c.name, value);
+                Ok((map, total_bytes))
+            },
+        )?
+        .0;
+    let mut metadata_bytes = serde_json::to_vec(&categories)?.len();
+    metadata_bytes = metadata_bytes.saturating_add(serde_json::to_vec(&tags)?.len());
+    if metadata_bytes > MAX_QBIT_SYNC_METADATA_BYTES {
+        return Err(anyhow::anyhow!(
+            "qBit sync metadata exceeds the maximum of {MAX_QBIT_SYNC_METADATA_BYTES} bytes"
+        ));
+    }
     Ok((categories, tags))
 }
 
@@ -4924,14 +5121,19 @@ mod tests {
 
     use super::{
         automation_state_write_status, bounded_qbit_values, cached_lifecycle_projection,
-        is_status_filter, map_sort, metadata_read_status, metadata_write_status,
-        parse_hash_selection, parse_peer_addrs, parse_qbit_torrent_add_urls, qb_server_state,
-        qbit_batch_work_within_limit, qbit_log_entry, qbit_ratio_limit_milli, qbit_status_filter,
-        resolve_all_hashes, resolve_hashes, rss_item_write_status, rss_rule_tags, split_hashes,
-        strict_tag_values, to_qb_torrent, LogMainQuery, MAX_QBIT_BANNED_PEERS,
-        MAX_QBIT_BATCH_OPERATIONS, MAX_QBIT_HASH_BYTES, MAX_QBIT_HASH_SELECTIONS,
-        MAX_QBIT_LIST_ENTRIES, MAX_QBIT_LIST_VALUE_BYTES, MAX_QBIT_MANUAL_PEERS,
-        MAX_QBIT_PEER_ADDRESS_BYTES, MAX_QBIT_RSS_RULE_TAGS, MAX_QBIT_TAG_BYTES,
+        form_component_decode, is_status_filter, map_sort, metadata_read_status,
+        metadata_write_status, next_qbit_search_id, parse_hash_selection, parse_peer_addrs,
+        parse_qbit_torrent_add_urls, qb_server_state, qbit_batch_work_within_limit,
+        qbit_compat_text_is_bounded, qbit_form_body_is_bounded, qbit_hash_is_bounded,
+        qbit_log_entry, qbit_ratio_limit_milli, qbit_required_text_status, qbit_state_can_insert,
+        qbit_state_can_insert_many, qbit_status_filter, required_qbit_form_list,
+        required_qbit_lines, required_qbit_list, resolve_all_hashes, resolve_hashes,
+        rss_item_write_status, rss_rule_tags, split_hashes, strict_tag_values, to_qb_torrent,
+        LogMainQuery, MAX_QBIT_BANNED_PEERS, MAX_QBIT_BATCH_OPERATIONS, MAX_QBIT_COMPAT_TEXT_BYTES,
+        MAX_QBIT_FORM_BODY_BYTES, MAX_QBIT_FORM_FIELDS, MAX_QBIT_HASH_BYTES,
+        MAX_QBIT_HASH_SELECTIONS, MAX_QBIT_LIST_ENTRIES, MAX_QBIT_LIST_VALUE_BYTES,
+        MAX_QBIT_MANUAL_PEERS, MAX_QBIT_PEER_ADDRESS_BYTES, MAX_QBIT_RSS_ITEMS,
+        MAX_QBIT_RSS_RULE_TAGS, MAX_QBIT_SEARCH_JOBS, MAX_QBIT_SEARCH_PLUGINS, MAX_QBIT_TAG_BYTES,
         MAX_QBIT_TAG_ENTRIES, MAX_QBIT_TORRENT_ADD_URLS, MAX_QBIT_TORRENT_ADD_URL_BYTES,
     };
 
@@ -5013,12 +5215,131 @@ mod tests {
     }
 
     #[test]
+    fn parse_peer_addrs_rejects_zero_ports() {
+        assert!(parse_peer_addrs("127.0.0.1:0", 4_096).is_err());
+        assert!(parse_peer_addrs("127.0.0.1:6881|[::1]:6882", 4_096).is_ok());
+        assert!(parse_peer_addrs("127.0.0.1:6881|127.0.0.1:6882", 1).is_err());
+    }
+
+    #[test]
     fn split_hashes_deduplicates_repeated_mutation_targets() {
         let dir = tempfile::tempdir().expect("create cache tempdir");
         let db = crate::cache::Db::open(&dir.path().join("cache.db")).expect("open cache");
         assert_eq!(split_hashes(&db, Some("A| a |B|A|B")), vec!["A", "B"]);
         assert!(resolve_hashes(&db, Some("A||B")).is_err());
         assert!(resolve_hashes(&db, Some("all|A")).is_err());
+        let oversized = std::iter::repeat_n("A", MAX_QBIT_HASH_SELECTIONS + 1)
+            .collect::<Vec<_>>()
+            .join("|");
+        assert!(resolve_hashes(&db, Some(&oversized)).is_err());
+    }
+
+    #[test]
+    fn qbit_compat_state_limits_and_search_ids_fail_closed() {
+        let mut values = serde_json::Map::new();
+        values.insert("existing".to_owned(), serde_json::Value::Null);
+        assert!(qbit_state_can_insert(&values, "existing", 1));
+        assert!(!qbit_state_can_insert(&values, "new", 1));
+        assert!(qbit_state_can_insert(&values, "new", 2));
+
+        assert!(!qbit_state_can_insert_many(&values, ["new-a", "new-b"], 2));
+        assert!(qbit_state_can_insert_many(&values, ["existing", "new"], 2));
+        assert_eq!(values.len(), 1);
+
+        assert_eq!(MAX_QBIT_SEARCH_PLUGINS, 256);
+        assert_eq!(MAX_QBIT_SEARCH_JOBS, 512);
+        assert_eq!(MAX_QBIT_RSS_ITEMS, 4_096);
+
+        assert!(qbit_compat_text_is_bounded("x"));
+        assert!(!qbit_compat_text_is_bounded(
+            &"x".repeat(MAX_QBIT_COMPAT_TEXT_BYTES + 1)
+        ));
+        assert!(qbit_hash_is_bounded(&"x".repeat(128)));
+        assert!(!qbit_hash_is_bounded(&"x".repeat(129)));
+        assert!(
+            strict_tag_values(Some(&"x".repeat(MAX_QBIT_COMPAT_TEXT_BYTES + 1)), false).is_err()
+        );
+        let aggregate_tags = std::iter::repeat_n("x".repeat(MAX_QBIT_COMPAT_TEXT_BYTES), 17)
+            .collect::<Vec<_>>()
+            .join(",");
+        assert!(strict_tag_values(Some(&aggregate_tags), false).is_err());
+        assert!(required_qbit_list(
+            Some(&"x".repeat(MAX_QBIT_COMPAT_TEXT_BYTES + 1)),
+            8,
+            MAX_QBIT_COMPAT_TEXT_BYTES,
+        )
+        .is_err());
+        assert!(required_qbit_lines(
+            Some(&"x".repeat(MAX_QBIT_COMPAT_TEXT_BYTES + 1)),
+            8,
+            MAX_QBIT_COMPAT_TEXT_BYTES,
+        )
+        .is_err());
+        let mut form = std::collections::HashMap::new();
+        form.insert(
+            "names".to_owned(),
+            "x".repeat(MAX_QBIT_COMPAT_TEXT_BYTES + 1),
+        );
+        assert!(required_qbit_form_list(&form, "names", 8, MAX_QBIT_COMPAT_TEXT_BYTES).is_err());
+        assert_eq!(
+            next_qbit_search_id(&std::sync::atomic::AtomicU64::new(u64::MAX)),
+            None
+        );
+        assert_eq!(
+            next_qbit_search_id(&std::sync::atomic::AtomicU64::new(41)),
+            Some(41)
+        );
+    }
+
+    #[test]
+    fn qbit_form_limits_bound_body_size_and_field_count() {
+        assert!(qbit_form_body_is_bounded(b"hashes=abc&deleteFiles=true"));
+        assert!(qbit_form_body_is_bounded(&vec![
+            b'x';
+            MAX_QBIT_FORM_BODY_BYTES
+        ]));
+        assert!(!qbit_form_body_is_bounded(&vec![
+            b'x';
+            MAX_QBIT_FORM_BODY_BYTES
+                + 1
+        ]));
+
+        let at_limit = (0..MAX_QBIT_FORM_FIELDS)
+            .map(|index| format!("field{index}=1"))
+            .collect::<Vec<_>>()
+            .join("&");
+        let over_limit = format!("{at_limit}&x=1");
+        assert!(qbit_form_body_is_bounded(at_limit.as_bytes()));
+        assert!(!qbit_form_body_is_bounded(over_limit.as_bytes()));
+        assert!(!qbit_form_body_is_bounded(b"hashes=a&hashes=b"));
+        assert!(!qbit_form_body_is_bounded(b"%68ashes=a&hashes=b"));
+        assert!(!qbit_form_body_is_bounded(b"hashes=%FF"));
+        assert!(!qbit_form_body_is_bounded(b"hashes=%ZZ"));
+    }
+
+    #[test]
+    fn qbit_required_mutation_text_rejects_empty_and_oversized_values() {
+        assert_eq!(qbit_required_text_status(" "), Err(StatusCode::BAD_REQUEST));
+        assert_eq!(
+            qbit_required_text_status(&"x".repeat(MAX_QBIT_COMPAT_TEXT_BYTES + 1)),
+            Err(StatusCode::PAYLOAD_TOO_LARGE)
+        );
+        assert_eq!(qbit_required_text_status("renamed-file"), Ok(()));
+    }
+
+    #[test]
+    fn qbit_login_form_uses_the_bounded_auth_request_limit() {
+        const {
+            assert!(crate::multipart::MAX_AUTH_REQUEST_BODY_BYTES < MAX_QBIT_FORM_BODY_BYTES);
+        }
+        let duplicate_username = ["user", "name=a&user", "name=b"].concat();
+        let malformed_password = ["pass", "word=bad%"].concat();
+        assert!(!qbit_form_body_is_bounded(duplicate_username.as_bytes()));
+        assert!(!qbit_form_body_is_bounded(malformed_password.as_bytes()));
+        assert_eq!(
+            form_component_decode("test%2Dtoken").as_deref(),
+            Some("test-token")
+        );
     }
 
     #[test]
@@ -5031,7 +5352,9 @@ mod tests {
 
         let oversized = "x".repeat(MAX_QBIT_HASH_BYTES + 1);
         let error = parse_hash_selection(&oversized).unwrap_err();
-        assert!(error.to_string().contains("at most 256 bytes"));
+        assert!(error
+            .to_string()
+            .contains(&format!("at most {MAX_QBIT_HASH_BYTES} bytes")));
 
         assert!(parse_hash_selection("hash-λ").is_err());
     }
@@ -5641,9 +5964,17 @@ fn parse_peer_addrs(values: &str, max_addresses: usize) -> Result<Vec<SocketAddr
         if peer.is_empty() {
             return Err(());
         }
-        peers.push(peer.parse::<SocketAddr>().map_err(|_| ())?);
+        let address = peer.parse::<SocketAddr>().map_err(|_| ())?;
+        if address.port() == 0 {
+            return Err(());
+        }
+        peers.push(address);
     }
     Ok(peers)
+}
+
+fn qbit_hash_is_bounded(value: &str) -> bool {
+    value.len() <= MAX_QBIT_HASH_BYTES
 }
 
 async fn emit(s: &AppState, event: Event) {
@@ -5826,6 +6157,92 @@ fn search_plugin_value(name: &str, source: &str, enabled: bool) -> serde_json::V
         "enabled": enabled,
         "supportedCategories": ["all"],
     })
+}
+
+fn qbit_compat_text_is_bounded(value: &str) -> bool {
+    value.len() <= MAX_QBIT_COMPAT_TEXT_BYTES
+}
+
+fn qbit_required_text_status(value: &str) -> Result<(), StatusCode> {
+    if value.trim().is_empty() {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    if !qbit_compat_text_is_bounded(value) {
+        return Err(StatusCode::PAYLOAD_TOO_LARGE);
+    }
+    Ok(())
+}
+
+fn qbit_form_body_is_bounded(body: &[u8]) -> bool {
+    if body.len() > MAX_QBIT_FORM_BODY_BYTES
+        || body.iter().filter(|byte| **byte == b'&').count() >= MAX_QBIT_FORM_FIELDS
+    {
+        return false;
+    }
+
+    // serde_urlencoded's map extraction is last-value-wins. Reject duplicate
+    // URL-decoded keys before it runs so a proxy and the application cannot
+    // select different mutation parameters from one request.
+    let mut seen = HashSet::new();
+    for field in body.split(|byte| *byte == b'&') {
+        let mut parts = field.splitn(2, |byte| *byte == b'=');
+        let raw_key = parts.next().unwrap_or_default();
+        let raw_value = parts.next().unwrap_or_default();
+        let Ok(raw_key) = std::str::from_utf8(raw_key) else {
+            return false;
+        };
+        let Some(key) = form_component_decode(raw_key) else {
+            return false;
+        };
+        if !seen.insert(key) {
+            return false;
+        }
+        let Ok(raw_value) = std::str::from_utf8(raw_value) else {
+            return false;
+        };
+        // serde_urlencoded replaces malformed percent escapes and invalid
+        // UTF-8 with lossy text. Validate the value first so a proxy and the
+        // application cannot authenticate or mutate different decoded data.
+        if form_component_decode(raw_value).is_none() {
+            return false;
+        }
+    }
+    true
+}
+
+fn qbit_state_can_insert(
+    values: &serde_json::Map<String, serde_json::Value>,
+    key: &str,
+    maximum: usize,
+) -> bool {
+    values.contains_key(key) || values.len() < maximum
+}
+
+fn qbit_state_can_insert_many<I, S>(
+    values: &serde_json::Map<String, serde_json::Value>,
+    keys: I,
+    maximum: usize,
+) -> bool
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<str>,
+{
+    let mut new_keys = HashSet::new();
+    for key in keys {
+        let key = key.as_ref();
+        if !values.contains_key(key) {
+            new_keys.insert(key.to_owned());
+        }
+    }
+    values.len().saturating_add(new_keys.len()) <= maximum
+}
+
+fn next_qbit_search_id(counter: &AtomicU64) -> Option<u64> {
+    counter
+        .try_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+            current.checked_add(1)
+        })
+        .ok()
 }
 
 fn plugin_name_from_source(source: &str) -> String {

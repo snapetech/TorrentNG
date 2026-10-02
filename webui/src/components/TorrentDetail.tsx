@@ -1,6 +1,6 @@
 import { useState } from 'react'
 import { useQuery, useQueryClient } from '@tanstack/react-query'
-import { api } from '../api/client'
+import { api, isFinalizing } from '../api/client'
 import type { TorrentSummary } from '../api/client'
 import { TrackerUrl } from '../lib/maskUrl'
 import { DetailDockControls, type DetailPosition } from './DetailDockControls'
@@ -156,6 +156,8 @@ export function TorrentDetail({ torrent: t, onClose, autoDisplay, onAutoDisplayC
           ? { label: 'Metadata', color: 'var(--muted)' }
       : t.complete && t.is_active
         ? { label: 'Seeding', color: 'var(--success)' }
+        : isFinalizing(t)
+          ? { label: 'Finalizing', color: 'var(--warning)' }
         : !t.complete && t.is_active
           ? { label: 'Downloading', color: 'var(--accent)' }
           : { label: 'Queued', color: 'var(--muted)' }

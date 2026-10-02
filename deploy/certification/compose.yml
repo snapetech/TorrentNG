@@ -55,7 +55,7 @@ services:
       retries: 8
 
   sonarr:
-    image: lscr.io/linuxserver/sonarr:latest
+    image: lscr.io/linuxserver/sonarr@sha256:a5c1a5fecbef946927ab90ad68df319ac5fe644057e5fc18cd993f01ac07b2b2
     restart: unless-stopped
     ports:
       - "127.0.0.1:${SONARR_HOST_PORT:-18989}:8989"
@@ -71,7 +71,7 @@ services:
       - torrentng
 
   radarr:
-    image: lscr.io/linuxserver/radarr:latest
+    image: lscr.io/linuxserver/radarr@sha256:c960f2b52ec6542dbe6707c5a21e696a7c74fd8b17997454f4d10a55dacee133
     restart: unless-stopped
     ports:
       - "127.0.0.1:${RADARR_HOST_PORT:-17878}:7878"
@@ -87,7 +87,7 @@ services:
       - torrentng
 
   prowlarr:
-    image: lscr.io/linuxserver/prowlarr:latest
+    image: lscr.io/linuxserver/prowlarr@sha256:c96b56d94d116a9f4de94bc23d3381689492e6c3cfb7435320e8d982e406f99a
     restart: unless-stopped
     ports:
       - "127.0.0.1:${PROWLARR_HOST_PORT:-19696}:9696"
@@ -101,7 +101,7 @@ services:
       - torrentng
 
   autobrr:
-    image: ghcr.io/autobrr/autobrr:latest
+    image: ghcr.io/autobrr/autobrr@sha256:0b8b997c40424557a4bd688a4cb487dd8a765a69b5aa5b003c0d8106f6a895af
     restart: unless-stopped
     ports:
       - "127.0.0.1:${AUTOBRR_HOST_PORT:-17474}:7474"
@@ -116,7 +116,7 @@ services:
       - torrentng
 
   cross-seed:
-    image: ghcr.io/cross-seed/cross-seed:latest
+    image: ghcr.io/cross-seed/cross-seed@sha256:a1fed512261fd968c55cb03c51cff9c6620aa76a34b3b591afca95c890aa8225
     restart: unless-stopped
     command: daemon
     ports:

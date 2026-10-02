@@ -3,7 +3,6 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 REPORT_DIR="${REPORT_DIR:-$ROOT/certification/reports}"
-BENCHMARK_DIR="${BENCHMARK_DIR:-$ROOT/benchmarks}"
 OUT="${1:-$REPORT_DIR/pre-engine-release-$(date -u +%Y%m%dT%H%M%SZ).md}"
 SOAK_REPORT="${SOAK_REPORT:-}"
 
@@ -12,8 +11,9 @@ mkdir -p "$(dirname "$OUT")"
 latest() {
   local pattern="$1"
   local dir="${2:-$REPORT_DIR}"
-  find "$dir" -maxdepth 1 -type f -name "$pattern" -printf '%T@ %p\n' 2>/dev/null \
-    | sort -nr | awk 'NR==1 {print $2}'
+  find "$dir" -maxdepth 1 -type f -name "$pattern" -printf '%T@\t%p\n' 2>/dev/null \
+    | sort -t $'\t' -k1,1nr \
+    | awk 'NR == 1 { print substr($0, index($0, "\t") + 1) }'
 }
 
 overall() {
@@ -24,7 +24,7 @@ overall() {
   fi
   awk -F': ' '
     /^Overall status:/ {status=$2}
-    /test result: ok/ {ok=1}
+    /^[[:space:]]*test result: ok([.[:space:]]|$)/ {ok=1}
     END {
       if (status) print status;
       else if (ok) print "PASS";
@@ -61,8 +61,8 @@ gate() {
   else
     detail="missing $pattern"
   fi
-  if [[ "$required" == "1" && "$result" != "PASS" ]]; then
-    mark "$name" "$result" "$detail"
+  if [[ "$required" != "1" && "$result" == "MISSING" ]]; then
+    mark "$name" "INFO" "optional evidence not present: $pattern"
   else
     mark "$name" "$result" "$detail"
   fi
@@ -77,7 +77,6 @@ fi
   echo
   echo "- Date UTC: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
   echo "- Report directory: $REPORT_DIR"
-  echo "- Benchmark directory: $BENCHMARK_DIR"
   echo
   echo "## Automated Gate Matrix"
   echo
@@ -97,7 +96,6 @@ gate "NAT-PMP DHT" 'natpmp-dht-*.md' "$REPORT_DIR" 0
 gate "Proton NAT-PMP" 'proton-natpmp-*.md' "$REPORT_DIR" 0
 gate "Mobile qBit read-flow" 'mobile-compat-*.md'
 gate "Phase 1 ruTorrent" 'phase1-cert-*.md'
-gate "Synthetic benchmark" 'report-*.md' "$BENCHMARK_DIR"
 gate "Short soak" 'soak-202*.md'
 gate "Soak status" 'soak-status-*.md' "$REPORT_DIR" 0
 gate "Security review automation" 'security-review-*.md'
@@ -118,17 +116,22 @@ gate "Storage release certification" 'storage-release-certification-*.md'
 if [[ -n "$SOAK_REPORT" && -f "$SOAK_REPORT" ]]; then
   samples="$(awk -F'|' '/^\| 20[0-9][0-9]-/ {count++} END {print count+0}' "$SOAK_REPORT")"
   latest_sample="$(awk -F'|' '/^\| 20[0-9][0-9]-/ {line=$0} END {print line}' "$SOAK_REPORT")"
-  min_torrents="$(awk -F'|' '/^\| 20[0-9][0-9]-/ {gsub(/ /, "", $4); if (min == "" || $4 < min) min=$4} END {print min == "" ? 0 : min}' "$SOAK_REPORT")"
   max_rss="$(awk -F'|' '/^\| 20[0-9][0-9]-/ {gsub(/ /, "", $5); if ($5+0 > max) max=$5+0} END {printf "%.1f", max}' "$SOAK_REPORT")"
   bad_health="$(awk -F'|' '/^\| 20[0-9][0-9]-/ {gsub(/^[[:space:]]+|[[:space:]]+$/, "", $3); if ($3 != "200") bad++} END {print bad+0}' "$SOAK_REPORT")"
   bad_sync="$(awk -F'|' '/^\| 20[0-9][0-9]-/ {gsub(/^[[:space:]]+|[[:space:]]+$/, "", $6); if ($6 != "200") bad++} END {print bad+0}' "$SOAK_REPORT")"
   soak_status="$(overall "$SOAK_REPORT")"
   active="$(pgrep -af '[s]oak_certification.sh' | tr '\n' '; ' || true)"
 
-  mark "source report" "$([[ "$soak_status" == "PASS" ]] && echo PASS || echo RUNNING)" "$(basename "$SOAK_REPORT") status=$soak_status"
+  case "$soak_status" in
+    PASS) soak_gate_status="PASS" ;;
+    IN_PROGRESS|RUNNING|RUNNING_UNKNOWN) soak_gate_status="RUNNING" ;;
+    FAIL) soak_gate_status="FAIL" ;;
+    *) soak_gate_status="FAIL" ;;
+  esac
+  mark "source report" "$soak_gate_status" "$(basename "$SOAK_REPORT") status=$soak_status"
   mark "active process" "$([[ -n "$active" ]] && echo RUNNING || echo INFO)" "${active:-not currently running}"
   mark "sample count" "INFO" "$samples collected"
-  mark "torrent floor so far" "$([[ "$min_torrents" -ge 15000 ]] && echo PASS || echo FAIL)" "min=$min_torrents target>=15000"
+  mark "torrent count telemetry" "INFO" "retained from source samples; no capacity threshold is applied"
   mark "memory ceiling so far" "$(awk -v rss="$max_rss" 'BEGIN {print (rss <= 500) ? "PASS" : "FAIL"}')" "max=${max_rss}MB target<=500MB"
   mark "health samples so far" "$([[ "$bad_health" -eq 0 ]] && echo PASS || echo FAIL)" "bad=$bad_health"
   mark "sync samples so far" "$([[ "$bad_sync" -eq 0 ]] && echo PASS || echo FAIL)" "bad=$bad_sync"

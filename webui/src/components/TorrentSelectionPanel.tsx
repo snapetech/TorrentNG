@@ -1,4 +1,4 @@
-import type { TorrentSummary } from '../api/client'
+import { isFinalizing, type TorrentSummary } from '../api/client'
 import { DetailDockControls, type DetailPosition } from './DetailDockControls'
 
 interface Props {
@@ -38,6 +38,7 @@ function statusFor(t: TorrentSummary): Status {
   if (t.state === 4) return { label: 'Metadata', color: 'var(--muted)' }
   if (t.state === 5) return { label: 'Queued', color: 'var(--muted)' }
   if (t.complete && t.is_active) return { label: 'Seeding', color: 'var(--success)' }
+  if (isFinalizing(t)) return { label: 'Finalizing', color: 'var(--warning)' }
   if (!t.complete && t.is_active) return { label: 'Downloading', color: 'var(--accent)' }
   if (t.is_open) return { label: 'Stalled', color: 'var(--warning)' }
   return { label: 'Queued', color: 'var(--muted)' }

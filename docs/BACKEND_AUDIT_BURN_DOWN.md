@@ -15,14 +15,39 @@ and release evidence exist together.
 
 ## Executive decision
 
-TorrentNG is not certified as a production-grade 100k-torrent deployment or as
-a universally compatible client. The current source has materially closed the
-functional storage, lifecycle, snapshot, and compatibility gaps, and the
-release binary passes the local authenticated daemon smoke. One official public
-Debian transfer, its completed counted soak, and the current kspls0 LVM storage
-qualification now have passing evidence. The release posture remains **do not
-make unqualified scale, security, public-interoperability, or universal-compatibility claims**
-until the remaining evidence exists.
+TorrentNG is not making a numeric torrent-capacity claim in the current release
+qualification. The 10k/100k and related torrent-count proofs are removed from
+the required release scope; historical reports and deterministic regression
+fixtures remain archival/diagnostic material. The current source has materially
+closed the functional storage, lifecycle, snapshot, and compatibility gaps, and
+the release binary passes the local authenticated daemon smoke. One official
+public Debian transfer and a temporary lab storage certification have passing
+evidence in the current qualification; the historical kspls0 LVM result remains
+tied to its earlier host/artifact and is not a current-device claim. The
+24-hour soak is explicitly deferred to a later test window.
+The release posture remains **do not make unqualified scale, security,
+public-interoperability, or universal-compatibility claims**.
+
+## Current qualification run — 2026-09-16
+
+Confidence: high for the recorded local, fault, lab-storage, and Debian
+results; moderate for the diagnosis that the Ubuntu and Fedora failures are
+swarm-availability/completion-bound because the bounded reports did not reach
+payload completion.
+
+The current source was exercised with the following evidence:
+
+- The canonical local Docker matrix is [`interop-matrix-current-local-20260916.md`](../certification/reports/interop-matrix-current-local-20260916.md): all 28 rows pass, including both magnet paths, recovery/recheck, and all four reference clients.
+- The official Debian public transfer is [`interop-matrix-current-public-debian-20260916.md`](../certification/reports/interop-matrix-current-public-debian-20260916.md): PASS, 792,723,456 bytes, and 143 observed Rust peers.
+- The official Ubuntu attempt is [`interop-matrix-current-public-ubuntu-bounded-20260916.md`](../certification/reports/interop-matrix-current-public-ubuntu-bounded-20260916.md): FAIL at the explicit 120-second bound, with one observed Rust peer and no completed payload.
+- The official Fedora attempt is [`interop-matrix-current-public-fedora-bounded-20260916.md`](../certification/reports/interop-matrix-current-public-fedora-bounded-20260916.md): FAIL at the explicit 120-second bound; 45 Rust peers were observed, but the 4,294,182,110-byte payload did not complete.
+- The live fault matrix is [`backend-burndown-fault-matrix-current-20260916.md`](../certification/reports/backend-burndown-fault-matrix-current-20260916.md): PASS, including the live child report for crash/restart, SQLite failure/recovery, cancellation, and filesystem isolation.
+- The temporary-root storage certification is [`storage-release-certification-lab-current-20260916.md`](../certification/reports/storage-release-certification-lab-current-20260916.md): PASS for the tmpfs lab root, including pread/io_uring selection, registered buffers/files, readahead, recheck, and move/import. It is not physical-device evidence.
+- The external preflight is [`external-evidence-preflight-current-20260916.md`](../certification/reports/external-evidence-preflight-current-20260916.md): `PASS_WITH_WARNINGS`; the only warning is that `/mnt/datapool_lvm_media` is not a writable real-device target. The soak row is informationally deferred.
+- Local readiness passes in [`release-readiness-local-current-20260916.md`](../certification/reports/release-readiness-local-current-20260916.md). Strict readiness remains FAIL because public-source coverage, target-device evidence, and other explicit policy rows are not all clean.
+
+Numeric torrent-count capacity proofs are not part of this run. The 24-hour
+soak is not claimed; it is explicitly deferred with `TNG_DEFER_24H_SOAK=1`.
 
 The burn-down order is:
 
@@ -32,11 +57,11 @@ The burn-down order is:
 4. deployment, CI, and independent release evidence;
 5. architecture seams and maintainability.
 
-Current execution priority is functional correctness and isolation. The
-100k-hot, broader public-compatibility, production-corpus, and multi-device
-qualification gates are extended proof work, not the current implementation
-gate; they remain explicitly bounded and must not be represented as completed
-by local unit tests or a synthetic dormant corpus.
+Current execution priority is functional correctness and isolation. Broader
+public-compatibility, production-corpus, and multi-device qualification gates
+remain bounded external work; they must not be represented as completed by
+local unit tests or a synthetic dormant corpus. Numeric torrent-count capacity
+proof is outside the current release gate.
 
 ## Status rules
 
@@ -47,6 +72,13 @@ by local unit tests or a synthetic dormant corpus.
   local repository cannot produce it.
 - **Resolved** — implementation, regression coverage, and required evidence are
   present. A passing unit test alone is not enough.
+- Numeric torrent-count capacity proofs are intentionally not release gates in
+  this qualification cycle. Existing count-based tests may remain useful for
+  regression diagnosis, but reports must not present them as capacity
+  certification.
+- The 24-hour soak is intentionally deferred. A qualification run may set
+  `TNG_DEFER_24H_SOAK=1`; that produces an informational deferral and makes no
+  stability claim.
 
 Severity is an engineering priority, not a statement about exploitability in a
 particular private deployment. P0 means release-blocking for any deployment
@@ -195,7 +227,7 @@ The following was run against the audit baseline before this burn-down began:
 | `cargo clippy --workspace --all-targets --locked -- -D warnings` | FAIL | Existing lint/MSRV/enum-layout failures remain. |
 | TorrentNG-client CI workflow | INCOMPLETE | `.github/workflows/ci.yml` builds the compatible-client service/WebUI but does not test TorrentNG-client crates. |
 | TorrentNG-client release workflow (baseline) | INCOMPLETE | Historical baseline: release built and smoke-checked the binary without TorrentNG-client test, fmt, or clippy gates. |
-| certification status | NOT CLEAN | Universal compatibility is `PASS_WITH_SKIPS` because the separate real-device wrapper leg is intentionally skipped; the completed 24h soak is PASS, while strict readiness still fails on non-clean evidence rows. |
+| certification status | NOT CLEAN | Universal compatibility remains `PASS_WITH_SKIPS`; the current 24h soak is explicitly deferred, and strict readiness still fails on non-clean external evidence rows. |
 | checked-in fuzz/OpenAPI/idempotency evidence | PARTIAL | Fuzz targets and bounded CI smoke commands are checked in; the TorrentNG API OpenAPI contract is now checked in; endpoint replay tests and an observed hosted-CI run remain evidence gaps. |
 
 ## Prior release and qualification evidence (2026-09-10 local / 2026-09-10 UTC)
@@ -206,9 +238,9 @@ burn-down entries. Runtime and external qualification evidence below targets
 product commit `b393eb0`; evidence reconciliation is `3cb0ba4`, and the latest
 certification-script hardening is `50e0fc3`. The public Debian transfer was
 rerun, the kspls0 LV was exercised directly, and the external preflight was
-rerun in strict mode. The counted public soak source predates b393; its
-finalization report is explicit about the source report and does not claim a
-b393 release soak.
+rerun in strict mode. The previous counted public soak source predates b393;
+its finalization report is archival and does not claim a b393 release soak.
+The current qualification defers a new 24-hour soak.
 
 | Check | Result | Meaning |
 | --- | --- | --- |
@@ -223,7 +255,7 @@ b393 release soak.
 | rTorrent startup identity timeout isolation | PASS | Commit `4a90048` gives the multi-thousand-download identity rewrite a separate 300-second timeout while ordinary XMLRPC calls remain 10 seconds; compatible-client service tests and warnings-denied clippy pass. |
 | kspls0 LVM storage release certification | PASS | [`storage-release-certification-kspls0-lvm-20260910-b393eb0.md`](../certification/reports/storage-release-certification-kspls0-lvm-20260910-b393eb0.md); exact commit `b393eb0`, `/dev/mapper/datapool_lvm-media`, HDD median ratio 5.11x, io_uring graduation, and real-root move/import all pass. |
 | kspls0 real-device storage matrix | PASS_WITH_SKIPS | [`universal-live-kspls0-lvm-20260910-b393eb0.md`](../certification/reports/universal-live-kspls0-lvm-20260910-b393eb0.md); the real-device storage gate passes against the LV; local Docker/public legs were intentionally not rerun in this targeted invocation. |
-| Public Debian 24-hour soak finalization | PASS | [`soak-final-public-debian-20260910.md`](../certification/reports/soak-final-public-debian-20260910.md); 1,437 samples, one exact completed torrent, resource/health checks pass. |
+| Public Debian 24-hour soak finalization | DEFERRED | The prior [`soak-final-public-debian-20260910.md`](../certification/reports/soak-final-public-debian-20260910.md) is archival; no current-artifact 24-hour claim is made. |
 | Canonical all-live compatibility certification | PASS_WITH_SKIPS | [`universal-compat-b393eb0-all-live.md`](../certification/reports/universal-compat-b393eb0-all-live.md); static, migration, local Docker, mobile, and public Debian gates pass; only the separate real-device wrapper gate is skipped. |
 | Clean release-binary smoke | PASS | [`backend-burndown-native-release-smoke-20260910-final.md`](../certification/reports/backend-burndown-native-release-smoke-20260910-final.md); build commit `3cb0ba4`, 22,449,216 bytes, SHA-256 `7fbac478b696316d989028c47573e4cd248f04a98a479f218017c0ec5a812b5e`, 457 ms, clean SIGTERM. |
 | Full local release gate | PASS_WITH_WARNINGS | [`local-release-20260910-50e0fc3.md`](../certification/reports/local-release-20260910-50e0fc3.md); TorrentNG-client, storage-feature, WebUI, API, smoke, backup, corpus, and security gates pass; only local block-device certification is skipped. |
@@ -297,14 +329,15 @@ qBittorrent-compatible read flow and passed it. The
 v1 info hash is `481b6e3617be4c88f96cb25e47c9d8272130071e`. This closes one
 public-swarm evidence row; it does not establish universal compatibility.
 
-The named public-torrent 24-hour soak is complete under the launch record
+The named public-torrent 24-hour soak completed in an earlier qualification under the launch record
 [`PUBLIC_TORRENT_SOAK_20260905.md`](PUBLIC_TORRENT_SOAK_20260905.md). The
-counted source report retained 1,437 samples and the finalizer reports PASS.
+counted source report retained 1,437 samples and the finalizer reports PASS;
+that result is archival rather than current-artifact qualification.
 
 The current strict external preflight is
 [`external-evidence-preflight-release-strict-20260910-b393eb0.md`](../certification/reports/external-evidence-preflight-release-strict-20260910-b393eb0.md):
-Docker, public opt-in, writable target, migration corpus, and completed soak
-are green with no warnings.
+Docker, public opt-in, writable target, and migration corpus are green with no
+warnings; the current qualification deliberately defers the soak.
 
 ### Pure-v2 metadata-completion evidence (2026-09-15 local)
 
@@ -483,7 +516,7 @@ and is superseded by the source reconciliation above.
 | TNG-023 | Implemented locally: implemented/enabled/certified/experimental assurance states are separate | Keep `certified` empty until external evidence is accepted |
 | TNG-024 | Implemented locally: fail-closed config validation, secret-file support, separate credential-required backend overlays, authenticated Transmission wiring, loopback-only backend management ports, and rootless compatible-client/Phase 1 images; disposable legacy-volume migration and custom-UID volume writes pass | Production volume/host-mount ownership and qBittorrent/Deluge target credentials/secrets still require deployment-specific verification |
 | TNG-025 | Resolved for the repository gate: TorrentNG-client and compatible-client service quality, clippy, MSRV, fuzz, release-smoke, security, backup, load, and fault jobs execute successfully | Branch-protection enforcement still needs repository-settings review |
-| TNG-026 | Runtime source is `b393eb0`; release evidence was reconciled at `3cb0ba4` and the certification harness was hardened at `50e0fc3`; clean deployment smoke, backup/restore, WebUI, and shutdown now pass | One official public Debian transfer, completed named soak, canonical all-live local/mobile/public compatibility, and kspls0 LVM storage now pass; remaining public sources and strict readiness remain external gates |
+| TNG-026 | Runtime source is `b393eb0`; release evidence was reconciled at `3cb0ba4` and the certification harness was hardened at `50e0fc3`; clean deployment smoke, backup/restore, WebUI, and shutdown now pass | One official public Debian transfer, canonical all-live local/mobile/public compatibility, and kspls0 LVM storage now pass; the named soak is archival and the current soak is deferred; remaining public sources and strict readiness remain external gates |
 | TNG-027 | Resolved for the repository gate: fuzz targets, OpenAPI validator, idempotency tests, and hosted bounded fuzz smoke are green | Broader parser and mutation replay corpus remains optional evidence work |
 | TNG-028 | Resolved for the repository gate: format, clippy, locked tests, and declared MSRV pass locally and in hosted CI | Branch-protection enforcement still needs repository-settings review |
 | TNG-029 | Resolved for the stated persistence-isolation finding and the scoped source decomposition: supervised DB ownership; private command-facade, lifecycle/restore, storage, read-model, peer-connection/session/transfer modules preserve actor ordering | None for the scoped repository work; deployment-specific fault qualification remains external |
@@ -603,9 +636,10 @@ and is superseded by the source reconciliation above.
 
 The practical release statement is therefore: **local functional remediation,
 live fault containment, API/SSE load, release-binary smoke, hosted CI, one
-official public transfer/soak, and the exercised kspls0 LVM storage gate pass;
-branch-protection enforcement, broader public/device coverage, and extended-
-scale proof are not complete.**
+official public transfer, and the exercised kspls0 LVM storage gate pass;
+branch-protection enforcement and broader public/device coverage remain
+external. The current 24-hour soak is deferred, and numeric torrent-count
+capacity proof is outside release scope.**
 
 ## P0 — security and data integrity
 
@@ -2489,9 +2523,10 @@ No further implementation work is required for the current tiering seam. Keep
 the registry projection and tier-policy projection explicit and preserve the
 no-per-dormant-task/timer invariant.
 
-Deferred proof gate: release-binary runs with 1k/2k simultaneous hot fixtures,
-real metadata diversity, and host-specific RSS/fd/thread/latency measurements.
-That work is intentionally not a prerequisite for this functional checkpoint.
+Optional diagnostic work: release-binary runs with synthetic hot fixtures, real
+metadata diversity, and host-specific RSS/fd/thread/latency measurements may
+be run for tuning. They are intentionally not a prerequisite or a capacity
+claim for this functional checkpoint.
 
 Acceptance for the current implementation gate is met: dormant rows remain
 addressable, promotion/demotion and restart preserve durable state, and no
@@ -2708,10 +2743,10 @@ bounded blocking-DB gate, and its log/stats probes keep filesystem reads behind
 blocking boundaries. The remaining action is representative production-corpus
 and allocator evidence, not another unbounded scan rewrite.
 
-Deferred proof gate: representative list/stat/SSE corpus load, allocator
-profiles, and current-artifact 1k/15k/100k capacity evidence. The local
-many-client/slow-consumer gate is complete and the measurements remain open
-only for production-representative certification.
+Deferred external work: representative list/stat/SSE corpus load, allocator
+profiles, and public-client evidence. The local many-client/slow-consumer gate
+is complete; numeric current-artifact capacity evidence is not part of the
+release scope.
 
 ### TNG-014 — Per-peer metadata/bitmap allocations threaten scale
 
@@ -3177,9 +3212,10 @@ is current local deployment evidence, not a clean public release certificate.
 The older 100k scale reports remain historical because they target an earlier
 binary digest.
 
-Remaining action is external release evidence: public/client compatibility,
-real-device storage, and 24-hour soak. Extended scale proof is intentionally
-deferred as a product-priority choice.
+Remaining action is external release evidence: public/client compatibility and
+real-device storage. The 24-hour soak is intentionally deferred for the
+current qualification window; numeric extended-scale proof is outside release
+scope as a product-priority choice.
 
 ### TNG-027 — Claimed fuzz/OpenAPI/idempotency coverage is not checked in
 
@@ -3898,7 +3934,7 @@ stack bound.
 Until the corresponding ledger item is resolved, these claims are not release
 claims:
 
-- “100k torrents” as a production capacity guarantee;
+- Any numeric torrent-count as a production capacity guarantee;
 - “pure v2 metadata completion” without the bounded BEP 9/BEP 52 validation
   and evidence boundary documented in TNG-016;
 - “universal compatibility” across clients and transports without live

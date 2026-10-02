@@ -1,11 +1,12 @@
 use std::{
+    fs::{File, OpenOptions},
     io::{Read, Seek, SeekFrom},
     path::{Path, PathBuf},
     sync::Arc,
     time::Duration,
 };
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use tokio::time::sleep;
 
 use crate::{
@@ -90,7 +91,13 @@ fn poll_paths(db: &Db, paths: &[PathBuf], retention: usize, read_from_start: boo
 }
 
 fn ingest_path(db: &Db, path: &Path, retention: usize, read_from_start: bool) -> Result<()> {
-    let metadata = std::fs::metadata(path).with_context(|| format!("stat {}", path.display()))?;
+    let file = open_log_file(path)?;
+    let metadata = file
+        .metadata()
+        .with_context(|| format!("stat {}", path.display()))?;
+    if !metadata.is_file() {
+        bail!("log path is not a regular file: {}", path.display());
+    }
     let offset_key = offset_key(path);
     let mut offset = match db.get_kv(&offset_key)?.and_then(|value| value.parse().ok()) {
         Some(offset) => offset,
@@ -137,6 +144,24 @@ fn ingest_path(db: &Db, path: &Path, retention: usize, read_from_start: bool) ->
     let next_offset = offset.saturating_add(complete_bytes as u64);
     db.set_kv(&offset_key, &next_offset.to_string())?;
     Ok(())
+}
+
+#[cfg(unix)]
+fn open_log_file(path: &Path) -> Result<File> {
+    use std::os::unix::fs::OpenOptionsExt;
+
+    OpenOptions::new()
+        .read(true)
+        // Log paths are written by another local process. Do not follow a
+        // final symlink or block a polling worker on a FIFO replacement.
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(path)
+        .with_context(|| format!("open {}", path.display()))
+}
+
+#[cfg(not(unix))]
+fn open_log_file(path: &Path) -> Result<File> {
+    File::open(path).with_context(|| format!("open {}", path.display()))
 }
 
 fn offset_key(path: &Path) -> String {

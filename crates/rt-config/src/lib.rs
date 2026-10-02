@@ -26,6 +26,9 @@ pub struct Config {
     pub daemon: DaemonConfig,
     pub network: NetworkConfig,
     pub storage: StorageConfig,
+    /// Host-crash detection, completion gating and post-crash verification.
+    /// See `docs/CRASH_SAFETY.md`.
+    pub crash_safety: CrashSafetyConfig,
     pub memory: MemoryConfig,
     pub runtime: RuntimeConfig,
     pub tracker: TrackerConfig,
@@ -47,6 +50,14 @@ const MAX_SEMAPHORE_PERMITS: usize = usize::MAX >> 3;
 const MAX_STORAGE_WORKER_THREADS: usize = 64;
 const MAX_STORAGE_QUEUE_DEPTH: usize = 16_384;
 const MAX_STORAGE_FILE_POOL_SIZE: usize = 65_536;
+/// Bound the per-scheduler peer-read cache metadata even when a deployment
+/// disables the shared memory governor. The cache stores one path-keyed entry
+/// per file and is instantiated for every active storage scheduler.
+const MAX_STORAGE_PEER_READ_CACHE_ENTRIES: usize = 65_536;
+/// The elevator budget is a batching window, not a timeout. A very large
+/// operator value can hold HDD peer reads for hours and make the scheduler
+/// appear hung, so reject values beyond one minute at the config boundary.
+const MAX_STORAGE_PEER_READ_ELEVATOR_BUDGET_MS: u64 = 60_000;
 const MAX_DHT_BOOTSTRAP_NODES: usize = 256;
 const MAX_DHT_BOOTSTRAP_NODE_BYTES: usize = 256;
 const MAX_DHT_BOOTSTRAP_BYTES: usize = 64 * 1024;
@@ -59,6 +70,8 @@ const DEFAULT_DHT_TRACKED_TORRENTS_CAP: usize = 131_072;
 /// misconfigured value producing runaway memory use, not a realistic
 /// deployment target -- it is far above the 100k top-end scale target.
 const MAX_DHT_TRACKED_TORRENTS_CAP: usize = 1_000_000;
+const MAX_AUTH_TOKENS: usize = 256;
+const MAX_AUTH_TOKEN_BYTES: usize = 4096;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -130,6 +143,255 @@ pub enum StorageDurabilityMode {
     Fast,
     Checkpoint,
     Strict,
+}
+
+/// What to verify for a torrent after the daemon detects that the previous
+/// run ended in a host crash (power loss, kernel panic, hard reset) instead of
+/// a clean shutdown or a process-only crash.
+///
+/// A host crash discards the OS page cache. Every mode below already benefits
+/// from the durability-barrier ordering (data fsync, then fastresume); these
+/// modes decide how much *additional* hashing to do as defense in depth
+/// against storage that acknowledged a sync it did not perform.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum HostCrashRecovery {
+    /// Trust the durable fastresume state and recheck only the dirty-piece
+    /// watermark. Fastest; correct when storage honors fsync.
+    Watermark,
+    /// Watermark, plus a full recheck of every torrent whose payload was
+    /// written within `recent_write_window_secs` before the crash.
+    #[default]
+    Recent,
+    /// Full recheck of every torrent. Expensive on large libraries.
+    Full,
+}
+
+/// When to compare a torrent's `Valid` pieces against the filesystem's own
+/// allocation map (holes and unwritten extents) before trusting them.
+///
+/// The audit is a metadata-only prefilter. A `Valid` piece that overlaps a
+/// hole or unwritten extent is downgraded to `Unknown` and re-hashed; it is
+/// never declared corrupt from allocation alone, because compressing and
+/// deduplicating filesystems legitimately store zero runs as holes.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum StructuralAuditMode {
+    Off,
+    /// Only after an unclean shutdown (host crash, process crash, or an
+    /// undetectable previous run). Default.
+    #[default]
+    OnUnclean,
+    /// On every torrent start. Costs one allocation query per file.
+    Always,
+}
+
+/// Optional re-read of freshly downloaded data from disk before the torrent is
+/// reported complete.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum CompletionVerifyMode {
+    /// Rely on the durability barrier alone. Default; no extra reads.
+    #[default]
+    Off,
+    /// After the barrier, drop cached pages where the OS allows it and re-hash
+    /// a bounded sample: every file's first and last piece plus a
+    /// deterministic percentage of the rest.
+    Sample,
+    /// After the barrier, re-hash every piece. Doubles the read I/O of a
+    /// download.
+    Full,
+}
+
+/// Unknown keys are rejected (config file and settings API alike): a typo in a
+/// safety setting must fail loudly instead of leaving the default in force
+/// while the operator believes otherwise.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(default, deny_unknown_fields)]
+pub struct CrashSafetyConfig {
+    /// Do not report a download as complete (progress 100%, `Seeding`, tracker
+    /// `completed`, `completed_at`) until its data has been made durable by a
+    /// storage barrier. While gated the torrent stays `Downloading` and
+    /// reports one byte remaining, so *arr clients do not import it early.
+    pub completion_gate: bool,
+    /// Keep a durable run marker and the OS boot identity so a host crash can
+    /// be told apart from a process crash. When disabled no marker is kept:
+    /// `host_crash_recovery`, weak-mount escalation and the unsynced-state
+    /// check are skipped, and recovery relies only on each torrent's own
+    /// fastresume flags (the behavior before this option existed).
+    pub host_crash_detection: bool,
+    pub host_crash_recovery: HostCrashRecovery,
+    /// Look-back window for [`HostCrashRecovery::Recent`], in seconds.
+    pub recent_write_window_secs: u64,
+    pub structural_audit: StructuralAuditMode,
+    /// Classify the filesystem under each save path and surface it in the API.
+    pub mount_probe: bool,
+    /// Recover more aggressively on mounts classified weak or unknown:
+    /// `Weak` mounts use a full recheck, `Unknown` mounts use at least
+    /// `recent`.
+    pub weak_mount_escalation: bool,
+    /// Operator overrides: paths under these prefixes are always classified
+    /// weak, or strong, regardless of what the probe detects.
+    pub weak_mount_paths: Vec<PathBuf>,
+    pub strong_mount_paths: Vec<PathBuf>,
+    pub completion_verify: CompletionVerifyMode,
+    /// Sample size for [`CompletionVerifyMode::Sample`], percent of pieces.
+    pub completion_verify_sample_percent: u8,
+    /// Per-location overrides of the settings above. The longest path prefix
+    /// that contains a torrent's save path wins; anything a policy leaves
+    /// unset is inherited from this section. See [`PathPolicy`].
+    pub path_policies: Vec<PathPolicy>,
+}
+
+/// An override of the crash-safety behavior for torrents saved under one
+/// directory: for example a lean policy for a scratch SSD and full read-back
+/// for a NAS. Unset fields inherit the global value.
+///
+/// Only settings that make sense per location can be overridden. Host-crash
+/// detection (one run marker per daemon), the recent-write window and the
+/// mount probe flags stay global; mount trust per location is already
+/// controlled by `weak_mount_paths` / `strong_mount_paths`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[serde(default, deny_unknown_fields)]
+pub struct PathPolicy {
+    /// Absolute directory this policy applies to (prefix match on components).
+    pub path: PathBuf,
+    pub completion_gate: Option<bool>,
+    pub host_crash_recovery: Option<HostCrashRecovery>,
+    pub structural_audit: Option<StructuralAuditMode>,
+    pub completion_verify: Option<CompletionVerifyMode>,
+    pub completion_verify_sample_percent: Option<u8>,
+}
+
+/// The settings that apply to one save location after resolving
+/// [`PathPolicy`] overrides against the global values.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ResolvedCrashSafety {
+    pub completion_gate: bool,
+    pub host_crash_recovery: HostCrashRecovery,
+    pub structural_audit: StructuralAuditMode,
+    pub completion_verify: CompletionVerifyMode,
+    pub completion_verify_sample_percent: u8,
+}
+
+const MAX_CRASH_SAFETY_PATHS: usize = 64;
+const MAX_CRASH_SAFETY_WINDOW_SECS: u64 = 365 * 24 * 60 * 60;
+
+impl Default for CrashSafetyConfig {
+    fn default() -> Self {
+        CrashSafetyConfig {
+            completion_gate: true,
+            host_crash_detection: true,
+            host_crash_recovery: HostCrashRecovery::Recent,
+            recent_write_window_secs: 24 * 60 * 60,
+            structural_audit: StructuralAuditMode::OnUnclean,
+            mount_probe: true,
+            weak_mount_escalation: true,
+            weak_mount_paths: Vec::new(),
+            strong_mount_paths: Vec::new(),
+            completion_verify: CompletionVerifyMode::Off,
+            completion_verify_sample_percent: 5,
+            path_policies: Vec::new(),
+        }
+    }
+}
+
+impl CrashSafetyConfig {
+    /// Resolve the settings for a torrent saved at `save_path`: the
+    /// [`PathPolicy`] with the longest matching path prefix overrides the
+    /// global values field by field. Also returns the policy that matched.
+    pub fn resolve_for(&self, save_path: &Path) -> (ResolvedCrashSafety, Option<&PathPolicy>) {
+        let matched = self
+            .path_policies
+            .iter()
+            .filter(|policy| save_path.starts_with(&policy.path))
+            .max_by_key(|policy| policy.path.components().count());
+        let resolved = ResolvedCrashSafety {
+            completion_gate: matched
+                .and_then(|p| p.completion_gate)
+                .unwrap_or(self.completion_gate),
+            host_crash_recovery: matched
+                .and_then(|p| p.host_crash_recovery)
+                .unwrap_or(self.host_crash_recovery),
+            structural_audit: matched
+                .and_then(|p| p.structural_audit)
+                .unwrap_or(self.structural_audit),
+            completion_verify: matched
+                .and_then(|p| p.completion_verify)
+                .unwrap_or(self.completion_verify),
+            completion_verify_sample_percent: matched
+                .and_then(|p| p.completion_verify_sample_percent)
+                .unwrap_or(self.completion_verify_sample_percent),
+        };
+        (resolved, matched)
+    }
+
+    /// Range and shape checks shared by config-file loading and the runtime
+    /// settings API.
+    pub fn validate(&self) -> Result<(), ConfigError> {
+        require(
+            self.recent_write_window_secs > 0,
+            "crash_safety.recent_write_window_secs must be greater than zero",
+        )?;
+        require(
+            self.recent_write_window_secs <= MAX_CRASH_SAFETY_WINDOW_SECS,
+            format!(
+                "crash_safety.recent_write_window_secs must be <= {MAX_CRASH_SAFETY_WINDOW_SECS}"
+            ),
+        )?;
+        require(
+            (1..=100).contains(&self.completion_verify_sample_percent),
+            "crash_safety.completion_verify_sample_percent must be between 1 and 100",
+        )?;
+        for (field, paths) in [
+            ("weak_mount_paths", &self.weak_mount_paths),
+            ("strong_mount_paths", &self.strong_mount_paths),
+        ] {
+            require(
+                paths.len() <= MAX_CRASH_SAFETY_PATHS,
+                format!("crash_safety.{field} must contain <= {MAX_CRASH_SAFETY_PATHS} entries"),
+            )?;
+            for path in paths {
+                require(
+                    path.is_absolute(),
+                    format!("crash_safety.{field} entries must be absolute paths"),
+                )?;
+            }
+        }
+        require(
+            self.path_policies.len() <= MAX_CRASH_SAFETY_PATHS,
+            format!("crash_safety.path_policies must contain <= {MAX_CRASH_SAFETY_PATHS} entries"),
+        )?;
+        for (index, policy) in self.path_policies.iter().enumerate() {
+            require(
+                policy.path.is_absolute(),
+                format!("crash_safety.path_policies[{index}].path must be an absolute path"),
+            )?;
+            if let Some(percent) = policy.completion_verify_sample_percent {
+                require(
+                    (1..=100).contains(&percent),
+                    format!(
+                        "crash_safety.path_policies[{index}].completion_verify_sample_percent must be between 1 and 100"
+                    ),
+                )?;
+            }
+            require(
+                !self.path_policies[..index]
+                    .iter()
+                    .any(|earlier| earlier.path == policy.path),
+                format!(
+                    "crash_safety.path_policies[{index}].path duplicates an earlier entry; each location may have one policy"
+                ),
+            )?;
+        }
+        for weak in &self.weak_mount_paths {
+            require(
+                !self.strong_mount_paths.iter().any(|strong| strong == weak),
+                "crash_safety.weak_mount_paths and strong_mount_paths must not share an entry",
+            )?;
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -248,7 +510,9 @@ impl Default for AuthConfig {
     fn default() -> Self {
         Self {
             username: "torrentng".to_owned(),
-            password: "torrentng".to_owned(),
+            // Empty selects a private per-install bootstrap password created
+            // by torrentngd in the session directory at startup.
+            password: String::new(),
             api_tokens: Vec::new(),
             api_tokens_file: None,
         }
@@ -515,6 +779,20 @@ impl Config {
             "storage.peer_read_readahead_bytes must be <= 64MiB",
         )?;
         require(
+            self.storage.peer_read_cache_entries <= MAX_STORAGE_PEER_READ_CACHE_ENTRIES,
+            format!(
+                "storage.peer_read_cache_entries must be <= {MAX_STORAGE_PEER_READ_CACHE_ENTRIES}"
+            ),
+        )?;
+        require(
+            self.storage.peer_read_elevator_budget_ms
+                <= MAX_STORAGE_PEER_READ_ELEVATOR_BUDGET_MS,
+            format!(
+                "storage.peer_read_elevator_budget_ms must be <= {MAX_STORAGE_PEER_READ_ELEVATOR_BUDGET_MS}"
+            ),
+        )?;
+        self.crash_safety.validate()?;
+        require(
             self.memory.total_cap_mb > 0,
             "memory.total_cap_mb must be greater than zero",
         )?;
@@ -603,13 +881,22 @@ impl Config {
             "auth.username must contain 1-256 bytes",
         )?;
         require(
-            self.auth.password.trim().len() >= 8 && self.auth.password.len() <= 1024,
-            "auth.password must contain at least 8 and at most 1024 bytes",
+            self.auth.password.is_empty()
+                || (self.auth.password.trim().len() >= 8 && self.auth.password.len() <= 1024),
+            "auth.password must be empty for a generated password or contain 8-1024 bytes",
+        )?;
+        require(
+            self.auth.api_tokens.len() <= MAX_AUTH_TOKENS,
+            format!("auth.api_tokens must contain <= {MAX_AUTH_TOKENS} tokens"),
         )?;
         for token in &self.auth.api_tokens {
             require(
                 !token.trim().is_empty(),
                 "auth.api_tokens must not contain empty tokens",
+            )?;
+            require(
+                token.len() <= MAX_AUTH_TOKEN_BYTES,
+                format!("auth.api_tokens entries must be <= {MAX_AUTH_TOKEN_BYTES} bytes"),
             )?;
             require(
                 !is_placeholder_token(token),
@@ -670,12 +957,29 @@ impl Config {
                 token_path.display()
             ))
         })?;
-        let file_tokens = token_text
+        let max_file_tokens = MAX_AUTH_TOKENS.saturating_sub(self.auth.api_tokens.len());
+        let mut file_tokens = Vec::new();
+        for token in token_text
             .lines()
             .map(str::trim)
             .filter(|token| !token.is_empty())
-            .map(str::to_owned)
-            .collect::<Vec<_>>();
+        {
+            if file_tokens.len() >= max_file_tokens {
+                return Err(ConfigError::Validation(format!(
+                    "auth.api_tokens_file {} contains more than {} tokens",
+                    token_path.display(),
+                    MAX_AUTH_TOKENS
+                )));
+            }
+            if token.len() > MAX_AUTH_TOKEN_BYTES {
+                return Err(ConfigError::Validation(format!(
+                    "auth.api_tokens_file {} contains a token longer than {} bytes",
+                    token_path.display(),
+                    MAX_AUTH_TOKEN_BYTES
+                )));
+            }
+            file_tokens.push(token.to_owned());
+        }
         if file_tokens.is_empty() {
             return Err(ConfigError::Validation(format!(
                 "auth.api_tokens_file {} contains no tokens",
@@ -786,7 +1090,7 @@ mod tests {
         assert!(c.auth.api_tokens.is_empty());
         assert!(c.auth.api_tokens_file.is_none());
         assert_eq!(c.auth.username, "torrentng");
-        assert_eq!(c.auth.password, "torrentng");
+        assert!(c.auth.password.is_empty());
         assert_eq!(c.daemon.shutdown_timeout_secs, 10);
         assert_eq!(c.memory.total_cap_mb, 512);
         assert_eq!(c.memory.storage_frame_cap_mb, 128);
@@ -808,6 +1112,316 @@ mod tests {
         assert_eq!(c.storage.peer_read_cache_entries, 64);
         assert_eq!(c.storage.peer_read_elevator_budget_ms, 25);
         assert_eq!(c.logging, rt_logging::LoggingConfig::default());
+    }
+
+    /// An absolute path on the platform running the tests: a leading `/` is not
+    /// absolute on Windows, which needs a drive.
+    fn abs(name: &str) -> String {
+        if cfg!(windows) {
+            format!("C:/{name}")
+        } else {
+            format!("/mnt/{name}")
+        }
+    }
+
+    #[test]
+    fn crash_safety_defaults_are_safe_and_valid() {
+        let c = Config::default();
+        assert!(c.crash_safety.completion_gate);
+        assert!(c.crash_safety.host_crash_detection);
+        assert_eq!(
+            c.crash_safety.host_crash_recovery,
+            HostCrashRecovery::Recent
+        );
+        assert_eq!(c.crash_safety.recent_write_window_secs, 86_400);
+        assert_eq!(
+            c.crash_safety.structural_audit,
+            StructuralAuditMode::OnUnclean
+        );
+        assert!(c.crash_safety.mount_probe);
+        assert!(c.crash_safety.weak_mount_escalation);
+        assert_eq!(c.crash_safety.completion_verify, CompletionVerifyMode::Off);
+        c.crash_safety.validate().unwrap();
+    }
+
+    #[test]
+    fn crash_safety_parses_from_toml_and_defaults_missing_fields() {
+        let c: Config = toml::from_str(&format!(
+            r#"
+[crash_safety]
+host_crash_recovery = "full"
+structural_audit = "always"
+completion_verify = "sample"
+completion_verify_sample_percent = 10
+weak_mount_paths = ["{}"]
+"#,
+            abs("pool")
+        ))
+        .unwrap();
+        c.validate().unwrap();
+        assert_eq!(c.crash_safety.host_crash_recovery, HostCrashRecovery::Full);
+        assert_eq!(c.crash_safety.structural_audit, StructuralAuditMode::Always);
+        assert_eq!(
+            c.crash_safety.completion_verify,
+            CompletionVerifyMode::Sample
+        );
+        assert_eq!(c.crash_safety.completion_verify_sample_percent, 10);
+        assert_eq!(
+            c.crash_safety.weak_mount_paths,
+            vec![PathBuf::from(abs("pool"))]
+        );
+        // Untouched fields keep their defaults.
+        assert!(c.crash_safety.completion_gate);
+        assert_eq!(c.crash_safety.recent_write_window_secs, 86_400);
+    }
+
+    #[test]
+    fn crash_safety_rejects_out_of_range_and_conflicting_values() {
+        let base = CrashSafetyConfig::default;
+
+        let c = CrashSafetyConfig {
+            recent_write_window_secs: 0,
+            ..base()
+        };
+        assert!(c.validate().is_err());
+
+        let c = CrashSafetyConfig {
+            recent_write_window_secs: MAX_CRASH_SAFETY_WINDOW_SECS + 1,
+            ..base()
+        };
+        assert!(c.validate().is_err());
+
+        for pct in [0u8, 101] {
+            let c = CrashSafetyConfig {
+                completion_verify_sample_percent: pct,
+                ..base()
+            };
+            assert!(c.validate().is_err(), "{pct}% must be rejected");
+        }
+
+        let c = CrashSafetyConfig {
+            weak_mount_paths: vec![PathBuf::from("relative/path")],
+            ..base()
+        };
+        assert!(c.validate().is_err());
+
+        let c = CrashSafetyConfig {
+            weak_mount_paths: vec![PathBuf::from(abs("a"))],
+            strong_mount_paths: vec![PathBuf::from(abs("a"))],
+            ..base()
+        };
+        assert!(c.validate().is_err());
+
+        let c = CrashSafetyConfig {
+            weak_mount_paths: (0..=MAX_CRASH_SAFETY_PATHS)
+                .map(|i| PathBuf::from(abs(&format!("d{i}"))))
+                .collect(),
+            ..base()
+        };
+        assert!(c.validate().is_err());
+    }
+
+    fn policy(path: &str) -> PathPolicy {
+        PathPolicy {
+            path: PathBuf::from(abs(path)),
+            ..PathPolicy::default()
+        }
+    }
+
+    #[test]
+    fn path_policies_resolve_by_longest_prefix_and_inherit_unset_fields() {
+        let config = CrashSafetyConfig {
+            completion_verify: CompletionVerifyMode::Sample,
+            path_policies: vec![
+                PathPolicy {
+                    completion_gate: Some(false),
+                    completion_verify: Some(CompletionVerifyMode::Off),
+                    ..policy("scratch")
+                },
+                PathPolicy {
+                    host_crash_recovery: Some(HostCrashRecovery::Full),
+                    completion_verify: Some(CompletionVerifyMode::Full),
+                    ..policy("nas")
+                },
+                PathPolicy {
+                    completion_verify_sample_percent: Some(50),
+                    ..PathPolicy {
+                        path: PathBuf::from(abs("nas")).join("media"),
+                        ..PathPolicy::default()
+                    }
+                },
+            ],
+            ..CrashSafetyConfig::default()
+        };
+        let under = |p: &str, rest: &str| PathBuf::from(abs(p)).join(rest);
+
+        // No policy: the global values.
+        let (plain, matched) = config.resolve_for(&under("other", "x"));
+        assert!(matched.is_none());
+        assert!(plain.completion_gate);
+        assert_eq!(plain.completion_verify, CompletionVerifyMode::Sample);
+        assert_eq!(plain.host_crash_recovery, HostCrashRecovery::Recent);
+
+        // A policy overrides only what it sets.
+        let (scratch, matched) = config.resolve_for(&under("scratch", "dl/movie"));
+        assert!(matched.is_some());
+        assert!(!scratch.completion_gate);
+        assert_eq!(scratch.completion_verify, CompletionVerifyMode::Off);
+        assert_eq!(
+            scratch.host_crash_recovery,
+            HostCrashRecovery::Recent,
+            "inherited"
+        );
+        assert_eq!(scratch.completion_verify_sample_percent, 5, "inherited");
+
+        // The longest matching prefix wins outright: `nas/media` does not also
+        // pick up `nas`'s settings, it inherits from the global section.
+        let (nas, _) = config.resolve_for(&under("nas", "iso"));
+        assert_eq!(nas.completion_verify, CompletionVerifyMode::Full);
+        assert_eq!(nas.host_crash_recovery, HostCrashRecovery::Full);
+        let (media, matched) = config.resolve_for(&under("nas", "media/tv"));
+        assert_eq!(
+            matched.unwrap().path,
+            PathBuf::from(abs("nas")).join("media")
+        );
+        assert_eq!(media.completion_verify_sample_percent, 50);
+        assert_eq!(
+            media.completion_verify,
+            CompletionVerifyMode::Sample,
+            "not nas's Full"
+        );
+        assert_eq!(media.host_crash_recovery, HostCrashRecovery::Recent);
+
+        // Matching is by path component, never by string prefix.
+        let (lookalike, matched) = config.resolve_for(&PathBuf::from(abs("scratchpad")).join("x"));
+        assert!(matched.is_none(), "{lookalike:?}");
+    }
+
+    #[test]
+    fn path_policies_parse_from_toml_array_of_tables() {
+        let c: Config = toml::from_str(&format!(
+            r#"
+[crash_safety]
+completion_verify = "off"
+
+[[crash_safety.path_policies]]
+path = "{a}"
+completion_verify = "full"
+host_crash_recovery = "full"
+
+[[crash_safety.path_policies]]
+path = "{b}"
+completion_gate = false
+"#,
+            a = abs("nas"),
+            b = abs("scratch")
+        ))
+        .unwrap();
+        c.validate().unwrap();
+        assert_eq!(c.crash_safety.path_policies.len(), 2);
+        assert_eq!(
+            c.crash_safety.path_policies[0].completion_verify,
+            Some(CompletionVerifyMode::Full)
+        );
+        assert_eq!(c.crash_safety.path_policies[1].completion_gate, Some(false));
+        assert_eq!(c.crash_safety.path_policies[1].completion_verify, None);
+    }
+
+    #[test]
+    fn path_policies_reject_bad_entries() {
+        let with = |policies: Vec<PathPolicy>| CrashSafetyConfig {
+            path_policies: policies,
+            ..CrashSafetyConfig::default()
+        };
+        // Relative path.
+        assert!(with(vec![PathPolicy {
+            path: PathBuf::from("relative"),
+            ..PathPolicy::default()
+        }])
+        .validate()
+        .is_err());
+        // Empty path (the Default) is not absolute either.
+        assert!(with(vec![PathPolicy::default()]).validate().is_err());
+        // Out-of-range sample percent.
+        for pct in [0u8, 101] {
+            assert!(with(vec![PathPolicy {
+                completion_verify_sample_percent: Some(pct),
+                ..policy("a")
+            }])
+            .validate()
+            .is_err());
+        }
+        // Duplicate path.
+        assert!(with(vec![policy("a"), policy("a")]).validate().is_err());
+        // Too many.
+        assert!(with(
+            (0..=MAX_CRASH_SAFETY_PATHS)
+                .map(|i| policy(&format!("p{i}")))
+                .collect()
+        )
+        .validate()
+        .is_err());
+        // Fine.
+        with(vec![policy("a"), policy("b")]).validate().unwrap();
+    }
+
+    #[test]
+    fn path_policy_typos_fail_loudly() {
+        let err = toml::from_str::<Config>(
+            r#"
+[[crash_safety.path_policies]]
+path = "/x"
+completion_verfy = "full"
+"#,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("completion_verfy"), "{err}");
+    }
+
+    #[test]
+    fn path_policies_round_trip_as_json_for_the_settings_api() {
+        let c = CrashSafetyConfig {
+            path_policies: vec![PathPolicy {
+                completion_verify: Some(CompletionVerifyMode::Sample),
+                completion_verify_sample_percent: Some(10),
+                ..policy("nas")
+            }],
+            ..CrashSafetyConfig::default()
+        };
+        let json = serde_json::to_value(&c).unwrap();
+        assert_eq!(json["path_policies"][0]["completion_verify"], "sample");
+        assert_eq!(
+            json["path_policies"][0]["host_crash_recovery"],
+            serde_json::Value::Null
+        );
+        let back: CrashSafetyConfig = serde_json::from_value(json).unwrap();
+        assert_eq!(back, c);
+    }
+
+    #[test]
+    fn crash_safety_rejects_unknown_keys_so_typos_fail_loudly() {
+        let err = toml::from_str::<Config>(
+            r#"
+[crash_safety]
+host_crash_recovry = "full"
+"#,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("host_crash_recovry"), "{err}");
+        assert!(serde_json::from_str::<CrashSafetyConfig>(r#"{"nope": 1}"#).is_err());
+    }
+
+    #[test]
+    fn crash_safety_json_round_trips_for_runtime_settings_api() {
+        let c = CrashSafetyConfig {
+            host_crash_recovery: HostCrashRecovery::Watermark,
+            completion_verify: CompletionVerifyMode::Full,
+            ..CrashSafetyConfig::default()
+        };
+        let json = serde_json::to_string(&c).unwrap();
+        let back: CrashSafetyConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(c, back);
+        assert!(json.contains("\"host_crash_recovery\":\"watermark\""));
     }
 
     #[test]
@@ -890,6 +1504,16 @@ mod tests {
         assert!(matches!(c.validate(), Err(ConfigError::Validation(_))));
 
         let mut c = Config::default();
+        c.auth.api_tokens = vec!["x".repeat(MAX_AUTH_TOKEN_BYTES + 1)];
+        assert!(matches!(c.validate(), Err(ConfigError::Validation(_))));
+
+        let mut c = Config::default();
+        c.auth.api_tokens = (0..=MAX_AUTH_TOKENS)
+            .map(|index| format!("token-{index:03}-long-enough"))
+            .collect();
+        assert!(matches!(c.validate(), Err(ConfigError::Validation(_))));
+
+        let mut c = Config::default();
         c.network.max_incoming_handshakes = 0;
         assert!(matches!(c.validate(), Err(ConfigError::Validation(_))));
 
@@ -919,6 +1543,14 @@ mod tests {
 
         let mut c = Config::default();
         c.storage.file_pool_size = MAX_STORAGE_FILE_POOL_SIZE + 1;
+        assert!(matches!(c.validate(), Err(ConfigError::Validation(_))));
+
+        let mut c = Config::default();
+        c.storage.peer_read_cache_entries = MAX_STORAGE_PEER_READ_CACHE_ENTRIES + 1;
+        assert!(matches!(c.validate(), Err(ConfigError::Validation(_))));
+
+        let mut c = Config::default();
+        c.storage.peer_read_elevator_budget_ms = MAX_STORAGE_PEER_READ_ELEVATOR_BUDGET_MS + 1;
         assert!(matches!(c.validate(), Err(ConfigError::Validation(_))));
 
         let mut c = Config::default();

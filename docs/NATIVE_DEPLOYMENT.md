@@ -24,17 +24,17 @@ real-device, or long-soak certificate.
 
 - Put the session DB and torrent metadata on durable local storage.
 - Put payload data on mounted storage roots with stable paths.
-- Set a WebUI login with `[auth].username` and `[auth].password`; fresh
-  loopback installs default to `torrentng` / `torrentng`. The password must be
-  at least eight characters. Change it in Settings -> Security after login,
-  or edit `config.toml` directly.
+- An unset `[auth].password` generates a unique value in
+  `<session_dir>/bootstrap-password` with mode `0600`. Retrieve the active
+  WebUI login with `torrentngd auth-token`; change it in Settings -> Security
+  or set `[auth].username` and `[auth].password` in `config.toml`.
 - Set TorrentNG API tokens in `[auth].api_tokens` or a protected
   `[auth].api_tokens_file`; public binds reject missing, short, or placeholder
   tokens at startup.
 - API tokens remain valid for bearer authentication and WebUI login. At the
   login screen, a token may be entered in either the username or password
-  field. Public binds reject the default `torrentng` password even if the
-  username is changed; use the API token to sign in and set a unique password.
+  field. Public binds require an API token and a WebUI password of at least 16
+  characters.
 - Bind the TorrentNG API behind TLS or a trusted reverse proxy.
 - Keep mutating endpoints token-protected.
 - Enable scripts only with a root-owned allowlist directory.
@@ -58,12 +58,12 @@ download_dir = "/data"
 
 [auth]
 username = "torrentng"
-password = "torrentng"
 api_tokens = ["REPLACE_WITH_A_RANDOM_TOKEN_OF_AT_LEAST_16_CHARACTERS"]
 ```
 
-The login screen points to the token source: `auth.api_tokens` or
-`auth.api_tokens_file`. Runtime username/password changes are saved as
+The login screen explains that API tokens from `auth.api_tokens` or
+`auth.api_tokens_file` work in either field. Run `torrentngd auth-token` to
+retrieve the active WebUI login. Runtime username/password changes are saved as
 `auth-settings.json` in `daemon.session_dir`, with mode `0600`; this runtime
 override takes precedence over the config file until **Restore config.toml
 credentials** is selected in Settings -> Security. Include that file with the
@@ -202,11 +202,12 @@ variable, since `torrentngd` itself has no per-field environment overrides.
 ## systemd
 
 Example unit and tmpfiles definitions are in [deploy/native/systemd](../deploy/native/systemd).
-Install the binary and config, create the service user, then enable the unit:
+Install the binary and the loopback-safe package config, create the service
+user, then enable the unit:
 
 ```sh
 install -Dm755 target/release/torrentngd /usr/local/bin/torrentngd
-install -Dm644 deploy/native/config.toml /etc/torrentngd/config.toml
+install -Dm644 packaging/torrentngd.config.toml /etc/torrentngd/config.toml
 install -Dm644 deploy/native/systemd/torrentngd.service /etc/systemd/system/torrentngd.service
 install -Dm644 deploy/native/systemd/sysusers.conf /etc/sysusers.d/torrentngd.conf
 install -Dm644 deploy/native/systemd/tmpfiles.conf /etc/tmpfiles.d/torrentngd.conf
@@ -214,6 +215,12 @@ systemd-sysusers /etc/sysusers.d/torrentngd.conf
 systemd-tmpfiles --create /etc/tmpfiles.d/torrentngd.conf
 systemctl enable --now torrentngd
 ```
+
+The package config intentionally binds only to `127.0.0.1` and has no API
+token. Before exposing the API beyond the host, add a protected
+`auth.api_tokens_file` (or inline token in a root-readable private config) and
+change `daemon.api_bind`; startup rejects non-loopback binds without a real
+token.
 
 ## Kubernetes
 
@@ -315,8 +322,21 @@ scripts/backend_burndown_scale_release.sh \
 
 The smoke binds the artifact digest to authenticated health, TorrentNG-client and qBittorrent
 REST, metrics, and SIGTERM evidence. The scale suite is synthetic optimized-build
-evidence; it does not certify production hardware, restart recovery, or a 100k
-live daemon fixture.
+evidence; it does not certify production hardware, restart recovery, or a
+numeric live-daemon capacity fixture.
+
+### Power loss and crash behavior
+
+`torrentngd` keeps a run marker in `session_dir` and, after an unclean shutdown,
+re-verifies data written shortly before the crash instead of trusting its resume
+state; finished downloads are held until their data is synced. Defaults are safe
+for local ext4/xfs/btrfs/zfs storage. If the download directory is on hardware or
+a mount whose `fsync` you do not fully trust (consumer drives with the write cache
+enabled and no UPS, hardware RAID without a battery, mergerfs, NFS, ZFS with
+`sync=disabled`), add it to `crash_safety.weak_mount_paths` and consider
+`completion_verify = "sample"`. Alert on `torrentng_completions_pending` and
+`torrentng_integrity_regressions_total`. Options, semantics and platform support
+are in [CRASH_SAFETY.md](CRASH_SAFETY.md).
 
 Live public transfer evidence is optional for offline CI but required before a
 production release:

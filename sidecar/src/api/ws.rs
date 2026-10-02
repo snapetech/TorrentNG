@@ -1,14 +1,17 @@
 use axum::{
     extract::{State, WebSocketUpgrade},
-    response::IntoResponse,
+    http::StatusCode,
+    response::{IntoResponse, Response},
 };
 use serde::Serialize;
 use std::time::Duration;
-use tokio::time::timeout;
+use tokio::{sync::OwnedSemaphorePermit, time::timeout};
 
 use super::server::AppState;
 
 const WS_SEND_TIMEOUT: Duration = Duration::from_secs(5);
+const MAX_WS_MESSAGE_BYTES: usize = 64 * 1024;
+const MAX_WS_WRITE_BUFFER_BYTES: usize = 256 * 1024;
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -45,13 +48,25 @@ pub enum Event {
     },
 }
 
-pub async fn handler(ws: WebSocketUpgrade, State(s): State<AppState>) -> impl IntoResponse {
-    ws.on_upgrade(move |socket| handle_socket(socket, s.events.subscribe()))
+pub async fn handler(ws: WebSocketUpgrade, State(s): State<AppState>) -> Response {
+    let Ok(permit) = s.ws_clients.clone().try_acquire_owned() else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "websocket client capacity exhausted; retry later",
+        )
+            .into_response();
+    };
+    ws.max_message_size(MAX_WS_MESSAGE_BYTES)
+        .max_frame_size(MAX_WS_MESSAGE_BYTES)
+        .max_write_buffer_size(MAX_WS_WRITE_BUFFER_BYTES)
+        .on_upgrade(move |socket| handle_socket(socket, s.events.subscribe(), permit))
+        .into_response()
 }
 
 async fn handle_socket(
     mut socket: axum::extract::ws::WebSocket,
     mut rx: tokio::sync::broadcast::Receiver<Event>,
+    _permit: OwnedSemaphorePermit,
 ) {
     loop {
         tokio::select! {

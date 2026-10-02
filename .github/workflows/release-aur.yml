@@ -17,8 +17,17 @@ jobs:
   publish-aur:
     runs-on: ubuntu-latest
     steps:
+      - name: Checkout trusted release policy
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          fetch-depth: 0
+          ref: main
+          persist-credentials: false
+
       - name: Resolve tag
         id: tag
+        env:
+          RELEASE_INPUT_TAG: ${{ github.event.inputs.tag || github.event.release.tag_name }}
         shell: bash
         env:
           REQUESTED_TAG: ${{ inputs.tag || github.event.release.tag_name }}
@@ -34,9 +43,16 @@ jobs:
             echo "Invalid release tag: $tag" >&2
             exit 1
           fi
-          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          git fetch --force origin main --tags
+          tag_commit="$(git rev-parse --verify "refs/tags/$tag^{commit}")"
+          if ! git merge-base --is-ancestor "$tag_commit" origin/main; then
+            echo "Tag $tag points at $tag_commit, which is not on origin/main." >&2
+            exit 1
+          fi
+          printf 'tag=%s\n' "$tag" >> "$GITHUB_OUTPUT"
 
-      - uses: actions/checkout@v7
+      - name: Checkout release source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           ref: main
           persist-credentials: false
@@ -75,6 +91,7 @@ jobs:
           git clone ssh://aur@aur.archlinux.org/torrentngd-git.git "$workdir/torrentngd-git"
           cp packaging/arch/PKGBUILD "$workdir/torrentngd-git/PKGBUILD"
           cp packaging/arch/torrentngd.{service,sysusers,tmpfiles} "$workdir/torrentngd-git/"
+          cp packaging/torrentngd.config.toml "$workdir/torrentngd-git/"
           docker run --rm \
             -e HOST_UID="$(id -u)" \
             -e HOST_GID="$(id -g)" \

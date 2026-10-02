@@ -13,9 +13,10 @@ protocol implementation.
 
 ## Constraints that shape this codebase
 
-- **Must handle 100k rows.** The torrent table is virtualized
+- **Keep row rendering bounded.** The torrent table is virtualized
   (`@tanstack/react-virtual`) — never render or hold a non-virtualized list of
-  all torrents.
+  all torrents. No numeric row-capacity claim is part of the current release
+  scope.
 - **Server-side sort/filter/paginate.** Filtering and sorting happen on
   whichever backend cache is running; the browser never loads the full
   torrent set to filter client-side.

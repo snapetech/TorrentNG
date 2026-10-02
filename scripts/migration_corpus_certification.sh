@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
+# These are literal Markdown instructions; backticks must not be shell-expanded.
+# shellcheck disable=SC2016
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 REPORT_DIR="${TNG_MIGRATION_CORPUS_REPORT_DIR:-$ROOT/certification/reports}"
@@ -310,7 +312,10 @@ fi
   if [[ "$manifest_status" == "PASS" ]]; then
     cat "$manifest_report"
   else
+    # Literal Markdown instructions intentionally contain backticks.
+    # shellcheck disable=SC2016
     echo 'Copy `manifest.example.toml` to `manifest.toml` and list every required source family.'
+    # shellcheck disable=SC2016
     echo 'Declared artifacts must stay under the matching source-family directory and include `path`, `source`, and `permission`.'
   fi
 } >> "$OUT"

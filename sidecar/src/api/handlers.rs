@@ -1,7 +1,7 @@
 use axum::{
     extract::{Multipart, Path, Query, State},
     http::StatusCode,
-    response::IntoResponse,
+    response::{IntoResponse, Response},
     Json,
 };
 use serde::{
@@ -10,8 +10,16 @@ use serde::{
 };
 #[cfg(unix)]
 use std::ffi::CString;
+#[cfg(target_os = "linux")]
+use std::io;
+#[cfg(target_os = "linux")]
+use std::os::{
+    fd::{AsRawFd, FromRawFd},
+    unix::ffi::OsStrExt,
+};
 use std::{
     collections::{BTreeMap, HashSet},
+    fs::File,
     io::{Read, Write},
     path::{Path as FsPath, PathBuf},
     process::Stdio,
@@ -27,10 +35,16 @@ use tokio::{
 use super::server::AppState;
 use super::ws::Event;
 use crate::backend::{post_remote_json, ratio_milli, BackendHealth, BackendStatus};
+use crate::cache::workflows::{validate_rss_rule, validate_workflow_rule, MAX_WORKFLOW_RULES};
 use crate::cache::{
     bounded_page_limit, is_automation_state_capacity_error, is_category_tag_capacity_error,
-    validate_page_offset, AppEventRow, Category, ListParams, RatioGroup, RssRule,
-    RssRuleUpsertResult, SavedView, TorrentLiveRow, WorkflowRule, WorkflowRun,
+    validate_page_offset, AppEventRow, ListParams, RatioGroup, RssRule, RssRuleUpsertResult,
+    SavedView, TorrentLiveRow, WorkflowRule, WorkflowRun, MAX_CATEGORY_TEXT_BYTES,
+    MAX_TAG_TEXT_BYTES, MAX_TORRENT_LOCATION_TEXT_BYTES,
+};
+use crate::cache::{
+    ratio::{validate_ratio_group, MAX_RATIO_GROUPS},
+    views::validate_saved_view,
 };
 use crate::rtorrent::{engine::ProbeValue, XmlValue};
 use crate::safe_file::open_regular_read;
@@ -50,9 +64,7 @@ const MAX_API_TRACKER_MUTATIONS: usize = 1_024;
 const MAX_API_TRACKER_URL_BYTES: usize = 8_192;
 const MAX_API_FILE_PRIORITY_UPDATES: usize = 4_096;
 const MAX_CROSS_SEED_OPERATIONS: usize = 10_000;
-const MAX_RATIO_GROUPS: usize = 1_024;
 const MAX_RATIO_GROUP_NAME_BYTES: usize = 256;
-const MAX_WORKFLOW_RULES: usize = 1_024;
 const MAX_WORKFLOW_ID_BYTES: usize = 128;
 const MAX_WORKFLOW_NAME_BYTES: usize = 256;
 const MAX_WORKFLOW_TOKEN_BYTES: usize = 64;
@@ -81,6 +93,24 @@ fn automation_state_write_status(error: &anyhow::Error) -> StatusCode {
     } else {
         StatusCode::INTERNAL_SERVER_ERROR
     }
+}
+
+const MAX_API_MUTATION_ITEMS: usize = 16_384;
+const MAX_API_TEXT_BYTES: usize = 64 * 1024;
+const MAX_API_HASH_BYTES: usize = 128;
+
+fn api_hash_is_bounded(hash: &str) -> bool {
+    !hash.is_empty() && hash.len() <= MAX_API_HASH_BYTES
+}
+
+fn reject_invalid_api_hash(hash: &str) -> Option<Response> {
+    (!api_hash_is_bounded(hash)).then(|| {
+        (
+            StatusCode::BAD_REQUEST,
+            format!("torrent hash must be non-empty and at most {MAX_API_HASH_BYTES} bytes"),
+        )
+            .into_response()
+    })
 }
 
 // --- Health ---
@@ -1259,6 +1289,13 @@ pub async fn upsert_saved_view(
     if view.name.is_empty() {
         return (StatusCode::BAD_REQUEST, "saved view name must not be empty").into_response();
     }
+    if validate_saved_view(&view).is_err() {
+        return (
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "saved view contains a field that exceeds the maximum length",
+        )
+            .into_response();
+    }
     let _write_guard = s.control_plane_write.lock().await;
     match s
         .db
@@ -1359,6 +1396,13 @@ pub async fn upsert_ratio_group(
         return (
             StatusCode::BAD_REQUEST,
             "seeding_time_limit must be -1 or greater",
+        )
+            .into_response();
+    }
+    if validate_ratio_group(&group).is_err() {
+        return (
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "ratio group contains a field that exceeds the maximum length",
         )
             .into_response();
     }
@@ -1604,6 +1648,13 @@ pub async fn upsert_rss_rule(
     if rule.include.is_empty() {
         return (StatusCode::BAD_REQUEST, "include must not be empty").into_response();
     }
+    if validate_rss_rule(&rule).is_err() {
+        return (
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "RSS rule contains a field that exceeds the maximum length",
+        )
+            .into_response();
+    }
 
     let _write_guard = s.control_plane_write.lock().await;
     match s
@@ -1678,6 +1729,18 @@ pub async fn test_rss_rules(
     if title.is_empty() {
         return (StatusCode::BAD_REQUEST, "title must not be empty").into_response();
     }
+    if title.len() > MAX_API_TEXT_BYTES
+        || body
+            .link
+            .as_deref()
+            .is_some_and(|link| link.len() > MAX_API_TEXT_BYTES)
+    {
+        return (
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "RSS text exceeds the maximum length",
+        )
+            .into_response();
+    }
     let title = title.to_owned();
     let link = body.link.clone();
     match s
@@ -1711,6 +1774,13 @@ pub async fn apply_rss_rules(
     else {
         return (StatusCode::BAD_REQUEST, "link must not be empty").into_response();
     };
+    if title.len() > MAX_API_TEXT_BYTES || link.len() > MAX_API_TEXT_BYTES {
+        return (
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "RSS text exceeds the maximum length",
+        )
+            .into_response();
+    }
 
     let title = title.to_owned();
     let link = link.to_owned();
@@ -1798,18 +1868,25 @@ pub async fn cross_seed_helper(
     Json(body): Json<CrossSeedBody>,
 ) -> impl IntoResponse {
     let mut seen_hashes = HashSet::new();
-    let hashes = normalized_nonempty(&body.hashes)
-        .into_iter()
-        .filter(|hash| seen_hashes.insert(hash.to_ascii_lowercase()))
-        .collect::<Vec<_>>();
+    let hashes = match normalized_nonempty(&body.hashes) {
+        Ok(values) => values
+            .into_iter()
+            .map(str::to_owned)
+            .filter(|hash| seen_hashes.insert(hash.to_ascii_lowercase()))
+            .collect::<Vec<_>>(),
+        Err(error) => return (StatusCode::PAYLOAD_TOO_LARGE, error).into_response(),
+    };
     if hashes.is_empty() {
         return (StatusCode::BAD_REQUEST, "hashes must not be empty").into_response();
     }
     let mut seen_trackers = HashSet::new();
-    let trackers = normalized_nonempty(&body.trackers)
-        .into_iter()
-        .filter(|tracker| seen_trackers.insert((*tracker).to_owned()))
-        .collect::<Vec<_>>();
+    let trackers = match normalized_nonempty(&body.trackers) {
+        Ok(values) => values
+            .into_iter()
+            .filter(|tracker| seen_trackers.insert((*tracker).to_owned()))
+            .collect::<Vec<_>>(),
+        Err(error) => return (StatusCode::PAYLOAD_TOO_LARGE, error).into_response(),
+    };
     if trackers.is_empty() && !body.reannounce {
         return (
             StatusCode::BAD_REQUEST,
@@ -1830,7 +1907,7 @@ pub async fn cross_seed_helper(
     }
     if body.dry_run {
         return Json(BulkResult {
-            applied: hashes.into_iter().map(str::to_owned).collect(),
+            applied: hashes,
             errors: vec![],
             dry_run: true,
         })
@@ -1839,7 +1916,7 @@ pub async fn cross_seed_helper(
 
     let mut applied = Vec::new();
     let mut errors = Vec::new();
-    for hash in hashes {
+    for hash in &hashes {
         let mut hash_errors = Vec::new();
         for tracker in &trackers {
             if s.backend.add_tracker(hash, tracker).await.is_err() {
@@ -1852,7 +1929,7 @@ pub async fn cross_seed_helper(
             }
         }
         if hash_errors.is_empty() {
-            applied.push(hash.to_owned());
+            applied.push(hash.clone());
             emit_torrent_updated(&s, hash).await;
         } else {
             errors.push(format!("{hash}: {}", hash_errors.join("; ")));
@@ -1968,6 +2045,13 @@ pub async fn upsert_workflow(
         return (
             StatusCode::BAD_REQUEST,
             "workflow category and target_category are limited to 256 bytes",
+        )
+            .into_response();
+    }
+    if validate_workflow_rule(&rule).is_err() {
+        return (
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "workflow rule contains a field that exceeds the maximum length",
         )
             .into_response();
     }
@@ -2241,6 +2325,91 @@ pub async fn run_workflow(
     }
 }
 
+struct ValidatedWorkflowScript {
+    #[cfg(not(target_os = "linux"))]
+    canonical: PathBuf,
+    #[cfg(target_os = "linux")]
+    file: File,
+}
+
+#[cfg(target_os = "linux")]
+fn open_workflow_script_no_follow(path: &FsPath) -> io::Result<File> {
+    use std::path::Component;
+
+    let mut components = path.components();
+    if !matches!(components.next(), Some(Component::RootDir)) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "workflow script path must be absolute",
+        ));
+    }
+    let mut parts = Vec::new();
+    for component in components {
+        let Component::Normal(value) = component else {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "workflow script path contains an unsafe component",
+            ));
+        };
+        parts.push(value.to_owned());
+    }
+    let Some(final_name) = parts.pop() else {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "workflow script path must identify a file",
+        ));
+    };
+
+    let root = CString::new("/").expect("literal has no NUL");
+    let root_fd = unsafe {
+        libc::open(
+            root.as_ptr(),
+            libc::O_PATH | libc::O_DIRECTORY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+        )
+    };
+    if root_fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let mut parent = unsafe { File::from_raw_fd(root_fd) };
+    for part in parts {
+        let name = CString::new(part.as_bytes()).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "workflow script path contains NUL",
+            )
+        })?;
+        let fd = unsafe {
+            libc::openat(
+                parent.as_raw_fd(),
+                name.as_ptr(),
+                libc::O_PATH | libc::O_DIRECTORY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+            )
+        };
+        if fd < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        parent = unsafe { File::from_raw_fd(fd) };
+    }
+
+    let name = CString::new(final_name.as_bytes()).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "workflow script path contains NUL",
+        )
+    })?;
+    let fd = unsafe {
+        libc::openat(
+            parent.as_raw_fd(),
+            name.as_ptr(),
+            libc::O_PATH | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+        )
+    };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(unsafe { File::from_raw_fd(fd) })
+}
+
 async fn execute_workflow_script(
     s: &AppState,
     rule: &WorkflowRule,
@@ -2259,7 +2428,7 @@ async fn execute_workflow_script(
     let args = parts.map(str::to_owned).collect::<Vec<_>>();
     let program_path = PathBuf::from(program);
     let allowed_script_dirs = s.cfg.workflows.allowed_script_dirs.clone();
-    let canonical = tokio::task::spawn_blocking(move || {
+    let script = tokio::task::spawn_blocking(move || {
         if !program_path.is_absolute() {
             return Err("script command must use an absolute executable path".to_owned());
         }
@@ -2274,14 +2443,55 @@ async fn execute_workflow_script(
         if !allowed {
             return Err("script path is outside allowed_script_dirs".to_owned());
         }
-        Ok::<_, String>(canonical)
+
+        #[cfg(target_os = "linux")]
+        {
+            // Keep the checked executable pinned to the inode that was
+            // validated. Spawning the canonical path later leaves a local
+            // attacker a check/use race in which the file can be replaced
+            // after validation but before execve.
+            let file = open_workflow_script_no_follow(&canonical)
+                .map_err(|e| format!("open validated script: {e}"))?;
+            if !file
+                .metadata()
+                .map_err(|e| format!("stat validated script: {e}"))?
+                .is_file()
+            {
+                return Err("validated script is not a regular file".to_owned());
+            }
+            Ok::<_, String>(ValidatedWorkflowScript { file })
+        }
+
+        #[cfg(not(target_os = "linux"))]
+        {
+            Ok::<_, String>(ValidatedWorkflowScript { canonical })
+        }
     })
     .await
     .map_err(|error| crate::task_join_error_summary("script path validation worker", &error))??;
 
     const MAX_SCRIPT_OUTPUT_BYTES: u64 = 64 * 1024;
 
-    let mut child = Command::new(canonical);
+    #[cfg(target_os = "linux")]
+    let mut child = {
+        let fd = script.file.as_raw_fd();
+        let mut command = Command::new(format!("/proc/self/fd/{fd}"));
+        unsafe {
+            command.pre_exec(move || {
+                let flags = libc::fcntl(fd, libc::F_GETFD);
+                if flags < 0 {
+                    return Err(io::Error::last_os_error());
+                }
+                if libc::fcntl(fd, libc::F_SETFD, flags & !libc::FD_CLOEXEC) < 0 {
+                    return Err(io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        command
+    };
+    #[cfg(not(target_os = "linux"))]
+    let mut child = Command::new(&script.canonical);
     child
         .args(args)
         .stdin(Stdio::null())
@@ -2890,6 +3100,9 @@ pub async fn update_torrent(
     Path(hash): Path<String>,
     Json(body): Json<UpdateTorrentBody>,
 ) -> impl IntoResponse {
+    if let Some(response) = reject_invalid_api_hash(&hash) {
+        return response;
+    }
     let Some(save_path) = body.save_path.as_deref().map(str::trim) else {
         return (StatusCode::BAD_REQUEST, "save_path is required").into_response();
     };
@@ -2931,6 +3144,13 @@ pub async fn update_torrent(
 // --- Add torrent ---
 
 pub async fn add_torrent(State(s): State<AppState>, mut multipart: Multipart) -> impl IntoResponse {
+    let Ok(_large_upload_permit) = s.large_uploads.clone().try_acquire_owned() else {
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
+            "too many concurrent torrent uploads; retry later",
+        )
+            .into_response();
+    };
     s.metrics.api_requests_total.fetch_add(1, Ordering::Relaxed);
     let mut save_path = String::new();
     let mut category = String::new();
@@ -3167,13 +3387,21 @@ pub async fn add_torrent(State(s): State<AppState>, mut multipart: Multipart) ->
 
 // --- Delete ---
 
+#[derive(Deserialize)]
+pub struct DeleteTorrentQuery {
+    pub delete_files: Option<String>,
+}
+
 pub async fn delete_torrent(
     State(s): State<AppState>,
     Path(hash): Path<String>,
-    Query(q): Query<std::collections::HashMap<String, String>>,
+    Query(q): Query<DeleteTorrentQuery>,
 ) -> impl IntoResponse {
-    let delete_files = match q.get("delete_files") {
-        Some(value) => match value.as_str() {
+    if let Some(response) = reject_invalid_api_hash(&hash) {
+        return response;
+    }
+    let delete_files = match q.delete_files.as_deref() {
+        Some(value) => match value {
             "true" => true,
             "false" => false,
             _ => return StatusCode::BAD_REQUEST.into_response(),
@@ -3387,14 +3615,45 @@ pub async fn patch_torrent_trackers(
     Path(hash): Path<String>,
     Json(body): Json<PatchTrackersBody>,
 ) -> impl IntoResponse {
-    let add = normalized_nonempty(&body.add);
-    let remove = normalized_nonempty(&body.remove);
+    if let Some(response) = reject_invalid_api_hash(&hash) {
+        return response;
+    }
+    if body
+        .add
+        .len()
+        .saturating_add(body.remove.len())
+        .saturating_add(body.edit.len())
+        > MAX_API_MUTATION_ITEMS
+    {
+        return (
+            StatusCode::PAYLOAD_TOO_LARGE,
+            format!("tracker mutation exceeds the maximum of {MAX_API_MUTATION_ITEMS} items"),
+        )
+            .into_response();
+    }
+    let add = match normalized_nonempty(&body.add) {
+        Ok(values) => values,
+        Err(error) => return (StatusCode::PAYLOAD_TOO_LARGE, error).into_response(),
+    };
+    let remove = match normalized_nonempty(&body.remove) {
+        Ok(values) => values,
+        Err(error) => return (StatusCode::PAYLOAD_TOO_LARGE, error).into_response(),
+    };
     let edit: Vec<(&str, &str)> = body
         .edit
         .iter()
         .map(|item| (item.orig_url.trim(), item.new_url.trim()))
         .filter(|(orig_url, new_url)| !orig_url.is_empty() && !new_url.is_empty())
         .collect();
+    if edit.iter().any(|(orig_url, new_url)| {
+        orig_url.len() > MAX_API_TEXT_BYTES || new_url.len() > MAX_API_TEXT_BYTES
+    }) {
+        return (
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "tracker URL exceeds the maximum length",
+        )
+            .into_response();
+    }
 
     if add.is_empty() && remove.is_empty() && edit.is_empty() {
         return (
@@ -3509,8 +3768,18 @@ pub async fn set_file_priorities(
     Path(hash): Path<String>,
     Json(body): Json<SetFilePrioritiesBody>,
 ) -> impl IntoResponse {
+    if let Some(response) = reject_invalid_api_hash(&hash) {
+        return response;
+    }
     if body.files.is_empty() {
         return (StatusCode::BAD_REQUEST, "files must not be empty").into_response();
+    }
+    if body.files.len() > MAX_API_MUTATION_ITEMS {
+        return (
+            StatusCode::PAYLOAD_TOO_LARGE,
+            format!("file priority mutation exceeds the maximum of {MAX_API_MUTATION_ITEMS} items"),
+        )
+            .into_response();
     }
 
     let hash = match cached_torrent_hash(&s, &hash).await {
@@ -3591,23 +3860,30 @@ pub async fn upsert_category(
         return (StatusCode::BAD_REQUEST, "category name must not be empty").into_response();
     }
     let save_path = body.save_path.as_deref().unwrap_or("");
+    if name.len() > MAX_CATEGORY_TEXT_BYTES || save_path.len() > MAX_CATEGORY_TEXT_BYTES {
+        return (
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "category name or save_path exceeds the maximum length",
+        )
+            .into_response();
+    }
     let category_name = name.to_owned();
     let category_path = save_path.to_owned();
+    let response_name = category_name.clone();
     match s
         .db
         .run_blocking("upsert_category", move |db| {
-            db.upsert_category(&category_name, &category_path)
+            db.upsert_category(&category_name, &category_path)?;
+            db.list_categories()?
+                .into_iter()
+                .find(|category| category.name == response_name)
+                .ok_or_else(|| anyhow::anyhow!("category disappeared after upsert"))
         })
         .await
     {
-        Ok(_) => {
+        Ok(category) => {
             emit(&s, Event::CategoriesUpdated).await;
-            Json(Category {
-                name: name.to_owned(),
-                save_path: save_path.to_owned(),
-                torrent_count: 0,
-            })
-            .into_response()
+            Json(category).into_response()
         }
         Err(e) => {
             tracing::error!(component = "api", operation = "upsert_category", result = "error", category = %crate::url_redaction::redact_display(&name), error = %crate::url_redaction::redact_display(&e), "category upsert failed");
@@ -3667,6 +3943,13 @@ pub async fn create_tag(State(s): State<AppState>, Json(body): Json<TagBody>) ->
     let name = body.name.trim();
     if name.is_empty() {
         return (StatusCode::BAD_REQUEST, "tag name must not be empty").into_response();
+    }
+    if name.len() > MAX_TAG_TEXT_BYTES {
+        return (
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "tag name exceeds the maximum length",
+        )
+            .into_response();
     }
     let tag_name = name.to_owned();
     match s
@@ -4067,7 +4350,7 @@ fn bounded_normalized_tags(tags: &[String]) -> Result<Vec<&str>, ()> {
     if tags.len() > MAX_API_TAGS || tags.iter().any(|tag| tag.len() > MAX_API_TAG_BYTES) {
         return Err(());
     }
-    let normalized = normalized_nonempty(tags);
+    let normalized = normalized_nonempty(tags).map_err(|_| ())?;
     if normalized.is_empty() {
         Err(())
     } else {
@@ -4075,12 +4358,25 @@ fn bounded_normalized_tags(tags: &[String]) -> Result<Vec<&str>, ()> {
     }
 }
 
-fn normalized_nonempty(values: &[String]) -> Vec<&str> {
-    values
-        .iter()
-        .map(|value| value.trim())
-        .filter(|value| !value.is_empty())
-        .collect()
+fn normalized_nonempty(values: &[String]) -> Result<Vec<&str>, String> {
+    if values.len() > MAX_API_MUTATION_ITEMS {
+        return Err(format!(
+            "mutation exceeds the maximum of {MAX_API_MUTATION_ITEMS} items"
+        ));
+    }
+    let mut normalized = Vec::with_capacity(values.len());
+    for value in values {
+        let value = value.trim();
+        if value.len() > MAX_API_TEXT_BYTES {
+            return Err(format!(
+                "mutation item exceeds the maximum of {MAX_API_TEXT_BYTES} bytes"
+            ));
+        }
+        if !value.is_empty() {
+            normalized.push(value);
+        }
+    }
+    Ok(normalized)
 }
 
 // --- Bulk actions ---
@@ -4396,6 +4692,15 @@ pub async fn bulk_action(
 
     let category = body.category.as_deref().map(str::trim);
     let save_path = body.save_path.as_deref().map(str::trim);
+    if category.is_some_and(|value| value.len() > MAX_CATEGORY_TEXT_BYTES)
+        || save_path.is_some_and(|value| value.len() > MAX_TORRENT_LOCATION_TEXT_BYTES)
+    {
+        return (
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "category or save_path exceeds the maximum length",
+        )
+            .into_response();
+    }
     if action == "set-category" && category.is_none() {
         return (StatusCode::BAD_REQUEST, "category is required").into_response();
     }

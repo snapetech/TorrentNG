@@ -11,11 +11,10 @@ cd sidecar
 cargo test --test benchmarks -- --ignored --nocapture
 ```
 
-Use a smaller local dataset while iterating:
+Use a bounded local fixture while diagnosing a regression:
 
-```sh
-TNG_BENCH_TORRENTS=10000 cargo test --test benchmarks -- --ignored --nocapture
-```
+Set `TNG_BENCH_TORRENTS` to a bounded fixture size while diagnosing a
+regression, then run the same command above.
 
 Generate a markdown report:
 
@@ -23,12 +22,14 @@ Generate a markdown report:
 ./scripts/benchmark_report.sh
 ```
 
-The report runner uses `cargo test --release` because the roadmap targets are release-build targets. Debug builds are useful for correctness but are not representative for the 50k-row JSON/API path.
+The report runner uses `cargo test --release` because optimized behavior is
+useful for diagnosis. The generated report is informational and is not a
+release gate or torrent-count capacity certificate.
 
-Current covered targets:
+Current covered regression surfaces:
 
-- qBit `/api/qb/v2/torrents/info` at 50k synthetic torrents: `< 500ms`
-- qBit `/api/qb/v2/sync/maindata` delta under normal churn: `< 50ms`
+- qBit `/api/qb/v2/torrents/info` serialization and pagination
+- qBit `/api/qb/v2/sync/maindata` delta under normal churn
 
 Storage hardware checks live in `rt-storage` and can be run against a specific
 mount:

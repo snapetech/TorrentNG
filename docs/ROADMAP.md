@@ -89,7 +89,7 @@ Make existing *arr/autobrr/tool integrations work by selecting "qBittorrent" as 
 Replace ruTorrent as the primary UI.
 
 **Priority features:**
-1. [x] Virtualized torrent table (100k-row target)
+1. [x] Virtualized torrent table with bounded row rendering
 2. [x] Server-side filter + sort
 3. [x] WebSocket delta sync
 4. [x] Bulk ops with dry-run preview
@@ -114,26 +114,27 @@ Compatible-client-service-managed replacement for high-value ruTorrent plugins.
 - [x] Webhook actions
 - [x] *arr status feedback compatibility surface
 
-## Track 1 benchmark targets
+## Track 1 historical diagnostics (non-release)
+
+The following targets are retained as historical context only. Numeric
+torrent-count capacity proofs are not current release gates.
 
 | Scenario | Target |
 |---|---|
-| 1k torrents — UI first paint | < 1s |
-| 10k torrents — UI first paint | < 2s |
-| 15k torrents — UI first paint | < 3s |
-| 50k synthetic — `/torrents/info` API | < 500ms |
+| Representative fixture — UI first paint | measure and publish |
+| Representative fixture — `/torrents/info` API | measure and publish |
 | `/sync/maindata` delta under normal churn | < 50ms |
-| Compatible-client service memory at 15k torrents after 24h | < 500MB |
+| Compatible-client service memory under a bounded fixture | measure and publish |
 | Cold start + first torrent list ready | < 5s |
 
 ---
 
 # Historical Track 2 — TorrentNG Rust Client
 
-A ground-up Rust BitTorrent client daemon optimized for 10k–100k torrents, 200+ TB
-libraries, private-tracker seeding, and operational observability. This track is
-implemented across the workspace; local certification scripts exist, but
-production-scale/public certification remains deferred.
+A ground-up Rust BitTorrent client daemon for large libraries, private-tracker
+seeding, and operational observability. This track is implemented across the
+workspace; local certification scripts exist, but numeric capacity and
+production-scale/public certification are not current release claims.
 
 See `docs/ENGINE.md` for the full design.
 
@@ -161,7 +162,7 @@ Deliverables:
 - Storage design doc and invariants
 - Session DB schema
 - Threat model
-- Benchmark plan with synthetic 1k/5k/10k/15k/50k datasets
+- Benchmark plan with host-selected bounded synthetic diagnostics
 - Migration plan (from rTorrent/qBit/Transmission)
 - Crate workspace layout
 - Coding standards and unsafe policy
@@ -188,7 +189,7 @@ Build:
 - Per-mount disk scheduler (queue depth, HDD vs SSD profile, priority)
 - Dry-run import mode
 
-Exit criteria: verify existing complete torrent without downloading, detect missing/corrupt files, survive crash mid-check, resume recheck, dry-run import a 15k-torrent library.
+Exit criteria: verify existing complete torrent without downloading, detect missing/corrupt files, survive crash mid-check, resume recheck, and dry-run import a representative library.
 
 ## Track 2 — Phase 3: Tracker engine
 
@@ -213,7 +214,7 @@ Build:
 - Upload accounting per torrent/tracker/session
 - Per-torrent and global peer caps
 
-Exit criteria: seed a complete torrent to another client, seed multi-file torrent, reject invalid requests, maintain correct upload stats, run 1k passive seeding torrents.
+Exit criteria: seed a complete torrent to another client, seed multi-file torrent, reject invalid requests, maintain correct upload stats, and exercise a bounded passive-seeding fixture.
 
 ## Track 2 — Phase 5: Session daemon
 
@@ -251,11 +252,28 @@ Build:
 
 Exit criteria: download Linux ISO from public swarm, resume partial download, handle corrupt piece, complete and transition to seeding.
 
-## Track 2 — Phase 8: Scale hardening
+## Track 2 — Phase 8: Runtime/resource hardening
 
-Target: 10k → 15k torrents, 200+ TB simulation, tracker jitter, low idle CPU, bounded memory.
+Target: large-library resource behavior, tracker jitter, low idle CPU, bounded memory, and storage backpressure.
 
-Exit criteria: 15k torrents cold start under target, API responsive, recheck does not starve seeding, tracker manager avoids burst failures, UI cache consistent.
+Exit criteria: representative fixture cold start is measured, API remains responsive, recheck does not starve seeding, tracker manager avoids burst failures, and UI cache stays consistent.
+
+### Track 2 — cross-phase: crash safety
+
+Completed: durability barrier before resume records (Phase 2), plus the crash-safety
+work in [CRASH_SAFETY.md](CRASH_SAFETY.md): completion gate, `fast`-mode
+honesty, `fallocate(2)` preallocation (no zero emulation), run marker with host
+crash detection, recovery policy (`watermark`/`recent`/`full`), allocation audit,
+mount durability ratings, optional read-back verification, integrity-regression
+events, migration crash detection for rTorrent, a runtime settings API and WebUI
+panel, and a power-cut model test. Also done: macOS/FreeBSD/Windows probes,
+pure-v2 read-back verification and events, an explicit `finalizing` flag, and
+qBittorrent/Deluge/`--source-lock` migration crash detection, and per-location
+policies (`[[crash_safety.path_policies]]`) so mixed storage can differ. Open: a run on
+real Windows, macOS and FreeBSD hardware (Windows ran under wine, the others
+were only type-checked); the Windows allocated-range success path; NTFS
+valid-data-length detection; page-cache drop on macOS and Windows; verifying the
+qBittorrent/Deluge lock locations against the real clients.
 
 ## Track 2 — Phase 9: Web UI
 
@@ -287,10 +305,9 @@ remain qualification evidence rather than unimplemented protocol work.
 Required before 1.0:
 - [x] Migration tools from rTorrent, qBittorrent, Transmission
 - [x] qBit API compatibility report
-- [x] TorrentNG-client scale benchmark implementation and synthetic evidence
-  (100k proxy and 1k/2k hot-set policy) are checked in. A target-hardware or
-  public benchmark report remains external evidence and is not represented as
-  certified here.
+- [x] TorrentNG-client deterministic resource-regression diagnostics are
+  checked in. Numeric torrent-count capacity proof is intentionally outside the
+  release checklist.
 - [x] Threat model review
 - [x] Backup/restore docs
 - [x] TorrentNG client deployment docs
@@ -300,15 +317,15 @@ Required before 1.0:
 - [x] Prometheus/Grafana dashboard artifact
 - [x] Arch/AUR package template
 
-## Track 2 benchmark targets
+## Track 2 diagnostic targets (non-release)
 
 ### Engine
 
 | Scenario | Target |
 |---|---|
-| Cold start — 15k torrents | < 120s |
-| Steady idle RAM — 15k torrents | < 2.5 GB |
-| Crash recovery — 15k torrents | < 30s |
+| Cold start — representative fixture | measure and publish |
+| Steady idle RAM — bounded fixture | measure and publish |
+| Crash recovery — representative fixture | measure and publish |
 | Session restore — no global recheck required | ✓ |
 | Tracker announce storm after restart | 0 |
 | Recheck throughput — NVMe | measure and publish |
@@ -318,19 +335,19 @@ Required before 1.0:
 
 | Scenario | Target |
 |---|---|
-| `/api/v2/torrents/info` — 15k torrents | < 250ms |
+| `/api/v2/torrents/info` — representative fixture | measure and publish |
 | `/api/v2/sync/maindata` delta | < 50ms |
-| TorrentNG-client filter/sort — 15k | < 250ms |
-| Bulk tag — 10k torrents | < 2s |
+| TorrentNG-client filter/sort — representative fixture | measure and publish |
+| Bulk tag — bounded fixture | measure and publish |
 
 ### UI
 
 | Scenario | Target |
 |---|---|
-| Initial load — 15k torrents | < 3s |
+| Initial load — representative fixture | measure and publish |
 | Filter response | < 200ms |
 | Torrent detail open | < 100ms |
-| Bulk preview — 10k | < 1s |
+| Bulk preview — bounded fixture | measure and publish |
 
 ## Track 2 — "best in class" acceptance criteria
 
@@ -341,15 +358,15 @@ operator-facing polish.
 
 | Criterion | Status | Evidence |
 |---|---|---|
-| 15k torrents loaded and manageable | Done | `rt-metrics` scale tests and `scripts/native_engine_certification_report.sh` |
+| Large-library rows remain manageable under bounded rendering | Done | `rt-metrics` regression tests and virtualized WebUI |
 | 200+ TB library imported without forced global recheck | Done | `rt-migrate` dry-run/import planning and durable DB import tests |
 | qBit-compatible API works with Sonarr/Radarr/Prowlarr/autobrr | Done | Compatible-client live certification plus TorrentNG-client qBit projection tests |
 | Cold restart does not announce-storm trackers | Done | tracker restart storm scale test |
 | Rechecks are queued, resumable, cancellable, and visible | Done | durable job queue, recheck job, and engine recovery tests |
 | Bulk path/category/tracker edits have dry-run previews | Done | TorrentNG-client bulk preview and storage planning tests |
 | Storage engine has per-mount queueing and backpressure | Done | `rt-storage` scheduler and starvation tests |
-| UI can filter/sort 15k torrents without browser death | Done | virtualized WebUI and TorrentNG API scale targets |
+| UI can filter/sort without unbounded browser rendering | Done | virtualized WebUI and TorrentNG API regression tests |
 | Crash during move/check/import is recoverable | Done | job recovery, move planning, and migration atomicity tests |
 | Private tracker mode disables DHT/PEX/LSD unless explicitly enabled | Done | tracker policy tests |
 | Metrics and event logs explain failures without log spelunking | Done | TorrentNG metrics, diagnostics, and append-only event log |
-| Public benchmark report published | Done | TorrentNG-client certification report output under `certification/reports/` |
+| Deterministic performance diagnostic available | Done | Optional benchmark output under `benchmarks/` |

@@ -1,8 +1,9 @@
 # Storage I/O
 
 This document tracks the TorrentNG client storage path for large seedboxes. The
-target is explicit userspace I/O control for 10k-100k torrents and 200+ TB
-libraries without mmap as the primary data path.
+target is explicit userspace I/O control for large seed libraries without mmap
+as the primary data path. Numeric torrent-count capacity is a diagnostic
+parameter, not a current release claim.
 
 The executable feature matrix for this storage branch lives in
 [`STORAGE_NG_TEST_MATRIX.md`](STORAGE_NG_TEST_MATRIX.md).
@@ -144,6 +145,14 @@ according to the configured durability mode before the fastresume state was
 saved. If that sync fails, the state is saved with `clean_shutdown = false`, so
 startup falls back to verification instead of trusting stale piece state.
 
+Beyond the per-save barrier, a finished download is held until its payload is
+synced (the completion gate), and a fastresume record written without a data
+sync (`durability_mode = "fast"`) is marked `synced = false` and discarded after
+a host crash. Full-size preallocation calls `fallocate(2)` directly rather than
+`posix_fallocate(3)`, whose emulation writes zero bytes into every block on
+filesystems without native support and would hide never-written regions from the
+allocation audit. See [CRASH_SAFETY.md](CRASH_SAFETY.md).
+
 ## Completed Follow-Through
 
 The following items were previously tracked as implementation targets and are
@@ -190,6 +199,11 @@ implementation:
   valid.
 - Fastresume must not trust valid pieces after a configured durability sync
   failure.
+- A torrent is not reported complete until a payload barrier has succeeded
+  (or the filesystem is known unable to `fsync`); see the completion gate in
+  [CRASH_SAFETY.md](CRASH_SAFETY.md).
+- Preallocation must never emulate by writing zeros: use native `fallocate` or
+  a sparse length, so unwritten space stays visible to the allocation audit.
 - If a storage plan cannot prove that a destructive or partially applied step
   is safely rolled back, its durable job is failed with a manual-recovery
   signal and owning torrents remain quiesced until the filesystem is resolved.

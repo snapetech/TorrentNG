@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
+# These are literal Markdown instructions; backticks must not be shell-expanded.
+# shellcheck disable=SC2016
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 REPORT_DIR="${REPORT_DIR:-$ROOT/certification/reports}"
@@ -31,6 +33,8 @@ nonclean_rows() {
   ' "$status_tmp"
 }
 
+# Literal Markdown instructions intentionally contain backticks.
+# shellcheck disable=SC2016
 action_for() {
   local gate="$1"
   local status="$2"

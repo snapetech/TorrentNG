@@ -217,18 +217,16 @@ impl AppState {
         api_tokens: Vec<String>,
         api_metrics: Arc<ApiRuntimeMetrics>,
     ) -> Self {
+        let default_credentials = AuthCredentials {
+            username: "torrentng".to_owned(),
+            password: uuid::Uuid::new_v4().simple().to_string(),
+        };
         AppState {
             registry,
             engine,
             api_tokens: Arc::new(api_tokens),
-            auth_credentials: Arc::new(RwLock::new(AuthCredentials {
-                username: "torrentng".to_owned(),
-                password: "torrentng".to_owned(),
-            })),
-            configured_auth_credentials: AuthCredentials {
-                username: "torrentng".to_owned(),
-                password: "torrentng".to_owned(),
-            },
+            auth_credentials: Arc::new(RwLock::new(default_credentials.clone())),
+            configured_auth_credentials: default_credentials,
             auth_settings_path: None,
             public_bind: false,
             local_webui_session_token: None,
@@ -1097,6 +1095,7 @@ pub(crate) fn torrent_summary(entry: &rt_session::TorrentEntry) -> TorrentSummar
         num_peers: 0,
         num_seeds: 0,
         tracker_message: entry.tracker_message.clone(),
+        finalizing: entry.finalizing,
     }
 }
 
@@ -1348,6 +1347,7 @@ mod tests {
             num_peers: 0,
             num_seeds: 0,
             tracker_message: None,
+            finalizing: false,
         };
         let items = ChunkedVec::from_vec(vec![
             TorrentSnapshotItem {
@@ -1405,6 +1405,7 @@ mod tests {
             num_peers: 0,
             num_seeds: 0,
             tracker_message: None,
+            finalizing: false,
         };
         let items = ChunkedVec::from_vec(vec![
             TorrentSnapshotItem {

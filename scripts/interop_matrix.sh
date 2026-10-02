@@ -328,7 +328,13 @@ capture_artifacts() {
   mkdir -p "$WORKDIR/logs/$STAMP"
   compose ps >"$WORKDIR/logs/$STAMP/compose-ps.txt" 2>&1 || true
   for service in torrentngd qbittorrent transmission deluge rtorrent opentracker fixture-http; do
-    compose logs --no-color --tail=250 "$service" >"$WORKDIR/logs/$STAMP/$service.log" 2>&1 || true
+    if [[ "$service" == "qbittorrent" ]]; then
+      compose logs --no-color --tail=250 "$service" 2>&1 \
+        | sed -E 's/(temporary password is provided for this session: ).*/\1<redacted>/' \
+        >"$WORKDIR/logs/$STAMP/$service.log" || true
+    else
+      compose logs --no-color --tail=250 "$service" >"$WORKDIR/logs/$STAMP/$service.log" 2>&1 || true
+    fi
   done
   curl --max-time "$CURL_MAX_TIME" -fsS -H "Authorization: Bearer $RUST_TOKEN" "$(client_url torrentngd)/health" >"$WORKDIR/logs/$STAMP/rust-health.json" 2>/dev/null || true
   curl --max-time "$CURL_MAX_TIME" -fsS -H "Authorization: Bearer $RUST_TOKEN" "$(client_url torrentngd)/metrics" >"$WORKDIR/logs/$STAMP/rust-metrics.txt" 2>/dev/null || true
@@ -1562,9 +1568,6 @@ run_qbit_mutation_facade_case() {
     --data-urlencode "hashes=$info_hash" \
     "$(client_url torrentngd)/api/qb/v2/torrents/topPrio" >/dev/null || status="FAIL"
   curl --max-time "$CURL_MAX_TIME" -fsS -H "Authorization: Bearer $RUST_TOKEN" \
-    --data-urlencode "hashes=$info_hash" \
-    "$(client_url torrentngd)/api/qb/v2/torrents/recheck" >/dev/null || status="FAIL"
-  curl --max-time "$CURL_MAX_TIME" -fsS -H "Authorization: Bearer $RUST_TOKEN" \
     --data-urlencode "hash=$info_hash" \
     --data-urlencode "urls=http://127.0.0.1:9/dead-announce" \
     "$(client_url torrentngd)/api/qb/v2/torrents/addTrackers" >/dev/null || status="FAIL"
@@ -1616,6 +1619,11 @@ run_qbit_mutation_facade_case() {
   curl --max-time "$CURL_MAX_TIME" -fsS -X PUT -H "Authorization: Bearer $RUST_TOKEN" -H "Content-Type: application/json" \
     -d '{"download_limit":1048576,"upload_limit":524288,"seed_ratio_limit":null,"sequential_download":true}' \
     "$(client_url torrentngd)/api/v1/torrents/$info_hash/limits" >/dev/null || status="FAIL"
+  # Recheck is asynchronous. Run it after the metadata/file mutation
+  # assertions so the REST updates do not race the engine's active-job guard.
+  curl --max-time "$CURL_MAX_TIME" -fsS -H "Authorization: Bearer $RUST_TOKEN" \
+    --data-urlencode "hashes=$info_hash" \
+    "$(client_url torrentngd)/api/qb/v2/torrents/recheck" >/dev/null || status="FAIL"
   curl --max-time "$CURL_MAX_TIME" -fsS -H "Authorization: Bearer $RUST_TOKEN" "$(client_url torrentngd)/api/v1/torrents/$info_hash/files" |
     jq -e 'type == "array" and length >= 1' >/dev/null || status="FAIL"
   curl --max-time "$CURL_MAX_TIME" -fsS -H "Authorization: Bearer $RUST_TOKEN" "$(client_url torrentngd)/api/v1/torrents/$info_hash/trackers" |
@@ -1836,7 +1844,7 @@ bridge_public_reference_peers_to_rust() {
 }
 
 run_public_entry() {
-  local entry="$1" id enabled source resolver pattern max clients url metadata torrent_file torrent_name total info_hash status="PASS"
+  local entry="$1" id enabled source resolver pattern max clients url metadata torrent_file torrent_name total info_hash status="PASS" timeout
   IFS='|' read -r id enabled source resolver pattern max clients <<<"$entry"
   local optional=false
   if [[ -n "${INTEROP_PUBLIC_ONLY:-}" && "$id" != "$INTEROP_PUBLIC_ONLY" ]]; then
@@ -1878,7 +1886,14 @@ run_public_entry() {
     add_public_to_client "$client" "$url" "$torrent_file" || status="FAIL"
   done
   bridge_public_reference_peers_to_rust "$info_hash" || status="FAIL"
-  if ! wait_public_complete "${max:-$TIMEOUT_PUBLIC}" "$torrent_name" "$info_hash" "${selected[@]}"; then
+  # An explicit environment timeout is an operator bound for this run.  It
+  # must be able to cap the per-source TOML maximum for bounded diagnostics.
+  if [[ -n "${INTEROP_PUBLIC_TIMEOUT_SECS:-}" ]]; then
+    timeout="$INTEROP_PUBLIC_TIMEOUT_SECS"
+  else
+    timeout="${max:-$TIMEOUT_PUBLIC}"
+  fi
+  if ! wait_public_complete "$timeout" "$torrent_name" "$info_hash" "${selected[@]}"; then
     status="FAIL"
   fi
 

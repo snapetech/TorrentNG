@@ -41,5 +41,6 @@ uuid.workspace = true
 tikv-jemallocator = { version = "0.7.0", features = ["background_threads"] }
 
 [dev-dependencies]
+libc.workspace = true
 tempfile.workspace = true
 tower.workspace = true

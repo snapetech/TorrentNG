@@ -3,6 +3,8 @@ use serde::Serialize;
 
 use super::client::{Client, XmlValue};
 
+const MAX_FILE_ROWS: usize = 100_000;
+
 #[derive(Debug, Clone, Serialize)]
 pub struct RawFile {
     pub index: usize,
@@ -36,6 +38,7 @@ impl Client {
             .with_context(|| format!("f.multicall {hash}"))?;
 
         let rows = result.try_into_array()?;
+        ensure_file_row_count(rows.len())?;
         let mut out = Vec::with_capacity(rows.len());
         for (i, row) in rows.into_iter().enumerate() {
             let f = row.try_into_array()?;
@@ -94,6 +97,13 @@ impl Client {
         .await?;
         Ok(())
     }
+}
+
+fn ensure_file_row_count(count: usize) -> Result<()> {
+    if count > MAX_FILE_ROWS {
+        bail!("rTorrent file response contains more than {MAX_FILE_ROWS} rows");
+    }
+    Ok(())
 }
 
 fn required_path(fields: &[XmlValue], index: usize) -> Result<String> {

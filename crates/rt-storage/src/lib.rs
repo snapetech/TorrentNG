@@ -1,5 +1,8 @@
+pub mod alloc_audit;
 pub mod backend;
+pub mod boot;
 pub mod device;
+pub mod durability_probe;
 pub mod elevator;
 pub mod error;
 pub mod fd_limit;
@@ -18,11 +21,25 @@ mod secure_fs;
 #[cfg(windows)]
 mod windows_secure_fs;
 
+#[cfg(windows)]
+pub(crate) mod win32;
+
+pub use alloc_audit::{
+    allocation_audit_supported, audit_file_allocation, AllocationAudit, AllocationGaps, AuditMethod,
+};
 pub use backend::{
     BackendKind, BackendRequest, BackendSelection, DiskBackend, FixedBufferStrategy, PreadBackend,
     SelectedDiskBackend, UringBackend, UringProbe,
 };
-pub use device::{detect_storage_profile, detect_storage_topology, StorageTopology};
+pub use boot::{boot_changed, current_boot_identity, normalize_boot_identity};
+pub use device::{
+    detect_mount_details, detect_storage_profile, detect_storage_topology, MountDetails,
+    StorageTopology,
+};
+pub use durability_probe::{
+    apply_overrides as apply_durability_overrides, classify_mount, mount_probe_supported,
+    probe_mount_durability, DurabilityTrust, MountDurability,
+};
 pub use elevator::{
     elevator_class_weight, DeviceElevator, DeviceId, ElevatorDispatch, FileKey, IoKind, IoOp,
 };

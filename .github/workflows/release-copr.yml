@@ -16,8 +16,17 @@ jobs:
   publish-copr:
     runs-on: ubuntu-latest
     steps:
+      - name: Checkout trusted release policy
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          fetch-depth: 0
+          ref: main
+          persist-credentials: false
+
       - name: Resolve version
         id: version
+        env:
+          RELEASE_INPUT_TAG: ${{ github.event.inputs.tag || github.event.release.tag_name }}
         shell: bash
         env:
           REQUESTED_TAG: ${{ inputs.tag || github.event.release.tag_name }}
@@ -36,8 +45,8 @@ jobs:
           rpm_version="${tag#main-}"
           rpm_version="${rpm_version//-/.}"
           {
-            echo "tag=$tag"
-            echo "rpm_version=$rpm_version"
+            printf 'tag=%s\n' "$tag"
+            printf 'rpm_version=%s\n' "$rpm_version"
           } >> "$GITHUB_OUTPUT"
 
       - uses: actions/checkout@v7
@@ -107,7 +116,7 @@ jobs:
           cp packaging/arch/torrentngd.service "$rpm_top/SOURCES/"
           cp packaging/arch/torrentngd.sysusers "$rpm_top/SOURCES/"
           cp packaging/arch/torrentngd.tmpfiles "$rpm_top/SOURCES/"
-          cp deploy/native/config.toml "$rpm_top/SOURCES/config.toml"
+          cp packaging/torrentngd.config.toml "$rpm_top/SOURCES/config.toml"
           cp packaging/rpm/torrentngd.spec "$rpm_top/SPECS/"
           sed -i "s/^Version:.*/Version:        ${rpm_version}/" "$rpm_top/SPECS/torrentngd.spec"
           sed -i "s|^Source0:.*|Source0:        ${asset}|" "$rpm_top/SPECS/torrentngd.spec"

@@ -1,4 +1,5 @@
 use std::{
+    fs::{File, OpenOptions},
     io::{BufRead, BufReader, Read},
     path::Path,
     sync::{
@@ -265,14 +266,10 @@ fn read_live_speeds(path: &str) -> Option<TransferRates> {
         updated_at: Option<i64>,
     }
 
-    let raw = read_bounded_text(path, MAX_LIVE_SPEEDS_BYTES).ok()?;
+    let (raw, modified_at) = read_bounded_text(path, MAX_LIVE_SPEEDS_BYTES).ok()?;
     let speeds: LiveSpeeds = serde_json::from_str(&raw).ok()?;
-    let legacy_modified_at = speeds.updated_at.is_none().then(|| {
-        std::fs::metadata(path)
-            .ok()
-            .and_then(|metadata| metadata.modified().ok())
-    });
-    if !is_live_speeds_fresh(speeds.updated_at, legacy_modified_at.flatten()) {
+    let legacy_modified_at = speeds.updated_at.is_none().then_some(modified_at).flatten();
+    if !is_live_speeds_fresh(speeds.updated_at, legacy_modified_at) {
         return None;
     }
     Some(TransferRates {
@@ -281,8 +278,16 @@ fn read_live_speeds(path: &str) -> Option<TransferRates> {
     })
 }
 
-fn read_bounded_text(path: &str, max_bytes: u64) -> std::io::Result<String> {
-    let file = open_regular_read(Path::new(path))?;
+fn read_bounded_text(path: &str, max_bytes: u64) -> std::io::Result<(String, Option<SystemTime>)> {
+    let file = open_live_speeds_file(path)?;
+    let metadata = file.metadata()?;
+    if !metadata.is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "configured text path is not a regular file",
+        ));
+    }
+    let modified_at = metadata.modified().ok();
     let mut bytes = Vec::new();
     file.take(max_bytes.saturating_add(1))
         .read_to_end(&mut bytes)?;
@@ -292,12 +297,30 @@ fn read_bounded_text(path: &str, max_bytes: u64) -> std::io::Result<String> {
             "live speed file exceeds size limit",
         ));
     }
-    String::from_utf8(bytes).map_err(|_| {
+    let text = String::from_utf8(bytes).map_err(|_| {
         std::io::Error::new(
             std::io::ErrorKind::InvalidData,
             "live speed file is not valid UTF-8",
         )
-    })
+    })?;
+    Ok((text, modified_at))
+}
+
+#[cfg(unix)]
+fn open_live_speeds_file(path: &str) -> std::io::Result<File> {
+    use std::os::unix::fs::OpenOptionsExt;
+
+    OpenOptions::new()
+        .read(true)
+        // A configured live-speed path is a local process boundary. Do not
+        // follow a final symlink or block forever if it is replaced by a FIFO.
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(path)
+}
+
+#[cfg(not(unix))]
+fn open_live_speeds_file(path: &str) -> std::io::Result<File> {
+    File::open(path)
 }
 
 fn is_live_speeds_fresh(updated_at: Option<i64>, legacy_modified_at: Option<SystemTime>) -> bool {
@@ -432,7 +455,7 @@ fn fill_feature_status_from_config(dht: &mut String, pex: &mut String) {
         "/etc/rtorrent/user.rc",
         "/config/rtorrent.rc",
     ] {
-        if let Ok(raw) = read_bounded_text(path, MAX_RTORRENT_CONFIG_PROBE_BYTES) {
+        if let Ok((raw, _)) = read_bounded_text(path, MAX_RTORRENT_CONFIG_PROBE_BYTES) {
             for line in raw.lines() {
                 let normalized = line.to_ascii_lowercase().replace(char::is_whitespace, "");
                 if let Some(value) = config_switch(
@@ -531,6 +554,29 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("live-speeds.json");
         std::fs::write(&path, vec![b' '; (MAX_LIVE_SPEEDS_BYTES + 1) as usize]).unwrap();
+        assert!(read_live_speeds(path.to_str().unwrap()).is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_live_speeds_are_ignored() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let outside = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(
+            outside.path(),
+            serde_json::json!({
+                "download": 123,
+                "upload": 45,
+                "updated_at": chrono::Utc::now().timestamp(),
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let path = dir.path().join("live-speeds.json");
+        symlink(outside.path(), &path).unwrap();
+
         assert!(read_live_speeds(path.to_str().unwrap()).is_none());
     }
 }

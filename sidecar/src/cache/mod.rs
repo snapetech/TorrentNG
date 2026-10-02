@@ -11,9 +11,11 @@ pub(crate) const MAX_AUTOMATION_STATE_JSON_BYTES: usize = 8 * 1024 * 1024;
 #[error("persisted automation state exceeds the configured byte limit")]
 pub struct AutomationStateCapacityError;
 
-pub use categories::Category;
 pub(crate) use categories::CategoryTagCapacityError;
-pub use db::{AppEventRow, Db, TorrentRow};
+pub use categories::{
+    Category, MAX_CATEGORY_TEXT_BYTES, MAX_TAG_TEXT_BYTES, MAX_TORRENT_LOCATION_TEXT_BYTES,
+};
+pub use db::{AppEventRow, Db, TorrentRow, MAX_TORRENT_TAG_BYTES};
 pub use query::{
     bounded_page_limit, validate_page_offset, ListParams, TorrentLiveRow, MAX_API_PAGE_ENTRIES,
     MAX_API_PAGE_OFFSET,

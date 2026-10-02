@@ -20,8 +20,9 @@ use tracing::info;
 
 use rt_api_deluge::AppState as DelugeState;
 use rt_api_model::{
-    api_token_allowed, csrf_request_allowed, has_browser_request_headers, session_cookie_value,
-    ApiRuntimeMetrics,
+    api_token_allowed, bearer_token as model_bearer_token, csrf_request_allowed,
+    has_browser_request_headers, session_cookie_value, ApiRuntimeMetrics,
+    MAX_API_URI_BYTES as MAX_REQUEST_URI_BYTES,
 };
 use rt_api_native::state::{AppState as TorrentNgApiState, AuthCredentials};
 use rt_api_qbit::state::AppState as QbitState;
@@ -106,6 +107,14 @@ async fn main() -> anyhow::Result<()> {
                     anyhow::Error::msg(rt_engine::task_join_error_summary("export command", &error))
                 })?;
         }
+        Some("auth-token") => {
+            let config = load_config()?;
+            let (_, credentials, _) = resolve_auth_credentials(&config)?;
+            println!("WebUI username: {}", credentials.username);
+            println!("WebUI password: {}", credentials.password);
+            println!("Configured API tokens can also be used in either login field.");
+            return Ok(());
+        }
         _ => {}
     }
 
@@ -142,13 +151,8 @@ async fn main() -> anyhow::Result<()> {
     rt_storage::create_dir_all_no_follow(&config.daemon.session_dir)
         .with_context(|| format!("creating session_dir {:?}", config.daemon.session_dir))?;
 
-    let configured_auth_credentials = AuthCredentials {
-        username: config.auth.username.clone(),
-        password: config.auth.password.clone(),
-    };
-    let auth_settings_path = config.daemon.session_dir.join("auth-settings.json");
-    let auth_credentials =
-        load_auth_credentials(&auth_settings_path, &configured_auth_credentials)?;
+    let (configured_auth_credentials, auth_credentials, auth_settings_path) =
+        resolve_auth_credentials(&config)?;
 
     // Resolve (and persist, if not already done) this install's tracker
     // peer id before any engine/tracker task can observe it. Must run
@@ -238,6 +242,7 @@ async fn main() -> anyhow::Result<()> {
         .fallback_service(
             ServeDir::new(&static_dir).not_found_service(ServeFile::new(&static_index)),
         )
+        .layer(middleware::from_fn(request_uri_guard))
         .layer(middleware::from_fn(request_log))
         .layer(middleware::from_fn_with_state(
             DaemonAuthGate {
@@ -553,8 +558,12 @@ fn daemon_public_path(path: &str) -> bool {
             | "/api/v1/auth/logout"
             | "/api/qb/v2/auth/login"
             | "/api/qb/v2/auth/logout"
+            | "/api/qb/v2/app/version"
+            | "/api/qb/v2/app/webapiVersion"
             | "/api/v2/auth/login"
             | "/api/v2/auth/logout"
+            | "/api/v2/app/version"
+            | "/api/v2/app/webapiVersion"
     ) || is_webui_path(path)
 }
 
@@ -571,16 +580,7 @@ fn daemon_public_auth_path(path: &str) -> bool {
 }
 
 fn bearer_token(headers: &HeaderMap) -> Option<String> {
-    let mut parts = headers
-        .get(header::AUTHORIZATION)
-        .and_then(|value| value.to_str().ok())?
-        .split_whitespace();
-    let scheme = parts.next()?;
-    let token = parts.next()?;
-    if parts.next().is_some() || !scheme.eq_ignore_ascii_case("Bearer") {
-        return None;
-    }
-    Some(token.to_owned())
+    model_bearer_token(headers)
 }
 
 fn daemon_is_mutating(req: &Request<Body>) -> bool {
@@ -639,6 +639,25 @@ async fn request_log(req: Request<Body>, next: Next) -> Response {
     response
 }
 
+async fn request_uri_guard(req: Request<Body>, next: Next) -> Response {
+    if !request_uri_is_bounded(req.uri()) {
+        return (
+            StatusCode::URI_TOO_LONG,
+            "request URI exceeds the maximum length",
+        )
+            .into_response();
+    }
+    next.run(req).await
+}
+
+fn request_uri_is_bounded(uri: &axum::http::Uri) -> bool {
+    let uri_bytes = uri
+        .path()
+        .len()
+        .saturating_add(uri.query().map_or(0, |query| query.len().saturating_add(1)));
+    uri_bytes <= MAX_REQUEST_URI_BYTES
+}
+
 fn request_id(headers: &HeaderMap) -> String {
     rt_logging::correlation_id(
         headers
@@ -677,26 +696,87 @@ fn load_config() -> anyhow::Result<Config> {
     Config::load_default().context("loading default config")
 }
 
+fn resolve_auth_credentials(
+    config: &Config,
+) -> anyhow::Result<(AuthCredentials, AuthCredentials, PathBuf)> {
+    rt_storage::create_dir_all_no_follow(&config.daemon.session_dir).with_context(|| {
+        format!(
+            "creating auth state directory {:?}",
+            config.daemon.session_dir
+        )
+    })?;
+    let auth_settings_path = config.daemon.session_dir.join("auth-settings.json");
+    let password = if config.auth.password.is_empty() {
+        load_or_create_bootstrap_password(&config.daemon.session_dir.join("bootstrap-password"))?
+    } else {
+        config.auth.password.clone()
+    };
+    let configured = AuthCredentials {
+        username: config.auth.username.clone(),
+        password,
+    };
+    let active = load_auth_credentials(&auth_settings_path, &configured)?;
+    Ok((configured, active, auth_settings_path))
+}
+
+const MAX_BOOTSTRAP_PASSWORD_BYTES: usize = 128;
+
+fn load_or_create_bootstrap_password(path: &std::path::Path) -> anyhow::Result<String> {
+    match rt_storage::read_file_no_follow_limited(path, MAX_BOOTSTRAP_PASSWORD_BYTES) {
+        Ok(bytes) => return validate_bootstrap_password(bytes),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("reading bootstrap password from {}", path.display()))
+        }
+    }
+
+    let password = uuid::Uuid::new_v4().simple().to_string();
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    match options.open(path) {
+        Ok(mut file) => {
+            use std::io::Write as _;
+            file.write_all(password.as_bytes())?;
+            file.write_all(b"\n")?;
+            file.sync_all()?;
+            Ok(password)
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            validate_bootstrap_password(rt_storage::read_file_no_follow_limited(
+                path,
+                MAX_BOOTSTRAP_PASSWORD_BYTES,
+            )?)
+        }
+        Err(error) => {
+            Err(error).with_context(|| format!("creating bootstrap password at {}", path.display()))
+        }
+    }
+}
+
+fn validate_bootstrap_password(bytes: Vec<u8>) -> anyhow::Result<String> {
+    let password = String::from_utf8(bytes).context("bootstrap password is not UTF-8")?;
+    let password = password.trim().to_owned();
+    anyhow::ensure!(
+        (16..=MAX_BOOTSTRAP_PASSWORD_BYTES).contains(&password.len()),
+        "bootstrap password file has an invalid length"
+    );
+    Ok(password)
+}
+
 fn load_auth_credentials(
     path: &std::path::Path,
     configured: &AuthCredentials,
 ) -> anyhow::Result<AuthCredentials> {
-    use std::io::Read as _;
     const MAX_AUTH_SETTINGS_BYTES: usize = 4096;
-    let credentials = match std::fs::File::open(path) {
-        Ok(file) => {
-            let mut bytes = Vec::with_capacity(512);
-            file.take((MAX_AUTH_SETTINGS_BYTES + 1) as u64)
-                .read_to_end(&mut bytes)
-                .with_context(|| format!("reading WebUI auth settings from {}", path.display()))?;
-            anyhow::ensure!(
-                bytes.len() <= MAX_AUTH_SETTINGS_BYTES,
-                "WebUI auth settings in {} exceed {MAX_AUTH_SETTINGS_BYTES} bytes",
-                path.display()
-            );
-            serde_json::from_slice(&bytes)
-                .with_context(|| format!("parsing WebUI auth settings from {}", path.display()))?
-        }
+    let credentials = match rt_storage::read_file_no_follow_limited(path, MAX_AUTH_SETTINGS_BYTES) {
+        Ok(bytes) => serde_json::from_slice(&bytes)
+            .with_context(|| format!("parsing WebUI auth settings from {}", path.display()))?,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => configured.clone(),
         Err(error) => Err(error)
             .with_context(|| format!("reading WebUI auth settings from {}", path.display()))?,
@@ -718,12 +798,13 @@ fn load_auth_credentials(
 mod tests {
     use super::{
         bearer_token, daemon_auth_guard, daemon_public_auth_path, daemon_public_path,
-        install_panic_payload_redacting_hook, request_id, skip_request_log, static_dir,
-        DaemonAuthGate,
+        install_panic_payload_redacting_hook, load_or_create_bootstrap_password, request_id,
+        request_uri_is_bounded, skip_request_log, static_dir, DaemonAuthGate,
+        MAX_REQUEST_URI_BYTES,
     };
     use axum::{
         body::Body,
-        http::{header, HeaderMap, HeaderValue, Request, StatusCode},
+        http::{header, HeaderMap, HeaderValue, Request, StatusCode, Uri},
         middleware,
         routing::get,
         Router,
@@ -731,6 +812,35 @@ mod tests {
     use std::process::Command;
     use std::sync::Arc;
     use tower::ServiceExt;
+
+    #[test]
+    fn bootstrap_password_is_unique_persistent_and_private() {
+        let dir = tempfile::tempdir().unwrap();
+        let first_path = dir.path().join("first").join("bootstrap-password");
+        let second_path = dir.path().join("second").join("bootstrap-password");
+        std::fs::create_dir_all(first_path.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(second_path.parent().unwrap()).unwrap();
+
+        let first = load_or_create_bootstrap_password(&first_path).unwrap();
+        assert_eq!(first.len(), 32);
+        assert!(first.bytes().all(|byte| byte.is_ascii_hexdigit()));
+        assert_eq!(
+            load_or_create_bootstrap_password(&first_path).unwrap(),
+            first
+        );
+
+        let second = load_or_create_bootstrap_password(&second_path).unwrap();
+        assert_ne!(first, second);
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(&first_path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+    }
 
     #[test]
     fn request_log_skips_health_metrics_ws_and_static_assets() {
@@ -751,6 +861,19 @@ mod tests {
     }
 
     #[test]
+    fn request_uri_limit_counts_path_and_query_bytes() {
+        let short = Uri::from_static("/api/v1/torrents?limit=50");
+        assert!(request_uri_is_bounded(&short));
+
+        let oversized = format!(
+            "/api/v1/torrents?filter={}",
+            "x".repeat(MAX_REQUEST_URI_BYTES)
+        );
+        let oversized = oversized.parse::<Uri>().unwrap();
+        assert!(!request_uri_is_bounded(&oversized));
+    }
+
+    #[test]
     fn daemon_auth_allows_webui_but_keeps_api_private() {
         for path in [
             "/",
@@ -761,6 +884,10 @@ mod tests {
             "/health",
             "/api/v1/auth/login",
             "/api/v1/auth/logout",
+            "/api/qb/v2/app/version",
+            "/api/qb/v2/app/webapiVersion",
+            "/api/v2/app/version",
+            "/api/v2/app/webapiVersion",
         ] {
             assert!(daemon_public_path(path), "{path}");
         }

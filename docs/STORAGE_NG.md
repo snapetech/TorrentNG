@@ -392,17 +392,18 @@ kernels — operators who want the conservative baseline can still force
 
 ---
 
-## Acceptance targets
+## Optional diagnostic targets
 
-Beyond the existing benchmark targets in `CLAUDE.md`:
+These measurements are useful for tuning and regression diagnosis. Numeric
+torrent-count capacity and long-duration claims are intentionally outside the
+current release scope:
 
-- 100k synthetic torrents, ≤2% with active peers: release-binary idle RSS
-  within target; fd/thread/task counts recorded; ≤1 Tokio task per *Hot*
-  torrent. The current controller/registry test is only a proxy for this
-  acceptance target and must not be cited as production capacity evidence.
-- HDD seed mix (100k torrents, churned peer set): aggregate read throughput
-  ≥ 5× the non-elevator baseline on the same dataset.
+- Bounded synthetic idle/active fixture: release-binary idle RSS within a
+  host-selected target; fd/thread/task counts recorded; no dormant-task growth.
+- HDD seed mix using a host-selected fixture: aggregate read throughput
+  compared with the non-elevator baseline on the same dataset.
 - Kill -9 under write load: post-restart recheck bounded to pieces written
   since last barrier; zero silent corruption.
-- Recheck of 50k torrents runs as a device-sequential sweep without
-  starving active seeding (existing starvation benchmark, tighter bound).
+- Recheck of a representative library runs as a device-sequential sweep
+  without starving active seeding (existing starvation benchmark, tighter
+  bound).

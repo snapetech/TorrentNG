@@ -82,7 +82,7 @@ run_gate "migration exported corpus coverage" "$ROOT/scripts/migration_corpus_ce
 run_gate "Track 1 compatible-client qBittorrent flows" bash -c 'cd sidecar && cargo test qb_'
 run_gate "TorrentNG API compatibility manifest" cargo test -p rt-api-native
 run_gate "TorrentNG client state, tracker, and storage hooks" cargo test -p rt-engine
-run_gate "scale and metrics compatibility evidence" cargo test -p rt-metrics
+run_gate "metrics and contract regression coverage" cargo test -p rt-metrics
 run_gate "storage topology and peer-read matrix" "$ROOT/scripts/storage_phase_b_matrix.sh"
 
 if [[ "${UNIVERSAL_COMPAT_LIVE:-0}" == "1" ]]; then
@@ -104,6 +104,8 @@ else
 fi
 
 if [[ "${UNIVERSAL_COMPAT_REAL_DEVICE:-0}" == "1" ]]; then
+  # The child shell must expand STORAGE_PHASE_B_REAL_DEVICE and its positional path.
+  # shellcheck disable=SC2016
   run_gate "real-device storage matrix" bash -c 'STORAGE_PHASE_B_REAL_DEVICE=1 "$1"' _ "$ROOT/scripts/storage_phase_b_matrix.sh"
 else
   skip_gate "real-device storage matrix" "set UNIVERSAL_COMPAT_REAL_DEVICE=1 and configure storage test paths to run ignored device tests"

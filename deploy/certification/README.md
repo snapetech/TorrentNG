@@ -26,6 +26,11 @@ Set `CERT_START_STACK=1` to have the runner start the stack before probing it:
 CERT_START_STACK=1 ./scripts/live_certification.sh
 ```
 
+Published certification ports bind to loopback by default. Set
+`CERT_BIND_ADDR=0.0.0.0` only for an explicit external-client or incoming-peer
+test; the stack uses deterministic lab credentials and is not a production
+deployment.
+
 Configure the live Sonarr, Radarr, Prowlarr, and autobrr containers to use TorrentNG as a qBittorrent-compatible download client:
 
 ```sh

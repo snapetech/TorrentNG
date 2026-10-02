@@ -11,6 +11,9 @@ MISS_LIMIT="${TNG_VPN_MISS_LIMIT:-0}"
 RUN_DHT_CERT="${TNG_VPN_RUN_DHT_CERT:-1}"
 RESTART_CMD="${TNG_VPN_RESTART_CMD:-restart-cert}"
 ON_MISSING="${TNG_VPN_ON_MISSING:-mark}"
+TMP_DIR="$(mktemp -d "${TMPDIR:-/tmp}/torrentng-vpn-watch.XXXXXX")"
+ERROR_LOG="$TMP_DIR/adapter.err"
+trap 'rm -rf "$TMP_DIR"' EXIT
 
 usage() {
   cat <<EOF
@@ -83,12 +86,12 @@ apply_mapping() {
 }
 
 run_once() {
-  if mapping="$("$ADAPTER" print 2>/tmp/tng-vpn-watch.err)"; then
+  if mapping="$("$ADAPTER" print 2>"$ERROR_LOG")"; then
     apply_mapping "$mapping"
     return 0
   fi
 
-  log "no forwarded port: $(tr '\n' ' ' </tmp/tng-vpn-watch.err)"
+  log "no forwarded port: $(tr '\n' ' ' <"$ERROR_LOG")"
   mark_degraded
   return 1
 }

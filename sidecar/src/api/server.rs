@@ -1,9 +1,10 @@
+use axum::body::to_bytes;
 use axum::{
     body::Body,
     extract::{ConnectInfo, DefaultBodyLimit, MatchedPath},
-    http::{header, HeaderMap, HeaderName, HeaderValue, Request},
+    http::{header, HeaderMap, HeaderName, HeaderValue, Request, StatusCode},
     middleware,
-    response::Response,
+    response::{IntoResponse, Response},
     routing::{delete, get, post, put},
     Router,
 };
@@ -16,7 +17,7 @@ use std::{
     },
     time::Instant,
 };
-use tokio::sync::{broadcast, Mutex, RwLock};
+use tokio::sync::{broadcast, Mutex, RwLock, Semaphore};
 use tower_http::limit::RequestBodyLimitLayer;
 use tower_http::services::{ServeDir, ServeFile};
 
@@ -30,6 +31,34 @@ use crate::{
 };
 
 use super::handlers;
+
+/// Keep request-driven backend, cache, and compatibility work bounded across
+/// the whole sidecar rather than allowing each mounted API surface to create
+/// its own unbounded queue of HTTP futures.
+pub const MAX_CONCURRENT_API_REQUESTS: usize = 256;
+
+/// Multipart torrent uploads are buffered before they reach a backend. Keep
+/// their aggregate memory footprint separate from ordinary request admission.
+pub const MAX_CONCURRENT_LARGE_UPLOADS: usize = 4;
+
+/// WebSocket connections are long-lived and intentionally bypass the ordinary
+/// request permit. They therefore need an independent admission limit.
+pub const MAX_WS_CLIENTS: usize = 256;
+
+/// Query extractors materialize the complete URI before a handler can clamp
+/// individual parameters. Reject oversized request targets at the HTTP
+/// boundary so a client cannot turn query parsing into an unbounded allocation.
+pub const MAX_REQUEST_URI_BYTES: usize = 16 * 1024;
+
+/// JSON control-plane requests carry metadata, not torrent payloads. Bound
+/// them independently from the larger multipart upload ceiling so malformed
+/// JSON cannot consume the upload budget before a handler validates fields.
+pub const MAX_JSON_BODY_BYTES: usize = 2 * 1024 * 1024;
+
+/// Form login carries only credentials. Keep it far below the global body
+/// limit so unauthenticated clients cannot force a large allocation in the
+/// compatibility extractor.
+pub const MAX_AUTH_BODY_BYTES: usize = 64 * 1024;
 
 #[derive(Clone)]
 pub struct AppState {
@@ -53,6 +82,9 @@ pub struct AppState {
     /// value in the cache database. The Db mutex protects individual SQL
     /// statements; this lock protects the multi-statement operation.
     pub control_plane_write: Arc<Mutex<()>>,
+    pub request_concurrency: Arc<Semaphore>,
+    pub large_uploads: Arc<Semaphore>,
+    pub ws_clients: Arc<Semaphore>,
 }
 
 pub fn build_router(state: AppState) -> Router {
@@ -216,7 +248,13 @@ pub fn build_router(state: AppState) -> Router {
             crate::multipart::MAX_DEFAULT_REQUEST_BODY_BYTES,
         ))
         .layer(middleware::from_fn(request_log))
+        .layer(middleware::from_fn(json_body_guard))
         .layer(middleware::from_fn_with_state(state.clone(), require_auth))
+        .layer(middleware::from_fn_with_state(
+            state.request_concurrency.clone(),
+            request_concurrency_guard,
+        ))
+        .layer(middleware::from_fn(request_uri_guard))
         .with_state(state)
 }
 
@@ -268,6 +306,76 @@ async fn request_log(req: Request<Body>, next: middleware::Next) -> Response {
     response
 }
 
+async fn request_uri_guard(req: Request<Body>, next: middleware::Next) -> Response {
+    if !request_uri_is_bounded(req.uri()) {
+        return (
+            StatusCode::URI_TOO_LONG,
+            "request URI exceeds the maximum length",
+        )
+            .into_response();
+    }
+    next.run(req).await
+}
+
+async fn json_body_guard(req: Request<Body>, next: middleware::Next) -> Response {
+    if has_duplicate_content_type(req.headers()) {
+        return (
+            StatusCode::BAD_REQUEST,
+            "duplicate Content-Type headers are not accepted",
+        )
+            .into_response();
+    }
+    if !is_json_content_type(req.headers()) {
+        return next.run(req).await;
+    }
+    let (mut parts, body) = req.into_parts();
+    let body = match to_bytes(body, MAX_JSON_BODY_BYTES).await {
+        Ok(body) => body,
+        Err(_) => {
+            return (
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "JSON request body exceeds the maximum length",
+            )
+                .into_response();
+        }
+    };
+    // The original Content-Length describes the consumed request body. Remove
+    // it before handing the rebuilt body to downstream extractors so a stale
+    // client-provided value cannot make them interpret the new body framing.
+    parts.headers.remove(header::CONTENT_LENGTH);
+    next.run(Request::from_parts(parts, Body::from(body))).await
+}
+
+fn has_duplicate_content_type(headers: &HeaderMap) -> bool {
+    headers
+        .get_all(header::CONTENT_TYPE)
+        .iter()
+        .nth(1)
+        .is_some()
+}
+
+fn is_json_content_type(headers: &HeaderMap) -> bool {
+    headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.split(';').next())
+        .map(str::trim)
+        .is_some_and(|value| {
+            value.eq_ignore_ascii_case("application/json")
+                || value
+                    .strip_prefix("application/")
+                    .is_some_and(|suffix| suffix.ends_with("+json"))
+        })
+}
+
+fn request_uri_is_bounded(uri: &axum::http::Uri) -> bool {
+    let uri_bytes = uri
+        .path()
+        .len()
+        .saturating_add(uri.query().map_or(0, |query| query.len().saturating_add(1)));
+    uri_bytes <= MAX_REQUEST_URI_BYTES
+}
+
 fn request_id(headers: &HeaderMap) -> String {
     rt_logging::correlation_id(
         headers
@@ -294,10 +402,42 @@ fn is_static_asset_path(path: &str) -> bool {
     )
 }
 
+/// Reject new ordinary work immediately when the sidecar is saturated. A
+/// rejected request cannot accumulate behind a slow backend or cache worker.
+async fn request_concurrency_guard(
+    axum::extract::State(limiter): axum::extract::State<Arc<Semaphore>>,
+    req: Request<Body>,
+    next: middleware::Next,
+) -> Response {
+    if request_concurrency_bypass(req.uri().path()) {
+        return next.run(req).await;
+    }
+
+    let Ok(_permit) = limiter.try_acquire() else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "sidecar request capacity exhausted; retry later",
+        )
+            .into_response();
+    };
+    next.run(req).await
+}
+
+fn request_concurrency_bypass(path: &str) -> bool {
+    // WebSockets own a separate client budget and remain open for the lifetime
+    // of the connection. Ordinary HTTP responses, including health and
+    // metrics, remain inside the shared request budget.
+    path == "/ws"
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{request_id, skip_request_log};
-    use axum::http::{HeaderMap, HeaderValue};
+    use super::{
+        has_duplicate_content_type, is_json_content_type, request_concurrency_bypass, request_id,
+        request_uri_is_bounded, skip_request_log, MAX_AUTH_BODY_BYTES, MAX_JSON_BODY_BYTES,
+        MAX_REQUEST_URI_BYTES,
+    };
+    use axum::http::{header, HeaderMap, HeaderValue, Uri};
 
     #[test]
     fn request_log_skips_health_metrics_ws_and_static_assets() {
@@ -331,5 +471,63 @@ mod tests {
 
         headers.insert("x-request-id", HeaderValue::from_static(""));
         assert!(request_id(&headers).starts_with("tng-"));
+    }
+
+    #[test]
+    fn websocket_is_the_only_long_lived_request_bypass() {
+        assert!(request_concurrency_bypass("/ws"));
+        assert!(!request_concurrency_bypass("/health"));
+        assert!(!request_concurrency_bypass("/metrics"));
+        assert!(!request_concurrency_bypass("/api/v1/torrents"));
+    }
+
+    #[test]
+    fn json_content_type_detection_accepts_json_variants_only() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("application/json"),
+        );
+        assert!(is_json_content_type(&headers));
+        headers.insert(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("application/problem+json; charset=utf-8"),
+        );
+        assert!(is_json_content_type(&headers));
+        headers.insert(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("application/x-www-form-urlencoded"),
+        );
+        assert!(!is_json_content_type(&headers));
+        assert_eq!(MAX_JSON_BODY_BYTES, 2 * 1024 * 1024);
+        assert_eq!(MAX_AUTH_BODY_BYTES, 64 * 1024);
+    }
+
+    #[test]
+    fn duplicate_content_type_headers_are_visible_to_the_boundary_guard() {
+        let mut headers = HeaderMap::new();
+        headers.append(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("application/json"),
+        );
+        headers.append(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("application/x-www-form-urlencoded"),
+        );
+        assert!(has_duplicate_content_type(&headers));
+    }
+
+    #[tokio::test]
+    async fn request_uri_guard_rejects_oversized_targets_before_routing() {
+        let uri: Uri = format!(
+            "/api/v1/torrents?filter={}",
+            "x".repeat(MAX_REQUEST_URI_BYTES)
+        )
+        .parse()
+        .unwrap();
+        assert!(!request_uri_is_bounded(&uri));
+
+        let uri: Uri = "/api/v1/torrents?limit=100".parse().unwrap();
+        assert!(request_uri_is_bounded(&uri));
     }
 }

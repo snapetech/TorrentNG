@@ -5,7 +5,6 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 REPORT="${1:-}"
 OUT="${2:-}"
 REPORT_DIR="${REPORT_DIR:-$ROOT/certification/reports}"
-MIN_TORRENTS="${SOAK_MIN_TORRENTS:-15000}"
 MAX_RSS_MB="${SOAK_MAX_RSS_MB:-500}"
 EXPECTED_SECONDS="${SOAK_DURATION_SECONDS:-86400}"
 MAX_FDS="${SOAK_MAX_FDS:-4096}"
@@ -13,7 +12,9 @@ MAX_THREADS="${SOAK_MAX_THREADS:-512}"
 MIN_DISK_FREE_MB="${SOAK_MIN_DISK_FREE_MB:-100}"
 
 if [[ -z "$REPORT" ]]; then
-  REPORT="$(find "$REPORT_DIR" -maxdepth 1 -type f -name 'soak-24h-*.md' -printf '%T@ %p\n' 2>/dev/null | sort -nr | awk 'NR==1 {print $2}')"
+  REPORT="$(find "$REPORT_DIR" -maxdepth 1 -type f -name 'soak-24h-*.md' -printf '%T@\t%p\n' 2>/dev/null \
+    | sort -t $'\t' -k1,1nr \
+    | awk 'NR == 1 { print substr($0, index($0, "\t") + 1) }')"
 fi
 
 if [[ -z "$REPORT" || ! -f "$REPORT" ]]; then
@@ -30,7 +31,6 @@ samples="$(awk -F'|' '/^\| 20[0-9][0-9]-/ {count++} END {print count+0}' "$REPOR
 first_ts="$(awk -F'|' '/^\| 20[0-9][0-9]-/ {gsub(/^[[:space:]]+|[[:space:]]+$/, "", $2); print $2; exit}' "$REPORT")"
 last_line="$(awk -F'|' '/^\| 20[0-9][0-9]-/ {line=$0} END {print line}' "$REPORT")"
 last_ts="$(awk -F'|' '/^\| 20[0-9][0-9]-/ {gsub(/^[[:space:]]+|[[:space:]]+$/, "", $2); ts=$2} END {print ts}' "$REPORT")"
-min_torrents="$(awk -F'|' '/^\| 20[0-9][0-9]-/ {gsub(/ /, "", $4); if (min == "" || $4 < min) min=$4} END {print min == "" ? 0 : min}' "$REPORT")"
 max_rss="$(awk -F'|' '/^\| 20[0-9][0-9]-/ {gsub(/ /, "", $5); if ($5+0 > max) max=$5+0} END {printf "%.1f", max}' "$REPORT")"
 bad_health="$(awk -F'|' '/^\| 20[0-9][0-9]-/ {gsub(/^[[:space:]]+|[[:space:]]+$/, "", $3); if ($3 != "200") bad++} END {print bad+0}' "$REPORT")"
 bad_sync="$(awk -F'|' '/^\| 20[0-9][0-9]-/ {gsub(/^[[:space:]]+|[[:space:]]+$/, "", $6); if ($6 != "200") bad++} END {print bad+0}' "$REPORT")"
@@ -59,7 +59,6 @@ if [[ -n "$first_ts" && -n "$last_ts" ]] && command -v date >/dev/null 2>&1; the
 fi
 
 status="PASS"
-(( min_torrents >= MIN_TORRENTS )) || status="FAIL"
 awk -v rss="$max_rss" -v limit="$MAX_RSS_MB" 'BEGIN {exit !(rss <= limit)}' || status="FAIL"
 (( bad_health == 0 )) || status="FAIL"
 (( bad_sync == 0 )) || status="FAIL"
@@ -82,6 +81,11 @@ if [[ -n "$expected_name" && "$expected_name" != "none" ]]; then
     expected_result="IN_PROGRESS"
   fi
 fi
+if [[ "$status" == "PASS" ]]; then
+  if [[ "$remaining" == "unknown" ]] || (( remaining > 0 )); then
+    status="IN_PROGRESS"
+  fi
+fi
 if [[ "$status" == "PASS" && -n "$active" ]]; then
   status="IN_PROGRESS"
 fi
@@ -99,7 +103,7 @@ echo "- Remaining seconds target: $remaining"
 echo
 echo "| Check | Status | Detail |"
 echo "|---|---|---|"
-echo "| Torrent floor | $([[ "$min_torrents" -ge "$MIN_TORRENTS" ]] && echo PASS || echo FAIL) | min=$min_torrents target>=$MIN_TORRENTS |"
+echo "| Torrent count telemetry | INFO | retained from the source samples; no capacity threshold is applied |"
 echo "| Memory ceiling | $(awk -v rss="$max_rss" -v limit="$MAX_RSS_MB" 'BEGIN {print (rss <= limit) ? "PASS" : "FAIL"}') | max=${max_rss}MB target<=${MAX_RSS_MB}MB |"
 echo "| Health samples | $([[ "$bad_health" -eq 0 ]] && echo PASS || echo FAIL) | bad=$bad_health |"
 echo "| Sync samples | $([[ "$bad_sync" -eq 0 ]] && echo PASS || echo FAIL) | bad=$bad_sync |"

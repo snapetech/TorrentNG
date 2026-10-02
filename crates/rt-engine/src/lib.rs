@@ -1,4 +1,5 @@
 pub mod command;
+pub mod crash_safety;
 mod db_worker;
 mod dht_task;
 pub mod egress_policy;
@@ -22,13 +23,26 @@ pub use command::{
     EngineTrackerHealth, EngineTrackerSnapshot, EngineWebseedSnapshot, HotTorrentMemoryStats,
     QueueMove, StorageDeviceLatencyStats, TorrentDiagnostic, TorrentLiveStats, TorrentRuntimeStats,
 };
+pub use crash_safety::{
+    CrashSafetyCounters, CrashSafetyReport, CrashSafetyRuntime, CrashSafetyView, LocationSettings,
+    MountReport, PathReport, PlatformSupport,
+};
 pub use egress_policy::{
     egress_policy_metrics, AddressClass, EgressPolicyError, EgressPolicyMetricsSnapshot,
     OutboundEgressPolicy, OutboundTargetKind,
 };
-pub use engine::{Engine, EngineHandle, MAX_MANUAL_PEER_ADDRESSES};
+pub use engine::{
+    Engine, EngineHandle, MAX_ENGINE_CATEGORY_BYTES, MAX_ENGINE_INFO_HASH_BYTES,
+    MAX_ENGINE_INFO_HASH_LIST_BYTES, MAX_ENGINE_LABEL_BYTES, MAX_ENGINE_NAME_BYTES,
+    MAX_ENGINE_SAVE_PATH_BYTES, MAX_ENGINE_STORAGE_PLAN_PATH_BYTES,
+    MAX_ENGINE_STORAGE_PLAN_TOTAL_PATH_BYTES, MAX_ENGINE_TRACKER_BYTES, MAX_MANUAL_PEER_ADDRESSES,
+    MAX_STORAGE_PLAN_AFFECTED_TORRENTS, MAX_TRACKER_URL_BYTES,
+};
 pub use peer_ingress::{
     PeerIngressBudget, PeerIngressConfig, PeerIngressPermit, PeerIngressReject, PeerIngressStats,
+};
+pub use rt_config::{
+    CompletionVerifyMode, CrashSafetyConfig, HostCrashRecovery, StructuralAuditMode,
 };
 pub use storage_authority::{ServerStorageRoots, StorageAuthorityError};
 pub use tier::{

@@ -60,21 +60,29 @@ listen_range="$(jq -r '.dht.listen_range.value // empty' <<<"$engine")"
 pex="$(jq -r '.dht.pex.value // false' <<<"$engine")"
 udp_trackers="$(jq -r '.dht.udp_trackers.value // false' <<<"$engine")"
 
-[[ "$listen_range" == "$PRIVATE_PORT-$PRIVATE_PORT" ]] \
-  && mark "rTorrent listen range" "PASS" "$listen_range" \
-  || mark "rTorrent listen range" "FAIL" "expected $PRIVATE_PORT-$PRIVATE_PORT got ${listen_range:-unknown}"
+if [[ "$listen_range" == "$PRIVATE_PORT-$PRIVATE_PORT" ]]; then
+  mark "rTorrent listen range" "PASS" "$listen_range"
+else
+  mark "rTorrent listen range" "FAIL" "expected $PRIVATE_PORT-$PRIVATE_PORT got ${listen_range:-unknown}"
+fi
 
-[[ "$dht_port" == "$PRIVATE_PORT" || "$override_port" == "$PRIVATE_PORT" ]] \
-  && mark "rTorrent DHT port" "PASS" "dht.port=${dht_port:-unknown} override=${override_port:-none}" \
-  || mark "rTorrent DHT port" "FAIL" "expected $PRIVATE_PORT got dht.port=${dht_port:-unknown} override=${override_port:-none}"
+if [[ "$dht_port" == "$PRIVATE_PORT" || "$override_port" == "$PRIVATE_PORT" ]]; then
+  mark "rTorrent DHT port" "PASS" "dht.port=${dht_port:-unknown} override=${override_port:-none}"
+else
+  mark "rTorrent DHT port" "FAIL" "expected $PRIVATE_PORT got dht.port=${dht_port:-unknown} override=${override_port:-none}"
+fi
 
-[[ "$pex" == "true" ]] \
-  && mark "PEX enabled" "PASS" "protocol.pex=true" \
-  || mark "PEX enabled" "FAIL" "protocol.pex=$pex"
+if [[ "$pex" == "true" ]]; then
+  mark "PEX enabled" "PASS" "protocol.pex=true"
+else
+  mark "PEX enabled" "FAIL" "protocol.pex=$pex"
+fi
 
-[[ "$udp_trackers" == "true" ]] \
-  && mark "UDP trackers enabled" "PASS" "trackers.use_udp=true" \
-  || mark "UDP trackers enabled" "FAIL" "trackers.use_udp=$udp_trackers"
+if [[ "$udp_trackers" == "true" ]]; then
+  mark "UDP trackers enabled" "PASS" "trackers.use_udp=true"
+else
+  mark "UDP trackers enabled" "FAIL" "trackers.use_udp=$udp_trackers"
+fi
 
 port_hex="$(printf '%04X' "$PRIVATE_PORT")"
 if docker exec "$TNG_CONTAINER" sh -lc "grep -qi ':$port_hex ' /proc/net/udp /proc/net/udp6 2>/dev/null"; then
@@ -85,9 +93,11 @@ fi
 
 if [[ -n "$PUBLIC_IP" ]]; then
   observed_ip="$(timeout 12 docker exec "$TNG_CONTAINER" sh -lc 'wget -T 5 -qO- https://ifconfig.me/ip 2>/dev/null || wget -T 5 -qO- https://api.ipify.org 2>/dev/null || true' | tr -d '\r\n' || true)"
-  [[ "$observed_ip" == "$PUBLIC_IP" ]] \
-    && mark "VPN egress IP" "PASS" "$observed_ip" \
-    || mark "VPN egress IP" "FAIL" "expected $PUBLIC_IP got ${observed_ip:-unknown}"
+  if [[ "$observed_ip" == "$PUBLIC_IP" ]]; then
+    mark "VPN egress IP" "PASS" "$observed_ip"
+  else
+    mark "VPN egress IP" "FAIL" "expected $PUBLIC_IP got ${observed_ip:-unknown}"
+  fi
 else
   mark "VPN egress IP" "INFO" "TNG_VPN_PUBLIC_IP not supplied"
 fi

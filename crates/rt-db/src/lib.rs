@@ -29,7 +29,7 @@ pub use event_row::{
     first_job_event, list_job_events, list_session_events, list_session_events_filtered,
     prune_session_events, prune_session_events_in_tx, JobEventRow, SessionEventRow,
     MAX_JOB_EVENT_PAYLOAD_BYTES, MAX_JOB_EVENT_RESULT_ITEMS, MAX_SESSION_EVENT_PAYLOAD_BYTES,
-    MAX_SESSION_EVENT_RESULT_ITEMS,
+    MAX_SESSION_EVENT_RESULT_BYTES, MAX_SESSION_EVENT_RESULT_ITEMS,
 };
 pub use job_row::{
     count_active_jobs, get_job, list_active_jobs, list_failed_jobs_with_error_prefix, upsert_job,
@@ -45,7 +45,8 @@ pub use projection_row::{
 };
 pub use schema::migrate;
 pub use settings_row::{
-    get_setting, set_setting, set_setting_in_tx, MAX_SETTING_KEY_BYTES, MAX_SETTING_VALUE_BYTES,
+    delete_setting, get_setting, set_setting, set_setting_in_tx, MAX_SETTING_KEY_BYTES,
+    MAX_SETTING_VALUE_BYTES,
 };
 pub use storage_row::{
     get_mount, get_storage_root, list_mounts, list_storage_roots, upsert_mount,

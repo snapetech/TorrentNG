@@ -203,14 +203,18 @@ for _ in $(seq 1 60); do
   [[ "$code" == "200" || "$code" == "503" ]] && break
   sleep 1
 done
-[[ "$code" == "200" || "$code" == "503" ]] \
-  && mark "TorrentNG health" "PASS" "HTTP $code" \
-  || mark "TorrentNG health" "FAIL" "HTTP $code"
+if [[ "$code" == "200" || "$code" == "503" ]]; then
+  mark "TorrentNG health" "PASS" "HTTP $code"
+else
+  mark "TorrentNG health" "FAIL" "HTTP $code"
+fi
 
 container_egress="$(timeout 12 docker exec "$CONTAINER" sh -lc 'wget -T 5 -qO- https://api.ipify.org 2>/dev/null || wget -T 5 -qO- http://ifconfig.me/ip 2>/dev/null || true' | tr -d '\r\n' || true)"
-[[ -n "$container_egress" ]] \
-  && mark "container egress" "PASS" "$container_egress" \
-  || mark "container egress" "INFO" "external IP lookup unavailable from container"
+if [[ -n "$container_egress" ]]; then
+  mark "container egress" "PASS" "$container_egress"
+else
+  mark "container egress" "INFO" "external IP lookup unavailable from container"
+fi
 
 set +e
 timeout 20 sudo ip netns exec "$NS" natpmpc -g "$NATPMP_GATEWAY" -a "$NATPMP_PUBLIC_PORT" "$PRIVATE_PORT" tcp "$NATPMP_LIFETIME" > "$TMP_OUTPUT" 2>&1
@@ -220,9 +224,11 @@ udp_natpmp_status=$?
 set -e
 public_ip="$(sed -n 's/^Public IP address : //p' "$TMP_OUTPUT" | tail -1)"
 public_port="$(awk '/Mapped public port/ {for (i=1; i<=NF; i++) if ($i=="port") {print $(i+1); exit}}' "$TMP_OUTPUT")"
-[[ "$tcp_natpmp_status" -eq 0 && "$udp_natpmp_status" -eq 0 && -n "$public_ip" && -n "$public_port" ]] \
-  && mark "Proton NAT-PMP mapping" "PASS" "$public_ip:$public_port -> $PRIVATE_PORT tcp/udp" \
-  || mark "Proton NAT-PMP mapping" "FAIL" "tcp_exit=$tcp_natpmp_status udp_exit=$udp_natpmp_status $(tr '\n' ' ' < "$TMP_OUTPUT")"
+if [[ "$tcp_natpmp_status" -eq 0 && "$udp_natpmp_status" -eq 0 && -n "$public_ip" && -n "$public_port" ]]; then
+  mark "Proton NAT-PMP mapping" "PASS" "$public_ip:$public_port -> $PRIVATE_PORT tcp/udp"
+else
+  mark "Proton NAT-PMP mapping" "FAIL" "tcp_exit=$tcp_natpmp_status udp_exit=$udp_natpmp_status $(tr '\n' ' ' < "$TMP_OUTPUT")"
+fi
 
 DHT_REPORT="$ROOT/certification/reports/dht-cert-proton-tng-$(date -u +%Y%m%dT%H%M%SZ).md"
 if [[ -n "$public_ip" && -n "$public_port" ]] && sudo -E ip netns exec "$NS" env PATH="$PATH" TNG_HOST_URL="http://$CONTAINER_IP:8080" TNG_PROTECTED_LOCAL_HTTP_ORIGIN="http://$CONTAINER_IP:8080" TNG_API_TOKEN="$API_TOKEN" TNG_CONTAINER="$CONTAINER" TNG_INCOMING_PORT="$PRIVATE_PORT" TNG_VPN_PUBLIC_PORT="$public_port" TNG_VPN_PUBLIC_IP="$public_ip" "$ROOT/scripts/dht_certification.sh" "$DHT_REPORT"; then

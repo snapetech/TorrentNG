@@ -260,11 +260,15 @@ for target in "$@"; do
     overall=1
   fi
 
-  echo >>"$OUT"
-  echo "Summary:" >>"$OUT"
-  echo >>"$OUT"
-  append_summary "$log" >>"$OUT"
-  echo >>"$OUT"
+  {
+    echo
+    echo "Summary:"
+    echo
+  } >>"$OUT"
+  {
+    append_summary "$log"
+    echo
+  } >>"$OUT"
 done
 
 {

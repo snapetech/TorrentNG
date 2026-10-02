@@ -1747,10 +1747,7 @@ async fn write_handshake(
     let hs = Handshake {
         info_hash: info_hash.wire_hash(),
         peer_id: crate::peer_id::our_peer_id(),
-        // Advertise v2 capability even for a v1 magnet: the peer may return
-        // a hybrid info dictionary whose BEP 52 piece layers then need the
-        // hash-exchange extension.
-        reserved: ExtensionFlags::with_v2_support(),
+        reserved: metadata_handshake_flags(info_hash),
     };
     timeout(
         METADATA_PEER_WRITE_TIMEOUT,
@@ -1779,12 +1776,21 @@ async fn write_utp_handshake(
     let hs = Handshake {
         info_hash: info_hash.wire_hash(),
         peer_id: crate::peer_id::our_peer_id(),
-        reserved: ExtensionFlags::with_v2_support(),
+        reserved: metadata_handshake_flags(info_hash),
     };
     timeout(METADATA_PEER_WRITE_TIMEOUT, stream.write_all(&hs.encode()))
         .await
         .map_err(|_| anyhow::anyhow!("metadata peer handshake write timed out"))??;
     Ok(())
+}
+
+fn metadata_handshake_flags(_info_hash: MetadataInfoHash) -> ExtensionFlags {
+    // A v1 magnet can resolve to a hybrid info dictionary. Keep the BEP 52
+    // capability advertised even while the wire identity is the v1 hash, so
+    // the peer can provide the hybrid's piece layers over hash exchange.
+    // The metadata decoder also accepts BEP 6 Fast messages, so the standard
+    // capability set is safe for this short-lived connection.
+    ExtensionFlags::with_v2_support()
 }
 
 async fn read_utp_handshake(stream: &mut UtpStream) -> anyhow::Result<Handshake> {

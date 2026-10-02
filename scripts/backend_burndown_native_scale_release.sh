@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Run a 100k-row restore/list/stats/promotion/demotion check against the
-# optimized production daemon. The dataset is deliberately synthetic, but it
-# goes through the real SQLite restore path and the real torrentngd binary.
+# Run an opt-in synthetic restore/list/stats/promotion/demotion diagnostic
+# against the optimized production daemon. It is not a release gate or a
+# numeric torrent-capacity certification.
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 # shellcheck source=scripts/curl_policy.sh
@@ -393,7 +393,7 @@ cp "$LOG_RESTART" "$ARTIFACT_DIR/restart.log"
 cp "$TMP_DIR"/*.json "$TMP_DIR"/*.txt "$ARTIFACT_DIR/"
 
 {
-  echo "# TorrentNG Client Release-Binary 100k Scale Evidence"
+  echo "# TorrentNG Client Release-Binary Non-Release Scale Diagnostic"
   echo
   echo "- Date UTC: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
   echo "- Host: $(hostname)"
@@ -434,6 +434,7 @@ filesystem contention, or a production soak."
   echo "| TorrentNG transfer info | ${native_transfer_latency_ms} ms |"
   echo "| qBittorrent transfer info | ${qbit_transfer_latency_ms} ms |"
   echo "| Restore metrics | ${metrics_restore_latency_ms} ms |"
+  echo "| Promoted metrics | ${metrics_promoted_latency_ms} ms |"
   echo
   echo "## Runtime tier exercise"
   echo
@@ -471,7 +472,7 @@ echo "| Restart RSS | ${restart_rss_bytes} bytes |"
   echo
   echo "- The corpus is synthetic and all cold rows share one save root, one piece shape, no trackers, and no peer traffic."
   echo "- This run does not establish 100k production readiness for real metadata diversity, tracker deadlines, SSE fan-out, slow clients, storage failures, crash recovery, or 24-hour stability."
-  echo "- TNG-029 persistence isolation and local live fault injection are complete in the current tree; this script measures the separate TNG-010 capacity proxy only and does not create a 100k production-readiness claim."
+  echo "- TNG-029 persistence isolation and local live fault injection are complete in the current tree; this script is retained as an opt-in TNG-010 diagnostic and does not create a numeric production-capacity claim."
   echo
   echo "Overall status: PASS_WITH_LIMITATIONS"
 } >"$OUT"

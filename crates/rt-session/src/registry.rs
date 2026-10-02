@@ -537,6 +537,21 @@ impl SessionRegistry {
         self.entries.get(handle).map(RegistryRecord::to_entry)
     }
 
+    /// Return the first entry in lexical info-hash order without materializing
+    /// every registry entry.
+    pub fn first_entry(&self) -> Option<TorrentEntry> {
+        self.entries
+            .values()
+            .min_by(|left, right| left.info_hash().cmp(right.info_hash()))
+            .map(RegistryRecord::to_entry)
+    }
+
+    /// Resolve a wire-format infohash to the canonical registry key.
+    pub fn resolve_info_hash(&self, info_hash: &str) -> Option<String> {
+        let info_hash = canonical_info_hash(info_hash);
+        self.by_hash.contains_key(&info_hash).then_some(info_hash)
+    }
+
     /// Check whether a canonical or case-insensitive hex infohash is present
     /// without cloning its active or dormant projection.
     pub fn contains_hash(&self, info_hash: &str) -> bool {

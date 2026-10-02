@@ -19,8 +19,10 @@ poll_interval_secs = 2
 read_from_start = false
 
 [auth]
-secret_key = "change-me"
-api_tokens = []
+# This loopback-only template intentionally has no credentials. For any
+# non-loopback deployment, provide auth.api_tokens and auth.secret_key through
+# a private config or environment override; public binds are rejected without
+# both values.
 trust_proxy_header = false
 secure_cookies = true
 

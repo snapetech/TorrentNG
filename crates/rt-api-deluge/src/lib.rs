@@ -18,13 +18,14 @@ use axum::{
 };
 use base64::{engine::general_purpose, Engine as _};
 use rt_api_model::{
-    api_token_allowed, bearer_token, csrf_request_allowed, request_fingerprint,
-    session_cookie_value, valid_idempotency_key, CachedResponse, IdempotencyClaim,
-    IdempotencyStore, MAX_IDEMPOTENCY_BODY_BYTES,
+    api_token_allowed, api_uri_is_bounded, bearer_token, cached_response_headers,
+    csrf_request_allowed, is_replayable_response_header, request_fingerprint, session_cookie_value,
+    single_header_value, valid_idempotency_key, CachedResponse, IdempotencyClaim, IdempotencyStore,
+    MAX_IDEMPOTENCY_BODY_BYTES,
 };
 use rt_engine::{
-    EngineHandle, EnginePeerSnapshot, EngineTorrentLimits, EngineTorrentMetadata,
-    EngineTrackerSnapshot, QueueMove,
+    EngineHandle, EnginePeerSnapshot, EngineTorrentFile, EngineTorrentLimits,
+    EngineTorrentMetadata, EngineTrackerSnapshot, QueueMove,
 };
 use rt_metainfo::{parse_magnet, MAX_TORRENT_BYTES};
 use rt_metrics::{MemoryClass, MemoryLease};
@@ -53,6 +54,7 @@ const MAX_DELUGE_PATH_BYTES: usize = 16 * 1024;
 const MAX_DELUGE_LABEL_BYTES: usize = 256;
 const MAX_DELUGE_TRACKER_URL_BYTES: usize = 8 * 1024;
 const MAX_DELUGE_TRACKER_BYTES: usize = 4 * 1024 * 1024;
+const MAX_DELUGE_TEXT_BYTES: usize = 16 * 1024;
 const DELUGE_RUNTIME_PROJECTION_CONCURRENCY: usize = 64;
 const MAX_DELUGE_AUTH_BODY_BYTES: usize = 16 * 1024;
 const MAX_DELUGE_LARGE_BODY_REQUESTS: usize = 4;
@@ -169,6 +171,29 @@ fn estimate_deluge_file_snapshot_bytes(files: &[rt_engine::EngineTorrentFile]) -
     16 * 1024 + (files.len() as u64).saturating_mul(512) + path_bytes.saturating_mul(4)
 }
 
+fn deluge_file_infos(entry: &rt_session::TorrentEntry, files: &[EngineTorrentFile]) -> Vec<Value> {
+    let completed = entry.total_length.saturating_sub(entry.amount_left);
+    files
+        .iter()
+        .map(|file| {
+            let file_completed = completed.saturating_sub(file.offset).min(file.length);
+            let progress = if file.length == 0 {
+                1.0
+            } else {
+                file_completed as f64 / file.length as f64
+            };
+            json!({
+                "index": file.index,
+                "path": file.path,
+                "size": file.length,
+                "offset": file.offset,
+                "progress": progress,
+                "priority": file.priority.clamp(0, 2),
+            })
+        })
+        .collect()
+}
+
 fn deluge_engine(state: &AppState) -> Result<&EngineHandle, String> {
     state
         .engine
@@ -215,7 +240,19 @@ pub fn build_deluge_router(state: AppState) -> Router {
             deluge_auth_guard,
         ))
         .layer(DefaultBodyLimit::max(MAX_DELUGE_DEFAULT_BODY_BYTES))
+        .layer(middleware::from_fn(deluge_request_uri_guard))
         .with_state(state)
+}
+
+async fn deluge_request_uri_guard(req: Request<Body>, next: Next) -> Response {
+    if !api_uri_is_bounded(req.uri()) {
+        return (
+            StatusCode::URI_TOO_LONG,
+            "request URI exceeds the maximum length",
+        )
+            .into_response();
+    }
+    next.run(req).await
 }
 
 async fn deluge_idempotency_guard(
@@ -223,13 +260,16 @@ async fn deluge_idempotency_guard(
     req: Request<Body>,
     next: Next,
 ) -> Response {
-    let Some(key) = req
-        .headers()
-        .get("idempotency-key")
-        .and_then(|value| value.to_str().ok())
-        .map(str::to_owned)
-    else {
-        return next.run(req).await;
+    let key = match single_header_value(req.headers(), "idempotency-key") {
+        Ok(Some(value)) => value.to_owned(),
+        Ok(None) => return next.run(req).await,
+        Err(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                "duplicate Idempotency-Key headers are not accepted",
+            )
+                .into_response();
+        }
     };
     if !valid_idempotency_key(&key) {
         return (StatusCode::BAD_REQUEST, "invalid Idempotency-Key").into_response();
@@ -282,11 +322,7 @@ async fn deluge_idempotency_guard(
     };
     let response = Response::from_parts(parts.clone(), Body::from(body.clone()));
     if parts.status.is_success() {
-        let headers = parts
-            .headers
-            .iter()
-            .map(|(name, value)| (name.to_string(), value.as_bytes().to_vec()))
-            .collect();
+        let headers = cached_response_headers(&parts.headers);
         execution.complete(CachedResponse {
             status: parts.status.as_u16(),
             headers,
@@ -307,8 +343,18 @@ fn replay_idempotent_response(cached: CachedResponse) -> Response {
             .into_response();
     }
     let mut response = Response::new(Body::from(cached.body));
-    *response.status_mut() = StatusCode::from_u16(cached.status).unwrap_or(StatusCode::OK);
+    let Ok(status) = StatusCode::from_u16(cached.status) else {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "cached idempotency response had an invalid status",
+        )
+            .into_response();
+    };
+    *response.status_mut() = status;
     for (name, value) in cached.headers {
+        if !is_replayable_response_header(&name) {
+            continue;
+        }
         let Ok(name) = axum::http::HeaderName::from_bytes(name.as_bytes()) else {
             continue;
         };
@@ -345,7 +391,7 @@ async fn deluge_auth_guard(
         return next.run(req).await;
     }
 
-    let (parts, body) = req.into_parts();
+    let (mut parts, body) = req.into_parts();
     let body = match to_bytes(body, MAX_DELUGE_AUTH_BODY_BYTES).await {
         Ok(body) => body,
         Err(_) => {
@@ -362,6 +408,10 @@ async fn deluge_auth_guard(
                 .and_then(|value| value.as_str())
                 .map(str::to_owned)
         });
+    // The body was consumed and rebuilt after the admission read. Remove the
+    // original framing header so a stale client value cannot disagree with
+    // the body handed to the JSON extractor.
+    parts.headers.remove(header::CONTENT_LENGTH);
     let req = Request::from_parts(parts, Body::from(body));
     if login_token.is_some_and(|token| api_token_allowed(&state.api_tokens, &token)) {
         return next.run(req).await;
@@ -413,6 +463,7 @@ pub async fn json_rpc(
 }
 
 async fn dispatch(state: &AppState, method: &str, params: &[Value]) -> Result<Value, String> {
+    ensure_deluge_text_bound(method, "Deluge method")?;
     ensure_deluge_input_bound(params.len(), "Deluge RPC params")?;
     match method {
         "auth.login" => Ok(json!(true)),
@@ -825,6 +876,7 @@ async fn deluge_config_values(state: &AppState, keys: Option<&Value>) -> Result<
             .map(str::trim)
             .filter(|key| !key.is_empty())
             .ok_or_else(|| format!("Deluge config keys[{index}] must be a non-empty string"))?;
+        ensure_deluge_text_bound(key, "Deluge config key")?;
         out.insert(
             key.to_owned(),
             config.get(key).cloned().unwrap_or(Value::Null),
@@ -839,6 +891,7 @@ async fn deluge_config_value(state: &AppState, key: Option<&Value>) -> Result<Va
         .map(str::trim)
         .filter(|key| !key.is_empty())
         .ok_or_else(|| "Deluge config key must be a non-empty string".to_owned())?;
+    ensure_deluge_text_bound(key, "Deluge config key")?;
     Ok(deluge_config(state)
         .await?
         .get(key)
@@ -877,10 +930,11 @@ async fn web_add_torrents(state: &AppState, params: &[Value]) -> Result<Value, S
             .or_else(|| torrent.get("file"))
             .and_then(Value::as_str)
             .unwrap_or_default();
-        let result = if path.starts_with("magnet:") {
+        ensure_deluge_text_bound(path, "Deluge torrent path")?;
+        let result = if has_url_scheme(path, "magnet:") {
             add_magnet(state, path, options).await
         } else if let Some(url) = state.url_downloads.write().await.remove(path) {
-            if url.starts_with("magnet:") {
+            if has_url_scheme(&url, "magnet:") {
                 add_magnet(state, &url, options).await
             } else {
                 Ok(json!({
@@ -889,7 +943,7 @@ async fn web_add_torrents(state: &AppState, params: &[Value]) -> Result<Value, S
                     "reason": "server-side URL fetch is disabled; token preserves Deluge WebUI flow",
                 }))
             }
-        } else if path.starts_with("http://") || path.starts_with("https://") {
+        } else if has_url_scheme(path, "http://") || has_url_scheme(path, "https://") {
             Ok(json!({
                 "url": path,
                 "downloaded": false,
@@ -934,7 +988,10 @@ async fn web_download_torrent_from_url(
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .ok_or_else(|| "missing URL".to_owned())?;
-    if !(url.starts_with("http://") || url.starts_with("https://") || url.starts_with("magnet:")) {
+    if !(has_url_scheme(url, "http://")
+        || has_url_scheme(url, "https://")
+        || has_url_scheme(url, "magnet:"))
+    {
         return Err("unsupported torrent URL scheme".to_owned());
     }
     if url.len() > MAX_DELUGE_URL_BYTES {
@@ -958,6 +1015,12 @@ async fn web_download_torrent_from_url(
     *next = next_token_id;
     url_downloads.insert(token.clone(), url.to_owned());
     Ok(json!(token))
+}
+
+fn has_url_scheme(value: &str, scheme: &str) -> bool {
+    value
+        .get(..scheme.len())
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case(scheme))
 }
 
 async fn move_storage(state: &AppState, params: &[Value]) -> Result<Value, String> {
@@ -1003,6 +1066,7 @@ async fn deluge_free_space(state: &AppState) -> Result<Value, String> {
 
 async fn session_state(state: &AppState) -> Result<Value, String> {
     let reg = state.registry.read().await;
+    ensure_legacy_full_list_bound(reg.len(), "Deluge core.get_session_state")?;
     let snapshot = reg.snapshot();
     ensure_legacy_full_list_bound(snapshot.len(), "Deluge core.get_session_state")?;
     Ok(json!(snapshot
@@ -1098,7 +1162,9 @@ async fn cache_status(state: &AppState) -> Result<Value, String> {
 
 async fn web_events(state: &AppState) -> Result<Value, String> {
     let reg = state.registry.read().await;
+    ensure_legacy_full_list_bound(reg.len(), "Deluge web.get_events")?;
     let snapshot = reg.snapshot();
+    ensure_legacy_full_list_bound(snapshot.len(), "Deluge web.get_events")?;
     Ok(json!(snapshot
         .iter()
         .map(|entry| {
@@ -1336,7 +1402,9 @@ fn notification_subscriptions() -> Value {
 
 async fn filter_tree(state: &AppState) -> Result<Value, String> {
     let reg = state.registry.read().await;
+    ensure_legacy_full_list_bound(reg.len(), "Deluge core.get_filter_tree")?;
     let snapshot = reg.snapshot();
+    ensure_legacy_full_list_bound(snapshot.len(), "Deluge core.get_filter_tree")?;
     let mut labels = std::collections::BTreeMap::<String, usize>::new();
     let mut states = std::collections::BTreeMap::<String, usize>::new();
     for entry in snapshot.iter() {
@@ -1468,6 +1536,7 @@ async fn update_ui(state: &AppState, params: &[Value]) -> Result<Value, String> 
     let wanted_fields = deluge_requested_fields(params.first())?;
     let snapshot = {
         let reg = state.registry.read().await;
+        ensure_legacy_full_list_bound(reg.len(), "Deluge web.update_ui")?;
         reg.snapshot()
     };
     ensure_legacy_full_list_bound(snapshot.len(), "Deluge web.update_ui")?;
@@ -1608,15 +1677,17 @@ fn deluge_filters_from_entries<'a>(
 
 async fn labels(state: &AppState) -> Result<Value, String> {
     if let Some(engine) = &state.engine {
-        return Ok(json!(engine
-            .list_categories()
-            .await?
+        let categories = engine.list_categories().await?;
+        ensure_legacy_full_list_bound(categories.len(), "Deluge label.get_labels")?;
+        return Ok(json!(categories
             .into_iter()
             .map(|category| category.name)
             .collect::<Vec<_>>()));
     }
     let reg = state.registry.read().await;
+    ensure_legacy_full_list_bound(reg.len(), "Deluge label.get_labels")?;
     let snapshot = reg.snapshot();
+    ensure_legacy_full_list_bound(snapshot.len(), "Deluge label.get_labels")?;
     Ok(json!(snapshot
         .iter()
         .filter_map(|entry| entry.category.clone())
@@ -1684,6 +1755,7 @@ async fn torrents_status(state: &AppState, params: &[Value]) -> Result<Value, St
     let wanted_fields = deluge_requested_fields(params.get(1))?;
     let snapshot = {
         let reg = state.registry.read().await;
+        ensure_legacy_full_list_bound(reg.len(), "Deluge core.get_torrents_status")?;
         reg.snapshot()
     };
     let active_rechecks = if let Some(engine) = &state.engine {
@@ -1794,6 +1866,15 @@ fn ensure_deluge_input_bound(count: usize, field: &str) -> Result<(), String> {
     Ok(())
 }
 
+fn ensure_deluge_text_bound(value: &str, field: &str) -> Result<(), String> {
+    if value.len() > MAX_DELUGE_TEXT_BYTES {
+        return Err(format!(
+            "{field} exceeds the {MAX_DELUGE_TEXT_BYTES} byte limit"
+        ));
+    }
+    Ok(())
+}
+
 fn validate_deluge_text(value: &str, maximum: usize, field: &str) -> Result<(), String> {
     if value.len() > maximum {
         return Err(format!("Deluge {field} exceeds the {maximum} byte limit"));
@@ -1857,16 +1938,14 @@ fn validate_deluge_status_filter(value: Option<&Value>) -> Result<(), String> {
             .ok_or_else(|| format!("Deluge status filter {key} must be an array"))?;
         ensure_deluge_input_bound(values.len(), &format!("Deluge status filter {key}"))?;
         for (index, item) in values.iter().enumerate() {
-            if item
+            let item = item
                 .as_str()
                 .map(str::trim)
                 .filter(|item| !item.is_empty())
-                .is_none()
-            {
-                return Err(format!(
-                    "Deluge status filter {key}[{index}] must be a non-empty string"
-                ));
-            }
+                .ok_or_else(|| {
+                    format!("Deluge status filter {key}[{index}] must be a non-empty string")
+                })?;
+            ensure_deluge_text_bound(item, &format!("Deluge status filter {key}[{index}]"))?;
         }
     }
     Ok(())
@@ -1962,6 +2041,7 @@ fn deluge_requested_fields(
             .map(str::trim)
             .filter(|field| !field.is_empty())
             .ok_or_else(|| "Deluge requested fields must contain non-empty strings".to_owned())?;
+        ensure_deluge_text_bound(field, "Deluge requested field")?;
         requested.insert(field.to_owned());
     }
     Ok(Some(requested))
@@ -2073,29 +2153,24 @@ async fn deluge_active_recheck_hashes(engine: &EngineHandle) -> Result<HashSet<S
 
 async fn torrent_files(state: &AppState, hash: &str) -> Result<Value, String> {
     let hash = canonical_torrent_hash(state, hash).await?;
-    if let Some(engine) = &state.engine {
-        let meta = engine.torrent_metadata(hash).await?;
-        let _lease = engine
-            .reserve_memory(
-                MemoryClass::ApiSnapshot,
-                estimate_deluge_file_snapshot_bytes(&meta.files),
-            )
-            .await?
-            .ok_or_else(|| "api snapshot memory budget exhausted".to_owned())?;
-        return Ok(json!(meta
-            .files
-            .into_iter()
-            .map(|file| json!({
-                "index": file.index,
-                "path": file.path,
-                "size": file.length,
-                "offset": 0,
-                "progress": 0.0,
-                "priority": 1,
-            }))
-            .collect::<Vec<_>>()));
-    }
-    Ok(json!([]))
+    let entry = state
+        .registry
+        .read()
+        .await
+        .get(&hash)
+        .ok_or_else(|| format!("torrent {hash} was removed before file projection"))?;
+    let engine = state.engine.as_ref().ok_or_else(|| {
+        "TorrentNG client is unavailable; file metadata was not loaded".to_owned()
+    })?;
+    let meta = engine.torrent_metadata(hash).await?;
+    let _lease = engine
+        .reserve_memory(
+            MemoryClass::ApiSnapshot,
+            estimate_deluge_file_snapshot_bytes(&meta.files),
+        )
+        .await?
+        .ok_or_else(|| "api snapshot memory budget exhausted".to_owned())?;
+    Ok(json!(deluge_file_infos(&entry, &meta.files)))
 }
 
 fn deluge_torrent(
@@ -2277,7 +2352,7 @@ fn deluge_eta(amount_left: u64, download_rate: i64) -> i64 {
 }
 
 fn deluge_is_finished(entry: &rt_session::TorrentEntry) -> bool {
-    entry.state.as_str() == "seeding" || (entry.total_length > 0 && entry.amount_left == 0)
+    entry.total_length > 0 && entry.amount_left == 0
 }
 
 fn deluge_distributed_copies(peers: Option<&[EnginePeerSnapshot]>) -> f64 {
@@ -2301,12 +2376,17 @@ fn deluge_seeds_peers_ratio(peers: Option<&[EnginePeerSnapshot]>) -> f64 {
 }
 
 async fn add_magnet(state: &AppState, uri: &str, options: Option<&Value>) -> Result<Value, String> {
+    ensure_deluge_text_bound(uri, "Deluge magnet URI")?;
     let magnet = parse_magnet(uri).map_err(|e| e.to_string())?;
     let engine = deluge_engine(state)?;
     let save_path = options
         .and_then(|value| value.get("download_location"))
         .and_then(Value::as_str)
-        .map(std::path::PathBuf::from);
+        .map(|path| {
+            ensure_deluge_text_bound(path, "Deluge download location")
+                .map(|()| std::path::PathBuf::from(path))
+        })
+        .transpose()?;
     let hash = engine
         .add_magnet_with_labels(magnet, save_path, false, None, Vec::new())
         .await?;
@@ -2323,7 +2403,11 @@ async fn add_torrent_file(
     let save_path = options
         .and_then(|value| value.get("download_location"))
         .and_then(Value::as_str)
-        .map(std::path::PathBuf::from);
+        .map(|path| {
+            ensure_deluge_text_bound(path, "Deluge download location")
+                .map(|()| std::path::PathBuf::from(path))
+        })
+        .transpose()?;
     let hash = engine
         .add_torrent_raw_with_labels(raw, save_path, false, None, Vec::new())
         .await?;
@@ -2603,8 +2687,11 @@ fn strict_string_list(value: Option<&Value>, field: &str) -> Result<Vec<String>,
                 .as_str()
                 .map(str::trim)
                 .filter(|value| !value.is_empty())
-                .map(str::to_owned)
                 .ok_or_else(|| format!("{field}[{index}] must be a non-empty string"))
+                .and_then(|value| {
+                    ensure_deluge_text_bound(value, &format!("{field}[{index}]"))
+                        .map(|()| value.to_owned())
+                })
         })
         .collect()
 }
@@ -2631,6 +2718,7 @@ fn strict_hashes_from_param(value: Option<&Value>) -> Result<Vec<String>, String
             if hash.is_empty() {
                 Err("torrent id must not be empty".to_owned())
             } else {
+                ensure_deluge_text_bound(hash, "Deluge torrent id")?;
                 Ok(vec![hash.to_owned()])
             }
         }
@@ -2644,8 +2732,11 @@ fn strict_hashes_from_param(value: Option<&Value>) -> Result<Vec<String>, String
                         .as_str()
                         .map(str::trim)
                         .filter(|hash| !hash.is_empty())
-                        .map(str::to_owned)
                         .ok_or_else(|| format!("torrent ids[{index}] must be a non-empty string"))
+                        .and_then(|hash| {
+                            ensure_deluge_text_bound(hash, &format!("torrent ids[{index}]"))
+                                .map(|()| hash.to_owned())
+                        })
                 })
                 .collect()
         }
@@ -2659,6 +2750,7 @@ async fn canonical_torrent_hash(state: &AppState, hash: &str) -> Result<String, 
     if hash.is_empty() {
         return Err("torrent id must not be empty".to_owned());
     }
+    ensure_deluge_text_bound(hash, "Deluge torrent id")?;
     let reg = state.registry.read().await;
     reg.get(hash)
         .map(|entry| entry.info_hash.clone())
@@ -2817,6 +2909,14 @@ fn validate_deluge_options(options: &serde_json::Map<String, Value>) -> Result<(
             ));
         }
     }
+    for key in ["move_completed_path", "move_on_completed_path"] {
+        if let Some(value) = options.get(key) {
+            let value = value
+                .as_str()
+                .ok_or_else(|| format!("Deluge option {key} must be a string"))?;
+            ensure_deluge_text_bound(value, &format!("Deluge option {key}"))?;
+        }
+    }
     if options.contains_key("stop_ratio")
         && options
             .get("stop_ratio")
@@ -2943,6 +3043,7 @@ fn collect_deluge_trackers(
 ) -> Result<(), String> {
     match value {
         Value::String(value) if !value.trim().is_empty() => {
+            ensure_deluge_text_bound(value, "Deluge tracker URL")?;
             ensure_deluge_input_bound(out.len().saturating_add(1), "Deluge tracker list")?;
             validate_deluge_text(value, MAX_DELUGE_TRACKER_URL_BYTES, "tracker URL")?;
             *bytes = bytes.saturating_add(value.len());
@@ -2969,6 +3070,7 @@ fn collect_deluge_trackers(
             else {
                 return Err("tracker entry must contain a non-empty url".to_owned());
             };
+            ensure_deluge_text_bound(url, "Deluge tracker URL")?;
             ensure_deluge_input_bound(out.len().saturating_add(1), "Deluge tracker list")?;
             validate_deluge_text(url, MAX_DELUGE_TRACKER_URL_BYTES, "tracker URL")?;
             *bytes = bytes.saturating_add(url.len());
@@ -2998,10 +3100,17 @@ fn normalize_deluge_trackers(values: Vec<String>) -> Vec<String> {
 
 fn deluge_peer_addr_arg(value: &Value) -> Result<SocketAddr, String> {
     match value {
-        Value::String(value) => value
-            .trim()
-            .parse()
-            .map_err(|_| "peer address must be a valid socket address".to_owned()),
+        Value::String(value) => {
+            ensure_deluge_text_bound(value, "Deluge peer address")?;
+            let peer = value
+                .trim()
+                .parse::<SocketAddr>()
+                .map_err(|_| "peer address must be a valid socket address".to_owned())?;
+            if peer.port() == 0 {
+                return Err("peer port must be between 1 and 65535".to_owned());
+            }
+            Ok(peer)
+        }
         Value::Array(values) => deluge_peer_host_port(values.first(), values.get(1)),
         Value::Object(obj) => {
             deluge_peer_host_port(obj.get("ip").or_else(|| obj.get("host")), obj.get("port"))
@@ -3016,6 +3125,7 @@ fn deluge_peer_host_port(host: Option<&Value>, port: Option<&Value>) -> Result<S
         .map(str::trim)
         .filter(|host| !host.is_empty())
         .ok_or_else(|| "peer host is required".to_owned())?;
+    ensure_deluge_text_bound(host, "Deluge peer host")?;
     let port = match port {
         Some(Value::Number(value)) => value
             .as_u64()
@@ -3027,6 +3137,9 @@ fn deluge_peer_host_port(host: Option<&Value>, port: Option<&Value>) -> Result<S
             .map_err(|_| "peer port must be between 0 and 65535".to_owned())?,
         _ => return Err("peer port is required".to_owned()),
     };
+    if port == 0 {
+        return Err("peer port must be between 1 and 65535".to_owned());
+    }
     format!("{host}:{port}")
         .parse()
         .map_err(|_| "peer host and port do not form a valid socket address".to_owned())
@@ -3115,6 +3228,34 @@ mod tests {
     use axum::{body::Body, http::Request};
     use rt_session::TorrentEntry;
     use tower::ServiceExt;
+
+    #[test]
+    fn url_schemes_are_matched_case_insensitively() {
+        assert!(has_url_scheme("MAGNET:?xt=urn:btih:test", "magnet:"));
+        assert!(has_url_scheme("HTTPS://example.invalid/a", "https://"));
+        assert!(!has_url_scheme("file:///tmp/a", "http://"));
+    }
+
+    #[tokio::test]
+    async fn deluge_legacy_registry_views_reject_oversized_snapshots() {
+        let registry = Arc::new(RwLock::new(SessionRegistry::new()));
+        {
+            let mut registry = registry.write().await;
+            for index in 0..=MAX_LEGACY_FULL_LIST_ENTRIES {
+                registry
+                    .add(TorrentEntry::new(
+                        format!("{index:040x}"),
+                        "bounded".to_owned(),
+                        "/data".to_owned(),
+                    ))
+                    .unwrap();
+            }
+        }
+        let state = AppState::new(registry);
+        assert!(web_events(&state).await.is_err());
+        assert!(filter_tree(&state).await.is_err());
+        assert!(labels(&state).await.is_err());
+    }
 
     #[tokio::test]
     async fn deluge_router_enforces_configured_token_and_preserves_login_body() {
@@ -3305,6 +3446,10 @@ mod tests {
 
         rechecked.amount_left = 0;
         assert!(deluge_is_finished(&rechecked));
+
+        rechecked.state = rt_session::TorrentState::Seeding;
+        rechecked.amount_left = 25;
+        assert!(!deluge_is_finished(&rechecked));
     }
 
     #[tokio::test]
@@ -4116,8 +4261,11 @@ mod tests {
             .unwrap();
         let body = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
         let body: Value = serde_json::from_slice(&body).unwrap();
-        assert!(body["error"].is_null());
-        assert!(body["result"].as_array().is_some());
+        assert!(body["result"].is_null());
+        assert!(body["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("file metadata was not loaded"));
     }
 
     #[tokio::test]
@@ -4402,6 +4550,8 @@ mod tests {
         );
         assert!(deluge_file_priority_updates(Some(&json!([u64::MAX])), Some(&json!(1))).is_err());
         assert!(deluge_peer_addr_arg(&json!(["127.0.0.1", 70_000])).is_err());
+        assert!(deluge_peer_addr_arg(&json!(["127.0.0.1", 0])).is_err());
+        assert!(deluge_peer_addr_arg(&json!("127.0.0.1:0")).is_err());
         assert!(deluge_rename_file_args(Some(&json!([[u64::MAX, "new"]]))).is_err());
         assert!(
             validate_deluge_options(json!({"max_download_speed": "NaN"}).as_object().unwrap())
@@ -4410,6 +4560,42 @@ mod tests {
         assert!(
             validate_deluge_options(json!({"unknown_option": true}).as_object().unwrap()).is_err()
         );
+    }
+
+    #[test]
+    fn deluge_file_projection_reports_offsets_progress_and_priority() {
+        let mut entry = TorrentEntry::new("a".repeat(40), "files".into(), "/data".into());
+        entry.total_length = 300;
+        entry.amount_left = 125;
+        let files = vec![
+            EngineTorrentFile {
+                index: 0,
+                path: "one.bin".into(),
+                length: 100,
+                offset: 0,
+                piece_offset: 0,
+                priority: 1,
+                wanted: true,
+            },
+            EngineTorrentFile {
+                index: 1,
+                path: "two.bin".into(),
+                length: 200,
+                offset: 100,
+                piece_offset: 100,
+                priority: 0,
+                wanted: false,
+            },
+        ];
+
+        let projected = deluge_file_infos(&entry, &files);
+
+        assert_eq!(projected[0]["offset"], 0);
+        assert_eq!(projected[0]["progress"], 1.0);
+        assert_eq!(projected[0]["priority"], 1);
+        assert_eq!(projected[1]["offset"], 100);
+        assert_eq!(projected[1]["progress"], 0.375);
+        assert_eq!(projected[1]["priority"], 0);
     }
 
     #[test]

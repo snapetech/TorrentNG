@@ -10,15 +10,27 @@ overall=0
 
 latest_report() {
   local pattern="$1"
-  find "$REPORT_DIR" -maxdepth 1 -type f -name "$pattern" -printf '%T@ %p\n' 2>/dev/null |
-    sort -nr |
-    awk 'NR == 1 { print $2 }'
+  find "$REPORT_DIR" -maxdepth 1 -type f -name "$pattern" -printf '%T@\t%p\n' 2>/dev/null |
+    sort -t $'\t' -k1,1nr |
+    awk 'NR == 1 { print substr($0, index($0, "\t") + 1) }'
 }
 
 contains() {
   local file="$1"
   local pattern="$2"
   [[ -n "$file" && -f "$file" ]] && grep -Eq "$pattern" "$file"
+}
+
+report_passes() {
+  local file="$1"
+  [[ -n "$file" && -f "$file" ]] || return 1
+  if grep -q '^Overall status:' "$file"; then
+    grep -q '^Overall status: PASS$' "$file"
+  elif grep -q '^Result:' "$file"; then
+    grep -q '^Result: PASS$' "$file"
+  else
+    grep -q '^test result: ok$' "$file"
+  fi
 }
 
 row() {
@@ -58,15 +70,15 @@ storage_uring="$(latest_report 'storage-uring-graduation-*.md')"
 } >"$OUT"
 
 if contains "$local_release" 'idle_memory_100k_keeps_fixed_rss_task_fd_budget.*ok'; then
-  row "10k/100k idle RSS/task/fd proxy" PASS "$(report_link "$local_release")"
+  row "idle RSS/task/fd regression proxy" PASS "$(report_link "$local_release")"
 else
-  row "10k/100k idle RSS/task/fd proxy" FAIL "$(report_link "$local_release")"
+  row "idle RSS/task/fd regression proxy" FAIL "$(report_link "$local_release")"
 fi
 
 if contains "$local_release" 'hot_seeding_1k_memory_attribution_stays_under_cap.*ok'; then
-  row "1k hot seeding memory-cap proxy" PASS "$(report_link "$local_release")"
+  row "hot-seeding memory attribution regression proxy" PASS "$(report_link "$local_release")"
 else
-  row "1k hot seeding memory-cap proxy" FAIL "$(report_link "$local_release")"
+  row "hot-seeding memory attribution regression proxy" FAIL "$(report_link "$local_release")"
 fi
 
 if contains "$local_release" 'storage_hash_pool_does_not_block_peer_read_path.*ok' &&
@@ -89,7 +101,7 @@ else
   row "process-level per-device queue registry" FAIL "$(report_link "$local_release")"
 fi
 
-if contains "$move_import" 'Overall status: PASS|test result: ok' &&
+if report_passes "$move_import" &&
   contains "$move_import" 'symlink'; then
   row "move/import/delete executor safety" PASS "$(report_link "$move_import")"
 else
@@ -102,10 +114,10 @@ else
   row "real-root move/import fixture evidence" WARN "$(report_link "$move_import")"
 fi
 
-if contains "$storage_hardware" 'Overall status: PASS' &&
+if report_passes "$storage_hardware" &&
   contains "$storage_hardware" 'TorrentNG storage elevator wall-clock ratio: [5-9][0-9]*\.|TorrentNG storage elevator wall-clock ratio: [5-9]\.'; then
   row "HDD 5x elevator release evidence" PASS "$(report_link "$storage_hardware")"
-elif contains "$storage_hardware" 'Overall status: PASS' &&
+elif report_passes "$storage_hardware" &&
   contains "$storage_hardware" 'tng_storage_elevator skipped_non_hdd_profile='; then
   row "HDD 5x elevator release evidence" INFO "$(report_link "$storage_hardware") (non-HDD target)"
 else
@@ -114,14 +126,14 @@ fi
 
 if contains "$storage_hardware" '/dev/sd.*\|.*\| 1 \|'; then
   row "sampled LVM physical-PV placement evidence" PASS "$(report_link "$storage_hardware")"
-elif contains "$storage_hardware" 'Overall status: PASS' &&
+elif report_passes "$storage_hardware" &&
   ! contains "$storage_hardware" 'LVM/PV extent probe:'; then
   row "sampled LVM physical-PV placement evidence" INFO "$(report_link "$storage_hardware") (non-LVM target)"
 else
   row "sampled LVM physical-PV placement evidence" WARN "$(report_link "$storage_hardware")"
 fi
 
-if contains "$storage_uring" 'Overall status: PASS' &&
+if report_passes "$storage_uring" &&
   contains "$storage_uring" 'Selected: uring' &&
   contains "$storage_uring" 'Fixed-buffer strategy: frame_pool_slots' &&
   contains "$storage_uring" '\| fixed-buffer strategy[^|]*\| (INFO(: [^|]+)?|PASS) \|'; then
@@ -130,7 +142,7 @@ else
   row "io_uring real-device capability probe" WARN "$(report_link "$storage_uring")"
 fi
 
-if contains "$storage_uring" 'Overall status: PASS' &&
+if report_passes "$storage_uring" &&
   contains "$storage_uring" 'Selected: uring' &&
   contains "$storage_uring" 'Fixed-buffer strategy: frame_pool_slots' &&
   contains "$storage_uring" '\| fixed-buffer strategy frame_pool_slots \| PASS \|'; then
@@ -139,7 +151,7 @@ else
   row "io_uring frame-pool slot graduation" WARN "$(report_link "$storage_uring")"
 fi
 
-if contains "$storage_release" 'Overall status: PASS'; then
+if report_passes "$storage_release"; then
   row "storage release certification wrapper" PASS "$(report_link "$storage_release")"
 else
   row "storage release certification wrapper" WARN "$(report_link "$storage_release")"
@@ -149,6 +161,7 @@ fi
   echo
   echo "## Boundaries"
   echo
+  echo "- Deterministic resource proxies are regression checks only; this report emits no torrent-count capacity certification and does not make a fleet-size claim."
   echo "- Deterministic LVM physical-drive placement remains a non-claim unless a lower-level PV-targeted path is added."
   echo "- io_uring remains explicit opt-in until graduation reports meet selected-backend, registered-file, frame-pool-slot strategy, and throughput thresholds on target hardware."
   echo "- Multi-TB move/import certification remains host/run evidence; use the real-root fixture knobs to scale the report on the target storage root."

@@ -14,6 +14,21 @@ download_rate_limit = 0
 download_dir = "/data"
 device_elevator_enabled = true
 
+[crash_safety]
+# Power-loss and crash protection. The defaults are safe for local ext4, xfs,
+# btrfs and zfs storage; see docs/CRASH_SAFETY.md. All keys are also editable at
+# runtime from the WebUI (Settings -> Backend -> Crash safety).
+# host_crash_recovery = "recent"    # "watermark" | "recent" | "full"
+# completion_verify = "off"         # "off" | "sample" | "full"
+# weak_mount_paths = []             # storage whose fsync you distrust, e.g. ["/mnt/mergerfs"]
+#
+# Per-location overrides for mixed storage (longest matching path wins; unset
+# keys inherit the values above):
+# [[crash_safety.path_policies]]
+# path = "/mnt/nas"
+# host_crash_recovery = "full"
+# completion_verify = "sample"
+
 [memory]
 total_cap_mb = 512
 storage_frame_cap_mb = 128
@@ -49,11 +64,9 @@ path = "/var/lib/torrentngd/state.db"
 wal_checkpoint_pages = 1000
 
 [auth]
-# Fresh local installs use torrentng / torrentng. Change this pair before
-# exposing the WebUI beyond loopback. Runtime changes in the WebUI are stored
-# in the session directory and override these config values.
+# When password is omitted, torrentngd generates a unique value in the session
+# directory. Retrieve the active WebUI login with `torrentngd auth-token`.
 username = "torrentng"
-password = "torrentng"
 # Compose mounts the one deployment token at this path. For a non-Compose
 # deployment, provide the same newline-delimited secret file or replace this
 # with api_tokens = ["..."] in a private config.

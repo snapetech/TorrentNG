@@ -919,6 +919,45 @@ impl EngineHandle {
         await_engine_reply(rx).await
     }
 
+    /// Crash-safety settings, run verdict, mount trust and counters.
+    pub async fn crash_safety(&self) -> CmdResult<crate::crash_safety::CrashSafetyView> {
+        let (reply, rx) = tokio::sync::oneshot::channel();
+        self.send_command(EngineCmd::GetCrashSafety { reply })
+            .await?;
+        await_engine_reply(rx).await
+    }
+
+    /// Persist and apply new crash-safety settings, or reset to config values.
+    pub async fn set_crash_safety(
+        &self,
+        settings: Option<rt_config::CrashSafetyConfig>,
+    ) -> CmdResult<crate::crash_safety::CrashSafetyView> {
+        if let Some(settings) = &settings {
+            settings.validate().map_err(|error| error.to_string())?;
+        }
+        let (reply, rx) = tokio::sync::oneshot::channel();
+        self.send_command(EngineCmd::SetCrashSafety { settings, reply })
+            .await?;
+        await_engine_reply(rx).await
+    }
+
+    /// Describe the crash-safety policy that applies to an absolute path.
+    pub async fn describe_crash_safety_path(
+        &self,
+        path: std::path::PathBuf,
+    ) -> CmdResult<crate::crash_safety::PathReport> {
+        if !path.is_absolute() {
+            return Err("path must be absolute".to_owned());
+        }
+        if path.as_os_str().len() > super::MAX_CRASH_SAFETY_QUERY_PATH_BYTES {
+            return Err("path is too long".to_owned());
+        }
+        let (reply, rx) = tokio::sync::oneshot::channel();
+        self.send_command(EngineCmd::DescribeCrashSafetyPath { path, reply })
+            .await?;
+        await_engine_reply(rx).await
+    }
+
     pub async fn queue_priority(&self, info_hash: String) -> CmdResult<i32> {
         let info_hash = canonical_info_hash_checked(info_hash)?;
         let (reply, rx) = tokio::sync::oneshot::channel();

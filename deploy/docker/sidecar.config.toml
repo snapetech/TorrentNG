@@ -22,8 +22,9 @@ poll_interval_secs = 2
 read_from_start = false
 
 [auth]
-secret_key = "change-me"
-api_tokens = []
+# Compose injects TNG_SECRET_KEY and TNG_API_TOKENS at startup. Keep
+# credentials out of the image and out of this template; a public bind without
+# those injected values is rejected by configuration validation.
 trust_proxy_header = false
 secure_cookies = true
 

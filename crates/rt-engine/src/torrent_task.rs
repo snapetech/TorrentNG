@@ -28,7 +28,8 @@ use url::Url;
 use std::sync::Arc;
 
 use rt_fastresume::{
-    FastresumeState, FastresumeStore, FileHint, ImportPolicy, PartialPieceState, PieceState,
+    decide_recovery, should_audit_allocation, FastresumeState, FastresumeStore, FileHint,
+    ImportPolicy, PartialPieceState, PieceState, RecheckReason, RecoveryAction, RecoveryInputs,
     MAX_FASTRESUME_BLOCKS_PER_PARTIAL_PIECE,
 };
 #[cfg(test)]
@@ -67,6 +68,7 @@ mod peer_session;
 #[path = "torrent_task/peer_transfer.rs"]
 mod peer_transfer;
 
+use crate::crash_safety::{self, CrashSafetyRuntime};
 use crate::db_worker::DbExecutor;
 use crate::egress_policy::{OutboundEgressPolicy, OutboundTargetKind};
 use crate::network_budget::{GlobalNetworkBudget, RateLimitCancellation, SharedRateLimiter};
@@ -371,6 +373,7 @@ fn parse_persisted_file_path(path: &str) -> Result<rt_path::SafeRelPath, String>
 fn restore_runtime_projection(entry: &mut TorrentEntry, previous: &TorrentEntry) {
     entry.total_length = previous.total_length;
     entry.amount_left = previous.amount_left;
+    entry.finalizing = previous.finalizing;
     entry.state = previous.state;
     entry.completed_at = previous.completed_at;
     entry.error_message = previous.error_message.clone();
@@ -379,6 +382,7 @@ fn restore_runtime_projection(entry: &mut TorrentEntry, previous: &TorrentEntry)
 fn restore_progress_projection(entry: &mut TorrentEntry, previous: &TorrentEntry) {
     entry.total_length = previous.total_length;
     entry.amount_left = previous.amount_left;
+    entry.finalizing = previous.finalizing;
 }
 
 /// Packed piece availability. A `Vec<bool>` uses one allocation and one
@@ -840,6 +844,184 @@ impl DirtyPieceTracker {
         self.pieces.clear();
         self.overflowed = false;
     }
+}
+
+/// Ceiling on pieces re-read by a `sample` completion verification, so a huge
+/// torrent cannot turn a spot check into a near-full recheck.
+const MAX_COMPLETION_SAMPLE_PIECES: usize = 16_384;
+const COMPLETION_GATE_RETRY_MIN: Duration = Duration::from_secs(5);
+const COMPLETION_GATE_RETRY_MAX: Duration = Duration::from_secs(60);
+const MAX_REGRESSION_SAMPLE_PIECES: usize = 32;
+const MAX_REGRESSION_FILES: usize = 20;
+
+/// A finished download held back until its data is durable.
+///
+/// While it exists the torrent stays `Downloading` and reports one byte
+/// remaining (see [`TorrentTask::reported_bytes_left`]), so no API consumer
+/// sees a completed torrent whose data a power cut could still take back.
+struct CompletionGate {
+    runtime: Arc<CrashSafetyRuntime>,
+    started: Instant,
+    next_attempt: Instant,
+    attempts: u32,
+    settled: bool,
+}
+
+impl CompletionGate {
+    fn new(runtime: Arc<CrashSafetyRuntime>) -> Self {
+        runtime.record_gate_started();
+        let now = Instant::now();
+        CompletionGate {
+            runtime,
+            started: now,
+            next_attempt: now,
+            attempts: 0,
+            settled: false,
+        }
+    }
+
+    fn schedule_retry(&mut self) {
+        let exponent = self.attempts.saturating_sub(1).min(4);
+        let delay = COMPLETION_GATE_RETRY_MIN
+            .saturating_mul(1u32 << exponent)
+            .min(COMPLETION_GATE_RETRY_MAX);
+        self.next_attempt = Instant::now() + delay;
+    }
+
+    fn release(mut self) {
+        self.settled = true;
+        self.runtime.record_gate_released();
+    }
+}
+
+impl Drop for CompletionGate {
+    fn drop(&mut self) {
+        if !self.settled {
+            self.runtime.record_gate_dropped();
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BarrierOutcome {
+    /// Payload files were fsynced.
+    Synced,
+    /// `fast` durability mode: no fsync by design.
+    SkippedFast,
+    /// The filesystem cannot fsync (e.g. some FUSE mounts); best effort.
+    Unsupported,
+    Failed,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SaveOutcome {
+    barrier: BarrierOutcome,
+    persisted: bool,
+}
+
+impl SaveOutcome {
+    /// Whether a completion may be released on the strength of this save.
+    fn releases_completion(self) -> bool {
+        self.persisted
+            && matches!(
+                self.barrier,
+                BarrierOutcome::Synced | BarrierOutcome::Unsupported
+            )
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum VerifyPlan {
+    Sample,
+    Full,
+}
+
+enum GateStep {
+    /// Waiting for the barrier to succeed.
+    Pending,
+    /// The barrier succeeded; a read-back verification must run next.
+    Verify(VerifyPlan),
+    Released,
+    /// The torrent is no longer complete; the gate was discarded.
+    Dropped,
+}
+
+pub(crate) fn splitmix64(state: &mut u64) -> u64 {
+    *state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+    let mut z = *state;
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    z ^ (z >> 31)
+}
+
+/// Pick the pieces a `sample` completion verification re-reads: the first and
+/// last piece of every file (where a size-only preallocation most often leaves
+/// an unwritten tail or head), plus a deterministic pseudo-random `percent` of
+/// all pieces. Returns `None` when the sample would cover every piece anyway,
+/// meaning a full verification is no more expensive.
+fn select_completion_sample(
+    piece_map: &PieceMap,
+    files: &[(u32, u64, bool)],
+    percent: u8,
+    seed: u64,
+) -> Option<Vec<u32>> {
+    let count = piece_map.piece_count as usize;
+    if count == 0 || percent >= 100 {
+        return None;
+    }
+    let mut selected = std::collections::BTreeSet::new();
+    for &(index, length, pad) in files {
+        if pad || length == 0 {
+            continue;
+        }
+        if let Some((first, _)) = piece_map.piece_range_for_file_bytes(index, 0, 1) {
+            selected.insert(first);
+        }
+        if let Some((_, last)) = piece_map.piece_range_for_file_bytes(index, length - 1, length) {
+            selected.insert(last.saturating_sub(1));
+        }
+    }
+    let target = ((count as u64) * u64::from(percent)).div_ceil(100).max(1) as usize;
+    let target = target
+        .min(MAX_COMPLETION_SAMPLE_PIECES)
+        .max(selected.len().min(MAX_COMPLETION_SAMPLE_PIECES));
+    let mut rng = seed;
+    let mut attempts = target.saturating_mul(4).saturating_add(16);
+    while selected.len() < target && attempts > 0 {
+        attempts -= 1;
+        selected.insert((splitmix64(&mut rng) % count as u64) as u32);
+    }
+    if selected.len() >= count {
+        return None;
+    }
+    let mut pieces: Vec<u32> = selected.into_iter().collect();
+    pieces.truncate(MAX_COMPLETION_SAMPLE_PIECES.max(1));
+    Some(pieces)
+}
+
+/// Blocking body of the startup allocation audit: which piece ranges overlap a
+/// hole or unwritten extent of any file. Files that are missing or unreadable
+/// are left to the file-hint check.
+fn audit_files_blocking(
+    piece_map: &PieceMap,
+    files: Vec<(u32, PathBuf, u64)>,
+) -> (Vec<(u32, u32)>, u64) {
+    let mut ranges = Vec::new();
+    let mut unsupported = 0u64;
+    for (index, path, length) in files {
+        match rt_storage::audit_file_allocation(&path, length) {
+            Ok(rt_storage::AllocationAudit::Gaps { gaps, .. }) => {
+                for (start, end) in gaps.merged() {
+                    if let Some(range) = piece_map.piece_range_for_file_bytes(index, start, end) {
+                        ranges.push(range);
+                    }
+                }
+            }
+            Ok(rt_storage::AllocationAudit::Unsupported) => unsupported += 1,
+            Err(_) => {}
+        }
+    }
+    (ranges, unsupported)
 }
 
 fn effective_piece_assembly_soft_cap(configured_bytes: usize) -> usize {
@@ -1492,6 +1674,29 @@ pub struct TorrentTask {
     peer_command_queue_full: u64,
     tracker_peer_cache_drops: u64,
     dirty_pieces_since_barrier: DirtyPieceTracker,
+    /// Shared crash-safety settings, run verdict and counters. Defaults to an
+    /// inert instance until the engine attaches the real one.
+    crash_safety: Arc<CrashSafetyRuntime>,
+    completion_gate: Option<CompletionGate>,
+    /// A read-back verification queued by the completion gate, started by
+    /// [`TorrentTask::drive_crash_safety`] where the command receiver is
+    /// available.
+    completion_verify_plan: Option<VerifyPlan>,
+    /// The recheck now running (or about to run) is a completion verification.
+    /// While set, the torrent keeps reporting one byte remaining.
+    completion_verifying: bool,
+    /// Pieces the next recheck should verify instead of the whole torrent.
+    recheck_subset: Option<Vec<u32>>,
+    /// A failed `sample` verification proved storage returned bad data; follow
+    /// it with a full recheck.
+    escalate_full_recheck: bool,
+    /// The save path's filesystem cannot fsync; stop retrying.
+    fsync_unsupported: bool,
+    /// Why the startup recheck was forced by crash recovery, for event labels.
+    recovery_recheck_reason: Option<RecheckReason>,
+    /// Unix seconds of the last payload write. Persisted into fastresume to
+    /// date recent writes for the post-host-crash recheck window.
+    last_data_write_unix: std::sync::atomic::AtomicU64,
     super_seeding: bool,
     seed_ratio_limit: Option<f64>,
     seed_idle_limit: Option<Duration>,
@@ -1541,6 +1746,11 @@ impl Drop for TorrentTask {
 impl TorrentTask {
     pub(crate) fn attach_torrent_metadata_memory_lease(&mut self, lease: MemoryLease) {
         self._torrent_metadata_memory_lease = Some(lease);
+    }
+
+    /// Share the engine's crash-safety runtime with this task.
+    pub(crate) fn attach_crash_safety(&mut self, runtime: Arc<CrashSafetyRuntime>) {
+        self.crash_safety = runtime;
     }
 
     fn reserve_file_policy_memory(
@@ -1821,6 +2031,15 @@ impl TorrentTask {
             peer_command_queue_full: 0,
             tracker_peer_cache_drops: 0,
             dirty_pieces_since_barrier: DirtyPieceTracker::default(),
+            crash_safety: CrashSafetyRuntime::inert(),
+            completion_gate: None,
+            completion_verify_plan: None,
+            completion_verifying: false,
+            recheck_subset: None,
+            escalate_full_recheck: false,
+            fsync_unsupported: false,
+            recovery_recheck_reason: None,
+            last_data_write_unix: std::sync::atomic::AtomicU64::new(0),
             super_seeding: false,
             seed_ratio_limit: None,
             seed_idle_limit: None,
@@ -1981,7 +2200,7 @@ impl TorrentTask {
                         self.cancel_tracker_announces();
                         self.announce_stopped_with_control_deadline().await;
                         self.persist_progress().await;
-                        self.save_fastresume(false).await;
+                        self.save_fastresume_for_exit().await;
                         self.shutdown_peers().await;
                         break;
                     };
@@ -1990,7 +2209,7 @@ impl TorrentTask {
                             self.cancel_tracker_announces();
                             self.announce_stopped_with_control_deadline().await;
                             self.persist_progress().await;
-                            self.save_fastresume(false).await;
+                            self.save_fastresume_for_exit().await;
                             self.shutdown_peers().await;
                             break;
                         }
@@ -2202,6 +2421,14 @@ impl TorrentTask {
                         }
                         TorrentCmd::PriorityPeers(addrs) => {
                             if !self.paused {
+                                // Private torrents have no tracker/DHT/PEX
+                                // peer source. An explicit peer supplied by a
+                                // client is therefore the authority that
+                                // admits this address for the connection and
+                                // for later reconnects.
+                                if self.meta.private {
+                                    self.remember_tracker_peers(&addrs);
+                                }
                                 self.connect_priority_peers(addrs).await;
                             }
                         }
@@ -2343,6 +2570,12 @@ impl TorrentTask {
                     if let Some(event) = peer_event_if_active(self.paused, event) {
                         self.handle_peer_event(event).await;
                     }
+                    if self.crash_safety_work_pending() {
+                        if !self.drive_crash_safety(&mut cmd_rx, &mut pending_command).await {
+                            break;
+                        }
+                        reset_webseed_sleep(&mut webseed_sleep, self.webseed_wake_delay());
+                    }
                 }
 
                 Some(event) = self.peer_disconnect_rx.recv() => {
@@ -2370,6 +2603,12 @@ impl TorrentTask {
                     }
                     if !self.paused {
                         self.start_due_tracker_announces().await;
+                    }
+                    if self.crash_safety_work_pending() {
+                        if !self.drive_crash_safety(&mut cmd_rx, &mut pending_command).await {
+                            break;
+                        }
+                        reset_webseed_sleep(&mut webseed_sleep, self.webseed_wake_delay());
                     }
                 }
 
@@ -2428,7 +2667,7 @@ impl TorrentTask {
                             self.cancel_tracker_announces();
                             self.announce_stopped_with_control_deadline().await;
                             self.persist_progress().await;
-                            self.save_fastresume(false).await;
+                            self.save_fastresume_for_exit().await;
                             self.shutdown_peers().await;
                             break;
                         }
@@ -2804,7 +3043,7 @@ impl TorrentTask {
 
     async fn persist_tracker_state_inner(&self) -> Result<(), String> {
         let (uploaded, downloaded) = self.transfer_snapshot().await;
-        let left = db_i64(self.picker.bytes_left());
+        let left = db_i64(self.reported_bytes_left());
         let now = Instant::now();
         let mut rows = Vec::new();
         let mut tracker_index = 0i64;
@@ -2977,7 +3216,6 @@ impl TorrentTask {
                 Ok((rows, limits))
             })
             .await?;
-        let has_file_policy = !rows.is_empty();
         // Admission must precede the clone and replacement map construction;
         // reserving only after those allocations lets a large durable policy
         // briefly bypass the metadata governor during reload.
@@ -3007,13 +3245,27 @@ impl TorrentTask {
                 ));
             }
             if policy
-                .insert(file_index, (row.wanted, row.priority))
+                .insert(
+                    file_index,
+                    (
+                        row.wanted && !file.pad,
+                        if file.pad { 0 } else { row.priority },
+                    ),
+                )
                 .is_some()
             {
                 return Err(format!(
                     "persisted file policy contains duplicate file index {file_index}"
                 ));
             }
+        }
+
+        // Padding entries are synthetic zero bytes. Keep them disabled even
+        // when a partial durable projection omitted the row.
+        for file in &effective_files {
+            policy
+                .entry(file.index)
+                .or_insert((!file.pad, if file.pad { 0 } else { 1 }));
         }
 
         crate::engine::validate_file_path_projection(
@@ -3077,13 +3329,6 @@ impl TorrentTask {
         }
 
         let piece_count = self.piece_map.piece_count as usize;
-        if !has_file_policy {
-            // No per-file projection means the metainfo defaults apply. This
-            // also clears a stale policy after the durable projection is
-            // intentionally removed.
-            self.apply_piece_policy(&vec![true; piece_count], vec![false; piece_count]);
-            return Ok(());
-        }
         let file_lengths: HashMap<u32, u64> = self
             .meta
             .files
@@ -3332,9 +3577,39 @@ impl TorrentTask {
         &mut self,
         cmd_rx: &mut mpsc::Receiver<TorrentCmd>,
         pending_command: &mut Option<TorrentCmd>,
+        job_id: Option<String>,
+    ) -> RecheckOutcome {
+        // A recheck decides the torrent's completion itself, so a completion
+        // gate or queued verification from before it is void.
+        self.completion_gate = None;
+        self.completion_verify_plan = None;
+        let outcome = self
+            .run_recheck_inner(cmd_rx, pending_command, job_id)
+            .await;
+        self.completion_verifying = false;
+        self.recheck_subset = None;
+        outcome
+    }
+
+    async fn run_recheck_inner(
+        &mut self,
+        cmd_rx: &mut mpsc::Receiver<TorrentCmd>,
+        pending_command: &mut Option<TorrentCmd>,
         mut job_id: Option<String>,
     ) -> RecheckOutcome {
         let mut valid = 0usize;
+        // A subset recheck (completion `sample` verification) re-hashes only
+        // the chosen pieces and leaves every other piece as it was.
+        let subset = self.recheck_subset.take();
+        let verification_run = self.completion_verifying;
+        let previously_completed = self.registry_completed_at().await.is_some();
+        let recheck_trigger = if verification_run {
+            "completion_verify"
+        } else if self.recovery_recheck_reason.take().is_some() {
+            "crash_recovery"
+        } else {
+            "recheck"
+        };
         let mut verified_bytes = 0_u64;
         // The picker is updated as each piece is verified, so retaining a
         // second result entry for every piece only multiplied recheck memory
@@ -3356,8 +3631,10 @@ impl TorrentTask {
         // Do not checkpoint the old fastresume bitmap while this scan is in
         // progress. Publish each piece below only after its current bytes
         // have been hashed, so a crash cannot restore stale-valid pieces.
-        for piece in 0..self.piece_map.piece_count {
-            self.picker.reject_piece(piece as usize);
+        if subset.is_none() {
+            for piece in 0..self.piece_map.piece_count {
+                self.picker.reject_piece(piece as usize);
+            }
         }
         if let Err(error) = self.set_state_checked(TorrentState::Checking).await {
             self.paused = true;
@@ -3379,7 +3656,23 @@ impl TorrentTask {
             ));
         }
 
-        for piece in 0..self.piece_map.piece_count {
+        let mut subset_pieces = subset.as_ref().map(|pieces| pieces.iter().copied());
+        let mut next_piece = 0u32;
+        loop {
+            let piece = match subset_pieces.as_mut() {
+                Some(pieces) => match pieces.next() {
+                    Some(piece) => piece,
+                    None => break,
+                },
+                None => {
+                    if next_piece >= self.piece_map.piece_count {
+                        break;
+                    }
+                    let piece = next_piece;
+                    next_piece += 1;
+                    piece
+                }
+            };
             match self
                 .pending_recheck_control(cmd_rx, pending_command, &mut job_id)
                 .await
@@ -3505,7 +3798,7 @@ impl TorrentTask {
                     // without the explicit Shutdown arm below. Keep the
                     // terminal tracker event best effort for both cases.
                     self.announce_stopped_with_control_deadline().await;
-                    self.save_fastresume(false).await;
+                    self.save_fastresume_for_exit().await;
                     if let Err(error) = self.set_state_checked(TorrentState::Stopped).await {
                         warn!(
                             component = "torrent",
@@ -3583,7 +3876,19 @@ impl TorrentTask {
             invalid = invalid_pieces.total,
             "recheck complete"
         );
-        self.save_fastresume(true).await;
+        // From here the recheck's own verdict (Seeding or Downloading) is
+        // authoritative; the one-byte completion hold no longer applies.
+        self.completion_verifying = false;
+        self.report_recheck_outcome(
+            &invalid_pieces,
+            valid,
+            previously_completed,
+            verification_run,
+            subset.is_some(),
+            recheck_trigger,
+        )
+        .await;
+        self.save_fastresume(subset.is_none()).await;
 
         let final_state = if self.paused {
             if let Some(restore_state) = self.recheck_restore_state {
@@ -3913,6 +4218,53 @@ impl TorrentTask {
             return false;
         }
 
+        let settings = self.crash_safety.settings();
+        let location = self.crash_safety.for_location(&self.save_root);
+        let previous_run = self.crash_safety.previous_run();
+        let saved_this_run = state.durability.saved_by_run_id != 0
+            && state.durability.saved_by_run_id == self.crash_safety.run_id();
+        let state_was_clean = state.clean_shutdown;
+        if previous_run.may_be_host_crash() && !saved_this_run {
+            let inputs = RecoveryInputs {
+                previous_run,
+                crash_reference_unix: self.crash_safety.assessment().crash_reference_unix,
+                now_unix: crash_safety::unix_seconds(),
+                policy: crash_safety::recovery_policy(location.resolved.host_crash_recovery),
+                recent_window_secs: settings.recent_write_window_secs,
+                mount_trust: location.trust,
+                weak_mount_escalation: settings.weak_mount_escalation,
+                state_synced: state.durability.synced,
+                last_data_write_unix: state.durability.last_data_write_unix,
+                completed_unix: self.registry_completed_at().await,
+                state_saved_this_run: saved_this_run,
+            };
+            if let RecoveryAction::Recheck(reason) = decide_recovery(&inputs) {
+                warn!(
+                    component = "fastresume",
+                    operation = "crash_recovery",
+                    torrent = %self.info_hash_hex,
+                    previous_run = previous_run.as_str(),
+                    reason = reason.as_str(),
+                    mount_trust = location.trust.as_str(),
+                    "discarding resume state after a possible host crash; the torrent will be rechecked"
+                );
+                self.crash_safety.record_recovery_recheck(reason);
+                self.recovery_recheck_reason = Some(reason);
+                self.append_torrent_event(
+                    "crash_recovery_recheck",
+                    "resume state discarded after an unclean host shutdown; rechecking",
+                    serde_json::json!({
+                        "level": "warn",
+                        "reason": reason.as_str(),
+                        "previous_run": previous_run.as_str(),
+                        "mount_trust": location.trust.as_str(),
+                    }),
+                )
+                .await;
+                return false;
+            }
+        }
+
         if !state.clean_shutdown {
             match state.apply_unclean_shutdown_watermark() {
                 Some(downgraded) => {
@@ -3942,6 +4294,36 @@ impl TorrentTask {
             );
         }
 
+        if should_audit_allocation(
+            crash_safety::audit_policy(location.resolved.structural_audit),
+            previous_run,
+            state_was_clean,
+            saved_this_run,
+        ) {
+            let (downgraded, unsupported_files) = self.audit_allocation(&mut state).await;
+            self.crash_safety
+                .record_audit(u64::from(downgraded), unsupported_files);
+            if downgraded > 0 {
+                warn!(
+                    component = "fastresume",
+                    operation = "allocation_audit",
+                    torrent = %self.info_hash_hex,
+                    downgraded,
+                    "pieces overlapping unwritten or hole extents were downgraded for re-verification"
+                );
+                self.append_torrent_event(
+                    "allocation_audit_downgraded",
+                    "pieces overlapping unwritten or hole extents will be re-verified",
+                    serde_json::json!({ "level": "warn", "pieces": downgraded }),
+                )
+                .await;
+            }
+        }
+        self.last_data_write_unix.store(
+            state.durability.last_data_write_unix,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+
         for (piece, piece_state) in state.pieces.iter().copied().enumerate() {
             match piece_state {
                 PieceState::Valid => self.picker.mark_have(piece),
@@ -3969,7 +4351,8 @@ impl TorrentTask {
                 entry.stats.uploaded = state.uploaded_bytes;
                 entry.stats.downloaded = state.downloaded_bytes;
                 entry.total_length = self.meta.total_length();
-                entry.amount_left = self.picker.bytes_left();
+                entry.amount_left = self.reported_bytes_left();
+                entry.finalizing = self.is_finalizing();
             };
         }
 
@@ -4036,6 +4419,7 @@ impl TorrentTask {
         if data_offset != block.data.len() {
             anyhow::bail!("mapped piece regions do not cover the peer block");
         }
+        self.note_data_write();
         Ok(())
     }
 
@@ -4081,6 +4465,7 @@ impl TorrentTask {
             )
             .await?;
         }
+        self.note_data_write();
         Ok(())
     }
 
@@ -4190,9 +4575,11 @@ impl TorrentTask {
                 return Err(error.to_string());
             }
             entry.total_length = self.meta.total_length();
-            entry.amount_left = self.picker.bytes_left();
+            entry.amount_left = self.reported_bytes_left();
+            entry.finalizing = self.is_finalizing();
             if state == TorrentState::Seeding && entry.completed_at.is_none() {
                 entry.amount_left = 0;
+                entry.finalizing = false;
                 entry.completed_at = Some(
                     SystemTime::now()
                         .duration_since(UNIX_EPOCH)
@@ -4275,7 +4662,8 @@ impl TorrentTask {
             };
             let previous = entry.clone();
             entry.total_length = self.meta.total_length();
-            entry.amount_left = self.picker.bytes_left();
+            entry.amount_left = self.reported_bytes_left();
+            entry.finalizing = self.is_finalizing();
             let row = crate::engine::row_from_v1_meta(&entry, &self.meta);
             (previous, row)
         };
@@ -4448,7 +4836,465 @@ impl TorrentTask {
         db_i64(bytes.min(self.meta.total_length()))
     }
 
-    async fn save_fastresume(&mut self, full_verify: bool) {
+    /// Bytes left as shown to trackers and API consumers. A finished download
+    /// still waiting for durability or read-back verification reports one byte,
+    /// so nothing treats it as complete before its data is safe.
+    fn reported_bytes_left(&self) -> u64 {
+        let left = self.picker.bytes_left();
+        if left == 0 && self.is_finalizing() {
+            1
+        } else {
+            left
+        }
+    }
+
+    /// The download is complete on disk but held until its data is durable
+    /// and any read-back verification has passed. Published to the registry as
+    /// `TorrentEntry::finalizing` next to every `amount_left` update.
+    fn is_finalizing(&self) -> bool {
+        self.picker.bytes_left() == 0
+            && (self.completion_gate.is_some() || self.completion_verifying)
+    }
+
+    fn note_data_write(&self) {
+        self.last_data_write_unix.store(
+            crash_safety::unix_seconds(),
+            std::sync::atomic::Ordering::Relaxed,
+        );
+    }
+
+    async fn registry_completed_at(&self) -> Option<u64> {
+        self.registry
+            .read()
+            .await
+            .get(&self.info_hash_hex)
+            .and_then(|entry| entry.completed_at)
+    }
+
+    /// Append a per-torrent event to the session event log. Best effort: a
+    /// failed append is logged and never affects the torrent.
+    async fn append_torrent_event(
+        &self,
+        kind: &'static str,
+        message: &str,
+        payload: serde_json::Value,
+    ) {
+        let event = rt_db::SessionEventRow {
+            event_id: None,
+            occurred_at: db_i64(unix_now()),
+            info_hash: Some(self.info_hash_hex.clone()),
+            kind: kind.to_owned(),
+            message: Some(message.to_owned()),
+            payload: payload.to_string(),
+        };
+        let retention = self.event_retention;
+        let result = self
+            .db
+            .run("append_torrent_event", move |db| {
+                let tx = db.transaction().map_err(|error| error.to_string())?;
+                rt_db::append_session_event_in_tx(&tx, &event)
+                    .map_err(|error| error.to_string())?;
+                rt_db::prune_session_events_in_tx(&tx, retention)
+                    .map_err(|error| error.to_string())?;
+                tx.commit().map_err(|error| error.to_string())
+            })
+            .await;
+        if let Err(error) = result {
+            debug!(
+                component = "db",
+                operation = "append_torrent_event",
+                torrent = %self.info_hash_hex,
+                kind,
+                error = %error,
+                "could not record torrent event"
+            );
+        }
+    }
+
+    /// The last piece just verified: decide how the download completes.
+    ///
+    /// With the completion gate (default) the torrent is held at "one byte
+    /// left" until the payload is durable and any configured read-back
+    /// verification has passed; only then does it become `Seeding`, tell the
+    /// tracker `completed`, and stamp `completed_at`.
+    async fn on_download_complete(&mut self) {
+        let location = self.crash_safety.for_location(&self.save_root);
+        if !location.resolved.completion_gate
+            && location.completion_verify == rt_config::CompletionVerifyMode::Off
+        {
+            // Gate disabled by the operator for this location: the historical
+            // behavior.
+            self.persist_progress_throttled(true).await;
+            self.save_fastresume(false).await;
+            self.finish_completion().await;
+            return;
+        }
+        if self.completion_gate.is_none() {
+            self.completion_gate = Some(CompletionGate::new(Arc::clone(&self.crash_safety)));
+            // Publish the one-byte-remaining projection before anything slow.
+            self.persist_progress().await;
+        }
+        if let GateStep::Verify(plan) = self.advance_completion_gate().await {
+            self.completion_verify_plan = Some(plan);
+        }
+    }
+
+    /// Try to satisfy the completion gate: run the payload barrier, then
+    /// either release the completion or hand off to read-back verification.
+    async fn advance_completion_gate(&mut self) -> GateStep {
+        if !self.picker.is_complete() {
+            // A piece was rejected (recheck, failed verification): the
+            // download is not finished after all.
+            self.completion_gate = None;
+            self.persist_progress().await;
+            return GateStep::Dropped;
+        }
+        let attempts = match self.completion_gate.as_mut() {
+            None => return GateStep::Dropped,
+            Some(gate) if Instant::now() < gate.next_attempt => return GateStep::Pending,
+            Some(gate) => {
+                gate.attempts += 1;
+                gate.attempts
+            }
+        };
+        if attempts > 1 {
+            self.crash_safety.record_gate_retry();
+        }
+        let outcome = self.save_fastresume_with(false, true).await;
+        if !outcome.releases_completion() {
+            if let Some(gate) = self.completion_gate.as_mut() {
+                gate.schedule_retry();
+            }
+            warn!(
+                component = "torrent",
+                operation = "completion_gate",
+                torrent = %self.info_hash_hex,
+                attempts,
+                barrier = ?outcome.barrier,
+                persisted = outcome.persisted,
+                "download complete but its data is not yet durable; holding completion and retrying"
+            );
+            if attempts == 1 {
+                self.append_torrent_event(
+                    "completion_deferred",
+                    "download complete but not yet durable; completion is held until storage confirms",
+                    serde_json::json!({
+                        "level": "warn",
+                        "barrier": format!("{:?}", outcome.barrier),
+                        "fastresume_persisted": outcome.persisted,
+                    }),
+                )
+                .await;
+            }
+            return GateStep::Pending;
+        }
+
+        let location = self.crash_safety.for_location(&self.save_root);
+        match location.completion_verify {
+            rt_config::CompletionVerifyMode::Off => {
+                self.finish_completion().await;
+                GateStep::Released
+            }
+            rt_config::CompletionVerifyMode::Sample => GateStep::Verify(VerifyPlan::Sample),
+            rt_config::CompletionVerifyMode::Full => GateStep::Verify(VerifyPlan::Full),
+        }
+    }
+
+    /// Release a completed download: tell the tracker and become `Seeding`.
+    async fn finish_completion(&mut self) {
+        if let Some(gate) = self.completion_gate.take() {
+            let attempts = gate.attempts;
+            let waited_ms = gate.started.elapsed().as_millis() as u64;
+            gate.release();
+            if attempts > 1 {
+                self.append_torrent_event(
+                    "completion_released",
+                    "completion released after storage confirmed the data is durable",
+                    serde_json::json!({ "attempts": attempts, "waited_ms": waited_ms }),
+                )
+                .await;
+            }
+        }
+        self.tracker_event = TrackerEvent::Completed;
+        self.schedule_trackers_now();
+        match self.set_state_checked(TorrentState::Seeding).await {
+            Ok(()) => info!(
+                component = "torrent",
+                operation = "complete_download",
+                torrent = %self.info_hash_hex,
+                result = "ok",
+                "download complete"
+            ),
+            Err(error) => {
+                // `set_state_checked` rolled the registry back to Downloading
+                // when its durable write failed. Keep the runtime on that same
+                // active state; marking only the actor as paused would leave
+                // the public projection claiming downloading while no task work
+                // was possible.
+                self.paused = false;
+                self.recheck_restore_state = None;
+                self.restart_tracker_session();
+                self.shutdown_peers().await;
+                warn!(
+                    component = "torrent",
+                    operation = "complete_download",
+                    torrent = %self.info_hash_hex,
+                    result = "error",
+                    error = %error,
+                    "failed to persist seeding state; retaining downloading state"
+                );
+            }
+        }
+    }
+
+    fn crash_safety_work_pending(&self) -> bool {
+        self.completion_gate.is_some()
+            || self.completion_verify_plan.is_some()
+            || self.escalate_full_recheck
+    }
+
+    /// Advance queued crash-safety work that needs the command receiver: the
+    /// completion gate's retry, the read-back verification it hands off to, and
+    /// a full recheck escalated by a failed sample. Returns `false` when the
+    /// task must stop (shutdown or an unrecoverable recheck failure).
+    async fn drive_crash_safety(
+        &mut self,
+        cmd_rx: &mut mpsc::Receiver<TorrentCmd>,
+        pending_command: &mut Option<TorrentCmd>,
+    ) -> bool {
+        if self.paused {
+            return true;
+        }
+        if self.completion_gate.is_some() {
+            if let GateStep::Verify(plan) = self.advance_completion_gate().await {
+                self.completion_verify_plan = Some(plan);
+            }
+        }
+        if let Some(plan) = self.completion_verify_plan.take() {
+            self.begin_completion_verification(plan).await;
+        } else if self.escalate_full_recheck {
+            self.escalate_full_recheck = false;
+        } else {
+            return true;
+        }
+        match self
+            .run_recheck_with_receiver(cmd_rx, pending_command, None)
+            .await
+        {
+            RecheckOutcome::Shutdown => false,
+            RecheckOutcome::Failed(error) => {
+                warn!(
+                    component = "torrent",
+                    operation = "completion_verify",
+                    torrent = %self.info_hash_hex,
+                    result = "error",
+                    error = %error,
+                    "verification recheck failed; stopping task"
+                );
+                false
+            }
+            RecheckOutcome::Complete
+            | RecheckOutcome::Paused { .. }
+            | RecheckOutcome::Cancelled => true,
+        }
+    }
+
+    /// Set up the recheck that reads a finished download back from disk.
+    async fn begin_completion_verification(&mut self, plan: VerifyPlan) {
+        if let Some(gate) = self.completion_gate.take() {
+            gate.release();
+        }
+        let sample_percent = self
+            .crash_safety
+            .for_location(&self.save_root)
+            .resolved
+            .completion_verify_sample_percent;
+        self.recheck_subset = match plan {
+            VerifyPlan::Full => None,
+            VerifyPlan::Sample => {
+                let files: Vec<(u32, u64, bool)> = self
+                    .meta
+                    .files
+                    .iter()
+                    .map(|file| (file.index, file.length, file.pad))
+                    .collect();
+                let mut seed_bytes = [0u8; 8];
+                for (slot, byte) in seed_bytes.iter_mut().zip(self.meta.info_hash.iter()) {
+                    *slot = *byte;
+                }
+                select_completion_sample(
+                    &self.piece_map,
+                    &files,
+                    sample_percent,
+                    u64::from_le_bytes(seed_bytes),
+                )
+            }
+        };
+        self.completion_verifying = true;
+        // Best effort: make the read-back come from the device, not RAM.
+        let mut dropped = 0usize;
+        for file in &self.meta.files {
+            let path = file.path.resolve(&self.save_root);
+            if self.storage.drop_page_cache(&path).await {
+                dropped += 1;
+            }
+        }
+        debug!(
+            component = "torrent",
+            operation = "completion_verify",
+            torrent = %self.info_hash_hex,
+            plan = ?plan,
+            sampled_pieces = self.recheck_subset.as_ref().map(Vec::len),
+            page_cache_dropped_files = dropped,
+            "starting read-back verification of the completed download"
+        );
+    }
+
+    /// Record what a recheck found: completion-verification results and, for a
+    /// torrent that had already been reported complete, an integrity
+    /// regression (with the affected paths so an operator or automation can
+    /// act on copies made before the damage was known).
+    async fn report_recheck_outcome(
+        &mut self,
+        invalid: &RecheckInvalidPieces,
+        valid: usize,
+        previously_completed: bool,
+        verification_run: bool,
+        sampled: bool,
+        trigger: &'static str,
+    ) {
+        let checked = valid.saturating_add(invalid.total);
+        if verification_run {
+            self.crash_safety
+                .record_completion_verify(checked as u64, invalid.total as u64);
+            if invalid.total == 0 {
+                self.append_torrent_event(
+                    "completion_verified",
+                    "completed download was read back from disk and verified",
+                    serde_json::json!({
+                        "mode": if sampled { "sample" } else { "full" },
+                        "pieces_checked": checked,
+                    }),
+                )
+                .await;
+            } else {
+                // Storage returned data that does not match what was written.
+                // A failed sample is evidence enough to check everything.
+                self.escalate_full_recheck = sampled;
+                self.append_torrent_event(
+                    "completion_verify_failed",
+                    "read-back verification found data that does not match; the bad pieces will be downloaded again",
+                    serde_json::json!({
+                        "level": "error",
+                        "mode": if sampled { "sample" } else { "full" },
+                        "pieces_checked": checked,
+                        "invalid_pieces": invalid.total,
+                    }),
+                )
+                .await;
+            }
+        }
+        if previously_completed && invalid.total > 0 {
+            let sample: Vec<i64> = invalid
+                .values
+                .iter()
+                .copied()
+                .take(MAX_REGRESSION_SAMPLE_PIECES)
+                .collect();
+            let mut files: Vec<String> = Vec::new();
+            for piece in &sample {
+                let Ok(regions) = self.piece_map.piece_to_file_regions(*piece as u32) else {
+                    continue;
+                };
+                for region in regions {
+                    let Some(file) = self
+                        .meta
+                        .files
+                        .iter()
+                        .find(|file| file.index == region.file_index)
+                    else {
+                        continue;
+                    };
+                    let path = file.path.resolve(&self.save_root).display().to_string();
+                    if files.len() < MAX_REGRESSION_FILES && !files.contains(&path) {
+                        files.push(path);
+                    }
+                }
+            }
+            self.crash_safety.record_integrity_regression();
+            warn!(
+                component = "torrent",
+                operation = "integrity_regression",
+                torrent = %self.info_hash_hex,
+                trigger,
+                invalid_pieces = invalid.total,
+                "a torrent already reported complete has pieces that no longer match; repairing in place"
+            );
+            self.append_torrent_event(
+                "integrity_regression",
+                "a completed torrent has pieces that no longer verify; missing data will be downloaded again in place",
+                serde_json::json!({
+                    "level": "error",
+                    "trigger": trigger,
+                    "invalid_pieces": invalid.total,
+                    "sample_pieces": sample,
+                    "affected_files": files,
+                    "note": "repair rewrites the existing files in place, so hardlinks to them are healed; copies made earlier are not",
+                }),
+            )
+            .await;
+        }
+    }
+
+    /// Downgrade `Valid` pieces that overlap a hole or unwritten extent of any
+    /// file, so they are re-hashed instead of trusted. Returns the pieces
+    /// downgraded and the files whose filesystem could not report allocation.
+    async fn audit_allocation(&self, state: &mut FastresumeState) -> (u32, u64) {
+        let files: Vec<(u32, PathBuf, u64)> = self
+            .meta
+            .files
+            .iter()
+            .filter(|file| !file.pad && file.length > 0)
+            .map(|file| (file.index, file.path.resolve(&self.save_root), file.length))
+            .collect();
+        if files.is_empty() {
+            return (0, 0);
+        }
+        let piece_map = Arc::clone(&self.piece_map);
+        let audited =
+            tokio::task::spawn_blocking(move || audit_files_blocking(&piece_map, files)).await;
+        match audited {
+            Ok((ranges, unsupported)) => (state.distrust_piece_ranges(&ranges), unsupported),
+            Err(error) => {
+                warn!(
+                    component = "fastresume",
+                    operation = "allocation_audit",
+                    torrent = %self.info_hash_hex,
+                    error = %error,
+                    "allocation audit task failed; continuing without it"
+                );
+                (0, 0)
+            }
+        }
+    }
+
+    async fn save_fastresume(&mut self, full_verify: bool) -> SaveOutcome {
+        self.save_fastresume_with(full_verify, false).await
+    }
+
+    /// The final save before this task exits (orderly shutdown, demotion to
+    /// dormant). It always runs a real payload barrier, even in `fast`
+    /// durability mode: the run marker will call a clean exit "clean", and a
+    /// clean exit must mean the data is on disk, not merely in the page cache
+    /// of a machine that might lose power a moment later.
+    async fn save_fastresume_for_exit(&mut self) -> SaveOutcome {
+        self.save_fastresume_with(false, true).await
+    }
+
+    /// Write the fastresume record. With `force_sync`, the payload fsync
+    /// barrier runs even in `fast` durability mode (the completion gate needs
+    /// a real barrier regardless of mode).
+    async fn save_fastresume_with(&mut self, full_verify: bool, force_sync: bool) -> SaveOutcome {
         let durable_assembly_pieces = self.flush_piece_assemblies_to_disk().await;
         let (uploaded, downloaded) = self.transfer_snapshot().await;
         let mut state = FastresumeState::new_empty(
@@ -4495,12 +5341,30 @@ impl TorrentTask {
                 self.dirty_pieces_since_barrier.pieces.iter().copied(),
             );
         }
-        if self.sync_before_clean_fastresume().await {
-            state.complete_durability_barrier();
-            self.dirty_pieces_since_barrier.clear();
-        } else {
-            state.clean_shutdown = false;
+        let barrier = self.run_barrier(force_sync).await;
+        match barrier {
+            BarrierOutcome::Synced => {
+                state.complete_durability_barrier();
+                self.dirty_pieces_since_barrier.clear();
+            }
+            // No data fsync happened (by configuration, or because this
+            // filesystem cannot). The state is still good after a clean
+            // shutdown or a process crash, but the loader must not trust it
+            // after a host crash.
+            BarrierOutcome::SkippedFast | BarrierOutcome::Unsupported => {
+                state.complete_durability_barrier();
+                state.mark_saved_without_data_sync();
+                self.dirty_pieces_since_barrier.clear();
+            }
+            BarrierOutcome::Failed => {
+                state.clean_shutdown = false;
+            }
         }
+        state.durability.boot_id = self.crash_safety.boot_id().map(str::to_owned);
+        state.durability.saved_by_run_id = self.crash_safety.run_id();
+        state.durability.last_data_write_unix = self
+            .last_data_write_unix
+            .load(std::sync::atomic::Ordering::Relaxed);
         state.file_hints = collect_file_hints(&self.save_root, &self.meta);
         if full_verify {
             state.last_full_verify = SystemTime::now()
@@ -4509,36 +5373,60 @@ impl TorrentTask {
                 .as_secs();
         }
 
-        if let Err(e) = self.fastresume.save_async(state).await {
-            warn!(
-                component = "fastresume",
-                operation = "save",
-                torrent = %self.info_hash_hex,
-                result = "error",
-                error = %e,
-                "failed to save fastresume state"
-            );
-        }
+        let persisted = match self.fastresume.save_async(state).await {
+            Ok(()) => true,
+            Err(e) => {
+                warn!(
+                    component = "fastresume",
+                    operation = "save",
+                    torrent = %self.info_hash_hex,
+                    result = "error",
+                    error = %e,
+                    "failed to save fastresume state"
+                );
+                false
+            }
+        };
+        SaveOutcome { barrier, persisted }
     }
 
-    async fn sync_before_clean_fastresume(&self) -> bool {
-        match self.storage.io_config().durability_mode {
-            rt_storage::DurabilityMode::Fast => true,
-            rt_storage::DurabilityMode::Checkpoint | rt_storage::DurabilityMode::Strict => {
-                match self.storage.sync_all_open_files().await {
-                    Ok(()) => true,
-                    Err(e) => {
-                        warn!(
-                            component = "storage",
-                            operation = "sync_before_fastresume",
-                            torrent = %self.info_hash_hex,
-                            result = "error",
-                            error = %e,
-                            "failed to sync torrent files before clean fastresume save"
-                        );
-                        false
-                    }
-                }
+    /// Flush payload data before a fastresume record may claim it.
+    ///
+    /// `fast` mode skips this unless `force` (the completion gate) demands it.
+    /// A filesystem that cannot fsync at all is detected once, remembered, and
+    /// reported as `Unsupported` instead of failing every save forever.
+    async fn run_barrier(&mut self, force: bool) -> BarrierOutcome {
+        if self.fsync_unsupported {
+            return BarrierOutcome::Unsupported;
+        }
+        if !force && self.storage.io_config().durability_mode == rt_storage::DurabilityMode::Fast {
+            return BarrierOutcome::SkippedFast;
+        }
+        match self.storage.sync_all_open_files().await {
+            Ok(()) => BarrierOutcome::Synced,
+            Err(e) if e.is_operation_unsupported() => {
+                self.fsync_unsupported = true;
+                self.crash_safety.note_fsync_unsupported(&self.save_root);
+                warn!(
+                    component = "storage",
+                    operation = "sync_before_fastresume",
+                    torrent = %self.info_hash_hex,
+                    result = "unsupported",
+                    error = %e,
+                    "this filesystem cannot fsync; durability is best effort and the mount is treated as weak"
+                );
+                BarrierOutcome::Unsupported
+            }
+            Err(e) => {
+                warn!(
+                    component = "storage",
+                    operation = "sync_before_fastresume",
+                    torrent = %self.info_hash_hex,
+                    result = "error",
+                    error = %e,
+                    "failed to sync torrent files before fastresume save"
+                );
+                BarrierOutcome::Failed
             }
         }
     }
@@ -6245,6 +7133,11 @@ async fn run_peer_loop(
                             break;
                         }
                     }
+                    // BEP 6 Fast extension: this is an optional request
+                    // hint. The picker still follows ordinary choke state,
+                    // so accepting the message keeps interoperable peers
+                    // alive without bypassing request admission controls.
+                    Message::AllowedFast(_) => {}
                     Message::Unchoke => {
                         download_choked = false;
                         if !send_peer_event(
@@ -7015,6 +7908,7 @@ fn webseed_error_for_log(error: &anyhow::Error) -> String {
 
 #[cfg(test)]
 mod tests {
+    use rt_fastresume::PreviousRun;
     use rt_path::SafeRelPath;
     use sha1::{Digest, Sha1};
 
@@ -11912,5 +12806,1355 @@ mod tests {
         assert!(task.active_peers.is_empty());
         assert_eq!(task.picker.availability.count(0), 0);
         assert!(task.picker.pick_from_seed().is_some());
+    }
+
+    // ---- crash safety -------------------------------------------------------
+
+    struct CrashFixture {
+        temp: tempfile::TempDir,
+        registry: Arc<RwLock<SessionRegistry>>,
+        db: Arc<Mutex<Connection>>,
+        info_hash: String,
+        meta: TorrentMetaV1,
+        data: Vec<u8>,
+    }
+
+    impl CrashFixture {
+        fn payload_path(&self) -> PathBuf {
+            self.temp.path().join(&self.meta.name)
+        }
+
+        fn write_payload(&self) {
+            std::fs::write(self.payload_path(), &self.data).unwrap();
+        }
+
+        fn fastresume_dir(&self) -> PathBuf {
+            self.temp.path().join("fastresume")
+        }
+
+        fn event_kinds(&self) -> Vec<String> {
+            let db = self.db.lock().unwrap();
+            let mut stmt = db
+                .prepare("SELECT kind FROM session_events ORDER BY event_id")
+                .unwrap();
+            stmt.query_map([], |row| row.get::<_, String>(0))
+                .unwrap()
+                .map(Result::unwrap)
+                .collect()
+        }
+
+        fn event_payload(&self, kind: &str) -> Option<serde_json::Value> {
+            let db = self.db.lock().unwrap();
+            db.query_row(
+                "SELECT payload FROM session_events WHERE kind = ?1 ORDER BY event_id DESC LIMIT 1",
+                [kind],
+                |row| row.get::<_, String>(0),
+            )
+            .ok()
+            .and_then(|payload| serde_json::from_str(&payload).ok())
+        }
+    }
+
+    async fn crash_fixture(data: Vec<u8>, piece_length: u64, seed: u8) -> CrashFixture {
+        let temp = tempfile::tempdir().unwrap();
+        let conn = Connection::open_in_memory().unwrap();
+        rt_db::migrate(&conn).unwrap();
+        let name = format!("crash-{seed}.bin");
+        let meta = TorrentMetaV1 {
+            info_hash: [seed; 20],
+            announce: None,
+            announce_list: Vec::new(),
+            webseeds: Vec::new(),
+            comment: None,
+            created_by: None,
+            creation_date: None,
+            name: name.clone(),
+            piece_length,
+            pieces: data
+                .chunks(piece_length as usize)
+                .map(|chunk| Sha1::digest(chunk).into())
+                .collect(),
+            files: vec![rt_metainfo::TorrentFileV1 {
+                index: 0,
+                length: data.len() as u64,
+                path: rt_path::SafeRelPath::from_name(&name, false).unwrap(),
+                offset: 0,
+                pad: false,
+            }],
+            private: false,
+            raw: Vec::new(),
+        };
+        let info_hash = hex::encode(meta.info_hash);
+        let registry = Arc::new(RwLock::new(SessionRegistry::new()));
+        let mut entry = rt_session::TorrentEntry::new(
+            info_hash.clone(),
+            meta.name.clone(),
+            temp.path().to_string_lossy().into_owned(),
+        );
+        entry.total_length = data.len() as u64;
+        entry.amount_left = data.len() as u64;
+        entry.state = TorrentState::Downloading;
+        persist_task_row(&conn, &entry, &meta);
+        registry.write().await.add(entry).unwrap();
+        CrashFixture {
+            temp,
+            registry,
+            db: Arc::new(Mutex::new(conn)),
+            info_hash,
+            meta,
+            data,
+        }
+    }
+
+    async fn crash_task(
+        fx: &CrashFixture,
+        runtime: Arc<CrashSafetyRuntime>,
+        io: StorageIoConfig,
+    ) -> TorrentTask {
+        let (task, cmd_tx) = crash_task_with_mailbox(fx, runtime, io).await;
+        // Keep the mailbox open for the whole test: a disconnected command
+        // channel makes a recheck report `Shutdown`.
+        std::mem::forget(cmd_tx);
+        task
+    }
+
+    async fn crash_task_with_mailbox(
+        fx: &CrashFixture,
+        runtime: Arc<CrashSafetyRuntime>,
+        io: StorageIoConfig,
+    ) -> (TorrentTask, mpsc::Sender<TorrentCmd>) {
+        let (cmd_tx, cmd_rx) = mpsc::channel(4);
+        let mut task = TorrentTask::new(
+            fx.meta.clone(),
+            fx.temp.path().to_path_buf(),
+            false,
+            TorrentState::Downloading,
+            Arc::clone(&fx.registry),
+            DbExecutor::direct(Arc::clone(&fx.db)),
+            ResourceGovernor::new(rt_metrics::ResourceGovernorConfig::default()),
+            cmd_rx,
+            fx.fastresume_dir(),
+            8,
+            6881,
+            10,
+            10,
+            60,
+            1024 * 1024,
+            io,
+            false,
+            OutboundEgressPolicy::default(),
+            GlobalNetworkBudget::unlimited(),
+            10_000,
+            None,
+        )
+        .await;
+        task.attach_crash_safety(runtime);
+        (task, cmd_tx)
+    }
+
+    /// Settings for a test: defaults, except weak-mount escalation is off so
+    /// the result does not depend on which filesystem the temp dir is on.
+    fn settings(
+        edit: impl FnOnce(&mut rt_config::CrashSafetyConfig),
+    ) -> rt_config::CrashSafetyConfig {
+        let mut config = rt_config::CrashSafetyConfig {
+            weak_mount_escalation: false,
+            ..rt_config::CrashSafetyConfig::default()
+        };
+        edit(&mut config);
+        config
+    }
+
+    fn quiet_runtime() -> Arc<CrashSafetyRuntime> {
+        let runtime = CrashSafetyRuntime::inert();
+        runtime.apply_settings(settings(|_| {}), false);
+        runtime
+    }
+
+    fn mark_all_have(task: &mut TorrentTask) {
+        for piece in 0..task.piece_map.piece_count {
+            task.picker.mark_have(piece as usize);
+        }
+    }
+
+    async fn registry_entry(fx: &CrashFixture) -> TorrentEntry {
+        fx.registry.read().await.get(&fx.info_hash).unwrap()
+    }
+
+    #[tokio::test]
+    async fn completion_gate_holds_until_the_state_is_durable_then_releases() {
+        let fx = crash_fixture(vec![7u8; 8], 4, 71).await;
+        fx.write_payload();
+        let runtime = quiet_runtime();
+        let mut task = crash_task(&fx, Arc::clone(&runtime), StorageIoConfig::default()).await;
+        mark_all_have(&mut task);
+
+        // Break persistence: a file where the fastresume directory should be.
+        std::fs::write(fx.fastresume_dir(), b"in the way").unwrap();
+
+        task.on_download_complete().await;
+
+        // Held: still downloading, one byte remaining, no completion stamp.
+        assert!(task.completion_gate.is_some());
+        assert_eq!(task.reported_bytes_left(), 1);
+        let entry = registry_entry(&fx).await;
+        assert_eq!(entry.state, TorrentState::Downloading);
+        assert_eq!(entry.amount_left, 1, "API must not see a finished torrent");
+        assert!(entry.finalizing, "the hold is published explicitly");
+        assert_eq!(entry.completed_at, None);
+        assert_eq!(runtime.counters().completions_pending, 1);
+        assert!(fx.event_kinds().contains(&"completion_deferred".to_owned()));
+
+        // Storage recovers; the next attempt releases the completion.
+        std::fs::remove_file(fx.fastresume_dir()).unwrap();
+        task.completion_gate.as_mut().unwrap().next_attempt = Instant::now();
+        assert!(matches!(
+            task.advance_completion_gate().await,
+            GateStep::Released
+        ));
+        let entry = registry_entry(&fx).await;
+        assert_eq!(entry.state, TorrentState::Seeding);
+        assert_eq!(entry.amount_left, 0);
+        assert!(!entry.finalizing, "released torrents are not finalizing");
+        assert!(entry.completed_at.is_some());
+        let counters = runtime.counters();
+        assert_eq!(counters.completions_pending, 0);
+        assert_eq!(counters.completions_released, 1);
+        assert!(counters.completion_gate_retries >= 1);
+        assert!(fx.event_kinds().contains(&"completion_released".to_owned()));
+    }
+
+    #[tokio::test]
+    async fn gate_retry_is_rate_limited_by_its_backoff() {
+        let fx = crash_fixture(vec![7u8; 8], 4, 72).await;
+        fx.write_payload();
+        let runtime = quiet_runtime();
+        let mut task = crash_task(&fx, Arc::clone(&runtime), StorageIoConfig::default()).await;
+        mark_all_have(&mut task);
+        std::fs::write(fx.fastresume_dir(), b"in the way").unwrap();
+        task.on_download_complete().await;
+        let first_retry = task.completion_gate.as_ref().unwrap().next_attempt;
+        assert!(
+            first_retry > Instant::now(),
+            "backoff must be in the future"
+        );
+
+        // Called again before the deadline: no new attempt is made.
+        assert!(matches!(
+            task.advance_completion_gate().await,
+            GateStep::Pending
+        ));
+        assert_eq!(task.completion_gate.as_ref().unwrap().attempts, 1);
+    }
+
+    #[tokio::test]
+    async fn gate_is_dropped_when_the_torrent_stops_being_complete() {
+        let fx = crash_fixture(vec![7u8; 8], 4, 73).await;
+        fx.write_payload();
+        let runtime = quiet_runtime();
+        let mut task = crash_task(&fx, Arc::clone(&runtime), StorageIoConfig::default()).await;
+        mark_all_have(&mut task);
+        std::fs::write(fx.fastresume_dir(), b"in the way").unwrap();
+        task.on_download_complete().await;
+        assert_eq!(runtime.counters().completions_pending, 1);
+
+        task.picker.reject_piece(0);
+        task.completion_gate.as_mut().unwrap().next_attempt = Instant::now();
+        assert!(matches!(
+            task.advance_completion_gate().await,
+            GateStep::Dropped
+        ));
+        assert!(task.completion_gate.is_none());
+        assert_eq!(runtime.counters().completions_pending, 0);
+        assert_ne!(task.reported_bytes_left(), 1 - 1, "real bytes remain");
+    }
+
+    #[tokio::test]
+    async fn disabling_the_gate_restores_immediate_completion() {
+        let fx = crash_fixture(vec![7u8; 8], 4, 74).await;
+        fx.write_payload();
+        let runtime = quiet_runtime();
+        runtime.apply_settings(settings(|c| c.completion_gate = false), true);
+        let mut task = crash_task(&fx, Arc::clone(&runtime), StorageIoConfig::default()).await;
+        mark_all_have(&mut task);
+        // Even with persistence broken, the historical behavior completes.
+        std::fs::write(fx.fastresume_dir(), b"in the way").unwrap();
+        task.on_download_complete().await;
+        assert!(task.completion_gate.is_none());
+        let entry = registry_entry(&fx).await;
+        assert_eq!(entry.state, TorrentState::Seeding);
+        assert_eq!(entry.amount_left, 0);
+        assert_eq!(runtime.counters().completions_gated, 0);
+    }
+
+    #[tokio::test]
+    async fn fast_mode_state_is_unsynced_and_discarded_only_after_a_host_crash() {
+        let fx = crash_fixture(vec![9u8; 8], 4, 75).await;
+        fx.write_payload();
+        let fast = StorageIoConfig {
+            durability_mode: rt_storage::DurabilityMode::Fast,
+            ..StorageIoConfig::default()
+        };
+        let mut writer = crash_task(&fx, quiet_runtime(), fast.clone()).await;
+        mark_all_have(&mut writer);
+        writer.save_fastresume(false).await;
+        let saved = FastresumeStore::new(fx.fastresume_dir())
+            .load(&fx.info_hash)
+            .unwrap();
+        assert!(saved.clean_shutdown);
+        assert!(
+            !saved.durability.synced,
+            "fast mode must not claim a data sync"
+        );
+
+        for (verdict, trusted) in [
+            (PreviousRun::Clean, true),
+            (PreviousRun::NoRecord, true),
+            (PreviousRun::ProcessCrash, true),
+            (PreviousRun::HostCrash, false),
+            (PreviousRun::UncleanUnknownCause, false),
+        ] {
+            let runtime = CrashSafetyRuntime::for_test(
+                rt_config::CrashSafetyConfig::default(),
+                verdict,
+                Some(crash_safety::unix_seconds()),
+                42,
+            );
+            let mut reader = crash_task(&fx, runtime, fast.clone()).await;
+            assert_eq!(
+                reader.restore_fastresume().await,
+                trusted,
+                "fast-mode state after {verdict:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn orderly_shutdown_makes_fast_mode_state_durable() {
+        // Fast mode never syncs between saves, but a clean exit must still
+        // leave a record backed by durable data: the run marker will call the
+        // exit clean, so nothing would recheck it after a power cut a moment
+        // later.
+        let fx = crash_fixture(vec![9u8; 8], 4, 131).await;
+        fx.write_payload();
+        let fast = StorageIoConfig {
+            durability_mode: rt_storage::DurabilityMode::Fast,
+            ..StorageIoConfig::default()
+        };
+        // An earlier run left an unsynced fast-mode record.
+        let mut earlier = crash_task(&fx, quiet_runtime(), fast.clone()).await;
+        mark_all_have(&mut earlier);
+        earlier.save_fastresume(false).await;
+        let store = FastresumeStore::new(fx.fastresume_dir());
+        assert!(!store.load(&fx.info_hash).unwrap().durability.synced);
+
+        // This run restores it, then shuts down in an orderly way.
+        let (task, cmd_tx) = crash_task_with_mailbox(&fx, quiet_runtime(), fast).await;
+        let handle = tokio::spawn(task.run());
+        // Let it reach steady state before asking it to stop.
+        timeout(Duration::from_secs(2), async {
+            loop {
+                if registry_entry(&fx).await.state == TorrentState::Seeding {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("torrent did not start seeding");
+        cmd_tx.send(TorrentCmd::Shutdown).await.unwrap();
+        timeout(Duration::from_secs(2), handle)
+            .await
+            .expect("task did not stop")
+            .unwrap();
+
+        let after = store.load(&fx.info_hash).unwrap();
+        assert!(after.clean_shutdown);
+        assert!(
+            after.durability.synced,
+            "an orderly exit must run a real barrier even in fast mode"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_forced_barrier_makes_fast_mode_state_synced() {
+        let fx = crash_fixture(vec![9u8; 8], 4, 76).await;
+        fx.write_payload();
+        let fast = StorageIoConfig {
+            durability_mode: rt_storage::DurabilityMode::Fast,
+            ..StorageIoConfig::default()
+        };
+        let mut task = crash_task(&fx, quiet_runtime(), fast).await;
+        mark_all_have(&mut task);
+        let outcome = task.save_fastresume_with(false, true).await;
+        assert_eq!(outcome.barrier, BarrierOutcome::Synced);
+        assert!(outcome.persisted);
+        assert!(
+            FastresumeStore::new(fx.fastresume_dir())
+                .load(&fx.info_hash)
+                .unwrap()
+                .durability
+                .synced
+        );
+    }
+
+    #[tokio::test]
+    async fn recent_write_window_rechecks_only_torrents_written_shortly_before_the_crash() {
+        let fx = crash_fixture(vec![3u8; 8], 4, 77).await;
+        fx.write_payload();
+        let crash_at = 1_000_000u64;
+        for (last_write, expect_trusted) in [
+            (crash_at - 60, false),        // a minute before the crash
+            (crash_at - 86_400 - 1, true), // just outside the 24 h window
+            (0, true),                     // undatable: not treated as recent
+        ] {
+            let mut writer = crash_task(&fx, quiet_runtime(), StorageIoConfig::default()).await;
+            mark_all_have(&mut writer);
+            writer
+                .last_data_write_unix
+                .store(last_write, std::sync::atomic::Ordering::Relaxed);
+            writer.save_fastresume(false).await;
+
+            let runtime = CrashSafetyRuntime::for_test(
+                settings(|_| {}),
+                PreviousRun::HostCrash,
+                Some(crash_at),
+                42,
+            );
+            let mut reader =
+                crash_task(&fx, Arc::clone(&runtime), StorageIoConfig::default()).await;
+            assert_eq!(
+                reader.restore_fastresume().await,
+                expect_trusted,
+                "last write {last_write}"
+            );
+            if !expect_trusted {
+                assert_eq!(runtime.counters().rechecks_recent_write, 1);
+                assert!(fx
+                    .event_kinds()
+                    .contains(&"crash_recovery_recheck".to_owned()));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn full_policy_and_weak_mounts_recheck_regardless_of_write_time() {
+        let fx = crash_fixture(vec![3u8; 8], 4, 78).await;
+        fx.write_payload();
+        let mut writer = crash_task(&fx, quiet_runtime(), StorageIoConfig::default()).await;
+        mark_all_have(&mut writer);
+        writer.save_fastresume(false).await; // undated: "recent" would trust it
+
+        let full = CrashSafetyRuntime::for_test(
+            settings(|c| c.host_crash_recovery = rt_config::HostCrashRecovery::Full),
+            PreviousRun::HostCrash,
+            Some(1_000_000),
+            42,
+        );
+        let mut reader = crash_task(&fx, Arc::clone(&full), StorageIoConfig::default()).await;
+        assert!(!reader.restore_fastresume().await);
+        assert_eq!(full.counters().rechecks_full_policy, 1);
+
+        let watermark_weak = CrashSafetyRuntime::for_test(
+            settings(|c| {
+                c.host_crash_recovery = rt_config::HostCrashRecovery::Watermark;
+                c.weak_mount_escalation = true;
+                c.weak_mount_paths = vec![fx.temp.path().to_path_buf()];
+            }),
+            PreviousRun::HostCrash,
+            Some(1_000_000),
+            42,
+        );
+        let mut reader =
+            crash_task(&fx, Arc::clone(&watermark_weak), StorageIoConfig::default()).await;
+        assert!(!reader.restore_fastresume().await);
+        assert_eq!(watermark_weak.counters().rechecks_weak_mount, 1);
+    }
+
+    fn location_policy(
+        path: &std::path::Path,
+        edit: impl FnOnce(&mut rt_config::PathPolicy),
+    ) -> rt_config::PathPolicy {
+        let mut policy = rt_config::PathPolicy {
+            path: path.to_path_buf(),
+            ..rt_config::PathPolicy::default()
+        };
+        edit(&mut policy);
+        policy
+    }
+
+    #[tokio::test]
+    async fn a_location_policy_can_turn_the_gate_off_for_that_location_only() {
+        // Global gate stays on; the matching location opts out.
+        let fx = crash_fixture(vec![7u8; 8], 4, 90).await;
+        fx.write_payload();
+        let runtime = quiet_runtime();
+        runtime.apply_settings(
+            settings(|c| {
+                c.path_policies = vec![location_policy(fx.temp.path(), |p| {
+                    p.completion_gate = Some(false);
+                })];
+            }),
+            true,
+        );
+        let mut task = crash_task(&fx, Arc::clone(&runtime), StorageIoConfig::default()).await;
+        mark_all_have(&mut task);
+        std::fs::write(fx.fastresume_dir(), b"in the way").unwrap();
+        task.on_download_complete().await;
+        assert!(task.completion_gate.is_none());
+        assert_eq!(registry_entry(&fx).await.state, TorrentState::Seeding);
+
+        // A policy for some other location leaves this torrent gated.
+        let fx = crash_fixture(vec![7u8; 8], 4, 91).await;
+        fx.write_payload();
+        let runtime = quiet_runtime();
+        runtime.apply_settings(
+            settings(|c| {
+                c.path_policies = vec![location_policy(
+                    std::path::Path::new("/srv/elsewhere"),
+                    |p| {
+                        p.completion_gate = Some(false);
+                    },
+                )];
+            }),
+            true,
+        );
+        let mut task = crash_task(&fx, Arc::clone(&runtime), StorageIoConfig::default()).await;
+        mark_all_have(&mut task);
+        std::fs::write(fx.fastresume_dir(), b"in the way").unwrap();
+        task.on_download_complete().await;
+        assert!(task.completion_gate.is_some(), "still held");
+        assert_eq!(registry_entry(&fx).await.amount_left, 1);
+    }
+
+    #[tokio::test]
+    async fn a_location_policy_can_require_read_back_where_the_default_does_not() {
+        let fx = crash_fixture((0..32u8).collect(), 8, 92).await;
+        fx.write_payload();
+        let runtime = quiet_runtime();
+        runtime.apply_settings(
+            settings(|c| {
+                c.completion_verify = rt_config::CompletionVerifyMode::Off;
+                c.path_policies = vec![location_policy(fx.temp.path(), |p| {
+                    p.completion_verify = Some(rt_config::CompletionVerifyMode::Full);
+                })];
+            }),
+            true,
+        );
+        let mut task = crash_task(&fx, Arc::clone(&runtime), StorageIoConfig::default()).await;
+        mark_all_have(&mut task);
+        task.on_download_complete().await;
+        assert_eq!(task.completion_verify_plan, Some(VerifyPlan::Full));
+    }
+
+    #[tokio::test]
+    async fn a_location_policy_sets_its_own_sample_size() {
+        let fx = crash_fixture((0..64u8).collect(), 8, 93).await;
+        fx.write_payload();
+        let runtime = quiet_runtime();
+        runtime.apply_settings(
+            settings(|c| {
+                c.completion_verify = rt_config::CompletionVerifyMode::Sample;
+                c.completion_verify_sample_percent = 1;
+                c.path_policies = vec![location_policy(fx.temp.path(), |p| {
+                    p.completion_verify_sample_percent = Some(100);
+                })];
+            }),
+            true,
+        );
+        let mut task = crash_task(&fx, Arc::clone(&runtime), StorageIoConfig::default()).await;
+        mark_all_have(&mut task);
+        task.on_download_complete().await;
+        let (_tx, mut cmd_rx) = mpsc::channel(4);
+        let mut pending = None;
+        assert!(task.drive_crash_safety(&mut cmd_rx, &mut pending).await);
+        assert_eq!(
+            runtime.counters().completion_verify_pieces,
+            8,
+            "the location's 100% sample covers every piece, not the global 1%"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_location_policy_can_demand_full_recovery_under_a_watermark_default() {
+        let fx = crash_fixture(vec![3u8; 8], 4, 94).await;
+        fx.write_payload();
+        let mut writer = crash_task(&fx, quiet_runtime(), StorageIoConfig::default()).await;
+        mark_all_have(&mut writer);
+        writer.save_fastresume(false).await;
+
+        let host_crash = |policies: Vec<rt_config::PathPolicy>| {
+            CrashSafetyRuntime::for_test(
+                settings(|c| {
+                    c.host_crash_recovery = rt_config::HostCrashRecovery::Watermark;
+                    c.path_policies = policies;
+                }),
+                PreviousRun::HostCrash,
+                Some(1_000_000),
+                42,
+            )
+        };
+
+        let strict = host_crash(vec![location_policy(fx.temp.path(), |p| {
+            p.host_crash_recovery = Some(rt_config::HostCrashRecovery::Full);
+        })]);
+        let mut reader = crash_task(&fx, Arc::clone(&strict), StorageIoConfig::default()).await;
+        assert!(!reader.restore_fastresume().await);
+        assert_eq!(strict.counters().rechecks_full_policy, 1);
+
+        let unrelated = host_crash(vec![location_policy(
+            std::path::Path::new("/srv/elsewhere"),
+            |p| {
+                p.host_crash_recovery = Some(rt_config::HostCrashRecovery::Full);
+            },
+        )]);
+        let mut reader = crash_task(&fx, Arc::clone(&unrelated), StorageIoConfig::default()).await;
+        assert!(
+            reader.restore_fastresume().await,
+            "the watermark default still trusts synced state here"
+        );
+        assert_eq!(unrelated.counters().recovery_rechecks, 0);
+    }
+
+    #[tokio::test]
+    async fn state_saved_by_the_current_run_is_never_rejudged_against_an_old_crash() {
+        let fx = crash_fixture(vec![3u8; 8], 4, 79).await;
+        fx.write_payload();
+        let runtime = CrashSafetyRuntime::for_test(
+            settings(|c| c.host_crash_recovery = rt_config::HostCrashRecovery::Full),
+            PreviousRun::HostCrash,
+            Some(1_000_000),
+            555,
+        );
+        let mut writer = crash_task(&fx, Arc::clone(&runtime), StorageIoConfig::default()).await;
+        mark_all_have(&mut writer);
+        writer.save_fastresume(false).await;
+        let mut reader = crash_task(&fx, Arc::clone(&runtime), StorageIoConfig::default()).await;
+        assert!(
+            reader.restore_fastresume().await,
+            "a record written this run post-dates the crash"
+        );
+        assert_eq!(runtime.counters().recovery_rechecks, 0);
+    }
+
+    #[tokio::test]
+    async fn watermark_policy_trusts_synced_state_after_a_host_crash() {
+        let fx = crash_fixture(vec![3u8; 8], 4, 80).await;
+        fx.write_payload();
+        let mut writer = crash_task(&fx, quiet_runtime(), StorageIoConfig::default()).await;
+        mark_all_have(&mut writer);
+        writer
+            .last_data_write_unix
+            .store(999_990, std::sync::atomic::Ordering::Relaxed);
+        writer.save_fastresume(false).await;
+        let runtime = CrashSafetyRuntime::for_test(
+            settings(|c| c.host_crash_recovery = rt_config::HostCrashRecovery::Watermark),
+            PreviousRun::HostCrash,
+            Some(1_000_000),
+            42,
+        );
+        let mut reader = crash_task(&fx, runtime, StorageIoConfig::default()).await;
+        assert!(reader.restore_fastresume().await);
+        assert!(reader.picker.is_complete());
+    }
+
+    /// The scenario that motivated all of this: a preallocated, never-written
+    /// file whose resume state claims every piece is valid.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn allocation_audit_distrusts_valid_pieces_over_unwritten_preallocation() {
+        use std::os::fd::AsRawFd;
+
+        // Use the working directory's filesystem; /tmp is often tmpfs.
+        let data = vec![0xC3u8; 4 << 20];
+        let mut fx = crash_fixture(data, 1 << 20, 81).await;
+        fx.temp = tempfile::Builder::new()
+            .prefix("crash-audit-")
+            .tempdir_in(std::env::current_dir().unwrap())
+            .unwrap();
+        let fs_type = rt_storage::detect_storage_topology(fx.temp.path()).fs_type;
+        if !matches!(fs_type.as_deref(), Some("ext4" | "xfs" | "btrfs")) {
+            eprintln!("fs {fs_type:?} does not expose unwritten extents; skipping");
+            return;
+        }
+        // Full-size file reserved with fallocate but never written.
+        let file = std::fs::File::create(fx.payload_path()).unwrap();
+        let rc = unsafe { libc::fallocate(file.as_raw_fd(), 0, 0, fx.data.len() as libc::off_t) };
+        assert_eq!(rc, 0);
+        file.sync_all().unwrap();
+        drop(file);
+
+        // A resume record that claims everything is valid, with matching file
+        // hints so the hint check alone cannot save us.
+        let mut state = FastresumeState::new_empty(
+            &fx.meta.info_hash,
+            fx.meta.pieces.len() as u32,
+            ImportPolicy::RequireVerification,
+        );
+        state.clean_shutdown = true;
+        state.pieces = vec![PieceState::Valid; fx.meta.pieces.len()];
+        state.file_hints = collect_file_hints(fx.temp.path(), &fx.meta);
+        FastresumeStore::new(fx.fastresume_dir())
+            .save(&state)
+            .unwrap();
+
+        // Audit on: the claim is rejected without reading any payload.
+        let runtime =
+            CrashSafetyRuntime::for_test(settings(|_| {}), PreviousRun::ProcessCrash, None, 42);
+        let mut reader = crash_task(&fx, Arc::clone(&runtime), StorageIoConfig::default()).await;
+        assert!(reader.restore_fastresume().await);
+        assert_eq!(
+            (0..fx.meta.pieces.len())
+                .filter(|p| reader.picker.have_piece(*p))
+                .count(),
+            0,
+            "unwritten preallocation must not be trusted as valid data"
+        );
+        assert_eq!(runtime.counters().audit_pieces_downgraded, 4);
+        assert!(fx
+            .event_kinds()
+            .contains(&"allocation_audit_downgraded".to_owned()));
+
+        // Audit off: the historical behavior trusts the record (documenting
+        // exactly what the audit prevents).
+        let off = CrashSafetyRuntime::for_test(
+            settings(|c| c.structural_audit = rt_config::StructuralAuditMode::Off),
+            PreviousRun::ProcessCrash,
+            None,
+            43,
+        );
+        let mut reader = crash_task(&fx, off, StorageIoConfig::default()).await;
+        assert!(reader.restore_fastresume().await);
+        assert!(reader.picker.is_complete());
+
+        // A clean previous run skips the on-unclean audit.
+        let clean = CrashSafetyRuntime::for_test(settings(|_| {}), PreviousRun::Clean, None, 44);
+        let mut reader = crash_task(&fx, clean, StorageIoConfig::default()).await;
+        assert!(reader.restore_fastresume().await);
+        assert!(reader.picker.is_complete());
+
+        // `always` audits even a clean start.
+        let always = CrashSafetyRuntime::for_test(
+            settings(|c| c.structural_audit = rt_config::StructuralAuditMode::Always),
+            PreviousRun::Clean,
+            None,
+            45,
+        );
+        let mut reader = crash_task(&fx, always, StorageIoConfig::default()).await;
+        assert!(reader.restore_fastresume().await);
+        assert!(!reader.picker.is_complete());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn allocation_audit_leaves_fully_written_files_alone() {
+        let fx = crash_fixture(vec![0x5Au8; 1 << 20], 1 << 18, 82).await;
+        fx.write_payload();
+        std::fs::File::open(fx.payload_path())
+            .unwrap()
+            .sync_all()
+            .unwrap();
+        let mut state = FastresumeState::new_empty(
+            &fx.meta.info_hash,
+            fx.meta.pieces.len() as u32,
+            ImportPolicy::RequireVerification,
+        );
+        state.clean_shutdown = true;
+        state.pieces = vec![PieceState::Valid; fx.meta.pieces.len()];
+        state.file_hints = collect_file_hints(fx.temp.path(), &fx.meta);
+        FastresumeStore::new(fx.fastresume_dir())
+            .save(&state)
+            .unwrap();
+        let runtime = CrashSafetyRuntime::for_test(
+            settings(|c| c.structural_audit = rt_config::StructuralAuditMode::Always),
+            PreviousRun::HostCrash,
+            None,
+            46,
+        );
+        // Watermark keeps the recovery decision out of the way so only the
+        // audit is under test.
+        runtime.apply_settings(
+            settings(|c| {
+                c.structural_audit = rt_config::StructuralAuditMode::Always;
+                c.host_crash_recovery = rt_config::HostCrashRecovery::Watermark;
+            }),
+            true,
+        );
+        let mut reader = crash_task(&fx, Arc::clone(&runtime), StorageIoConfig::default()).await;
+        assert!(reader.restore_fastresume().await);
+        assert!(reader.picker.is_complete());
+        assert_eq!(runtime.counters().audit_pieces_downgraded, 0);
+    }
+
+    #[test]
+    fn completion_sample_always_covers_file_boundaries_and_is_deterministic() {
+        let files = vec![
+            rt_piece_map::FileSpan {
+                file_index: 0,
+                path: rt_path::SafeRelPath::from_name("a.bin", false).unwrap(),
+                content_offset: 0,
+                length: 100 * 64,
+            },
+            rt_piece_map::FileSpan {
+                file_index: 1,
+                path: rt_path::SafeRelPath::from_name("b.bin", false).unwrap(),
+                content_offset: 100 * 64,
+                length: 100 * 64,
+            },
+        ];
+        let map = PieceMap::new(64, files).unwrap();
+        assert_eq!(map.piece_count, 200);
+        let meta_files = [(0u32, 100u64 * 64, false), (1u32, 100u64 * 64, false)];
+
+        let a = select_completion_sample(&map, &meta_files, 5, 1234).unwrap();
+        let b = select_completion_sample(&map, &meta_files, 5, 1234).unwrap();
+        assert_eq!(a, b, "same seed, same sample");
+        assert_ne!(
+            a,
+            select_completion_sample(&map, &meta_files, 5, 999).unwrap()
+        );
+        for boundary in [0u32, 99, 100, 199] {
+            assert!(
+                a.contains(&boundary),
+                "boundary piece {boundary} missing: {a:?}"
+            );
+        }
+        assert!(a.len() >= 10 && a.len() < 200);
+        assert!(a.windows(2).all(|w| w[0] < w[1]), "sorted and distinct");
+
+        assert_eq!(select_completion_sample(&map, &meta_files, 100, 1), None);
+        // 99% of 200 pieces is still a sample (198 pieces), not everything.
+        assert_eq!(
+            select_completion_sample(&map, &meta_files, 99, 1).map(|s| s.len()),
+            Some(198)
+        );
+
+        // A sample that would cover every piece degrades to a full check.
+        let small = vec![rt_piece_map::FileSpan {
+            file_index: 0,
+            path: rt_path::SafeRelPath::from_name("s.bin", false).unwrap(),
+            content_offset: 0,
+            length: 10 * 64,
+        }];
+        let small_map = PieceMap::new(64, small).unwrap();
+        assert_eq!(
+            select_completion_sample(&small_map, &[(0, 10 * 64, false)], 95, 1),
+            None
+        );
+    }
+
+    #[test]
+    fn completion_sample_skips_pad_files_and_respects_the_cap() {
+        let files = vec![
+            rt_piece_map::FileSpan {
+                file_index: 0,
+                path: rt_path::SafeRelPath::from_name("real.bin", false).unwrap(),
+                content_offset: 0,
+                length: 64,
+            },
+            rt_piece_map::FileSpan {
+                file_index: 1,
+                path: rt_path::SafeRelPath::from_name("pad.bin", false).unwrap(),
+                content_offset: 64,
+                length: 64,
+            },
+        ];
+        let map = PieceMap::new(64, files).unwrap();
+        let meta_files = [(0u32, 64u64, false), (1u32, 64u64, true)];
+        let sample = select_completion_sample(&map, &meta_files, 1, 5).unwrap();
+        assert_eq!(sample, vec![0], "pad file boundaries are not sampled");
+
+        let big = vec![rt_piece_map::FileSpan {
+            file_index: 0,
+            path: rt_path::SafeRelPath::from_name("huge.bin", false).unwrap(),
+            content_offset: 0,
+            length: 64 * 200_000,
+        }];
+        let map = PieceMap::new(64, big).unwrap();
+        let sample = select_completion_sample(&map, &[(0, 64 * 200_000, false)], 90, 1).unwrap();
+        assert!(sample.len() <= MAX_COMPLETION_SAMPLE_PIECES);
+    }
+
+    #[tokio::test]
+    async fn sample_verification_releases_a_download_that_reads_back_clean() {
+        let fx = crash_fixture((0..64u8).collect(), 8, 83).await;
+        fx.write_payload();
+        let runtime = quiet_runtime();
+        runtime.apply_settings(
+            settings(|c| {
+                c.completion_verify = rt_config::CompletionVerifyMode::Sample;
+                c.completion_verify_sample_percent = 25;
+            }),
+            true,
+        );
+        let mut task = crash_task(&fx, Arc::clone(&runtime), StorageIoConfig::default()).await;
+        mark_all_have(&mut task);
+
+        task.on_download_complete().await;
+        // Barrier done; verification is queued, completion still held back.
+        assert_eq!(task.completion_verify_plan, Some(VerifyPlan::Sample));
+        assert_eq!(registry_entry(&fx).await.state, TorrentState::Downloading);
+        assert_eq!(registry_entry(&fx).await.amount_left, 1);
+        assert!(registry_entry(&fx).await.finalizing);
+
+        let (_tx, mut cmd_rx) = mpsc::channel(4);
+        let mut pending = None;
+        assert!(task.drive_crash_safety(&mut cmd_rx, &mut pending).await);
+
+        let entry = registry_entry(&fx).await;
+        assert_eq!(entry.state, TorrentState::Seeding);
+        assert_eq!(entry.amount_left, 0);
+        assert!(entry.completed_at.is_some());
+        assert!(fx.event_kinds().contains(&"completion_verified".to_owned()));
+        let counters = runtime.counters();
+        assert!(counters.completion_verify_pieces > 0);
+        assert!(
+            counters.completion_verify_pieces < 8,
+            "a sample, not everything"
+        );
+        assert_eq!(counters.completion_verify_failures, 0);
+        assert_eq!(task.reported_bytes_left(), 0);
+    }
+
+    #[tokio::test]
+    async fn sample_verification_catches_corruption_and_escalates_to_a_full_recheck() {
+        let fx = crash_fixture((0..64u8).collect(), 8, 84).await;
+        // The bytes on disk differ from what the metainfo hashes describe:
+        // the first piece was "written" but never reached the platter.
+        let mut on_disk = fx.data.clone();
+        on_disk[..8].fill(0);
+        std::fs::write(fx.payload_path(), &on_disk).unwrap();
+        let runtime = quiet_runtime();
+        runtime.apply_settings(
+            settings(|c| {
+                c.completion_verify = rt_config::CompletionVerifyMode::Sample;
+                c.completion_verify_sample_percent = 10;
+            }),
+            true,
+        );
+        let mut task = crash_task(&fx, Arc::clone(&runtime), StorageIoConfig::default()).await;
+        mark_all_have(&mut task);
+
+        task.on_download_complete().await;
+        let (_tx, mut cmd_rx) = mpsc::channel(4);
+        let mut pending = None;
+        assert!(task.drive_crash_safety(&mut cmd_rx, &mut pending).await);
+
+        // Piece 0 is a file-boundary piece, so it is always sampled.
+        let entry = registry_entry(&fx).await;
+        assert_eq!(entry.state, TorrentState::Downloading, "not handed to arr");
+        assert_eq!(entry.completed_at, None);
+        assert!(!task.picker.have_piece(0));
+        assert!(fx
+            .event_kinds()
+            .contains(&"completion_verify_failed".to_owned()));
+        assert_eq!(runtime.counters().completion_verify_failures, 1);
+        assert!(
+            task.escalate_full_recheck,
+            "a failed sample proves storage lied"
+        );
+
+        // The escalation runs the full recheck and finds the same single hole.
+        assert!(task.drive_crash_safety(&mut cmd_rx, &mut pending).await);
+        assert!(!task.escalate_full_recheck);
+        assert!(!task.picker.have_piece(0));
+        assert!((1..8).all(|p| task.picker.have_piece(p)));
+    }
+
+    #[tokio::test]
+    async fn full_verification_rereads_every_piece() {
+        let fx = crash_fixture((0..32u8).collect(), 8, 85).await;
+        fx.write_payload();
+        let runtime = quiet_runtime();
+        runtime.apply_settings(
+            settings(|c| c.completion_verify = rt_config::CompletionVerifyMode::Full),
+            true,
+        );
+        let mut task = crash_task(&fx, Arc::clone(&runtime), StorageIoConfig::default()).await;
+        mark_all_have(&mut task);
+        task.on_download_complete().await;
+        assert_eq!(task.completion_verify_plan, Some(VerifyPlan::Full));
+        let (_tx, mut cmd_rx) = mpsc::channel(4);
+        let mut pending = None;
+        assert!(task.drive_crash_safety(&mut cmd_rx, &mut pending).await);
+        assert_eq!(registry_entry(&fx).await.state, TorrentState::Seeding);
+        assert_eq!(runtime.counters().completion_verify_pieces, 4);
+    }
+
+    #[tokio::test]
+    async fn recheck_of_an_already_completed_torrent_reports_an_integrity_regression() {
+        let fx = crash_fixture((0..32u8).collect(), 8, 86).await;
+        let mut on_disk = fx.data.clone();
+        on_disk[8..16].fill(0); // piece 1 lost its data
+        std::fs::write(fx.payload_path(), &on_disk).unwrap();
+        {
+            let mut registry = fx.registry.write().await;
+            let mut entry = registry.get_mut(&fx.info_hash).unwrap();
+            entry.state = TorrentState::Seeding;
+            entry.completed_at = Some(1_700_000_000);
+            entry.amount_left = 0;
+        }
+        let runtime = quiet_runtime();
+        let mut task = crash_task(&fx, Arc::clone(&runtime), StorageIoConfig::default()).await;
+        mark_all_have(&mut task);
+
+        assert!(matches!(
+            task.run_recheck(None).await,
+            RecheckOutcome::Complete
+        ));
+
+        assert_eq!(registry_entry(&fx).await.state, TorrentState::Downloading);
+        assert_eq!(runtime.counters().integrity_regressions, 1);
+        let payload = fx
+            .event_payload("integrity_regression")
+            .expect("event recorded");
+        assert_eq!(payload["invalid_pieces"], 1);
+        assert_eq!(payload["sample_pieces"], serde_json::json!([1]));
+        assert_eq!(payload["trigger"], "recheck");
+        let files = payload["affected_files"].as_array().unwrap();
+        assert_eq!(files.len(), 1);
+        assert!(files[0].as_str().unwrap().ends_with("crash-86.bin"));
+    }
+
+    #[tokio::test]
+    async fn recheck_of_a_torrent_never_reported_complete_is_not_a_regression() {
+        let fx = crash_fixture((0..32u8).collect(), 8, 87).await;
+        let mut on_disk = fx.data.clone();
+        on_disk[8..16].fill(0);
+        std::fs::write(fx.payload_path(), &on_disk).unwrap();
+        let runtime = quiet_runtime();
+        let mut task = crash_task(&fx, Arc::clone(&runtime), StorageIoConfig::default()).await;
+        mark_all_have(&mut task);
+        assert!(matches!(
+            task.run_recheck(None).await,
+            RecheckOutcome::Complete
+        ));
+        assert_eq!(runtime.counters().integrity_regressions, 0);
+        assert!(!fx
+            .event_kinds()
+            .contains(&"integrity_regression".to_owned()));
+    }
+
+    #[tokio::test]
+    async fn dormant_promotion_after_recovery_does_not_recheck_again() {
+        // A torrent recovered at startup re-saves its state during this run.
+        // Promoting it again later must trust that record, not repeat the
+        // crash recovery.
+        let fx = crash_fixture(vec![3u8; 8], 4, 88).await;
+        fx.write_payload();
+        let runtime = CrashSafetyRuntime::for_test(
+            settings(|c| c.host_crash_recovery = rt_config::HostCrashRecovery::Full),
+            PreviousRun::HostCrash,
+            Some(1_000_000),
+            700,
+        );
+        // Stale record from the crashed run (run id 1, not synced).
+        let mut old =
+            FastresumeState::new_empty(&fx.meta.info_hash, 2, ImportPolicy::RequireVerification);
+        old.clean_shutdown = true;
+        old.pieces = vec![PieceState::Valid; 2];
+        old.durability.saved_by_run_id = 1;
+        FastresumeStore::new(fx.fastresume_dir())
+            .save(&old)
+            .unwrap();
+
+        let mut first = crash_task(&fx, Arc::clone(&runtime), StorageIoConfig::default()).await;
+        assert!(!first.restore_fastresume().await, "recovery rechecks it");
+        assert_eq!(runtime.counters().recovery_rechecks, 1);
+
+        // The recheck completes and re-saves under this run's id.
+        mark_all_have(&mut first);
+        first.save_fastresume(true).await;
+
+        let mut promoted = crash_task(&fx, Arc::clone(&runtime), StorageIoConfig::default()).await;
+        assert!(promoted.restore_fastresume().await);
+        assert_eq!(runtime.counters().recovery_rechecks, 1, "no second recheck");
+    }
+
+    // ---- power-cut model ----------------------------------------------------
+    //
+    // A userspace test cannot drop the page cache, so it models it. `DiskModel`
+    // tracks two images of the payload file: `live` (what a running process
+    // reads, page cache included) and `durable` (what survives a power cut).
+    // A write updates only `live`; a *successful payload barrier* copies `live`
+    // into `durable`. After every step of a randomized walk the test "cuts the
+    // power": it rebuilds the data file from `durable`, keeps the fastresume
+    // record exactly as it was on disk (records are fsynced atomically), lets
+    // the loader decide what to trust, and checks that every piece the loader
+    // would serve really hashes correctly against the durable bytes.
+
+    const MODEL_PIECE_LEN: usize = 8;
+    const MODEL_PIECES: usize = 8;
+
+    struct DiskModel {
+        live: Vec<u8>,
+        durable: Vec<u8>,
+    }
+
+    impl DiskModel {
+        fn new() -> Self {
+            DiskModel {
+                live: vec![0; MODEL_PIECE_LEN * MODEL_PIECES],
+                durable: vec![0; MODEL_PIECE_LEN * MODEL_PIECES],
+            }
+        }
+
+        fn write_piece(&mut self, piece: usize, data: &[u8]) {
+            let start = piece * MODEL_PIECE_LEN;
+            self.live[start..start + MODEL_PIECE_LEN].copy_from_slice(data);
+        }
+
+        fn barrier(&mut self) {
+            self.durable = self.live.clone();
+        }
+    }
+
+    fn model_payload() -> Vec<u8> {
+        (0..(MODEL_PIECE_LEN * MODEL_PIECES) as u32)
+            .map(|i| (i * 31 + 7) as u8 | 1) // never zero: a lost write is visible
+            .collect()
+    }
+
+    /// Cut the power: rebuild the payload from the durable image, keep the
+    /// fastresume record, and return the pieces the loader would still trust
+    /// even though their durable bytes are wrong.
+    async fn cut_power_and_count_bad_trusted_pieces(
+        fx: &CrashFixture,
+        durable: &[u8],
+        crash_verdict: PreviousRun,
+        crash_settings: rt_config::CrashSafetyConfig,
+        io: StorageIoConfig,
+    ) -> Vec<usize> {
+        // The post-crash machine: same metainfo, the durable payload, and the
+        // fastresume file exactly as the process left it.
+        let crashed = crash_fixture(
+            fx.data.clone(),
+            MODEL_PIECE_LEN as u64,
+            fx.meta.info_hash[0],
+        )
+        .await;
+        std::fs::write(crashed.payload_path(), durable).unwrap();
+        std::fs::create_dir_all(crashed.fastresume_dir()).unwrap();
+        if let Ok(dir) = std::fs::read_dir(fx.fastresume_dir()) {
+            for entry in dir.flatten() {
+                std::fs::copy(
+                    entry.path(),
+                    crashed.fastresume_dir().join(entry.file_name()),
+                )
+                .unwrap();
+            }
+        }
+        // Adversarial: let the size/mtime/inode hints match the rebuilt file,
+        // as they can by coincidence. The loader must be right regardless.
+        let store = FastresumeStore::new(crashed.fastresume_dir());
+        if let Ok(mut state) = store.load(&crashed.info_hash) {
+            state.file_hints = collect_file_hints(crashed.temp.path(), &crashed.meta);
+            store.save(&state).unwrap();
+        }
+        let runtime = CrashSafetyRuntime::for_test(
+            crash_settings,
+            crash_verdict,
+            Some(crash_safety::unix_seconds()),
+            9_999,
+        );
+        let mut reader = crash_task(&crashed, runtime, io).await;
+        let mut bad = Vec::new();
+        if reader.restore_fastresume().await {
+            for (piece, expected) in crashed.meta.pieces.iter().enumerate() {
+                if !reader.picker.have_piece(piece) {
+                    continue;
+                }
+                let start = piece * MODEL_PIECE_LEN;
+                let on_disk: [u8; 20] =
+                    Sha1::digest(&durable[start..start + MODEL_PIECE_LEN]).into();
+                if &on_disk != expected {
+                    bad.push(piece);
+                }
+            }
+        }
+        bad
+    }
+
+    /// One randomized walk: write pieces, occasionally save, and cut the power
+    /// after every step. Returns how many (step, piece) pairs the loader
+    /// trusted although the durable bytes were wrong.
+    async fn power_cut_walk(
+        seed: u64,
+        io: StorageIoConfig,
+        crash_verdict: PreviousRun,
+        crash_settings: rt_config::CrashSafetyConfig,
+    ) -> usize {
+        let payload = model_payload();
+        let fx = crash_fixture(
+            payload.clone(),
+            MODEL_PIECE_LEN as u64,
+            90 + (seed % 100) as u8,
+        )
+        .await;
+        // Preallocated: full size, all zeros, exactly the failure's start state.
+        std::fs::write(fx.payload_path(), vec![0u8; payload.len()]).unwrap();
+        let mut task = crash_task(&fx, quiet_runtime(), io.clone()).await;
+        let mut model = DiskModel::new();
+        let mut rng = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ 0xD1B5_4A32_D192_ED03;
+        let mut violations = 0usize;
+
+        for _ in 0..40 {
+            match splitmix64(&mut rng) % 5 {
+                // Receive and verify a piece: bytes reach the page cache only.
+                0..=2 => {
+                    let piece = (splitmix64(&mut rng) as usize) % MODEL_PIECES;
+                    let start = piece * MODEL_PIECE_LEN;
+                    let bytes = payload[start..start + MODEL_PIECE_LEN].to_vec();
+                    task.write_block(&BlockEvent {
+                        piece: piece as u32,
+                        offset: 0,
+                        data: bytes::Bytes::from(bytes.clone()),
+                    })
+                    .await
+                    .unwrap();
+                    model.write_piece(piece, &bytes);
+                    task.picker.mark_have(piece);
+                    task.dirty_pieces_since_barrier.insert(piece as u32);
+                }
+                // Periodic progress save (barrier depends on the durability mode).
+                3 => {
+                    let outcome = task.save_fastresume(false).await;
+                    if outcome.barrier == BarrierOutcome::Synced {
+                        model.barrier();
+                    }
+                }
+                // Idle tick.
+                _ => {}
+            }
+            violations += cut_power_and_count_bad_trusted_pieces(
+                &fx,
+                &model.durable,
+                crash_verdict,
+                crash_settings.clone(),
+                io.clone(),
+            )
+            .await
+            .len();
+        }
+        violations
+    }
+
+    #[tokio::test]
+    async fn power_cut_after_a_synced_save_never_trusts_missing_data() {
+        // Checkpoint mode: the barrier precedes every record, so whatever a
+        // record claims was durable when it was written.
+        for seed in 0..12 {
+            let violations = power_cut_walk(
+                seed,
+                StorageIoConfig::default(),
+                PreviousRun::HostCrash,
+                settings(|c| c.host_crash_recovery = rt_config::HostCrashRecovery::Watermark),
+            )
+            .await;
+            assert_eq!(
+                violations, 0,
+                "seed {seed}: trusted pieces missing from disk"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn power_cut_after_fast_mode_saves_is_safe_because_the_loader_discards_them() {
+        // Fast mode never fsyncs, so records claim more than the disk holds.
+        // Host-crash detection is what keeps that from being trusted.
+        let fast = StorageIoConfig {
+            durability_mode: rt_storage::DurabilityMode::Fast,
+            ..StorageIoConfig::default()
+        };
+        for seed in 0..12 {
+            let violations = power_cut_walk(
+                seed,
+                fast.clone(),
+                PreviousRun::HostCrash,
+                settings(|c| c.host_crash_recovery = rt_config::HostCrashRecovery::Watermark),
+            )
+            .await;
+            assert_eq!(violations, 0, "seed {seed}");
+        }
+    }
+
+    /// The harness must be able to fail. With crash detection disabled (the
+    /// loader sees `NoRecord`) and Fast mode, this is exactly the behavior of
+    /// a client that trusts its own resume state after a host crash: pieces the
+    /// record claims but the disk never received are served as valid.
+    #[tokio::test]
+    async fn power_cut_model_detects_the_failure_when_protection_is_off() {
+        let fast = StorageIoConfig {
+            durability_mode: rt_storage::DurabilityMode::Fast,
+            ..StorageIoConfig::default()
+        };
+        let mut total = 0;
+        for seed in 0..12 {
+            total +=
+                power_cut_walk(seed, fast.clone(), PreviousRun::NoRecord, settings(|_| {})).await;
+        }
+        assert!(
+            total > 0,
+            "an unprotected client must trip the model, or the model proves nothing"
+        );
+    }
+
+    #[tokio::test]
+    async fn completion_is_never_reported_before_the_data_is_durable() {
+        // Gate on (default): by the time the torrent is `Seeding` the
+        // completing barrier has made every byte durable.
+        for (gate, fast_mode, expect_durable) in [
+            (true, false, true),
+            (true, true, true), // the gate forces a real barrier even in fast mode
+            (false, true, false), // historical behavior: reported complete, not durable
+        ] {
+            let payload = model_payload();
+            let fx = crash_fixture(payload.clone(), MODEL_PIECE_LEN as u64, 120).await;
+            std::fs::write(fx.payload_path(), vec![0u8; payload.len()]).unwrap();
+            let io = StorageIoConfig {
+                durability_mode: if fast_mode {
+                    rt_storage::DurabilityMode::Fast
+                } else {
+                    rt_storage::DurabilityMode::Checkpoint
+                },
+                ..StorageIoConfig::default()
+            };
+            let runtime = CrashSafetyRuntime::inert();
+            runtime.apply_settings(settings(|c| c.completion_gate = gate), true);
+            let mut task = crash_task(&fx, runtime, io).await;
+            let mut model = DiskModel::new();
+            for piece in 0..MODEL_PIECES {
+                let start = piece * MODEL_PIECE_LEN;
+                let bytes = payload[start..start + MODEL_PIECE_LEN].to_vec();
+                task.write_block(&BlockEvent {
+                    piece: piece as u32,
+                    offset: 0,
+                    data: bytes::Bytes::from(bytes.clone()),
+                })
+                .await
+                .unwrap();
+                model.write_piece(piece, &bytes);
+                task.picker.mark_have(piece);
+                task.dirty_pieces_since_barrier.insert(piece as u32);
+            }
+            // The completion path's own barrier is what must make it durable.
+            // Mirror the task's real barrier into the model.
+            let before = task.storage.stats().sync_ops;
+            task.on_download_complete().await;
+            if task.storage.stats().sync_ops > before {
+                model.barrier();
+            }
+            let entry = registry_entry(&fx).await;
+            assert_eq!(
+                entry.state,
+                TorrentState::Seeding,
+                "gate={gate} fast={fast_mode}"
+            );
+            assert_eq!(
+                model.durable == model.live,
+                expect_durable,
+                "gate={gate} fast={fast_mode}: data durable when completion was reported"
+            );
+        }
     }
 }

@@ -7,7 +7,7 @@ COPY Cargo.toml Cargo.lock ./
 COPY crates ./crates
 RUN cargo build --release --locked --target x86_64-unknown-linux-musl -p torrentngd
 
-FROM node:22-bookworm-slim AS webui-build
+FROM node:22-bookworm-slim@sha256:48e4b67d85f87bd551df43704e24d252f56cc5f8e9718841aace50f19948f0f9 AS webui-build
 
 WORKDIR /webui
 COPY webui/package.json webui/package-lock.json ./

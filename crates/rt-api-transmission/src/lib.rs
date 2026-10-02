@@ -18,9 +18,10 @@ use axum::{
 };
 use base64::{engine::general_purpose, Engine as _};
 use rt_api_model::{
-    api_token_allowed, bearer_token, csrf_request_allowed, request_fingerprint,
-    session_cookie_value, valid_idempotency_key, CachedResponse, IdempotencyClaim,
-    IdempotencyStore, MAX_IDEMPOTENCY_BODY_BYTES,
+    api_token_allowed, api_uri_is_bounded, bearer_token, cached_response_headers,
+    csrf_request_allowed, is_replayable_response_header, request_fingerprint, session_cookie_value,
+    single_header_value, valid_idempotency_key, CachedResponse, IdempotencyClaim, IdempotencyStore,
+    MAX_IDEMPOTENCY_BODY_BYTES,
 };
 use rt_engine::{
     EngineGlobalLimits, EngineHandle, EngineJob, EngineNetworkFeatures, EnginePeerSnapshot,
@@ -45,6 +46,7 @@ const MAX_TRANSMISSION_MUTATION_ITEMS: usize = 16_384;
 const SETTING_TRANSMISSION_SESSION: &str = "compat.transmission.session";
 const MAX_TRANSMISSION_SESSION_BYTES: usize = 64 * 1024;
 const MAX_TRANSMISSION_SESSION_TEXT_BYTES: usize = 16 * 1024;
+const MAX_TRANSMISSION_TEXT_BYTES: usize = MAX_TRANSMISSION_SESSION_TEXT_BYTES;
 const MAX_TRANSMISSION_PATH_BYTES: usize = 16 * 1024;
 const MAX_TRANSMISSION_URL_BYTES: usize = 8 * 1024;
 const MAX_TRANSMISSION_LABEL_BYTES: usize = 256;
@@ -341,6 +343,15 @@ fn estimate_transmission_torrent_get_snapshot_bytes(
     16 * 1024 + (torrent_count as u64).saturating_mul(1024 + fields.saturating_mul(384))
 }
 
+fn ensure_transmission_full_list_bound(count: usize) -> Result<(), String> {
+    if count > MAX_LEGACY_FULL_LIST_ENTRIES {
+        return Err(format!(
+            "Transmission torrent-get full-list response has {count} torrents; maximum is {MAX_LEGACY_FULL_LIST_ENTRIES}; use the paged TorrentNG API"
+        ));
+    }
+    Ok(())
+}
+
 fn estimate_transmission_tracker_snapshot_bytes(tracker_count: u64, tracker_bytes: u64) -> u64 {
     // The engine query owns the durable strings, the compatibility projection
     // clones them into a response value, and JSON encoding adds another byte
@@ -520,7 +531,19 @@ pub fn build_transmission_router(state: AppState) -> Router {
             transmission_auth_guard,
         ))
         .layer(DefaultBodyLimit::max(MAX_TRANSMISSION_DEFAULT_BODY_BYTES))
+        .layer(middleware::from_fn(transmission_request_uri_guard))
         .with_state(state)
+}
+
+async fn transmission_request_uri_guard(req: Request<Body>, next: Next) -> Response {
+    if !api_uri_is_bounded(req.uri()) {
+        return (
+            StatusCode::URI_TOO_LONG,
+            "request URI exceeds the maximum length",
+        )
+            .into_response();
+    }
+    next.run(req).await
 }
 
 async fn transmission_idempotency_guard(
@@ -528,13 +551,16 @@ async fn transmission_idempotency_guard(
     req: Request<Body>,
     next: Next,
 ) -> Response {
-    let Some(key) = req
-        .headers()
-        .get("idempotency-key")
-        .and_then(|value| value.to_str().ok())
-        .map(str::to_owned)
-    else {
-        return next.run(req).await;
+    let key = match single_header_value(req.headers(), "idempotency-key") {
+        Ok(Some(value)) => value.to_owned(),
+        Ok(None) => return next.run(req).await,
+        Err(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                "duplicate Idempotency-Key headers are not accepted",
+            )
+                .into_response();
+        }
     };
     if !valid_idempotency_key(&key) {
         return (StatusCode::BAD_REQUEST, "invalid Idempotency-Key").into_response();
@@ -587,11 +613,7 @@ async fn transmission_idempotency_guard(
     };
     let response = Response::from_parts(parts.clone(), Body::from(body.clone()));
     if parts.status.is_success() {
-        let headers = parts
-            .headers
-            .iter()
-            .map(|(name, value)| (name.to_string(), value.as_bytes().to_vec()))
-            .collect();
+        let headers = cached_response_headers(&parts.headers);
         execution.complete(CachedResponse {
             status: parts.status.as_u16(),
             headers,
@@ -612,8 +634,18 @@ fn replay_idempotent_response(cached: CachedResponse) -> Response {
             .into_response();
     }
     let mut response = Response::new(Body::from(cached.body));
-    *response.status_mut() = StatusCode::from_u16(cached.status).unwrap_or(StatusCode::OK);
+    let Ok(status) = StatusCode::from_u16(cached.status) else {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "cached idempotency response had an invalid status",
+        )
+            .into_response();
+    };
+    *response.status_mut() = status;
     for (name, value) in cached.headers {
+        if !is_replayable_response_header(&name) {
+            continue;
+        }
         let Ok(name) = axum::http::HeaderName::from_bytes(name.as_bytes()) else {
             continue;
         };
@@ -678,18 +710,11 @@ async fn rpc(
     headers: HeaderMap,
     Json(body): Json<Value>,
 ) -> impl IntoResponse {
-    if headers.get("x-transmission-session-id").is_none() {
-        let mut headers = HeaderMap::new();
-        headers.insert(
-            "x-transmission-session-id",
-            HeaderValue::from_static(SESSION_ID),
-        );
-        return (
-            StatusCode::CONFLICT,
-            headers,
-            Json(json!({"result":"missing session-id"})),
-        )
-            .into_response();
+    if !matches!(
+        single_header_value(&headers, "x-transmission-session-id"),
+        Ok(Some(SESSION_ID))
+    ) {
+        return transmission_session_challenge();
     }
 
     if let Value::Array(requests) = body {
@@ -712,6 +737,20 @@ async fn rpc(
     Json(transmission_rpc_payload(&state, body).await).into_response()
 }
 
+fn transmission_session_challenge() -> Response {
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        "x-transmission-session-id",
+        HeaderValue::from_static(SESSION_ID),
+    );
+    (
+        StatusCode::CONFLICT,
+        headers,
+        Json(json!({"result":"missing or invalid session-id"})),
+    )
+        .into_response()
+}
+
 async fn transmission_rpc_payload(state: &AppState, body: Value) -> Value {
     let method = body
         .get("method")
@@ -723,15 +762,18 @@ async fn transmission_rpc_payload(state: &AppState, body: Value) -> Value {
         .is_some_and(|version| version == "2.0");
     let snake_case_rpc = method.contains('_');
     let method_key = method.replace('_', "-");
-    let args = normalize_transmission_request_keys(
+    let tag = body.get("tag").cloned();
+    let id = body.get("id").cloned().unwrap_or(Value::Null);
+    let args = match normalize_transmission_request_keys(
         body.get(if json_rpc { "params" } else { "arguments" })
             .or_else(|| body.get("arguments"))
             .or_else(|| body.get("params"))
             .cloned()
             .unwrap_or_else(|| json!({})),
-    );
-    let tag = body.get("tag").cloned();
-    let id = body.get("id").cloned().unwrap_or(Value::Null);
+    ) {
+        Ok(args) => args,
+        Err(error) => return transmission_response(tag, id, json_rpc, Err(error)),
+    };
     let result = match method_key.as_str() {
         "session-get" => session_get(state, &args).await,
         "session-stats" => session_stats(state).await,
@@ -1676,25 +1718,27 @@ fn transmission_json_rpc_error_code(message: &str) -> i64 {
     }
 }
 
-fn normalize_transmission_request_keys(value: Value) -> Value {
+fn normalize_transmission_request_keys(value: Value) -> Result<Value, String> {
     match value {
-        Value::Object(map) => Value::Object(
-            map.into_iter()
-                .map(|(key, value)| {
-                    (
-                        key.replace('_', "-"),
-                        normalize_transmission_request_keys(value),
-                    )
-                })
-                .collect(),
-        ),
-        Value::Array(values) => Value::Array(
-            values
-                .into_iter()
-                .map(normalize_transmission_request_keys)
-                .collect(),
-        ),
-        other => other,
+        Value::Object(map) => {
+            let mut normalized = serde_json::Map::with_capacity(map.len());
+            for (key, value) in map {
+                let normalized_key = key.replace('_', "-");
+                if normalized.contains_key(&normalized_key) {
+                    return Err(format!(
+                        "Transmission request contains colliding fields for `{normalized_key}`"
+                    ));
+                }
+                normalized.insert(normalized_key, normalize_transmission_request_keys(value)?);
+            }
+            Ok(Value::Object(normalized))
+        }
+        Value::Array(values) => values
+            .into_iter()
+            .map(normalize_transmission_request_keys)
+            .collect::<Result<Vec<_>, _>>()
+            .map(Value::Array),
+        other => Ok(other),
     }
 }
 
@@ -1954,20 +1998,23 @@ async fn torrent_get(state: &AppState, args: &Value) -> Result<Value, String> {
     } else {
         ids(state, args).await?
     };
-    let snapshot = {
+    // An explicit hash request must not rebuild the entire deterministic
+    // snapshot. The legacy full-list form is admitted by count before the
+    // snapshot is materialized; otherwise a registry just over the response
+    // cap could still force a large projection allocation before rejection.
+    let entries = if requested.is_empty() {
         let reg = state.registry.read().await;
-        reg.snapshot()
+        ensure_transmission_full_list_bound(reg.len())?;
+        reg.snapshot().iter().cloned().collect::<Vec<_>>()
+    } else {
+        let reg = state.registry.read().await;
+        let mut seen = HashSet::with_capacity(requested.len());
+        requested
+            .iter()
+            .filter_map(|hash| reg.get(hash))
+            .filter(|entry| seen.insert(entry.info_hash.clone()))
+            .collect::<Vec<_>>()
     };
-    let entries = snapshot
-        .iter()
-        .filter(|entry| requested.is_empty() || requested.contains(&entry.info_hash))
-        .collect::<Vec<_>>();
-    if entries.len() > MAX_LEGACY_FULL_LIST_ENTRIES {
-        return Err(format!(
-            "Transmission torrent-get full-list response has {} torrents; maximum is {MAX_LEGACY_FULL_LIST_ENTRIES}; use the paged TorrentNG API",
-            entries.len()
-        ));
-    }
     let need_trackers = fields
         .iter()
         .any(|field| transmission_field_needs_trackers(field));
@@ -2586,14 +2633,9 @@ fn file_completed_bytes(
     meta: &EngineTorrentMetadata,
 ) -> Vec<u64> {
     let done = entry.total_length.saturating_sub(entry.amount_left);
-    let mut offset = 0u64;
     meta.files
         .iter()
-        .map(|file| {
-            let file_start = offset;
-            offset = offset.saturating_add(file.length);
-            done.saturating_sub(file_start).min(file.length)
-        })
+        .map(|file| done.saturating_sub(file.offset).min(file.length))
         .collect()
 }
 
@@ -2980,7 +3022,10 @@ async fn ids(state: &AppState, args: &Value) -> Result<Vec<String>, String> {
     };
     ensure_transmission_input_bound(values.len(), "Transmission ids")?;
     let reg = state.registry.read().await;
-    let snapshot = reg.snapshot();
+    let snapshot = values
+        .iter()
+        .any(|value| value.as_u64().is_some())
+        .then(|| reg.snapshot());
     let mut hashes = Vec::with_capacity(values.len());
     for value in values {
         if let Some(hash) = value.as_str() {
@@ -2988,10 +3033,9 @@ async fn ids(state: &AppState, args: &Value) -> Result<Vec<String>, String> {
             if hash.is_empty() {
                 return Err("Transmission ids cannot contain an empty hash".to_owned());
             }
+            ensure_transmission_text_bound(hash, "Transmission torrent id")?;
             hashes.push(
-                snapshot
-                    .find(hash)
-                    .map(|entry| entry.info_hash.clone())
+                reg.resolve_info_hash(hash)
                     .unwrap_or_else(|| hash.to_owned()),
             );
             continue;
@@ -3005,7 +3049,8 @@ async fn ids(state: &AppState, args: &Value) -> Result<Vec<String>, String> {
         let index = usize::try_from(id - 1)
             .map_err(|_| "Transmission numeric torrent id is too large".to_owned())?;
         let entry = snapshot
-            .get(index)
+            .as_ref()
+            .and_then(|snapshot| snapshot.get(index))
             .ok_or_else(|| format!("Transmission torrent id {id} was not found"))?;
         hashes.push(entry.info_hash.clone());
     }
@@ -3036,9 +3081,9 @@ async fn mutation_ids(state: &AppState, args: &Value) -> Result<Vec<String>, Str
 
 async fn default_download_dir(state: &AppState) -> String {
     let reg = state.registry.read().await;
-    let snapshot = reg.snapshot();
-    let dir = snapshot
-        .get(0)
+    let dir = reg
+        .iter()
+        .next()
         .map(|entry| entry.save_path.clone())
         .unwrap_or_else(|| "/downloads".to_owned());
     dir
@@ -3483,8 +3528,11 @@ fn validate_transmission_session_args(args: &Value) -> Result<(), String> {
         }
     }
     for key in STRING_FIELDS {
-        if args.get(*key).is_some() && !args.get(*key).is_some_and(Value::is_string) {
-            return Err(format!("Transmission session field {key} must be a string"));
+        if let Some(value) = args.get(*key) {
+            let value = value
+                .as_str()
+                .ok_or_else(|| format!("Transmission session field {key} must be a string"))?;
+            ensure_transmission_text_bound(value, &format!("Transmission session field {key}"))?;
         }
     }
     for key in [
@@ -3612,6 +3660,15 @@ fn ensure_transmission_input_bound(count: usize, field: &str) -> Result<(), Stri
     Ok(())
 }
 
+fn ensure_transmission_text_bound(value: &str, field: &str) -> Result<(), String> {
+    if value.len() > MAX_TRANSMISSION_TEXT_BYTES {
+        return Err(format!(
+            "{field} exceeds the {MAX_TRANSMISSION_TEXT_BYTES} byte limit"
+        ));
+    }
+    Ok(())
+}
+
 /// Validate the fields that `torrent-set` actually consumes before applying
 /// any of them.  Transmission clients commonly send a large settings object;
 /// unknown fields remain forward-compatible, but a recognized field with an
@@ -3628,8 +3685,11 @@ fn validate_transmission_torrent_set_args(args: &Value) -> Result<(), String> {
             return Err("Transmission torrent field labels must be an array".to_owned());
         };
         ensure_transmission_input_bound(labels.len(), "Transmission torrent field labels")?;
-        if labels.iter().any(|label| !label.is_string()) {
-            return Err("Transmission torrent field labels must contain only strings".to_owned());
+        for label in labels {
+            let label = label.as_str().ok_or_else(|| {
+                "Transmission torrent field labels must contain only strings".to_owned()
+            })?;
+            ensure_transmission_text_bound(label, "Transmission torrent label")?;
         }
         if labels.iter().any(|label| {
             label
@@ -3642,8 +3702,11 @@ fn validate_transmission_torrent_set_args(args: &Value) -> Result<(), String> {
         }
     }
     for key in ["download-dir", "group"] {
-        if args.get(key).is_some_and(|value| !value.is_string()) {
-            return Err(format!("Transmission torrent field {key} must be a string"));
+        if let Some(value) = args.get(key) {
+            let value = value
+                .as_str()
+                .ok_or_else(|| format!("Transmission torrent field {key} must be a string"))?;
+            ensure_transmission_text_bound(value, &format!("Transmission torrent field {key}"))?;
         }
     }
     validate_transmission_string_bytes(args, "download-dir", MAX_TRANSMISSION_PATH_BYTES, "path")?;
@@ -3716,14 +3779,18 @@ fn validate_transmission_torrent_get_args(args: &Value) -> Result<(), String> {
             return Err("Transmission torrent-get fields must be an array".to_owned());
         };
         ensure_transmission_input_bound(fields.len(), "Transmission torrent-get fields")?;
-        if fields.iter().any(|field| !field.is_string()) {
-            return Err("Transmission torrent-get fields must contain only strings".to_owned());
+        for field in fields {
+            let field = field.as_str().ok_or_else(|| {
+                "Transmission torrent-get fields must contain only strings".to_owned()
+            })?;
+            ensure_transmission_text_bound(field, "Transmission torrent-get field")?;
         }
     }
     if let Some(format) = args.get("format") {
-        if !format.is_string() {
-            return Err("Transmission torrent-get format must be a string".to_owned());
-        }
+        let format = format
+            .as_str()
+            .ok_or_else(|| "Transmission torrent-get format must be a string".to_owned())?;
+        ensure_transmission_text_bound(format, "Transmission torrent-get format")?;
     }
     Ok(())
 }
@@ -3744,8 +3811,11 @@ fn validate_transmission_group_set_args(args: &Value) -> Result<(), String> {
         }
     }
     for key in ["group", "name"] {
-        if args.get(key).is_some_and(|value| !value.is_string()) {
-            return Err(format!("Transmission group field {key} must be a string"));
+        if let Some(value) = args.get(key) {
+            let value = value
+                .as_str()
+                .ok_or_else(|| format!("Transmission group field {key} must be a string"))?;
+            ensure_transmission_text_bound(value, &format!("Transmission group field {key}"))?;
         }
         validate_transmission_string_bytes(args, key, MAX_TRANSMISSION_GROUP_NAME_BYTES, "group")?;
     }
@@ -3766,10 +3836,14 @@ fn validate_transmission_subscription_args(args: &Value) -> Result<(), String> {
             values.len(),
             &format!("Transmission subscription field {key}"),
         )?;
-        if values.iter().any(|value| !value.is_string()) {
-            return Err(format!(
-                "Transmission subscription field {key} must contain only strings"
-            ));
+        for value in values {
+            let value = value.as_str().ok_or_else(|| {
+                format!("Transmission subscription field {key} must contain only strings")
+            })?;
+            ensure_transmission_text_bound(
+                value,
+                &format!("Transmission subscription field {key}"),
+            )?;
         }
         if values.iter().any(|value| {
             value
@@ -3823,6 +3897,9 @@ fn transmission_tracker_value_is_valid(
     match value {
         Value::String(value) => {
             if value.trim().is_empty() || value.len() > MAX_TRANSMISSION_URL_BYTES {
+                return false;
+            }
+            if value.len() > MAX_TRANSMISSION_TEXT_BYTES {
                 return false;
             }
             *count = count.saturating_add(1);
@@ -3906,8 +3983,11 @@ fn validate_transmission_torrent_add_args(args: &Value) -> Result<(), String> {
             return Err("Transmission torrent-add labels must be an array".to_owned());
         };
         ensure_transmission_input_bound(labels.len(), "Transmission torrent-add labels")?;
-        if labels.iter().any(|label| !label.is_string()) {
-            return Err("Transmission torrent-add labels must contain only strings".to_owned());
+        for label in labels {
+            let label = label.as_str().ok_or_else(|| {
+                "Transmission torrent-add labels must contain only strings".to_owned()
+            })?;
+            ensure_transmission_text_bound(label, "Transmission torrent-add label")?;
         }
         if labels.iter().any(|label| {
             label
@@ -3918,6 +3998,12 @@ fn validate_transmission_torrent_add_args(args: &Value) -> Result<(), String> {
                 "Transmission torrent-add labels exceed {MAX_TRANSMISSION_LABEL_BYTES} bytes"
             ));
         }
+    }
+    if let Some(filename) = args.get("filename").and_then(Value::as_str) {
+        ensure_transmission_text_bound(filename, "Transmission torrent-add filename")?;
+    }
+    if let Some(download_dir) = args.get("download-dir").and_then(Value::as_str) {
+        ensure_transmission_text_bound(download_dir, "Transmission torrent-add download-dir")?;
     }
     if args.get("filename").is_none() && args.get("metainfo").is_none() {
         return Err("missing filename or metainfo".to_owned());
@@ -3998,7 +4084,7 @@ fn transmission_status(state: &str) -> i64 {
 }
 
 fn transmission_is_finished(entry: &rt_session::TorrentEntry) -> bool {
-    entry.state.as_str() == "seeding" || (entry.total_length > 0 && entry.amount_left == 0)
+    entry.total_length > 0 && entry.amount_left == 0
 }
 
 #[cfg(test)]
@@ -4120,6 +4206,45 @@ mod tests {
             .unwrap();
         assert_eq!(resp.status(), StatusCode::CONFLICT);
         assert!(resp.headers().contains_key("x-transmission-session-id"));
+    }
+
+    #[tokio::test]
+    async fn transmission_session_id_rejects_wrong_or_duplicate_headers() {
+        let app =
+            build_transmission_router(AppState::new(Arc::new(RwLock::new(SessionRegistry::new()))));
+        let wrong = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/transmission/rpc")
+                    .header("content-type", "application/json")
+                    .header("x-transmission-session-id", "attacker-chosen")
+                    .body(Body::from(r#"{"method":"session-get"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(wrong.status(), StatusCode::CONFLICT);
+        assert_eq!(
+            wrong.headers().get("x-transmission-session-id").unwrap(),
+            SESSION_ID
+        );
+
+        let duplicate = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/transmission/rpc")
+                    .header("content-type", "application/json")
+                    .header("x-transmission-session-id", SESSION_ID)
+                    .header("x-transmission-session-id", "attacker-chosen")
+                    .body(Body::from(r#"{"method":"session-get"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(duplicate.status(), StatusCode::CONFLICT);
     }
 
     #[tokio::test]
@@ -4507,6 +4632,8 @@ mod tests {
                     index: 0,
                     path: "one.bin".into(),
                     length: 100,
+                    offset: 0,
+                    piece_offset: 0,
                     priority: 1,
                     wanted: true,
                 },
@@ -4514,6 +4641,8 @@ mod tests {
                     index: 1,
                     path: "two.mkv".into(),
                     length: 200,
+                    offset: 100,
+                    piece_offset: 100,
                     priority: 0,
                     wanted: false,
                 },
@@ -4560,6 +4689,10 @@ mod tests {
 
         rechecked.amount_left = 0;
         assert!(transmission_is_finished(&rechecked));
+
+        rechecked.state = rt_session::TorrentState::Seeding;
+        rechecked.amount_left = 25;
+        assert!(!transmission_is_finished(&rechecked));
     }
 
     #[test]
@@ -5898,6 +6031,22 @@ mod tests {
             "format": false,
         }))
         .is_err());
+    }
+
+    #[test]
+    fn transmission_request_key_normalization_rejects_collisions() {
+        let error = normalize_transmission_request_keys(json!({
+            "download-dir": "/one",
+            "download_dir": "/two",
+        }))
+        .unwrap_err();
+        assert!(error.contains("download-dir"));
+
+        let nested = normalize_transmission_request_keys(json!({
+            "arguments": {"seed_ratio_limit": 1.0},
+        }))
+        .unwrap();
+        assert_eq!(nested["arguments"]["seed-ratio-limit"], json!(1.0));
     }
 
     #[test]

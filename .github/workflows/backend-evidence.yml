@@ -78,7 +78,7 @@ jobs:
           persist-credentials: false
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
 
       - name: Run deterministic matrix
         run: |
@@ -88,7 +88,7 @@ jobs:
 
       - name: Upload deterministic evidence
         if: always()
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: backend-deterministic-fault-${{ github.run_id }}
           path: |
@@ -109,7 +109,7 @@ jobs:
           persist-credentials: false
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
 
       - name: Build release daemon
         run: cargo build --release --locked -p torrentngd
@@ -124,7 +124,7 @@ jobs:
 
       - name: Upload live fault evidence
         if: always()
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: backend-live-fault-${{ github.run_id }}
           path: certification/reports/backend-burndown-native-fault-*
@@ -162,7 +162,7 @@ jobs:
 
       - name: Upload API/SSE evidence
         if: always()
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: backend-api-load-${{ github.run_id }}
           path: certification/reports/backend-api-load-*
@@ -190,7 +190,7 @@ jobs:
 
       - name: Upload public compatibility evidence
         if: always()
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: backend-public-compat-${{ github.run_id }}
           path: certification/reports/universal-compat-backend-*
@@ -222,7 +222,7 @@ jobs:
 
       - name: Upload storage evidence
         if: always()
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: backend-real-device-${{ github.run_id }}
           path: certification/reports/storage-*
@@ -259,7 +259,7 @@ jobs:
 
       - name: Upload soak evidence
         if: always()
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: backend-24h-soak-${{ github.run_id }}
           path: certification/reports/soak-24h-backend-*
