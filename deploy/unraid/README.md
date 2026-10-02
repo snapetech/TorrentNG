@@ -25,6 +25,8 @@ templates publish on a public container bind, so first sign in with the
 template's **API Token** or **API Tokens** value; the same token can be entered
 in either login field. Retrieve the generated login from the container console
 with `torrentngd auth-token` (native) or `torrentng auth-token` (WebUI service).
+Run either command from an interactive container console; credentials are
+written to the controlling terminal and not stdout.
 Then open **Settings -> Security** to choose a username and password of at
 least 16 characters. API tokens remain available for automation. Runtime
 changes persist in the profile's state directory.

@@ -604,8 +604,11 @@ browser mutations and WebSocket handshakes. Automation clients should use an
 API-token Bearer credential instead.
 
 Fresh installs generate a unique WebUI password in the service data directory.
-Run `torrentng auth-token [config.toml]` to print the active login. Change
-credentials in **Settings -> Security** or in the service `[auth]` config.
+Run `torrentng auth-token [config.toml]` from an interactive terminal to
+retrieve the active login. The command writes only to the controlling terminal
+and refuses non-interactive use, so stdout redirection cannot capture the
+credentials. Change credentials in **Settings -> Security** or in the service
+`[auth]` config.
 Runtime changes persist in `auth-settings.json` under the service data directory
 with mode `0600`. Public binds require API tokens and a WebUI password of at
 least 16 bytes. API tokens can be entered in either login field.
