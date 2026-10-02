@@ -148,6 +148,16 @@ class WorkflowSecurityTests(unittest.TestCase):
         self.assertNotIn("steps.tag.outputs.tag", checksum_step)
         self.assertEqual(release.count("${{ steps.tag.outputs.tag }}"), 1)
 
+    def test_aur_publish_stages_every_declared_package_source_file(self) -> None:
+        aur = (WORKFLOWS / "release-aur.yml").read_text(encoding="utf-8")
+        pkgbuild = (ROOT / "packaging" / "arch" / "PKGBUILD").read_text(encoding="utf-8")
+        self.assertIn('"torrentngd.config.toml"', pkgbuild)
+        self.assertIn(
+            'git -C "$workdir/torrentngd-git" add PKGBUILD .SRCINFO '
+            "torrentngd.service torrentngd.sysusers torrentngd.tmpfiles torrentngd.config.toml",
+            aur,
+        )
+
     def test_bearer_targets_and_soak_transport_fail_closed(self) -> None:
         api_load = (ROOT / "scripts" / "backend_burndown_api_load.py").read_text(encoding="utf-8")
         self.assertIn("NoProxyHandler", api_load)

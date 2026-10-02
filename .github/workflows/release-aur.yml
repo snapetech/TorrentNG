@@ -104,6 +104,6 @@ jobs:
             '
           git -C "$workdir/torrentngd-git" config user.name "snapetech release bot"
           git -C "$workdir/torrentngd-git" config user.email "release@snapetech.local"
-          git -C "$workdir/torrentngd-git" add PKGBUILD .SRCINFO torrentngd.service torrentngd.sysusers torrentngd.tmpfiles
+          git -C "$workdir/torrentngd-git" add PKGBUILD .SRCINFO torrentngd.service torrentngd.sysusers torrentngd.tmpfiles torrentngd.config.toml
           git -C "$workdir/torrentngd-git" commit -m "Update to $RELEASE_TAG" || exit 0
           git -C "$workdir/torrentngd-git" push
