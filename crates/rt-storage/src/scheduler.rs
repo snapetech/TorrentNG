@@ -384,37 +384,34 @@ struct FileIdentity {
     file_index: u64,
 }
 
+#[cfg(windows)]
+fn file_identity(file: &File) -> io::Result<FileIdentity> {
+    let (volume_serial, file_index) = crate::win32::file_identity(file)?;
+    Ok(FileIdentity {
+        volume_serial,
+        file_index,
+    })
+}
+
 #[cfg(not(windows))]
 fn file_identity(file: &File) -> io::Result<FileIdentity> {
-    #[cfg(windows)]
-    {
-        let (volume_serial, file_index) = crate::open::windows_file_identity(file)?;
-        return Ok(FileIdentity {
-            volume_serial,
-            file_index,
-        });
-    }
+    metadata_identity(&file.metadata()?)
+}
 
-    #[cfg(not(windows))]
-    {
-        metadata_identity(&file.metadata()?)
-    }
+#[cfg(windows)]
+fn path_identity(path: &Path) -> io::Result<FileIdentity> {
+    let (volume_serial, file_index) = crate::win32::path_identity(path)?;
+    Ok(FileIdentity {
+        volume_serial,
+        file_index,
+    })
 }
 
 #[cfg(not(windows))]
 fn path_identity(path: &Path) -> io::Result<FileIdentity> {
     // Do not follow a final symlink here. Runtime opens reject symlinks, and a
     // symlink replacing a cached regular file must force a fresh safe open.
-    #[cfg(windows)]
-    {
-        let file = crate::open::open_path_no_follow(path, false, false)?;
-        return file_identity(&file);
-    }
-
-    #[cfg(not(windows))]
-    {
-        metadata_identity(&std::fs::symlink_metadata(path)?)
-    }
+    metadata_identity(&std::fs::symlink_metadata(path)?)
 }
 
 #[cfg(not(windows))]
