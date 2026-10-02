@@ -158,6 +158,17 @@ class WorkflowSecurityTests(unittest.TestCase):
             aur,
         )
 
+    def test_ppa_publish_can_resume_a_single_series_with_the_shared_orig(self) -> None:
+        ppa = (WORKFLOWS / "release-ppa.yml").read_text(encoding="utf-8")
+        self.assertIn("default: all\n        type: choice", ppa)
+        for series in ("all", "jammy", "noble", "resolute"):
+            with self.subTest(series=series):
+                self.assertIn(f"          - {series}", ppa)
+        self.assertIn("INPUT_SERIES: ${{ inputs.series }}", ppa)
+        self.assertIn('noble|resolute) series_list=("$target_series")', ppa)
+        self.assertIn('if [[ "$target_series" == noble || "$target_series" == resolute ]]', ppa)
+        self.assertIn('shared_orig="$output_dir/jammy/torrentngd_${upstream_version}.orig.tar.gz"', ppa)
+
     def test_bearer_targets_and_soak_transport_fail_closed(self) -> None:
         api_load = (ROOT / "scripts" / "backend_burndown_api_load.py").read_text(encoding="utf-8")
         self.assertIn("NoProxyHandler", api_load)

@@ -12,6 +12,16 @@ on:
         required: false
         default: true
         type: boolean
+      series:
+        description: Target Ubuntu series, or all three; choose one series to resume a partial upload
+        required: false
+        default: all
+        type: choice
+        options:
+          - all
+          - jammy
+          - noble
+          - resolute
 
 permissions:
   contents: read
@@ -102,6 +112,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           RELEASE_TAG: ${{ steps.tag.outputs.tag }}
           INPUT_INCLUDE_ORIG: ${{ inputs.include_orig }}
+          INPUT_SERIES: ${{ inputs.series }}
           LAUNCHPAD_GPG_FINGERPRINT: 07E2531E1F470F8008ACCFC996A07606FE65392F
         shell: bash
         run: |
@@ -111,11 +122,25 @@ jobs:
           upstream_version="${RELEASE_TAG#main-}"
           upstream_version="${upstream_version#v}"
           upstream_version="${upstream_version//-/.}"
+          target_series="${INPUT_SERIES:-all}"
+          case "$target_series" in
+            all) series_list=(jammy noble resolute) ;;
+            jammy|noble|resolute) series_list=("$target_series") ;;
+            *) echo "Unsupported Ubuntu series selection: $target_series" >&2; exit 1 ;;
+          esac
+
           shared_orig=""
-          for series in jammy noble resolute; do
-            include_orig="$INPUT_INCLUDE_ORIG"
-            if [[ "$series" != jammy ]]; then
-              include_orig=false
+          if [[ "$target_series" == noble || "$target_series" == resolute ]]; then
+            scripts/build_launchpad_ppa_source.sh \
+              "$RELEASE_TAG" jammy "$GITHUB_RUN_ID" \
+              "$GITHUB_RUN_ATTEMPT" "$output_dir" true >/dev/null
+            shared_orig="$output_dir/jammy/torrentngd_${upstream_version}.orig.tar.gz"
+          fi
+
+          for series in "${series_list[@]}"; do
+            include_orig=false
+            if [[ "$series" == jammy ]]; then
+              include_orig="$INPUT_INCLUDE_ORIG"
             fi
             changes_file="$(scripts/build_launchpad_ppa_source.sh \
               "$RELEASE_TAG" "$series" "$GITHUB_RUN_ID" \
@@ -132,6 +157,6 @@ jobs:
             echo
             echo "Release: `$RELEASE_TAG`"
             echo "PPA: [ppa:keefshape/torrentng](https://launchpad.net/~keefshape/+archive/ubuntu/torrentng)"
-            echo "Series: Jammy, Noble, Resolute; architectures: amd64 and arm64."
+            echo "Series: ${series_list[*]}; architectures: amd64 and arm64."
             echo "Launchpad builds the installable packages after the signed source uploads are accepted."
           } >> "$GITHUB_STEP_SUMMARY"
