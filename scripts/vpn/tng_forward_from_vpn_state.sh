@@ -14,6 +14,25 @@ PRIVATE_PORT="${TNG_VPN_PRIVATE_PORT:-50000}"
 PROTO="${TNG_VPN_PROTO:-tcp}"
 OUT_ENV="${TNG_VPN_OUT_ENV:-$ROOT/certification/reports/tng-vpn-forward.env}"
 
+valid_port() {
+  local value="$1"
+  [[ "$value" =~ ^[0-9]+$ ]] && (( 10#$value >= 1 && 10#$value <= 65535 ))
+}
+
+valid_public_ip() {
+  local value="$1"
+  [[ -z "$value" || "$value" =~ ^[0-9A-Fa-f:.]+$ ]]
+}
+
+if ! valid_port "$PRIVATE_PORT"; then
+  echo "TNG_VPN_PRIVATE_PORT must be an integer from 1 to 65535" >&2
+  exit 64
+fi
+if [[ "$PROTO" != tcp && "$PROTO" != udp ]]; then
+  echo "TNG_VPN_PROTO must be tcp or udp" >&2
+  exit 64
+fi
+
 usage() {
   cat <<EOF
 Usage: $(basename "$0") [print|write-env|restart-cert]
@@ -45,10 +64,11 @@ read_env_file() {
   public_port="$(sed -n 's/^public_port=//p' "$file" | tail -1)"
   public_ip="$(sed -n 's/^public_ip=//p' "$file" | tail -1)"
   proto="$(sed -n 's/^proto=//p' "$file" | tail -1)"
-  [[ -n "$public_port" ]] || return 1
+  valid_port "$public_port" || return 1
   [[ -z "$target_port" || "$target_port" == "$PRIVATE_PORT" ]] || return 1
   [[ -z "$local_port" || "$local_port" == "$PRIVATE_PORT" ]] || return 1
   [[ -z "$proto" || "$proto" == "$PROTO" ]] || return 1
+  valid_public_ip "$public_ip" || return 1
   printf 'source=%s\npublic_ip=%s\npublic_port=%s\nprivate_port=%s\nproto=%s\n' \
     "$file" "$public_ip" "$public_port" "$PRIVATE_PORT" "${proto:-$PROTO}"
 }
@@ -56,9 +76,9 @@ read_env_file() {
 read_gluetun_api() {
   [[ -n "$GLUETUN_API" ]] || return 1
   local json port
-  json="$(curl -fsS "$GLUETUN_API/v1/openvpn/portforwarded" 2>/dev/null)" || return 1
+  json="$(curl --connect-timeout 5 --max-time 10 -fsS "$GLUETUN_API/v1/openvpn/portforwarded" 2>/dev/null)" || return 1
   port="$(jq -r '.port // .forwarded_port // .forwardedPort // empty' <<<"$json")"
-  [[ -n "$port" && "$port" != "0" ]] || return 1
+  valid_port "$port" || return 1
   printf 'source=%s\npublic_ip=\npublic_port=%s\nprivate_port=%s\nproto=%s\n' \
     "$GLUETUN_API" "$port" "$PRIVATE_PORT" "$PROTO"
 }
@@ -67,9 +87,9 @@ discover() {
   read_gluetun_api && return 0
   for dir in "$STATE_DIR" "$STATIC_FORWARD_DIR"; do
     [[ -d "$dir" ]] || continue
-    while IFS= read -r file; do
+    while IFS= read -r -d '' file; do
       read_env_file "$file" && return 0
-    done < <(find "$dir" -maxdepth 1 -type f -name 'pf*.env' | sort)
+    done < <(find "$dir" -maxdepth 1 -type f -name 'pf*.env' -print0 | sort -z)
   done
   return 1
 }
@@ -83,13 +103,16 @@ write_env() {
   proto="$(sed -n 's/^proto=//p' <<<"$mapping")"
   source="$(sed -n 's/^source=//p' <<<"$mapping")"
   mkdir -p "$(dirname "$OUT_ENV")"
-  cat > "$OUT_ENV" <<EOF
-TNG_INCOMING_PORT=$private_port
-TNG_VPN_PUBLIC_PORT=$public_port
-TNG_VPN_PUBLIC_IP=$public_ip
-TNG_VPN_FORWARD_PROTO=$proto
-TNG_VPN_FORWARD_SOURCE=$source
-EOF
+  # The watcher sources this file. `%q` keeps state-file contents data even
+  # if a provider emits whitespace, shell metacharacters, or a newline in a
+  # diagnostic/source field.
+  {
+    printf 'TNG_INCOMING_PORT=%q\n' "$private_port"
+    printf 'TNG_VPN_PUBLIC_PORT=%q\n' "$public_port"
+    printf 'TNG_VPN_PUBLIC_IP=%q\n' "$public_ip"
+    printf 'TNG_VPN_FORWARD_PROTO=%q\n' "$proto"
+    printf 'TNG_VPN_FORWARD_SOURCE=%q\n' "$source"
+  } > "$OUT_ENV"
   echo "$OUT_ENV"
 }
 

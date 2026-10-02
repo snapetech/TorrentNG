@@ -6,6 +6,7 @@ use serde_json::{json, Value};
 use tokio::sync::Mutex;
 
 use super::{
+    download_remote_torrent, ensure_backend_collection_bound, is_magnet_url, parse_backend_url,
     response_json_bounded, BackendCapabilities, BackendStatus, BackendType, TorrentBackend,
     MAX_BACKEND_JSON_BYTES,
 };
@@ -27,11 +28,14 @@ impl TransmissionBackend {
         let client = super::backend_client_builder()
             .timeout(std::time::Duration::from_secs(cfg.timeout_secs.max(1)))
             .danger_accept_invalid_certs(cfg.accept_invalid_certs)
+            // Keep configured RPC traffic direct; proxy use is not a
+            // supported backend setting and could expose RPC credentials.
+            .no_proxy()
             .build()
             .context("create Transmission RPC client")?;
         Ok(Self {
             client,
-            url: Url::parse(cfg.url.trim()).context("parse transmission.url")?,
+            url: parse_backend_url(&cfg.url, "transmission.url")?,
             username: cfg.username.clone(),
             password: cfg.password.clone(),
             session_id: Mutex::new(None),
@@ -196,7 +200,11 @@ impl TorrentBackend for TransmissionBackend {
     }
 
     async fn add_url(&self, url: &str, save_path: &str, category: &str, start: bool) -> Result<()> {
-        self.add_magnet(url, save_path, category, start).await
+        if is_magnet_url(url) {
+            return self.add_magnet(url, save_path, category, start).await;
+        }
+        let data = download_remote_torrent(url).await?;
+        self.add_torrent(&data, save_path, category, start).await
     }
 
     async fn remove(&self, hash: &str, delete_data: bool) -> Result<()> {
@@ -504,12 +512,15 @@ fn bytes_to_kib_ceil(bytes: i64) -> i64 {
 }
 
 fn required_array<'a>(value: &'a Value, key: &str, method: &str) -> Result<&'a [Value]> {
-    value
+    let array = value
         .as_object()
         .and_then(|object| object.get(key))
         .and_then(Value::as_array)
-        .map(Vec::as_slice)
-        .ok_or_else(|| anyhow::anyhow!("Transmission {method} result has no array field {key:?}"))
+        .ok_or_else(|| {
+            anyhow::anyhow!("Transmission {method} result has no array field {key:?}")
+        })?;
+    ensure_backend_collection_bound(array.len(), &format!("Transmission {method} field {key}"))?;
+    Ok(array)
 }
 
 fn map_torrent(t: &Value) -> Result<RawTorrent> {
@@ -527,20 +538,24 @@ fn map_torrent(t: &Value) -> Result<RawTorrent> {
         .unwrap_or_default();
     let labels = match t.get("labels") {
         None => String::new(),
-        Some(value) => value
-            .as_array()
-            .ok_or_else(|| anyhow::anyhow!("Transmission torrent labels is not an array"))?
-            .iter()
-            .map(|label| {
-                label
-                    .as_str()
-                    .ok_or_else(|| anyhow::anyhow!("Transmission torrent label is not a string"))
-            })
-            .collect::<Result<Vec<_>>>()?
-            .first()
-            .copied()
-            .unwrap_or("")
-            .to_owned(),
+        Some(value) => {
+            let labels = value
+                .as_array()
+                .ok_or_else(|| anyhow::anyhow!("Transmission torrent labels is not an array"))?;
+            ensure_backend_collection_bound(labels.len(), "Transmission torrent labels")?;
+            labels
+                .iter()
+                .map(|label| {
+                    label.as_str().ok_or_else(|| {
+                        anyhow::anyhow!("Transmission torrent label is not a string")
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?
+                .first()
+                .copied()
+                .unwrap_or("")
+                .to_owned()
+        }
     };
     let category = match t.get("group") {
         None => labels,
@@ -613,8 +628,8 @@ fn map_tracker((index, tracker): (usize, &Value)) -> Result<RawTracker> {
     let last_succeeded = required_bool_or_int(tracker, "lastAnnounceSucceeded")?;
     Ok(RawTracker {
         url: required_nonempty_string(tracker, "announce")?,
-        id: required_i64(tracker, "id")?,
-        group: required_i64(tracker, "tier")?,
+        id: required_nonnegative_i64(tracker, "id")?,
+        group: required_nonnegative_i64(tracker, "tier")?,
         group_index: index as i64,
         is_enabled: true,
         is_open: last_succeeded,

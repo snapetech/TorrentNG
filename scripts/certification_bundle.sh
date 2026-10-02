@@ -16,7 +16,7 @@ trap 'rm -rf "$tmpdir"' EXIT
 status_report="$tmpdir/certification-status.md"
 manifest="$tmpdir/MANIFEST.md"
 bundle_root="$tmpdir/torrentng-certification-bundle-$STAMP"
-mkdir -p "$bundle_root/reports"
+mkdir -p "$bundle_root/reports" "$bundle_root/benchmarks"
 missing=0
 
 BENCHMARK_DIR="$BENCHMARK_DIR" "$ROOT/scripts/certification_status.sh" "$REPORT_DIR" >"$status_report"
@@ -43,6 +43,10 @@ cp "$status_report" "$bundle_root/certification-status.md"
 
 while IFS=$'\t' read -r gate status report; do
   [[ -n "$gate" ]] || continue
+  if [[ "$status" == "INFO" && "$report" == deferred\ by\ * ]]; then
+    printf '| %s | %s | %s | intentionally deferred; no report is required |\n' "$gate" "$status" "$report" >>"$manifest"
+    continue
+  fi
   src="$REPORT_DIR/$report"
   dest_prefix="reports"
   if [[ ! -f "$src" && -f "$BENCHMARK_DIR/$report" ]]; then

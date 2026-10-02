@@ -77,7 +77,26 @@ fn task_exit_error(
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let cfg_path = std::env::args().nth(1);
+    let mut args = std::env::args().skip(1);
+    let first_arg = args.next();
+    if first_arg.as_deref() == Some("auth-token") {
+        let cfg_path = args.next();
+        anyhow::ensure!(
+            args.next().is_none(),
+            "usage: torrentng auth-token [config.toml]"
+        );
+        let cfg = Config::load(cfg_path.as_deref()).context("load config")?;
+        let (_, credentials, _) = resolve_auth_credentials(&cfg)?;
+        println!("WebUI username: {}", credentials.username);
+        println!("WebUI password: {}", credentials.password);
+        println!("Configured API tokens can also be used in either login field.");
+        return Ok(());
+    }
+    if matches!(first_arg.as_deref(), Some("-h" | "--help" | "help")) {
+        println!("torrentng [config.toml]\n       torrentng auth-token [config.toml]");
+        return Ok(());
+    }
+    let cfg_path = first_arg;
     let cfg = Config::load(cfg_path.as_deref()).context("load config")?;
 
     let legacy_filter = if cfg.debug { "debug" } else { "info" };
@@ -183,13 +202,8 @@ async fn main() -> Result<()> {
         .parse()
         .with_context(|| format!("parse listen_addr {}", cfg.listen_addr))?;
     let public_bind = !api_addr.ip().is_loopback();
-    let configured_auth_credentials = torrentng::auth::AuthCredentials {
-        username: cfg.auth.username.clone(),
-        password: cfg.auth.password.clone(),
-    };
-    let auth_settings_path = cfg.cache_path().with_file_name("auth-settings.json");
-    let auth_credentials =
-        torrentng::auth::load_auth_credentials(&auth_settings_path, &configured_auth_credentials)?;
+    let (configured_auth_credentials, auth_credentials, auth_settings_path) =
+        resolve_auth_credentials(&cfg)?;
     let local_webui_session_token = if cfg.auth.api_tokens.is_empty() {
         Some(format!("tng-local-{}", uuid::Uuid::new_v4().simple()))
     } else {
@@ -214,6 +228,13 @@ async fn main() -> Result<()> {
         local_webui_session_token,
         public_bind,
         control_plane_write: Arc::new(tokio::sync::Mutex::new(())),
+        request_concurrency: Arc::new(tokio::sync::Semaphore::new(
+            api::server::MAX_CONCURRENT_API_REQUESTS,
+        )),
+        large_uploads: Arc::new(tokio::sync::Semaphore::new(
+            api::server::MAX_CONCURRENT_LARGE_UPLOADS,
+        )),
+        ws_clients: Arc::new(tokio::sync::Semaphore::new(api::server::MAX_WS_CLIENTS)),
     };
     let app = build_router(state);
 
@@ -316,6 +337,29 @@ async fn main() -> Result<()> {
         "shutdown complete"
     );
     Ok(())
+}
+
+fn resolve_auth_credentials(
+    cfg: &Config,
+) -> Result<(
+    torrentng::auth::AuthCredentials,
+    torrentng::auth::AuthCredentials,
+    std::path::PathBuf,
+)> {
+    let auth_settings_path = cfg.cache_path().with_file_name("auth-settings.json");
+    let password = if cfg.auth.password.is_empty() {
+        torrentng::auth::load_or_create_bootstrap_password(
+            &auth_settings_path.with_file_name("bootstrap-password"),
+        )?
+    } else {
+        cfg.auth.password.clone()
+    };
+    let configured = torrentng::auth::AuthCredentials {
+        username: cfg.auth.username.clone(),
+        password,
+    };
+    let active = torrentng::auth::load_auth_credentials(&auth_settings_path, &configured)?;
+    Ok((configured, active, auth_settings_path))
 }
 
 /// Apply every tracker-facing rTorrent identity before starting any

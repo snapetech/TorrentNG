@@ -41,6 +41,7 @@ use tokio::time::{interval, sleep, timeout};
 use tokio_util::codec::Framed;
 use tracing::{debug, warn};
 
+use crate::crash_safety::CrashSafetyRuntime;
 use crate::db_worker::DbExecutor;
 use crate::egress_policy::OutboundEgressPolicy;
 use crate::network_budget::GlobalNetworkBudget;
@@ -186,6 +187,43 @@ pub(crate) fn persistent_torrent_metadata_memory_bytes_v2(meta: &TorrentMetaV2) 
         );
     }
     total
+}
+
+const MAX_V2_REGRESSION_PIECES: usize = 32;
+const MAX_V2_REGRESSION_FILES: usize = 20;
+
+/// Pick the files a v2 `sample` read-back verifies: a deterministic
+/// pseudo-random order, taken until at least `percent` of the bytes are
+/// covered, and always at least one file. Returns `None` when that would be
+/// every file anyway (a full verification costs no more).
+fn select_v2_sample_files(files: &[(u32, u64)], percent: u8, seed: u64) -> Option<Vec<u32>> {
+    if files.is_empty() || percent >= 100 {
+        return None;
+    }
+    let total: u64 = files.iter().map(|(_, length)| *length).sum();
+    let budget = (u128::from(total) * u128::from(percent)).div_ceil(100) as u64;
+    let mut order: Vec<(u64, u32, u64)> = files
+        .iter()
+        .map(|(index, length)| {
+            let mut state = seed ^ u64::from(*index).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+            (crate::torrent_task::splitmix64(&mut state), *index, *length)
+        })
+        .collect();
+    order.sort_unstable();
+    let mut picked = Vec::new();
+    let mut covered = 0u64;
+    for (_, index, length) in order {
+        if !picked.is_empty() && covered >= budget {
+            break;
+        }
+        picked.push(index);
+        covered = covered.saturating_add(length);
+    }
+    if picked.len() >= files.len() {
+        return None;
+    }
+    picked.sort_unstable();
+    Some(picked)
 }
 
 #[derive(Debug, Clone)]
@@ -577,6 +615,13 @@ pub struct V2TorrentTask {
     _file_policy_memory_lease: Option<MemoryLease>,
     _tracker_state_memory_lease: Option<MemoryLease>,
     _tracker_peer_cache_memory_lease: Option<MemoryLease>,
+    /// Shared crash-safety settings and counters; inert until attached.
+    crash_safety: Arc<CrashSafetyRuntime>,
+    /// A finished download is being held until its data is durable. While set
+    /// the torrent reports one byte remaining and stays `Downloading`.
+    completion_held: std::sync::atomic::AtomicBool,
+    /// The save path's filesystem cannot fsync; stop retrying.
+    fsync_unsupported: std::sync::atomic::AtomicBool,
 }
 
 impl Drop for V2TorrentTask {
@@ -742,6 +787,9 @@ impl V2TorrentTask {
             _file_policy_memory_lease: None,
             _tracker_state_memory_lease: tracker_state_memory_lease,
             _tracker_peer_cache_memory_lease: None,
+            crash_safety: CrashSafetyRuntime::inert(),
+            completion_held: std::sync::atomic::AtomicBool::new(false),
+            fsync_unsupported: std::sync::atomic::AtomicBool::new(false),
         };
         let (known_tracker_peers, tracker_peer_cache_memory_lease) =
             prepare_tracker_peer_cache(&task.resources, task.max_peers);
@@ -762,8 +810,335 @@ impl V2TorrentTask {
         task
     }
 
+    /// Share the engine's crash-safety runtime with this task.
+    pub(crate) fn attach_crash_safety(&mut self, runtime: Arc<CrashSafetyRuntime>) {
+        self.crash_safety = runtime;
+    }
+
+    /// Whether a finished download may be reported complete now.
+    ///
+    /// Pure-v2 torrents re-hash every file at startup, so they never trust a
+    /// stale resume record; this guards the *hand-off*: nothing may see the
+    /// torrent as complete before its data has been fsynced and, when
+    /// configured (or forced by a weak mount), re-read from disk and verified.
+    /// Returns `true` when the completion may be released.
+    async fn completion_may_release(&self) -> bool {
+        use std::sync::atomic::Ordering;
+        let location = self.crash_safety.for_location(&self.save_root);
+        let verify = location.completion_verify;
+        // Read-back verification implies the barrier, exactly as in the v1 task.
+        if !location.resolved.completion_gate && verify == rt_config::CompletionVerifyMode::Off {
+            self.completion_held.store(false, Ordering::Relaxed);
+            return true;
+        }
+        let barrier_ok = if self.fsync_unsupported.load(Ordering::Relaxed) {
+            if self.completion_held.swap(false, Ordering::Relaxed) {
+                self.crash_safety.record_gate_released();
+            }
+            true
+        } else {
+            self.apply_barrier_result(self.storage.sync_all_open_files().await)
+        };
+        if !barrier_ok {
+            return false;
+        }
+        match verify {
+            rt_config::CompletionVerifyMode::Off => true,
+            mode => self.verify_completed_download(mode).await,
+        }
+    }
+
+    /// Re-read the finished download from disk and check it against the
+    /// metainfo. `full` checks every file; `sample` checks a deterministic
+    /// subset of files covering at least the configured share of the bytes
+    /// (a v2 file is verified as a whole against its Merkle root, so the unit
+    /// of sampling is the file). Returns whether the torrent may be released.
+    ///
+    /// A failure clears the affected pieces so they are downloaded again; a
+    /// failed sample escalates to a full verification, since it proves storage
+    /// returned data other than what was written.
+    async fn verify_completed_download(&self, mode: rt_config::CompletionVerifyMode) -> bool {
+        use std::sync::atomic::Ordering;
+        let sampled = mode == rt_config::CompletionVerifyMode::Sample;
+        // Show the hold while the (possibly long) read-back runs.
+        if !self.completion_held.swap(true, Ordering::Relaxed) {
+            self.crash_safety.record_gate_started();
+        }
+        let _ = self.persist_runtime(None, None).await;
+
+        let mut dropped = 0usize;
+        for file in self.meta.files.iter().filter(|file| !file.pad) {
+            if self
+                .storage
+                .drop_page_cache(&file.path.resolve(&self.save_root))
+                .await
+            {
+                dropped += 1;
+            }
+        }
+        debug!(
+            component = "torrent_v2",
+            operation = "completion_verify",
+            torrent = %self.info_hash_hex,
+            sampled,
+            page_cache_dropped_files = dropped,
+            "starting read-back verification of the completed download"
+        );
+
+        let sample_percent = self
+            .crash_safety
+            .for_location(&self.save_root)
+            .resolved
+            .completion_verify_sample_percent;
+        let selection = if sampled {
+            let sizes: Vec<(u32, u64)> = self
+                .meta
+                .files
+                .iter()
+                .filter(|file| !file.pad && file.length > 0)
+                .map(|file| (file.index, file.length))
+                .collect();
+            let mut seed_bytes = [0u8; 8];
+            for (slot, byte) in seed_bytes.iter_mut().zip(self.meta.info_hash_v2.iter()) {
+                *slot = *byte;
+            }
+            select_v2_sample_files(&sizes, sample_percent, u64::from_le_bytes(seed_bytes))
+        } else {
+            None
+        };
+        let (mut failed, mut checked) = self.verify_v2_files(selection.as_deref()).await;
+        // A failed sample: check everything, so every bad file is found now.
+        if sampled && !failed.is_empty() && selection.is_some() {
+            let (all_failed, all_checked) = self.verify_v2_files(None).await;
+            failed = all_failed;
+            checked = all_checked;
+        }
+        let failed_pieces = self.clear_v2_files_from_have(&failed).await;
+        self.crash_safety
+            .record_completion_verify(checked as u64, failed_pieces as u64);
+
+        let mode_name = if sampled && selection.is_some() {
+            "sample"
+        } else {
+            "full"
+        };
+        if failed.is_empty() {
+            self.completion_held.store(false, Ordering::Relaxed);
+            self.crash_safety.record_gate_released();
+            self.append_v2_event(
+                "completion_verified",
+                "completed download was read back from disk and verified",
+                serde_json::json!({ "mode": mode_name, "files_checked": checked }),
+            )
+            .await;
+            true
+        } else {
+            self.completion_held.store(false, Ordering::Relaxed);
+            self.crash_safety.record_gate_dropped();
+            self.notify_local_have_changed();
+            self.append_v2_event(
+                "completion_verify_failed",
+                "read-back verification found data that does not match; the bad pieces will be downloaded again",
+                serde_json::json!({
+                    "level": "error",
+                    "mode": mode_name,
+                    "files_checked": checked,
+                    "files_failed": failed.len(),
+                    "pieces_invalidated": failed_pieces,
+                }),
+            )
+            .await;
+            false
+        }
+    }
+
+    /// Verify the named files (all non-pad files when `only` is `None`).
+    /// Returns the indexes of files that did not verify and how many were
+    /// checked.
+    async fn verify_v2_files(&self, only: Option<&[u32]>) -> (Vec<u32>, usize) {
+        let files: Vec<V2FileHash> = self
+            .meta
+            .files
+            .iter()
+            .filter(|file| !file.pad)
+            .filter(|file| only.is_none_or(|only| only.contains(&file.index)))
+            .map(|file| V2FileHash {
+                file_index: file.index,
+                path: file.path.clone(),
+                length: file.length,
+                pieces_root: file.pieces_root,
+            })
+            .collect();
+        let verifier = V2FileVerifier::new(&self.save_root, &self.storage, &files);
+        let results = verifier.verify_all().await;
+        let checked = results.len();
+        let failed = results
+            .into_iter()
+            .filter(|(_, result)| !matches!(result, VerifyResult::Valid))
+            .map(|(index, _)| index)
+            .collect();
+        (failed, checked)
+    }
+
+    /// Mark every piece of the given files as not held. Returns how many
+    /// pieces were cleared.
+    async fn clear_v2_files_from_have(&self, files: &[u32]) -> usize {
+        if files.is_empty() {
+            return 0;
+        }
+        let mut cleared = 0usize;
+        let mut have = self.local_have.write().await;
+        let have = Arc::make_mut(&mut have);
+        if let Ok(ranges) = self.piece_map.piece_ranges_for_file_indices(&{
+            let mut sorted = files.to_vec();
+            sorted.sort_unstable();
+            sorted.dedup();
+            sorted
+        }) {
+            for (first, last) in ranges {
+                for piece in first..last {
+                    if have.get(piece as usize) {
+                        have.set(piece as usize, false);
+                        cleared += 1;
+                    }
+                }
+            }
+        }
+        cleared
+    }
+
+    /// Append a per-torrent event to the session event log. Best effort.
+    async fn append_v2_event(&self, kind: &'static str, message: &str, payload: serde_json::Value) {
+        let event = rt_db::SessionEventRow {
+            event_id: None,
+            occurred_at: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs()
+                .min(i64::MAX as u64) as i64,
+            info_hash: Some(self.info_hash_hex.clone()),
+            kind: kind.to_owned(),
+            message: Some(message.to_owned()),
+            payload: payload.to_string(),
+        };
+        let result = self
+            .db
+            .run("append_v2_torrent_event", move |db| {
+                let tx = db.transaction().map_err(|error| error.to_string())?;
+                rt_db::append_session_event_in_tx(&tx, &event)
+                    .map_err(|error| error.to_string())?;
+                tx.commit().map_err(|error| error.to_string())
+            })
+            .await;
+        if let Err(error) = result {
+            debug!(
+                component = "db",
+                operation = "append_v2_torrent_event",
+                torrent = %self.info_hash_hex,
+                kind,
+                error = %error,
+                "could not record torrent event"
+            );
+        }
+    }
+
+    /// After a recheck: a torrent already reported complete that now lacks
+    /// wanted pieces is an integrity regression. Records the event with the
+    /// affected files; repair downloads the missing pieces in place.
+    async fn report_v2_recheck(&self, have: &V2Bitmap, trigger: &'static str) {
+        let completed = self
+            .registry
+            .read()
+            .await
+            .get(&self.info_hash_hex)
+            .is_some_and(|entry| entry.completed_at.is_some());
+        if !completed {
+            return;
+        }
+        let missing: Vec<u32> = (0..self.piece_map.piece_count)
+            .filter(|piece| self.piece_is_wanted(*piece) && !have.get(*piece as usize))
+            .collect();
+        if missing.is_empty() {
+            return;
+        }
+        let mut files: Vec<String> = Vec::new();
+        for piece in missing.iter().take(MAX_V2_REGRESSION_PIECES) {
+            if let Ok(region) = self.piece_map.piece_to_file(*piece) {
+                let path = region.path.resolve(&self.save_root).display().to_string();
+                if files.len() < MAX_V2_REGRESSION_FILES && !files.contains(&path) {
+                    files.push(path);
+                }
+            }
+        }
+        self.crash_safety.record_integrity_regression();
+        warn!(
+            component = "torrent_v2",
+            operation = "integrity_regression",
+            torrent = %self.info_hash_hex,
+            trigger,
+            missing_pieces = missing.len(),
+            "a torrent already reported complete has pieces that no longer verify; repairing in place"
+        );
+        self.append_v2_event(
+            "integrity_regression",
+            "a completed torrent has pieces that no longer verify; missing data will be downloaded again in place",
+            serde_json::json!({
+                "level": "error",
+                "trigger": trigger,
+                "invalid_pieces": missing.len(),
+                "sample_pieces": missing.iter().take(MAX_V2_REGRESSION_PIECES).collect::<Vec<_>>(),
+                "affected_files": files,
+                "note": "repair rewrites the existing files in place, so hardlinks to them are healed; copies made earlier are not",
+            }),
+        )
+        .await;
+    }
+
+    /// Decide from the outcome of a payload barrier. Split from the sync itself
+    /// so every branch is testable without a failing disk.
+    fn apply_barrier_result(&self, result: Result<(), rt_storage::StorageError>) -> bool {
+        use std::sync::atomic::Ordering;
+        match result {
+            Ok(()) => {
+                if self.completion_held.swap(false, Ordering::Relaxed) {
+                    self.crash_safety.record_gate_released();
+                }
+                true
+            }
+            Err(error) if error.is_operation_unsupported() => {
+                self.fsync_unsupported.store(true, Ordering::Relaxed);
+                self.crash_safety.note_fsync_unsupported(&self.save_root);
+                warn!(
+                    component = "torrent_v2",
+                    operation = "completion_gate",
+                    torrent = %self.info_hash_hex,
+                    error = %error,
+                    "this filesystem cannot fsync; completion is released without a data barrier"
+                );
+                if self.completion_held.swap(false, Ordering::Relaxed) {
+                    self.crash_safety.record_gate_released();
+                }
+                true
+            }
+            Err(error) => {
+                if !self.completion_held.swap(true, Ordering::Relaxed) {
+                    self.crash_safety.record_gate_started();
+                }
+                warn!(
+                    component = "torrent_v2",
+                    operation = "completion_gate",
+                    torrent = %self.info_hash_hex,
+                    error = %error,
+                    "download complete but its data is not yet durable; holding completion and retrying"
+                );
+                false
+            }
+        }
+    }
+
     pub async fn run(mut self) {
         let new_have = self.recheck_files().await;
+        self.report_v2_recheck(&new_have, "startup").await;
         *self.local_have.write().await = Arc::new(new_have);
         self.notify_local_have_changed();
 
@@ -815,7 +1190,15 @@ impl V2TorrentTask {
                 }
                 _ = flush_tick.tick() => {
                     if !self.paused {
-                        let _ = self.persist_runtime(None, None).await;
+                        let held = self.completion_held.load(std::sync::atomic::Ordering::Relaxed);
+                        let target = if held && self.is_complete().await {
+                            self.completion_may_release()
+                                .await
+                                .then_some(TorrentState::Seeding)
+                        } else {
+                            None
+                        };
+                        let _ = self.persist_runtime(target, None).await;
                     }
                 }
                 _ = tracker_tick.tick() => {
@@ -925,6 +1308,13 @@ impl V2TorrentTask {
             }
             TorrentCmd::PriorityPeers(peers) => {
                 if !self.paused {
+                    // Private torrents have no tracker/DHT/PEX peer source.
+                    // An explicit peer supplied by a client is therefore the
+                    // authority that admits this address for the connection
+                    // and for later reconnects.
+                    if self.meta.private {
+                        self.remember_tracker_peers(&peers);
+                    }
                     self.connect_priority_peers(peers).await;
                 }
                 false
@@ -1050,7 +1440,7 @@ impl V2TorrentTask {
             self.meta
                 .files
                 .iter()
-                .map(|file| (file.index, (!file.pad, 1)))
+                .map(|file| (file.index, (!file.pad, if file.pad { 0 } else { 1 })))
                 .collect(),
         );
     }
@@ -1157,7 +1547,9 @@ impl V2TorrentTask {
             effective_files.iter().map(|file| file.path.as_display()),
         )?;
         for file in &effective_files {
-            policy.entry(file.index).or_insert((!file.pad, 1));
+            policy
+                .entry(file.index)
+                .or_insert((!file.pad, if file.pad { 0 } else { 1 }));
         }
 
         let policy_changed = self.file_policy.as_ref() != &policy;
@@ -1694,6 +2086,7 @@ impl V2TorrentTask {
         // clean peer set so no connection can use stale availability.
         self.shutdown_peers().await;
         let new_have = self.recheck_files().await;
+        self.report_v2_recheck(&new_have, "recheck").await;
         *self.local_have.write().await = Arc::new(new_have);
         self.notify_local_have_changed();
         let target = if self.paused {
@@ -1790,7 +2183,16 @@ impl V2TorrentTask {
         transfer: Option<(bool, u64)>,
     ) -> Result<(), String> {
         let have = self.local_have.read().await.clone();
-        let amount_left = self.bytes_left(have.as_ref());
+        let mut amount_left = self.bytes_left(have.as_ref());
+        let held = self
+            .completion_held
+            .load(std::sync::atomic::Ordering::Relaxed)
+            && target_state != Some(TorrentState::Seeding);
+        let finalizing = held && amount_left == 0;
+        if finalizing {
+            // Complete on disk but not yet durable: report one byte remaining.
+            amount_left = 1;
+        }
         let (previous, row) = {
             let mut registry = self.registry.write().await;
             let mut entry = registry.get_mut(&self.info_hash_hex).ok_or_else(|| {
@@ -1812,6 +2214,7 @@ impl V2TorrentTask {
             }
             entry.total_length = self.meta.total_length();
             entry.amount_left = amount_left;
+            entry.finalizing = finalizing;
             if entry.state == TorrentState::Seeding && entry.completed_at.is_none() {
                 entry.completed_at = Some(
                     std::time::SystemTime::now()
@@ -1820,6 +2223,7 @@ impl V2TorrentTask {
                         .as_secs(),
                 );
                 entry.amount_left = 0;
+                entry.finalizing = false;
             }
             let row = crate::engine::row_from_v2_meta(&entry, &self.meta);
             (previous, row)
@@ -1851,7 +2255,8 @@ impl V2TorrentTask {
         match event {
             V2PeerEvent::Downloaded { peer, bytes } => {
                 let complete = self.is_complete().await;
-                let target = complete.then_some(TorrentState::Seeding);
+                let release = complete && self.completion_may_release().await;
+                let target = release.then_some(TorrentState::Seeding);
                 if let Err(error) = self.persist_runtime(target, Some((false, bytes))).await {
                     debug!(
                         component = "torrent_v2",
@@ -2786,6 +3191,9 @@ async fn run_v2_peer_protocol(
                         }
                         fill_v2_requests(&context, &mut framed, &state, &mut outstanding, &mut assemblies).await?;
                     }
+                    // BEP 6 Fast extension: TorrentNG does not bypass its
+                    // normal choke/request policy for this optional hint.
+                    Message::AllowedFast(_) => {}
                     Message::Piece { piece, begin, data } => {
                         handle_v2_piece(
                             &context,
@@ -3814,5 +4222,645 @@ mod tests {
         assert!(hash_request_bounds(8, 0, 4, 8, 0).is_none());
         assert!(hash_request_bounds(8, 4, 0, 2, 0).is_none());
         assert!(hash_request_bounds(1024, 0, 0, 1024, 0).is_none());
+    }
+
+    // ---- crash safety: completion gate -------------------------------------
+
+    fn v2_raw_with_content(content: &[u8]) -> Vec<u8> {
+        use rt_bencode::{encode, BValue};
+        use rt_hash::{merkle_root, BlockHash};
+        let piece_layers: Vec<[u8; 32]> = content
+            .chunks(16_384)
+            .map(|chunk| BlockHash::of(chunk).0)
+            .collect();
+        let pieces_root = merkle_root(&piece_layers);
+        let mut layer_bytes = Vec::new();
+        for hash in &piece_layers {
+            layer_bytes.extend_from_slice(hash);
+        }
+        let leaf = BValue::Dict({
+            let mut pairs: Vec<(&[u8], BValue<'_>)> = vec![
+                (b"length", BValue::Int(content.len() as i64)),
+                (b"pieces root", BValue::Bytes(&pieces_root)),
+            ];
+            pairs.sort_by(|a, b| a.0.cmp(b.0));
+            pairs
+        });
+        let file_tree = BValue::Dict(vec![(
+            b"data.bin".as_ref(),
+            BValue::Dict(vec![(b"".as_ref(), leaf)]),
+        )]);
+        let mut info: Vec<(&[u8], BValue<'_>)> = vec![
+            (b"file tree", file_tree),
+            (b"meta version", BValue::Int(2)),
+            (b"name", BValue::Bytes(b"v2dir")),
+            (b"piece length", BValue::Int(16_384)),
+        ];
+        info.sort_by(|a, b| a.0.cmp(b.0));
+        let layers = BValue::Dict(vec![(&pieces_root[..], BValue::Bytes(&layer_bytes))]);
+        let mut top: Vec<(&[u8], BValue<'_>)> = vec![
+            (b"announce", BValue::Bytes(b"http://tracker.example/v2")),
+            (b"info", BValue::Dict(info)),
+            (b"piece layers", layers),
+        ];
+        top.sort_by(|a, b| a.0.cmp(b.0));
+        encode(&BValue::Dict(top))
+    }
+
+    struct V2Fixture {
+        temp: tempfile::TempDir,
+        registry: Arc<RwLock<SessionRegistry>>,
+        info_hash: String,
+    }
+
+    async fn v2_task(runtime: Arc<CrashSafetyRuntime>) -> (V2TorrentTask, V2Fixture) {
+        let temp = tempfile::tempdir().unwrap();
+        let raw = v2_raw_with_content(&vec![0x5Au8; 32_768]);
+        let rt_metainfo::TorrentMeta::V2(meta) = rt_metainfo::parse_torrent(&raw).unwrap() else {
+            panic!("expected a pure-v2 torrent");
+        };
+        let info_hash = hex::encode(meta.info_hash_v2);
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        rt_db::migrate(&conn).unwrap();
+        let mut entry = rt_session::TorrentEntry::new(
+            info_hash.clone(),
+            meta.name.clone(),
+            temp.path().to_string_lossy().into_owned(),
+        );
+        entry.total_length = 32_768;
+        entry.amount_left = 32_768;
+        entry.state = TorrentState::Downloading;
+        rt_db::upsert(&conn, &crate::engine::row_from_v2_meta(&entry, &meta)).unwrap();
+        let registry = Arc::new(RwLock::new(SessionRegistry::new()));
+        registry.write().await.add(entry).unwrap();
+        let (cmd_tx, cmd_rx) = mpsc::channel(4);
+        std::mem::forget(cmd_tx);
+        let mut task = V2TorrentTask::new(
+            meta,
+            temp.path().to_path_buf(),
+            false,
+            TorrentState::Downloading,
+            Arc::clone(&registry),
+            DbExecutor::direct(Arc::new(std::sync::Mutex::new(conn))),
+            ResourceGovernor::new(rt_metrics::ResourceGovernorConfig::default()),
+            cmd_rx,
+            8,
+            1024 * 1024,
+            StorageIoConfig::default(),
+            OutboundEgressPolicy::default(),
+            6881,
+            10,
+            10,
+            60,
+            GlobalNetworkBudget::unlimited(),
+            None,
+            None,
+        )
+        .await;
+        task.attach_crash_safety(runtime);
+        // Every piece is on disk and verified: the download just finished.
+        let mut have = V2Bitmap::new(task.piece_map.piece_count as usize);
+        for piece in 0..task.piece_map.piece_count as usize {
+            have.set(piece, true);
+        }
+        *task.local_have.write().await = Arc::new(have);
+        (
+            task,
+            V2Fixture {
+                temp,
+                registry,
+                info_hash,
+            },
+        )
+    }
+
+    /// A genuine I/O failure (EIO on Unix, ERROR_CRC on Windows), not an
+    /// "unsupported" answer.
+    fn eio() -> rt_storage::StorageError {
+        rt_storage::StorageError::Io {
+            path: "payload".to_owned(),
+            source: std::io::Error::from_raw_os_error(if cfg!(windows) { 23 } else { 5 }),
+        }
+    }
+
+    fn quiet_v2_runtime() -> Arc<CrashSafetyRuntime> {
+        // Weak-mount escalation is irrelevant to this task type, and /tmp is
+        // often tmpfs; keep the runtime independent of the temp filesystem.
+        let runtime = CrashSafetyRuntime::inert();
+        runtime.apply_settings(
+            rt_config::CrashSafetyConfig {
+                weak_mount_escalation: false,
+                ..rt_config::CrashSafetyConfig::default()
+            },
+            false,
+        );
+        runtime
+    }
+
+    #[tokio::test]
+    async fn v2_failed_barrier_holds_completion_and_reports_one_byte() {
+        let runtime = quiet_v2_runtime();
+        let (task, fx) = v2_task(Arc::clone(&runtime)).await;
+        assert!(task.is_complete().await);
+
+        // The barrier fails: not releasable, gauge raised once.
+        assert!(!task.apply_barrier_result(Err(eio())));
+        assert!(
+            !task.apply_barrier_result(Err(eio())),
+            "a retry is still held"
+        );
+        assert_eq!(runtime.counters().completions_pending, 1, "counted once");
+        assert_eq!(runtime.counters().completions_gated, 1);
+
+        // A held torrent is complete on disk but must not look complete.
+        task.persist_runtime(None, None).await.unwrap();
+        let entry = fx.registry.read().await.get(&fx.info_hash).unwrap();
+        assert_eq!(entry.state, TorrentState::Downloading);
+        assert_eq!(entry.amount_left, 1);
+        assert!(entry.finalizing);
+        assert_eq!(entry.completed_at, None);
+
+        // Storage recovers: released, becomes Seeding with true accounting.
+        assert!(task.apply_barrier_result(Ok(())));
+        assert_eq!(runtime.counters().completions_pending, 0);
+        assert_eq!(runtime.counters().completions_released, 1);
+        task.persist_runtime(Some(TorrentState::Seeding), None)
+            .await
+            .unwrap();
+        let entry = fx.registry.read().await.get(&fx.info_hash).unwrap();
+        assert_eq!(entry.state, TorrentState::Seeding);
+        assert_eq!(entry.amount_left, 0);
+        assert!(!entry.finalizing);
+        assert!(entry.completed_at.is_some());
+    }
+
+    #[tokio::test]
+    async fn v2_filesystem_that_cannot_fsync_is_released_and_rated_weak() {
+        let runtime = quiet_v2_runtime();
+        let (task, fx) = v2_task(Arc::clone(&runtime)).await;
+        // Hold it first so the unsupported answer must also clear the hold.
+        assert!(!task.apply_barrier_result(Err(eio())));
+        let unsupported = rt_storage::StorageError::Io {
+            path: "payload".to_owned(),
+            // ENOSYS on Unix, ERROR_NOT_SUPPORTED on Windows.
+            source: std::io::Error::from_raw_os_error(if cfg!(windows) { 50 } else { 38 }),
+        };
+        assert!(task.apply_barrier_result(Err(unsupported)));
+        assert!(!task
+            .completion_held
+            .load(std::sync::atomic::Ordering::Relaxed));
+        assert!(task
+            .fsync_unsupported
+            .load(std::sync::atomic::Ordering::Relaxed));
+        assert_eq!(runtime.counters().completions_pending, 0);
+        assert_eq!(runtime.counters().completion_sync_unsupported, 1);
+        assert_eq!(
+            runtime.mount_durability(fx.temp.path()).trust,
+            rt_storage::DurabilityTrust::Weak
+        );
+        // Remembered: later completions skip the doomed sync entirely.
+        assert!(task.completion_may_release().await);
+    }
+
+    #[tokio::test]
+    async fn v2_gate_can_be_disabled() {
+        let runtime = quiet_v2_runtime();
+        runtime.apply_settings(
+            rt_config::CrashSafetyConfig {
+                completion_gate: false,
+                weak_mount_escalation: false,
+                ..rt_config::CrashSafetyConfig::default()
+            },
+            true,
+        );
+        let (task, _fx) = v2_task(Arc::clone(&runtime)).await;
+        assert!(task.completion_may_release().await);
+        assert_eq!(runtime.counters().completions_gated, 0);
+    }
+
+    #[tokio::test]
+    async fn v2_location_policy_applies_only_to_matching_save_roots() {
+        // The gate is on globally; the location that holds this torrent opts out.
+        let runtime = quiet_v2_runtime();
+        let (task, fx) = v2_task(Arc::clone(&runtime)).await;
+        let with_policies = |path: &std::path::Path| rt_config::CrashSafetyConfig {
+            weak_mount_escalation: false,
+            path_policies: vec![rt_config::PathPolicy {
+                path: path.to_path_buf(),
+                completion_gate: Some(false),
+                ..rt_config::PathPolicy::default()
+            }],
+            ..rt_config::CrashSafetyConfig::default()
+        };
+        runtime.apply_settings(with_policies(fx.temp.path()), true);
+        assert!(task.completion_may_release().await);
+        assert_eq!(runtime.counters().completions_gated, 0, "gate skipped here");
+
+        // The same policy pointed elsewhere leaves this torrent gated: a
+        // failing barrier holds it.
+        runtime.apply_settings(with_policies(std::path::Path::new("/srv/elsewhere")), true);
+        assert!(!task.apply_barrier_result(Err(eio())));
+        assert_eq!(runtime.counters().completions_gated, 1);
+    }
+
+    #[tokio::test]
+    async fn v2_location_policy_can_require_read_back() {
+        let runtime = quiet_v2_runtime();
+        let (task, fx) = v2_task(Arc::clone(&runtime)).await;
+        runtime.apply_settings(
+            rt_config::CrashSafetyConfig {
+                weak_mount_escalation: false,
+                completion_verify: rt_config::CompletionVerifyMode::Off,
+                path_policies: vec![rt_config::PathPolicy {
+                    path: fx.temp.path().to_path_buf(),
+                    completion_verify: Some(rt_config::CompletionVerifyMode::Full),
+                    ..rt_config::PathPolicy::default()
+                }],
+                ..rt_config::CrashSafetyConfig::default()
+            },
+            true,
+        );
+        // Bytes on disk differ from the metainfo: only a read-back notices.
+        let mut on_disk = vec![0x5Au8; 32_768];
+        on_disk[..16_384].fill(0);
+        v2_write_payload(&task, &fx, &[("data.bin", on_disk)]);
+        assert!(!task.completion_may_release().await);
+        assert!(v2_event_kinds(&task).contains(&"completion_verify_failed".to_owned()));
+    }
+
+    #[tokio::test]
+    async fn v2_release_with_a_working_disk_needs_no_hold() {
+        let runtime = quiet_v2_runtime();
+        let (task, fx) = v2_task(Arc::clone(&runtime)).await;
+        assert!(task.completion_may_release().await, "real sync succeeds");
+        task.persist_runtime(Some(TorrentState::Seeding), None)
+            .await
+            .unwrap();
+        let entry = fx.registry.read().await.get(&fx.info_hash).unwrap();
+        assert_eq!(entry.state, TorrentState::Seeding);
+        assert_eq!(entry.amount_left, 0);
+        assert_eq!(runtime.counters().completions_gated, 0, "never held");
+    }
+
+    // ---- crash safety: read-back verification ------------------------------
+
+    /// A pure-v2 torrent of several small files (each at most one 16 KiB
+    /// piece, so no piece layers are needed).
+    fn v2_raw_multi(files: &[(&str, Vec<u8>)]) -> Vec<u8> {
+        use rt_bencode::{encode, BValue};
+        use rt_hash::BlockHash;
+        let mut roots: Vec<[u8; 32]> = Vec::new();
+        for (_, content) in files {
+            assert!(content.len() <= 16_384);
+            roots.push(BlockHash::of(content).0);
+        }
+        let mut tree: Vec<(&[u8], BValue<'_>)> = Vec::new();
+        for (index, (name, content)) in files.iter().enumerate() {
+            let leaf = BValue::Dict(vec![
+                (b"length".as_ref(), BValue::Int(content.len() as i64)),
+                (b"pieces root".as_ref(), BValue::Bytes(&roots[index])),
+            ]);
+            tree.push((name.as_bytes(), BValue::Dict(vec![(b"".as_ref(), leaf)])));
+        }
+        tree.sort_by(|a, b| a.0.cmp(b.0));
+        let mut info: Vec<(&[u8], BValue<'_>)> = vec![
+            (b"file tree", BValue::Dict(tree)),
+            (b"meta version", BValue::Int(2)),
+            (b"name", BValue::Bytes(b"multi")),
+            (b"piece length", BValue::Int(16_384)),
+        ];
+        info.sort_by(|a, b| a.0.cmp(b.0));
+        let mut top: Vec<(&[u8], BValue<'_>)> = vec![
+            (b"announce", BValue::Bytes(b"http://tracker.example/v2")),
+            (b"info", BValue::Dict(info)),
+            (b"piece layers", BValue::Dict(vec![])),
+        ];
+        top.sort_by(|a, b| a.0.cmp(b.0));
+        encode(&BValue::Dict(top))
+    }
+
+    async fn v2_task_from_raw(
+        runtime: Arc<CrashSafetyRuntime>,
+        raw: &[u8],
+    ) -> (V2TorrentTask, V2Fixture) {
+        let temp = tempfile::tempdir().unwrap();
+        let rt_metainfo::TorrentMeta::V2(meta) = rt_metainfo::parse_torrent(raw).unwrap() else {
+            panic!("expected a pure-v2 torrent");
+        };
+        let info_hash = hex::encode(meta.info_hash_v2);
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        rt_db::migrate(&conn).unwrap();
+        let total = meta.files.iter().map(|file| file.length).sum::<u64>();
+        let mut entry = rt_session::TorrentEntry::new(
+            info_hash.clone(),
+            meta.name.clone(),
+            temp.path().to_string_lossy().into_owned(),
+        );
+        entry.total_length = total;
+        entry.amount_left = total;
+        entry.state = TorrentState::Downloading;
+        rt_db::upsert(&conn, &crate::engine::row_from_v2_meta(&entry, &meta)).unwrap();
+        let registry = Arc::new(RwLock::new(SessionRegistry::new()));
+        registry.write().await.add(entry).unwrap();
+        let (cmd_tx, cmd_rx) = mpsc::channel(4);
+        std::mem::forget(cmd_tx);
+        let mut task = V2TorrentTask::new(
+            meta,
+            temp.path().to_path_buf(),
+            false,
+            TorrentState::Downloading,
+            Arc::clone(&registry),
+            DbExecutor::direct(Arc::new(std::sync::Mutex::new(conn))),
+            ResourceGovernor::new(rt_metrics::ResourceGovernorConfig::default()),
+            cmd_rx,
+            8,
+            1024 * 1024,
+            StorageIoConfig::default(),
+            OutboundEgressPolicy::default(),
+            6881,
+            10,
+            10,
+            60,
+            GlobalNetworkBudget::unlimited(),
+            None,
+            None,
+        )
+        .await;
+        task.attach_crash_safety(runtime);
+        let mut have = V2Bitmap::new(task.piece_map.piece_count as usize);
+        for piece in 0..task.piece_map.piece_count as usize {
+            have.set(piece, true);
+        }
+        *task.local_have.write().await = Arc::new(have);
+        (
+            task,
+            V2Fixture {
+                temp,
+                registry,
+                info_hash,
+            },
+        )
+    }
+
+    fn v2_write_payload(task: &V2TorrentTask, fx: &V2Fixture, contents: &[(&str, Vec<u8>)]) {
+        for file in &task.meta.files {
+            let name = file.path.components().last().cloned().unwrap_or_default();
+            let content = contents
+                .iter()
+                .find(|(n, _)| *n == name)
+                .unwrap_or_else(|| panic!("no content for {name}"));
+            let path = file.path.resolve(fx.temp.path());
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, &content.1).unwrap();
+        }
+    }
+
+    fn v2_verify_runtime(
+        mode: rt_config::CompletionVerifyMode,
+        percent: u8,
+    ) -> Arc<CrashSafetyRuntime> {
+        let runtime = CrashSafetyRuntime::inert();
+        runtime.apply_settings(
+            rt_config::CrashSafetyConfig {
+                weak_mount_escalation: false,
+                completion_verify: mode,
+                completion_verify_sample_percent: percent,
+                ..rt_config::CrashSafetyConfig::default()
+            },
+            true,
+        );
+        runtime
+    }
+
+    fn v2_event_kinds(task: &V2TorrentTask) -> Vec<String> {
+        // The executor is `direct` over an in-memory connection.
+        let mut kinds = Vec::new();
+        let rows = futures::executor::block_on(task.db.run("read_events", |db| {
+            let mut stmt = db
+                .prepare("SELECT kind FROM session_events ORDER BY event_id")
+                .map_err(|e| e.to_string())?;
+            let rows = stmt
+                .query_map([], |row| row.get::<_, String>(0))
+                .map_err(|e| e.to_string())?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| e.to_string())?;
+            Ok(rows)
+        }));
+        kinds.extend(rows.unwrap_or_default());
+        kinds
+    }
+
+    #[test]
+    fn v2_sample_selection_is_deterministic_covers_the_budget_and_never_empty() {
+        let files: Vec<(u32, u64)> = (0..10).map(|i| (i, 1000)).collect();
+        let a = select_v2_sample_files(&files, 30, 7).unwrap();
+        assert_eq!(
+            a,
+            select_v2_sample_files(&files, 30, 7).unwrap(),
+            "same seed"
+        );
+        assert_ne!(
+            a,
+            select_v2_sample_files(&files, 30, 8).unwrap(),
+            "seed matters"
+        );
+        assert_eq!(a.len(), 3, "30% of ten equal files");
+        assert!(a.windows(2).all(|w| w[0] < w[1]), "sorted and distinct");
+
+        // A tiny percentage still checks something.
+        assert_eq!(select_v2_sample_files(&files, 1, 7).unwrap().len(), 1);
+        // 100%, or a budget that needs every file, is just a full check.
+        assert_eq!(select_v2_sample_files(&files, 100, 7), None);
+        assert_eq!(select_v2_sample_files(&files, 99, 7), None);
+        // One file cannot be sampled below itself.
+        assert_eq!(select_v2_sample_files(&[(0, 5000)], 5, 7), None);
+        assert_eq!(select_v2_sample_files(&[], 5, 7), None);
+    }
+
+    #[test]
+    fn v2_sample_selection_stops_once_the_byte_budget_is_met() {
+        // One huge file and many tiny ones: the budget is bytes, not files.
+        let mut files: Vec<(u32, u64)> = (1..=20).map(|i| (i, 10)).collect();
+        files.push((0, 10_000));
+        let total: u64 = files.iter().map(|f| f.1).sum();
+        let picked = select_v2_sample_files(&files, 5, 3).unwrap();
+        let covered: u64 = picked
+            .iter()
+            .map(|i| files.iter().find(|f| f.0 == *i).unwrap().1)
+            .sum();
+        assert!(covered * 100 >= total * 5, "budget met: {covered}/{total}");
+        assert!(picked.len() < files.len());
+    }
+
+    #[tokio::test]
+    async fn v2_full_verification_releases_a_clean_download() {
+        let runtime = v2_verify_runtime(rt_config::CompletionVerifyMode::Full, 5);
+        let (task, fx) = v2_task(Arc::clone(&runtime)).await;
+        let content = vec![0x5Au8; 32_768];
+        v2_write_payload(&task, &fx, &[("data.bin", content)]);
+
+        assert!(task.completion_may_release().await);
+        assert!(!task
+            .completion_held
+            .load(std::sync::atomic::Ordering::Relaxed));
+        assert!(v2_event_kinds(&task).contains(&"completion_verified".to_owned()));
+        let counters = runtime.counters();
+        assert_eq!(counters.completion_verify_failures, 0);
+        assert!(counters.completion_verify_pieces >= 1);
+        assert_eq!(counters.completions_pending, 0);
+        assert_eq!(counters.completions_released, 1);
+    }
+
+    #[tokio::test]
+    async fn v2_verification_failure_reopens_the_download_and_clears_the_hold() {
+        let runtime = v2_verify_runtime(rt_config::CompletionVerifyMode::Full, 5);
+        let (task, fx) = v2_task(Arc::clone(&runtime)).await;
+        // The first 16 KiB reached the page cache but never the disk.
+        let mut on_disk = vec![0x5Au8; 32_768];
+        on_disk[..16_384].fill(0);
+        v2_write_payload(&task, &fx, &[("data.bin", on_disk)]);
+
+        assert!(!task.completion_may_release().await, "must not be released");
+        assert!(!task.is_complete().await, "the bad pieces are wanted again");
+        assert!(!task
+            .completion_held
+            .load(std::sync::atomic::Ordering::Relaxed));
+        assert!(v2_event_kinds(&task).contains(&"completion_verify_failed".to_owned()));
+        assert_eq!(runtime.counters().completion_verify_failures, 2);
+        assert_eq!(runtime.counters().completions_pending, 0, "gauge released");
+
+        task.persist_runtime(None, None).await.unwrap();
+        let entry = fx.registry.read().await.get(&fx.info_hash).unwrap();
+        assert_eq!(entry.state, TorrentState::Downloading);
+        assert!(!entry.finalizing);
+        assert_eq!(entry.amount_left, 32_768);
+    }
+
+    #[tokio::test]
+    async fn v2_sample_misses_damage_outside_it_but_a_hit_escalates_to_a_full_check() {
+        let names = ["a.bin", "b.bin", "c.bin", "d.bin"];
+        let good: Vec<(&str, Vec<u8>)> = names
+            .iter()
+            .enumerate()
+            .map(|(i, n)| (*n, vec![i as u8 + 1; 16_384]))
+            .collect();
+        let raw = v2_raw_multi(&good);
+
+        // Which single file does a 25% sample pick for this torrent?
+        let runtime = v2_verify_runtime(rt_config::CompletionVerifyMode::Sample, 25);
+        let (probe, _fx) = v2_task_from_raw(Arc::clone(&runtime), &raw).await;
+        let sizes: Vec<(u32, u64)> = probe
+            .meta
+            .files
+            .iter()
+            .map(|f| (f.index, f.length))
+            .collect();
+        let mut seed = [0u8; 8];
+        for (slot, byte) in seed.iter_mut().zip(probe.meta.info_hash_v2.iter()) {
+            *slot = *byte;
+        }
+        let sampled = select_v2_sample_files(&sizes, 25, u64::from_le_bytes(seed)).unwrap();
+        assert_eq!(sampled.len(), 1);
+        let sampled_name = |task: &V2TorrentTask| {
+            task.meta
+                .files
+                .iter()
+                .find(|f| f.index == sampled[0])
+                .unwrap()
+                .path
+                .components()
+                .last()
+                .cloned()
+                .unwrap()
+        };
+        let sampled_file = sampled_name(&probe);
+        let other_file = names
+            .iter()
+            .find(|n| **n != sampled_file)
+            .map(|n| n.to_string())
+            .unwrap();
+        let corrupt = |broken: &[&str]| -> Vec<(&str, Vec<u8>)> {
+            good.iter()
+                .map(|(n, c)| {
+                    let mut c = c.clone();
+                    if broken.contains(n) {
+                        c.fill(0xEE);
+                    }
+                    (*n, c)
+                })
+                .collect()
+        };
+
+        // Damage the sample does not cover: it passes (sampling is a spot
+        // check, and the docs say so).
+        let runtime = v2_verify_runtime(rt_config::CompletionVerifyMode::Sample, 25);
+        let (task, fx) = v2_task_from_raw(Arc::clone(&runtime), &raw).await;
+        v2_write_payload(&task, &fx, &corrupt(&[other_file.as_str()]));
+        assert!(
+            task.completion_may_release().await,
+            "damage outside the sample"
+        );
+        assert_eq!(runtime.counters().completion_verify_failures, 0);
+
+        // Damage the sample covers, plus another file: the failed sample
+        // escalates and the full check finds both.
+        let runtime = v2_verify_runtime(rt_config::CompletionVerifyMode::Sample, 25);
+        let (task, fx) = v2_task_from_raw(Arc::clone(&runtime), &raw).await;
+        v2_write_payload(
+            &task,
+            &fx,
+            &corrupt(&[sampled_file.as_str(), other_file.as_str()]),
+        );
+        assert!(!task.completion_may_release().await);
+        assert_eq!(
+            runtime.counters().completion_verify_failures,
+            2,
+            "escalation to a full check found the second damaged file"
+        );
+        assert!(!task.is_complete().await);
+    }
+
+    #[tokio::test]
+    async fn v2_weak_mounts_get_a_read_back_even_when_verification_is_off() {
+        let runtime = CrashSafetyRuntime::inert();
+        runtime.apply_settings(
+            rt_config::CrashSafetyConfig {
+                weak_mount_escalation: true,
+                ..rt_config::CrashSafetyConfig::default()
+            },
+            true,
+        );
+        let (task, fx) = v2_task(Arc::clone(&runtime)).await;
+        // Declare the save path weak regardless of the temp filesystem.
+        let mut settings = (*runtime.settings()).clone();
+        settings.weak_mount_paths = vec![fx.temp.path().to_path_buf()];
+        runtime.apply_settings(settings, true);
+        // Nothing on disk: a read-back must catch that.
+        assert!(!task.completion_may_release().await);
+        assert!(v2_event_kinds(&task).contains(&"completion_verify_failed".to_owned()));
+    }
+
+    #[tokio::test]
+    async fn v2_recheck_of_a_completed_torrent_reports_an_integrity_regression() {
+        let runtime = quiet_v2_runtime();
+        let (task, fx) = v2_task(Arc::clone(&runtime)).await;
+        {
+            let mut registry = fx.registry.write().await;
+            let mut entry = registry.get_mut(&fx.info_hash).unwrap();
+            entry.completed_at = Some(1_700_000_000);
+            entry.state = TorrentState::Seeding;
+        }
+        // Only the first of the two pieces is intact.
+        let mut have = V2Bitmap::new(task.piece_map.piece_count as usize);
+        have.set(0, true);
+        task.report_v2_recheck(&have, "recheck").await;
+        assert_eq!(runtime.counters().integrity_regressions, 1);
+        assert!(v2_event_kinds(&task).contains(&"integrity_regression".to_owned()));
+
+        // A torrent never reported complete is not a regression.
+        let runtime = quiet_v2_runtime();
+        let (fresh, _fx) = v2_task(Arc::clone(&runtime)).await;
+        fresh.report_v2_recheck(&have, "startup").await;
+        assert_eq!(runtime.counters().integrity_regressions, 0);
     }
 }

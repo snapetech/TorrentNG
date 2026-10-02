@@ -37,6 +37,12 @@ pub struct TorrentSummary {
     /// tracker"), which `state` alone never reflects.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tracker_message: Option<String>,
+    /// The download finished but is held until its data is confirmed durable
+    /// (see docs/CRASH_SAFETY.md). Omitted when false. `amount_left` is 1 while
+    /// this is true, so clients that ignore this field still see an
+    /// unfinished torrent.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub finalizing: bool,
 }
 
 /// Full detail returned by `GET /api/v1/torrents/{hash}`.
@@ -301,6 +307,7 @@ mod tests {
             num_peers: 3,
             num_seeds: 10,
             tracker_message: None,
+            finalizing: false,
         };
         let json = serde_json::to_string(&s).unwrap();
         let back: TorrentSummary = serde_json::from_str(&json).unwrap();

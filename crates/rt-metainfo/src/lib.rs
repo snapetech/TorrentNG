@@ -4,7 +4,7 @@ pub mod parse;
 pub mod types;
 
 pub use error::MetainfoError;
-pub use magnet::parse_magnet;
+pub use magnet::{parse_magnet, MAX_MAGNET_BYTES};
 pub use parse::{
     parse_torrent, parse_torrent_with_allocation_reservation, torrent_info_bytes,
     torrent_info_bytes_with_allocation_reservation, v2_piece_layer_requirements,

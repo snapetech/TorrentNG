@@ -35,6 +35,24 @@ The matrix has two legs.
 LibreOffice is available as optional desktop-application coverage when its
 official torrent resolver matches an available release.
 
+## Current qualification run — 2026-09-16
+
+The current local matrix passes all 28 rows in
+[`interop-matrix-current-local-20260916.md`](../certification/reports/interop-matrix-current-local-20260916.md).
+The official public-source results are split by swarm availability:
+
+| Source | Result | Evidence |
+|---|---|---|
+| Debian 13.7 netinst | PASS | [`interop-matrix-current-public-debian-20260916.md`](../certification/reports/interop-matrix-current-public-debian-20260916.md); 792,723,456 bytes and 143 Rust peers observed |
+| Ubuntu 26.04.1 live server | FAIL at bounded window | [`interop-matrix-current-public-ubuntu-bounded-20260916.md`](../certification/reports/interop-matrix-current-public-ubuntu-bounded-20260916.md); one Rust peer observed and no completion within 120 seconds |
+| Fedora Server 45 Beta | FAIL at bounded window | [`interop-matrix-current-public-fedora-bounded-20260916.md`](../certification/reports/interop-matrix-current-public-fedora-bounded-20260916.md); 45 Rust peers observed but no completion within 120 seconds |
+
+These public rows are transfer/interoperability evidence only. They are not
+torrent-count capacity proofs, and the current run makes no 24-hour soak claim.
+`INTEROP_PUBLIC_TIMEOUT_SECS` explicitly caps the per-source TOML maximum, so
+operators can run a bounded diagnostic without the source configuration
+silently extending the requested timeout.
+
 ## Run
 
 Run the local deterministic matrix:
@@ -85,10 +103,12 @@ INTEROP_KEEP_PUBLIC_DATA=1 \
 scripts/interop_matrix.sh --public
 ```
 
-The latest full local run, recorded against clean `main` at `b393eb0`, passed all 28 cases (10
+## Historical qualification reference — 2026-09-10
+
+The historical full local run, recorded against clean `main` at `b393eb0`, passed all 28 cases (10
 base, 4 extended, and 14 protocol rows):
 [`interop-matrix-20260910T190228Z.md`](../certification/reports/interop-matrix-20260910T190228Z.md).
-The current public Debian leg also passed at `b393eb0`:
+The historical public Debian leg also passed at `b393eb0`:
 [`interop-matrix-20260910T192200Z.md`](../certification/reports/interop-matrix-20260910T192200Z.md),
 with the canonical all-live certification record in
 [`universal-compat-b393eb0-all-live.md`](../certification/reports/universal-compat-b393eb0-all-live.md).

@@ -33,6 +33,65 @@ const torrents = Array.from({ length: 40 }, (_, i) => {
   }
 })
 
+const crashSafetySettings = {
+  completion_gate: true,
+  host_crash_detection: true,
+  host_crash_recovery: 'recent',
+  recent_write_window_secs: 86_400,
+  structural_audit: 'on_unclean',
+  mount_probe: true,
+  weak_mount_escalation: true,
+  weak_mount_paths: [],
+  strong_mount_paths: [],
+  completion_verify: 'off',
+  completion_verify_sample_percent: 5,
+  path_policies: [{
+    path: '/mnt/nas',
+    completion_gate: null,
+    host_crash_recovery: 'full',
+    structural_audit: null,
+    completion_verify: 'sample',
+    completion_verify_sample_percent: 10,
+  }],
+}
+
+const crashSafetyPathReport = {
+  path: '/mnt/nas/tv',
+  matched_policy: '/mnt/nas',
+  completion_gate: true,
+  host_crash_recovery: 'full',
+  host_crash_recovery_effective: 'full',
+  recovery_escalated_by: null,
+  structural_audit: 'on_unclean',
+  completion_verify: 'sample',
+  completion_verify_effective: 'sample',
+  completion_verify_sample_percent: 10,
+  mount: { path: '/mnt/nas/tv', trust: 'weak', fs_type: 'tmpfs', reasons: ['tmpfs is volatile'] },
+}
+
+const crashSafetyView = {
+  settings: crashSafetySettings,
+  defaults: crashSafetySettings,
+  overridden: false,
+  report: {
+    run_started_unix: 1_700_000_000,
+    detection_active: true,
+    previous_run: { verdict: 'host_crash', crash_reference_unix: 1_699_999_000, previous_boot_id: 'a', current_boot_id: 'b' },
+    counters: {
+      recovery_rechecks: 2, rechecks_unsynced_state: 0, rechecks_full_policy: 0, rechecks_recent_write: 2,
+      rechecks_weak_mount: 0, rechecks_unknown_mount: 0, audit_torrents: 4, audit_files_unsupported: 0,
+      audit_pieces_downgraded: 6, completions_gated: 3, completions_released: 3, completion_gate_retries: 0,
+      completion_sync_unsupported: 0, completion_verify_pieces: 0, completion_verify_failures: 0,
+      integrity_regressions: 0, completions_pending: 0,
+    },
+    mounts: [
+      { path: '/data/a11y', trust: 'strong', fs_type: 'ext4', reasons: ['local block filesystem'] },
+      { path: '/mnt/nas', trust: 'weak', fs_type: 'tmpfs', reasons: ['tmpfs is volatile'] },
+    ],
+    platform: { boot_identity: true, allocation_audit: true, mount_probe: true, page_cache_drop: true },
+  },
+}
+
 const engineDiagnostics = {
   backend: {
     type: 'torrentng',
@@ -59,6 +118,7 @@ const engineDiagnostics = {
       supports_torrent_rename: true,
       supports_file_rename: true,
       supports_runtime_user_agent: false,
+      supports_crash_safety: true,
       supports_config_overlay: false,
       supports_restart: false,
     },
@@ -175,6 +235,8 @@ async function installA11yApiMock(page: Page) {
     if (path === '/api/v1/engine') return json(engineDiagnostics)
     if (path === '/api/v1/engine/commands') return json({ commands: [] })
     if (path === '/api/v1/settings/user-agent') return json({ user_agent: 'TorrentNG/e2e-a11y' })
+    if (path === '/api/v1/settings/crash-safety/path') return json(crashSafetyPathReport)
+    if (path === '/api/v1/settings/crash-safety') return json(crashSafetyView)
     if (path === '/api/v1/ratio-groups' || path === '/api/v1/workflows' || path === '/api/v1/workflow-runs' || path === '/api/v1/rss-rules') return json([])
     if (path === '/api/v1/logs') return json({ logs: [] })
     if (path.startsWith('/api/v1/torrents/') && path.endsWith('/trackers')) {
@@ -276,6 +338,33 @@ test('every settings section has no serious automated accessibility violations',
       targets: violation.nodes.flatMap(node => node.target),
     }))).toEqual([])
   }
+})
+
+test('crash safety panel renders its status, help and save locations', async ({ page, isMobile }) => {
+  test.skip(isMobile, 'desktop settings surfaces provide the complete certification viewport')
+
+  await page.getByRole('button', { name: 'Settings' }).click()
+  await page.getByRole('tab', { name: /Backend/i }).click()
+  await expect(page.getByRole('heading', { name: 'Crash safety', level: 2 })).toBeVisible()
+  await expect(page.getByTestId('crash-safety-status').getByText('Power loss or system crash')).toBeVisible()
+  await expect(page.getByLabel('Hold completion until data is synced')).toBeChecked()
+  await expect(page.getByRole('table').getByText('Weak')).toBeVisible()
+
+  // A saved folder policy is editable, and a location can be checked.
+  const policy = page.getByTestId('path-policy')
+  await expect(policy.getByLabel('Folder', { exact: true })).toHaveValue('/mnt/nas')
+  await expect(policy.getByLabel('Recovery policy')).toHaveValue('full')
+  const check = page.getByRole('form', { name: 'Check a location' })
+  await check.getByLabel('Folder', { exact: true }).fill('/mnt/nas/tv')
+  await check.getByRole('button', { name: 'Check' }).click()
+  await expect(page.getByTestId('path-report')).toContainText('/mnt/nas')
+
+  const results = await new AxeBuilder({ page })
+    .include('body')
+    .withTags(['wcag2a', 'wcag2aa', 'wcag21a', 'wcag21aa'])
+    .analyze()
+  const serious = results.violations.filter(violation => violation.impact === 'serious' || violation.impact === 'critical')
+  expect(serious.map(violation => ({ id: violation.id, impact: violation.impact, targets: violation.nodes.flatMap(node => node.target) }))).toEqual([])
 })
 
 test('transient dialogs keep focus contained and have no serious automated accessibility violations', async ({ page, isMobile }) => {

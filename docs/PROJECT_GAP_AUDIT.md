@@ -18,6 +18,18 @@ broader public clients/networks, additional physical targets,
 branch-protection settings, or optional scale/profiling work and are not hidden
 implementation backlog.
 
+## Current qualification update — 2026-09-16
+
+The current local implementation and fault gates are green. The 28-row local
+Docker matrix passes, the official Debian public transfer passes, and the live
+fault-containment and temporary-root storage lab reports pass. Bounded Ubuntu
+and Fedora public attempts did not complete their payloads within 120 seconds;
+they remain unqualified public-source rows. The configured real-device target
+is not writable/available on this host, and the 24-hour soak is explicitly
+deferred. Numeric torrent-count capacity proofs are outside the release scope.
+
+Current evidence: [`interop-matrix-current-local-20260916.md`](../certification/reports/interop-matrix-current-local-20260916.md), [`interop-matrix-current-public-debian-20260916.md`](../certification/reports/interop-matrix-current-public-debian-20260916.md), [`backend-burndown-fault-matrix-current-20260916.md`](../certification/reports/backend-burndown-fault-matrix-current-20260916.md), [`storage-release-certification-lab-current-20260916.md`](../certification/reports/storage-release-certification-lab-current-20260916.md), and [`external-evidence-preflight-current-20260916.md`](../certification/reports/external-evidence-preflight-current-20260916.md).
+
 ## Executive Summary
 
 The TorrentNG client, storage hot path, memory/resource governor, WebUI build, and
@@ -26,9 +38,9 @@ not concentrated in storage anymore. It is concentrated in release evidence and
 compatibility depth:
 
 - the local Docker universal-live interop leg and one official public-swarm
-  transfer have passing evidence; the counted public Debian soak and the
-  kspls0 real-device storage gate now also pass. Broader public sources and
-  additional hardware remain opt-in qualification depth;
+  transfer have passing evidence; bounded Ubuntu and Fedora attempts remain
+  unqualified, and real-device storage is unavailable on this host. Broader
+  public sources and additional hardware remain opt-in qualification depth;
 - the migration corpus gate now has checked-in generated fixtures for every
   legacy client family and passes strict local validation; adding real exported
   corpora remains optional release-depth evidence for undocumented variants;
@@ -48,7 +60,7 @@ compatibility depth:
   (container PID 1), not `torrentngd`; daemon resource soak evidence remains
   open under TNG-145 even though the original finalizer recorded PASS.
 
-## Certification Snapshot
+## Historical Certification Snapshot
 
 Current `scripts/certification_status.sh` highlights:
 

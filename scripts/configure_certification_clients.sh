@@ -50,6 +50,8 @@ for protected_url in "$SONARR_HOST_URL" "$RADARR_HOST_URL" \
 done
 
 mkdir -p "$(dirname "$OUT")"
+TMP_DIR="$(mktemp -d "${TMPDIR:-/tmp}/torrentng-client-config.XXXXXX")"
+trap 'rm -rf "$TMP_DIR"' EXIT
 
 status="PASS"
 
@@ -116,7 +118,7 @@ configure_arr_client() {
 
   code="$(curl -q -sS --noproxy "*" -o /tmp/tng-arr-test-body.txt -w '%{http_code}' -H "X-Api-Key: $api_key" -H 'Content-Type: application/json' -X POST -d "$payload" "$base_url$api_path/downloadclient/test")"
   if [[ "$code" != "200" ]]; then
-    mark "$label qBit test" "FAIL" "HTTP $code $(tr '\n' ' ' </tmp/tng-arr-test-body.txt)"
+    mark "$label qBit test" "FAIL" "HTTP $code $(tr '\n' ' ' <"$test_body")"
     return
   fi
 
@@ -129,12 +131,16 @@ configure_arr_client() {
   if [[ "$code" == "200" || "$code" == "201" || "$code" == "202" ]]; then
     mark "$label qBit client" "PASS" "tested and saved as $name"
   else
-    mark "$label qBit client" "FAIL" "HTTP $code $(tr '\n' ' ' </tmp/tng-arr-save-body.txt)"
+    mark "$label qBit client" "FAIL" "HTTP $code $(tr '\n' ' ' <"$save_body")"
   fi
 }
 
 configure_autobrr_client() {
-  local cookies="/tmp/tng-autobrr-cookies.txt"
+  local cookies="$TMP_DIR/autobrr-cookies"
+  local onboard_body="$TMP_DIR/autobrr-onboard-body"
+  local login_body="$TMP_DIR/autobrr-login-body"
+  local test_body="$TMP_DIR/autobrr-test-body"
+  local save_body="$TMP_DIR/autobrr-save-body"
   local user="${AUTOBRR_CERT_USER:-cert}"
   local pass="${AUTOBRR_CERT_PASSWORD:-cert}"
   local payload code existing_id
@@ -146,7 +152,7 @@ configure_autobrr_client() {
 
   code="$(curl -q -sS --noproxy "*" -c "$cookies" -o /tmp/tng-autobrr-login.txt -w '%{http_code}' -H 'Content-Type: application/json' -X POST -d "{\"username\":\"$user\",\"password\":\"$pass\",\"remember_me\":true}" "$AUTOBRR_HOST_URL/api/auth/login")"
   if [[ "$code" != "204" ]]; then
-    mark "autobrr login" "FAIL" "HTTP $code $(tr '\n' ' ' </tmp/tng-autobrr-login.txt)"
+    mark "autobrr login" "FAIL" "HTTP $code $(tr '\n' ' ' <"$login_body")"
     return
   fi
 
@@ -168,7 +174,7 @@ configure_autobrr_client() {
 
   code="$(curl -q -sS --noproxy "*" -b "$cookies" -o /tmp/tng-autobrr-test.txt -w '%{http_code}' -H 'Content-Type: application/json' -X POST -d "$payload" "$AUTOBRR_HOST_URL/api/download_clients/test")"
   if [[ "$code" != "204" ]]; then
-    mark "autobrr qBit test" "FAIL" "HTTP $code $(tr '\n' ' ' </tmp/tng-autobrr-test.txt)"
+    mark "autobrr qBit test" "FAIL" "HTTP $code $(tr '\n' ' ' <"$test_body")"
     return
   fi
 
@@ -183,7 +189,7 @@ configure_autobrr_client() {
   if [[ "$code" == "200" || "$code" == "201" ]]; then
     mark "autobrr qBit client" "PASS" "tested and saved as TorrentNG-qBit"
   else
-    mark "autobrr qBit client" "FAIL" "HTTP $code $(tr '\n' ' ' </tmp/tng-autobrr-save.txt)"
+    mark "autobrr qBit client" "FAIL" "HTTP $code $(tr '\n' ' ' <"$save_body")"
   fi
 }
 

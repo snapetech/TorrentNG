@@ -160,7 +160,7 @@ pub struct PartialPieceState {
     pub received_blocks: Vec<u32>,
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct DurabilityWatermark {
     /// Completed storage-sync barrier generation. Valid pieces at or below this
     /// generation can be trusted after a clean fastresume load.
@@ -172,6 +172,48 @@ pub struct DurabilityWatermark {
     #[serde(default)]
     #[serde(deserialize_with = "deserialize_dirty_pieces")]
     pub dirty_pieces_since_barrier: Vec<u32>,
+    /// Whether the payload data behind the `Valid` pieces in this record was
+    /// flushed to stable storage before the record was written.
+    ///
+    /// `false` is written by the `fast` durability mode, which deliberately
+    /// skips the data fsync. Such a record is only safe to trust if the host
+    /// did not crash, so the loader discards it after a detected (or
+    /// undetectable) host crash. Records written before this field existed
+    /// default to `true`: their durability is unknowable, and treating them as
+    /// unsynced would force a library-wide recheck on upgrade.
+    #[serde(default = "default_synced")]
+    pub synced: bool,
+    /// Boot identity when the record was written (see `rt_storage::boot`).
+    #[serde(default)]
+    pub boot_id: Option<String>,
+    /// Unix seconds of the most recent payload write for this torrent, or 0
+    /// when unknown. Drives the "recent write" recheck window after a host
+    /// crash; idle seeding torrents keep an old value and are left alone.
+    #[serde(default)]
+    pub last_data_write_unix: u64,
+    /// `RunMarker::run_id` of the daemon run that wrote this record, or 0 when
+    /// unknown. A record written by the *current* run post-dates any earlier
+    /// crash and is never re-judged against it (matters when a dormant torrent
+    /// is promoted hours after startup).
+    #[serde(default)]
+    pub saved_by_run_id: u64,
+}
+
+fn default_synced() -> bool {
+    true
+}
+
+impl Default for DurabilityWatermark {
+    fn default() -> Self {
+        DurabilityWatermark {
+            barrier_generation: 0,
+            dirty_pieces_since_barrier: Vec::new(),
+            synced: true,
+            boot_id: None,
+            last_data_write_unix: 0,
+            saved_by_run_id: 0,
+        }
+    }
 }
 
 /// Policy controlling when pieces can be marked Valid without explicit hash check.
@@ -393,7 +435,24 @@ impl FastresumeState {
     pub fn complete_durability_barrier(&mut self) {
         self.durability.barrier_generation = self.durability.barrier_generation.saturating_add(1);
         self.durability.dirty_pieces_since_barrier.clear();
+        self.durability.synced = true;
         self.clean_shutdown = true;
+    }
+
+    /// Record that this state was written **without** flushing payload data
+    /// (`fast` durability mode). It is still trusted after a clean shutdown or
+    /// a process-only crash, but not after a host crash.
+    pub fn mark_saved_without_data_sync(&mut self) {
+        self.durability.synced = false;
+    }
+
+    /// Downgrade every `Valid` piece in the given half-open piece ranges to
+    /// `Unknown` (and drop partial-piece records inside them), so the next
+    /// verification pass re-hashes them. Returns the number of pieces
+    /// downgraded. Ranges need not be sorted or disjoint.
+    pub fn distrust_piece_ranges(&mut self, ranges: &[(u32, u32)]) -> u32 {
+        let ranges = merge_piece_ranges(ranges.to_vec());
+        self.invalidate_piece_ranges(&ranges)
     }
 
     pub fn apply_unclean_shutdown_watermark(&mut self) -> Option<u32> {
@@ -748,6 +807,85 @@ mod tests {
         );
         assert_eq!(state.partial_pieces.len(), 1);
         assert_eq!(state.partial_pieces[0].piece, 4);
+    }
+
+    #[test]
+    fn barrier_marks_the_record_synced_and_fast_mode_marks_it_unsynced() {
+        let mut state =
+            FastresumeState::new_empty(&test_hash(), 2, ImportPolicy::RequireVerification);
+        assert!(state.durability.synced, "default is legacy-trusting");
+        state.mark_saved_without_data_sync();
+        assert!(!state.durability.synced);
+        state.complete_durability_barrier();
+        assert!(state.durability.synced);
+        assert!(state.clean_shutdown);
+    }
+
+    #[test]
+    fn legacy_records_without_the_new_fields_decode_as_synced_and_undated() {
+        let json = r#"{
+            "barrier_generation": 3,
+            "dirty_pieces_since_barrier": [1]
+        }"#;
+        let watermark: DurabilityWatermark = serde_json::from_str(json).unwrap();
+        assert_eq!(watermark.barrier_generation, 3);
+        assert!(watermark.synced);
+        assert_eq!(watermark.boot_id, None);
+        assert_eq!(watermark.last_data_write_unix, 0);
+        assert_eq!(watermark.saved_by_run_id, 0);
+
+        let empty: DurabilityWatermark = serde_json::from_str("{}").unwrap();
+        assert!(empty.synced);
+    }
+
+    #[test]
+    fn new_durability_fields_round_trip() {
+        let mut state =
+            FastresumeState::new_empty(&test_hash(), 2, ImportPolicy::RequireVerification);
+        state.durability.synced = false;
+        state.durability.boot_id = Some("boot-xyz".to_owned());
+        state.durability.last_data_write_unix = 1_700_000_000;
+        state.durability.saved_by_run_id = 77;
+        let json = serde_json::to_string(&state).unwrap();
+        let back: FastresumeState = serde_json::from_str(&json).unwrap();
+        assert!(!back.durability.synced);
+        assert_eq!(back.durability.boot_id.as_deref(), Some("boot-xyz"));
+        assert_eq!(back.durability.last_data_write_unix, 1_700_000_000);
+        assert_eq!(back.durability.saved_by_run_id, 77);
+    }
+
+    #[test]
+    fn distrust_piece_ranges_downgrades_valid_pieces_and_partials_in_range() {
+        let mut state =
+            FastresumeState::new_empty(&test_hash(), 6, ImportPolicy::RequireVerification);
+        state.pieces = vec![PieceState::Valid; 6];
+        state.partial_pieces = vec![
+            PartialPieceState {
+                piece: 2,
+                received_blocks: vec![0],
+            },
+            PartialPieceState {
+                piece: 5,
+                received_blocks: vec![0],
+            },
+        ];
+        // Unsorted, overlapping input is accepted.
+        let downgraded = state.distrust_piece_ranges(&[(4, 5), (1, 3), (2, 4)]);
+        assert_eq!(downgraded, 4);
+        assert_eq!(
+            state.pieces,
+            vec![
+                PieceState::Valid,
+                PieceState::Unknown,
+                PieceState::Unknown,
+                PieceState::Unknown,
+                PieceState::Unknown,
+                PieceState::Valid,
+            ]
+        );
+        assert_eq!(state.partial_pieces.len(), 1);
+        assert_eq!(state.partial_pieces[0].piece, 5);
+        assert_eq!(state.distrust_piece_ranges(&[]), 0);
     }
 
     #[test]

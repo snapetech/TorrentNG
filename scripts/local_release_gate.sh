@@ -6,6 +6,7 @@ REPORT_DIR="${REPORT_DIR:-$ROOT/certification/reports}"
 OUT="${1:-$REPORT_DIR/local-release-$(date -u +%Y%m%dT%H%M%SZ).md}"
 
 mkdir -p "$(dirname "$OUT")"
+mkdir -p "$REPORT_DIR"
 
 status="PASS"
 warnings=0
@@ -67,8 +68,7 @@ run_report_gate() {
     case "$report_status" in
       PASS) result="PASS" ;;
       PASS_WITH_GAPS|PASS_WITH_SKIPS|PASS_WITH_WARNINGS) result="WARN" ;;
-      "") result="PASS" ;;
-      *) result="$report_status" ;;
+      *) result="FAIL" ;;
     esac
     if [[ "$result" == "FAIL" ]]; then
       status="FAIL"
@@ -77,13 +77,16 @@ run_report_gate() {
     fi
   elif (cd "$ROOT" && "$@") >>"$OUT" 2>&1; then
     echo '```' >>"$OUT"
-    report_status="$(awk -F': ' '/^Overall status:/ {status=$2} END {print status}' "$report" 2>/dev/null || true)"
-    case "$report_status" in
-      PASS) result="PASS" ;;
-      PASS_WITH_GAPS|PASS_WITH_SKIPS|PASS_WITH_WARNINGS) result="WARN" ;;
-      "") result="PASS" ;;
-      *) result="$report_status" ;;
-    esac
+    if [[ ! -f "$report" ]]; then
+      result="FAIL"
+    else
+      report_status="$(awk -F': ' '/^Overall status:/ {status=$2} END {print status}' "$report" 2>/dev/null || true)"
+      case "$report_status" in
+        PASS) result="PASS" ;;
+        PASS_WITH_GAPS|PASS_WITH_SKIPS|PASS_WITH_WARNINGS) result="WARN" ;;
+        *) result="FAIL" ;;
+      esac
+    fi
     if [[ "$result" == "FAIL" ]]; then
       status="FAIL"
     elif [[ "$result" == "WARN" ]]; then
@@ -161,12 +164,16 @@ run_report_gate "backup and restore drill" "$backup_restore_report" \
 corpus_report="$REPORT_DIR/migration-corpus-local-release-$(date -u +%Y%m%dT%H%M%SZ).md"
 run_report_gate "migration exported corpus coverage" "$corpus_report" "$ROOT/scripts/migration_corpus_certification.sh" "$corpus_report"
 
+# The nested shell expands its own positional arguments at gate runtime.
+# shellcheck disable=SC2016
 run_gate "native config security review" bash -c '
   set -euo pipefail
   TNG_API_TOKENS="${TNG_API_TOKENS:-local-release-native-token}" \
     "$1/scripts/security_review.sh" "$1/deploy/native/config.toml" "$2/security-review-native-local-$(date -u +%Y%m%dT%H%M%SZ).md"
 ' _ "$ROOT" "$REPORT_DIR"
 
+# The nested shell expands its own positional arguments at gate runtime.
+# shellcheck disable=SC2016
 run_gate "compatible-client service config security review" bash -c '
   set -euo pipefail
   TNG_API_TOKENS="${TNG_API_TOKENS:-local-release-sidecar-token}" \

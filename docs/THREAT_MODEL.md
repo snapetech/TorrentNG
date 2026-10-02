@@ -25,6 +25,9 @@
 - Tracker announce storms after restart.
 - Token leakage through logs, reverse proxies, or browser storage.
 - Script workflow escape if an operator enables broad script directories.
+- Power loss or a crash leaving preallocated files partly zero-filled while
+  resume state claims they are complete, handing corrupt media to downstream
+  automation.
 
 ## Controls
 
@@ -36,13 +39,18 @@
   compatible-client loopback WebUI browser requests require the configured
   username/password session; unauthenticated machine API calls remain
   available only on loopback.
-- Public binds reject the unchanged default WebUI password; runtime credentials
-  are written with owner-only file permissions and are never returned by the
-  authentication-settings API.
+- Unset passwords are generated randomly per installation and stored outside
+  source-controlled config with owner-only permissions. Public binds require an
+  API token and a WebUI password of at least 16 bytes; settings reads never
+  return passwords.
 - API tokens remain valid for machine clients and may be submitted in either
   WebUI login field.
 - Script execution requires opt-in and explicit allowlisted directories.
 - SQLite state is backed up before migration and import.
+- Resume state is written only after payload data is synced; completion is held
+  until data is durable; host crashes are detected and trigger bounded
+  re-verification; migration refuses or downgrades trust for crashed sources
+  ([CRASH_SAFETY.md](CRASH_SAFETY.md)).
 
 ## Residual Risk
 

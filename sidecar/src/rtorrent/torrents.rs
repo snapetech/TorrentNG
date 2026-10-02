@@ -31,11 +31,19 @@ const TORRENT_FIELDS: &[&str] = &[
 ];
 
 pub const MULTICALL_RANGE_PAGE_SIZE: i64 = 100;
+const MAX_LEGACY_FULL_LIST_ENTRIES: usize = 10_000;
 
 const RTORRENT_MULTICALL_RANGE_PATCH: &str = "rtorrent-0.16.11-multicall-range";
 const LEGACY_RTORRENT_NONZERO_RATE_PATCH: &str = "rtorrent-0.16.11-multicall-nonzero-rate";
 const LEGACY_RTORRENT_LIVE_SUMMARY_PATCH: &str = "rtorrent-0.16.11-tng-live-summary";
 const RTORRENT_DEFAULT_SAVE_PATH: &str = "/downloads/temp";
+
+fn ensure_paged_torrent_capacity(current: usize, additional: usize) -> Result<()> {
+    if current.saturating_add(additional) > MAX_LEGACY_FULL_LIST_ENTRIES {
+        bail!("rTorrent paged response contains more than {MAX_LEGACY_FULL_LIST_ENTRIES} torrents");
+    }
+    Ok(())
+}
 
 #[derive(Debug, Clone)]
 pub struct RawTorrent {
@@ -76,6 +84,20 @@ pub struct TransferRates {
 pub struct LiveSummary {
     pub rates: TransferRates,
     pub moving: Vec<RawTorrent>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct TorrentMetrics {
+    size_bytes: i64,
+    bytes_done: i64,
+    down_rate: i64,
+    up_rate: i64,
+    up_total: i64,
+    down_total: i64,
+    ratio: i64,
+    priority: i64,
+    peers_connected: i64,
+    peers_complete: i64,
 }
 
 impl Client {
@@ -126,7 +148,13 @@ impl Client {
             .await
             .context("d.multicall2")?;
 
-        parse_torrent_rows(result.try_into_array()?)
+        let rows = result.try_into_array()?;
+        if rows.len() > MAX_LEGACY_FULL_LIST_ENTRIES {
+            bail!(
+                "rTorrent legacy full-list response contains more than {MAX_LEGACY_FULL_LIST_ENTRIES} torrents"
+            );
+        }
+        parse_torrent_rows(rows)
     }
 
     pub async fn has_multicall_range(&self) -> bool {
@@ -217,6 +245,7 @@ impl Client {
                 .list_torrents_range(view, offset, MULTICALL_RANGE_PAGE_SIZE)
                 .await?;
             let page_len = i64::try_from(page.len()).context("rTorrent page length exceeds i64")?;
+            ensure_paged_torrent_capacity(torrents.len(), page.len())?;
             torrents.append(&mut page);
             if page_len < MULTICALL_RANGE_PAGE_SIZE {
                 break;
@@ -293,7 +322,7 @@ impl Client {
         category: &str,
         start: bool,
     ) -> Result<()> {
-        if url.starts_with("magnet:") {
+        if crate::backend::is_magnet_url(url) {
             return self.load_magnet(url, save_path, category, start).await;
         }
         let data = crate::backend::download_remote_torrent(url).await?;
@@ -586,6 +615,9 @@ fn rtorrent_patch_manifest_enables_bounded_live(patches: &str) -> bool {
 }
 
 fn parse_torrent_rows(rows: Vec<XmlValue>) -> Result<Vec<RawTorrent>> {
+    if rows.len() > MAX_LEGACY_FULL_LIST_ENTRIES {
+        bail!("rTorrent torrent response contains more than {MAX_LEGACY_FULL_LIST_ENTRIES} rows");
+    }
     let mut torrents = Vec::with_capacity(rows.len());
     for (row_index, row) in rows.into_iter().enumerate() {
         let fields = row
@@ -598,21 +630,46 @@ fn parse_torrent_rows(rows: Vec<XmlValue>) -> Result<Vec<RawTorrent>> {
                 TORRENT_FIELDS.len()
             );
         }
+        let size_bytes = required_i64_field(&fields, 2, "d.size_bytes")?;
+        let bytes_done = required_i64_field(&fields, 3, "d.bytes_done")?;
+        let down_rate = required_i64_field(&fields, 4, "d.down.rate")?;
+        let up_rate = required_i64_field(&fields, 5, "d.up.rate")?;
+        let up_total = required_i64_field(&fields, 6, "d.up.total")?;
+        let down_total = required_i64_field(&fields, 7, "d.down.total")?;
+        let ratio = required_i64_field(&fields, 8, "d.ratio")?;
+        let priority = required_i64_field(&fields, 13, "d.priority")?;
+        let peers_connected = required_i64_field(&fields, 20, "d.peers_connected")?;
+        let peers_complete = required_i64_field(&fields, 21, "d.peers_complete")?;
+        validate_torrent_metrics(
+            row_index,
+            TorrentMetrics {
+                size_bytes,
+                bytes_done,
+                down_rate,
+                up_rate,
+                up_total,
+                down_total,
+                ratio,
+                priority,
+                peers_connected,
+                peers_complete,
+            },
+        )?;
         torrents.push(RawTorrent {
-            hash: required_string_field(&fields, 0, "d.hash")?,
-            name: required_string_field(&fields, 1, "d.name")?,
-            size_bytes: required_i64_field(&fields, 2, "d.size_bytes")?,
-            bytes_done: required_i64_field(&fields, 3, "d.bytes_done")?,
-            down_rate: required_i64_field(&fields, 4, "d.down.rate")?,
-            up_rate: required_i64_field(&fields, 5, "d.up.rate")?,
-            up_total: required_i64_field(&fields, 6, "d.up.total")?,
-            down_total: required_i64_field(&fields, 7, "d.down.total")?,
-            ratio: required_i64_field(&fields, 8, "d.ratio")?,
+            hash: required_nonempty_string_field(&fields, 0, "d.hash")?,
+            name: required_nonempty_string_field(&fields, 1, "d.name")?,
+            size_bytes,
+            bytes_done,
+            down_rate,
+            up_rate,
+            up_total,
+            down_total,
+            ratio,
             is_active: required_bool_field(&fields, 9, "d.is_active")?,
             is_open: required_bool_field(&fields, 10, "d.is_open")?,
             complete: required_bool_field(&fields, 11, "d.complete")?,
             state: required_i64_field(&fields, 12, "d.state")?,
-            priority: required_i64_field(&fields, 13, "d.priority")?,
+            priority,
             category: decode_legacy_category(required_string_field(&fields, 14, "d.custom1")?),
             base_path: required_string_field(&fields, 15, "d.base_path")?,
             directory: required_string_field(&fields, 16, "d.directory")?,
@@ -658,6 +715,14 @@ fn required_string_field(fields: &[XmlValue], i: usize, name: &str) -> Result<St
         .ok_or_else(|| anyhow!("rTorrent response omitted valid {name}"))
 }
 
+fn required_nonempty_string_field(fields: &[XmlValue], i: usize, name: &str) -> Result<String> {
+    let value = required_string_field(fields, i, name)?;
+    if value.trim().is_empty() {
+        bail!("rTorrent response omitted non-empty {name}");
+    }
+    Ok(value)
+}
+
 fn required_i64_field(fields: &[XmlValue], i: usize, name: &str) -> Result<i64> {
     fields
         .get(i)
@@ -672,13 +737,54 @@ fn required_bool_field(fields: &[XmlValue], i: usize, name: &str) -> Result<bool
         .ok_or_else(|| anyhow!("rTorrent response omitted valid {name}"))
 }
 
+fn validate_torrent_metrics(index: usize, metrics: TorrentMetrics) -> Result<()> {
+    if metrics.size_bytes < 0 {
+        bail!(
+            "rTorrent torrent row {index} returned negative d.size_bytes {}",
+            metrics.size_bytes
+        );
+    }
+    if metrics.bytes_done < 0 || metrics.bytes_done > metrics.size_bytes {
+        bail!(
+            "rTorrent torrent row {index} returned d.bytes_done {} outside 0..={}",
+            metrics.bytes_done,
+            metrics.size_bytes
+        );
+    }
+    for (field, value) in [
+        ("d.down.rate", metrics.down_rate),
+        ("d.up.rate", metrics.up_rate),
+        ("d.up.total", metrics.up_total),
+        ("d.down.total", metrics.down_total),
+        ("d.ratio", metrics.ratio),
+        ("d.peers_connected", metrics.peers_connected),
+        ("d.peers_complete", metrics.peers_complete),
+    ] {
+        if value < 0 {
+            bail!("rTorrent torrent row {index} returned negative {field} {value}");
+        }
+    }
+    if !(0..=2).contains(&metrics.priority) {
+        bail!(
+            "rTorrent torrent row {index} returned invalid d.priority {}",
+            metrics.priority
+        );
+    }
+    Ok(())
+}
+
 fn normalize_rtorrent_save_path(path: &str) -> String {
     let trimmed = path.trim();
     if trimmed.is_empty() || trimmed == "." {
         return RTORRENT_DEFAULT_SAVE_PATH.to_owned();
     }
     if trimmed.starts_with('/') {
-        return trimmed.trim_end_matches('/').to_owned();
+        let normalized = trimmed.trim_end_matches('/');
+        return if normalized.is_empty() {
+            "/".to_owned()
+        } else {
+            normalized.to_owned()
+        };
     }
 
     let mut parts = Vec::new();
@@ -739,11 +845,19 @@ fn base64_encode(data: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        bounded_range_args, decode_legacy_category, live_summary_args, nonzero_rate_args,
-        normalize_rtorrent_save_path, parse_torrent_rows,
-        rtorrent_patch_manifest_enables_bounded_live,
+        bounded_range_args, decode_legacy_category, ensure_paged_torrent_capacity,
+        live_summary_args, nonzero_rate_args, normalize_rtorrent_save_path, parse_torrent_rows,
+        rtorrent_patch_manifest_enables_bounded_live, validate_torrent_metrics, TorrentMetrics,
+        MAX_LEGACY_FULL_LIST_ENTRIES,
     };
     use crate::rtorrent::XmlValue;
+
+    #[test]
+    fn paged_torrent_list_stops_at_the_legacy_response_limit() {
+        assert!(ensure_paged_torrent_capacity(MAX_LEGACY_FULL_LIST_ENTRIES - 1, 1).is_ok());
+        assert!(ensure_paged_torrent_capacity(MAX_LEGACY_FULL_LIST_ENTRIES, 1).is_err());
+        assert!(ensure_paged_torrent_capacity(usize::MAX, 1).is_err());
+    }
 
     #[test]
     fn decode_legacy_category_decodes_rutorrent_style_encoding() {
@@ -863,6 +977,8 @@ mod tests {
     fn normalizes_relative_rtorrent_save_paths_under_writable_download_root() {
         assert_eq!(normalize_rtorrent_save_path(""), "/downloads/temp");
         assert_eq!(normalize_rtorrent_save_path("."), "/downloads/temp");
+        assert_eq!(normalize_rtorrent_save_path("/"), "/");
+        assert_eq!(normalize_rtorrent_save_path("////"), "/");
         assert_eq!(
             normalize_rtorrent_save_path("./Movie.Name.2026"),
             "/downloads/temp/Movie.Name.2026"
@@ -879,6 +995,61 @@ mod tests {
             normalize_rtorrent_save_path("/downloads/download/movies"),
             "/downloads/download/movies"
         );
+    }
+
+    #[test]
+    fn torrent_metrics_reject_negative_and_inconsistent_values() {
+        let valid = |size_bytes, bytes_done, down_rate, priority| TorrentMetrics {
+            size_bytes,
+            bytes_done,
+            down_rate,
+            up_rate: 0,
+            up_total: 0,
+            down_total: 0,
+            ratio: 0,
+            priority,
+            peers_connected: 0,
+            peers_complete: 0,
+        };
+        assert!(validate_torrent_metrics(0, valid(100, 101, 0, 1)).is_err());
+        assert!(validate_torrent_metrics(0, valid(100, 10, -1, 1)).is_err());
+        assert!(validate_torrent_metrics(0, valid(100, 10, 0, 3)).is_err());
+    }
+
+    #[test]
+    fn torrent_metrics_accept_zero_length_and_valid_counters() {
+        assert!(validate_torrent_metrics(
+            0,
+            TorrentMetrics {
+                size_bytes: 0,
+                bytes_done: 0,
+                down_rate: 0,
+                up_rate: 0,
+                up_total: 0,
+                down_total: 0,
+                ratio: 0,
+                priority: 0,
+                peers_connected: 0,
+                peers_complete: 0,
+            }
+        )
+        .is_ok());
+        assert!(validate_torrent_metrics(
+            0,
+            TorrentMetrics {
+                size_bytes: 100,
+                bytes_done: 100,
+                down_rate: 1,
+                up_rate: 2,
+                up_total: 3,
+                down_total: 4,
+                ratio: 5,
+                priority: 2,
+                peers_connected: 6,
+                peers_complete: 7,
+            }
+        )
+        .is_ok());
     }
 
     fn str_arg(args: &[XmlValue], index: usize) -> &str {

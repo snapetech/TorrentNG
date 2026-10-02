@@ -445,40 +445,7 @@ impl TorrentTask {
                 );
                 self.send_have_to_peers(block.piece).await;
                 if self.picker.is_complete() {
-                    self.persist_progress_throttled(true).await;
-                    self.save_fastresume(false).await;
-                    self.tracker_event = TrackerEvent::Completed;
-                    self.schedule_trackers_now();
-                    match self.set_state_checked(TorrentState::Seeding).await {
-                        Ok(()) => info!(
-                            component = "torrent",
-                            operation = "complete_download",
-                            torrent = %self.info_hash_hex,
-                            result = "ok",
-                            "download complete"
-                        ),
-                        Err(error) => {
-                            // `set_state_checked` rolled the registry
-                            // back to Downloading when its durable write
-                            // failed. Keep the runtime on that same
-                            // active state; marking only the actor as
-                            // paused would leave the public projection
-                            // claiming downloading while no task work was
-                            // possible.
-                            self.paused = false;
-                            self.recheck_restore_state = None;
-                            self.restart_tracker_session();
-                            self.shutdown_peers().await;
-                            warn!(
-                                component = "torrent",
-                                operation = "complete_download",
-                                torrent = %self.info_hash_hex,
-                                result = "error",
-                                error = %error,
-                                "failed to persist seeding state; retaining downloading state"
-                            );
-                        }
-                    }
+                    self.on_download_complete().await;
                 }
             }
             VerifyResult::Invalid => {

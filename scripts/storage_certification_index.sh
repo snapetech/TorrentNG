@@ -62,9 +62,13 @@ fixed_buffer_strategy_for_report() {
 
 result_for_report() {
   local report="$1"
-  if grep -qE 'Overall status: FAIL|Result: FAIL|\|[^|]+\| FAIL \|' "$report"; then
+  if grep -qE '^Overall status: FAIL$|^Result: FAIL$|\|[^|]+\| FAIL \|' "$report"; then
     printf 'FAIL'
-  elif grep -qE 'Overall status: PASS|Result: PASS|\|[^|]+\| PASS \|' "$report"; then
+  elif grep -q '^Overall status: PASS$' "$report"; then
+    printf 'PASS'
+  elif grep -q '^Overall status:' "$report"; then
+    printf 'INFO'
+  elif grep -qE '^Result: PASS$|\|[^|]+\| PASS \|' "$report"; then
     printf 'PASS'
   elif grep -qE '\|[^|]+\| SKIP' "$report"; then
     printf 'SKIP'
@@ -85,7 +89,7 @@ result_for_report() {
   shopt -s nullglob
   reports=("$REPORT_DIR"/storage-hardware-*.md "$REPORT_DIR"/storage-uring-graduation-*.md "$REPORT_DIR"/storage-move-import-*.md)
   if [[ "${#reports[@]}" -eq 0 ]]; then
-    echo "| _none_ | storage |  |  |  |  | INFO |"
+    echo "| _none_ | storage |  |  |  |  | n/a | n/a | n/a | INFO |"
   else
     for report in "${reports[@]}"; do
       rel="${report#"$ROOT"/}"

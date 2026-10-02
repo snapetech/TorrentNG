@@ -358,7 +358,12 @@ fn optional_bounded_tracker_id_column(
 impl TorrentLimitRow {
     fn from_row(row: &Row<'_>) -> rusqlite::Result<Self> {
         Ok(TorrentLimitRow {
-            info_hash: row.get(0)?,
+            info_hash: bounded_tracker_text_column(
+                row,
+                0,
+                "torrent limit info hash",
+                MAX_TORRENT_TRACKER_INFO_HASH_BYTES,
+            )?,
             download_limit: row.get(1)?,
             upload_limit: row.get(2)?,
             max_connections: row.get(3)?,
@@ -1700,5 +1705,22 @@ mod tests {
         assert_eq!(limits.sequential_download_from_piece, Some(3));
         assert!(limits.auto_tmm);
         assert!(limits.auto_management);
+    }
+
+    #[test]
+    fn limit_reads_reject_oversized_legacy_info_hashes_before_string_conversion() {
+        let conn = setup();
+        conn.execute_batch("PRAGMA foreign_keys = OFF;").unwrap();
+        let oversized_hash = "x".repeat(MAX_TORRENT_TRACKER_INFO_HASH_BYTES + 1);
+        conn.execute(
+            "INSERT INTO torrent_limits
+                (info_hash, sequential_download, first_last_piece_prio,
+                 force_start, super_seeding, auto_tmm, auto_management)
+             VALUES (?1, 0, 0, 0, 0, 0, 0)",
+            params![oversized_hash],
+        )
+        .unwrap();
+
+        assert!(get_torrent_limits(&conn, &oversized_hash).is_err());
     }
 }

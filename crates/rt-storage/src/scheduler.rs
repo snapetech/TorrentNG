@@ -384,35 +384,34 @@ struct FileIdentity {
     file_index: u64,
 }
 
+#[cfg(windows)]
 fn file_identity(file: &File) -> io::Result<FileIdentity> {
-    #[cfg(windows)]
-    {
-        let (volume_serial, file_index) = crate::open::windows_file_identity(file)?;
-        return Ok(FileIdentity {
-            volume_serial,
-            file_index,
-        });
-    }
-
-    #[cfg(not(windows))]
-    {
-        metadata_identity(&file.metadata()?)
-    }
+    let (volume_serial, file_index) = crate::win32::file_identity(file)?;
+    Ok(FileIdentity {
+        volume_serial,
+        file_index,
+    })
 }
 
+#[cfg(not(windows))]
+fn file_identity(file: &File) -> io::Result<FileIdentity> {
+    metadata_identity(&file.metadata()?)
+}
+
+#[cfg(windows)]
+fn path_identity(path: &Path) -> io::Result<FileIdentity> {
+    let (volume_serial, file_index) = crate::win32::path_identity(path)?;
+    Ok(FileIdentity {
+        volume_serial,
+        file_index,
+    })
+}
+
+#[cfg(not(windows))]
 fn path_identity(path: &Path) -> io::Result<FileIdentity> {
     // Do not follow a final symlink here. Runtime opens reject symlinks, and a
     // symlink replacing a cached regular file must force a fresh safe open.
-    #[cfg(windows)]
-    {
-        let file = crate::open::open_path_no_follow(path, false, false)?;
-        return file_identity(&file);
-    }
-
-    #[cfg(not(windows))]
-    {
-        metadata_identity(&std::fs::symlink_metadata(path)?)
-    }
+    metadata_identity(&std::fs::symlink_metadata(path)?)
 }
 
 #[cfg(not(windows))]
@@ -2559,6 +2558,52 @@ impl MountScheduler {
         Ok(())
     }
 
+    /// Whether this platform has a page-cache drop primitive at all
+    /// (`posix_fadvise(DONTNEED)` on Linux and FreeBSD).
+    pub const fn page_cache_drop_supported() -> bool {
+        cfg!(any(target_os = "linux", target_os = "freebsd"))
+    }
+
+    /// Best-effort request that the OS drop cached pages for `path`, so the
+    /// next read of it is served by the device instead of the page cache. Used
+    /// after a durability barrier to make a verification pass read what is on
+    /// disk. Returns whether the platform accepted the hint; platforms with no
+    /// such primitive return `false` and callers must treat the read-back as
+    /// possibly cache-served.
+    pub async fn drop_page_cache(&self, path: &Path) -> bool {
+        #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+        {
+            let pool = self.file_pool.clone();
+            let key = normalized_key(path);
+            let counters = self.counters.clone();
+            let result = self
+                .run_queued_blocking(0, move || {
+                    let file = pool.get_or_open(&key, OpenMode::Read, false)?;
+                    Ok(advise_page_cache(&file, 0, 0, PageCacheAdvice::DontNeed))
+                })
+                .await;
+            match result {
+                Ok(true) => {
+                    counters
+                        .page_cache_advise_dontneed
+                        .fetch_add(1, Ordering::Relaxed);
+                    true
+                }
+                _ => {
+                    counters
+                        .page_cache_advise_failures
+                        .fetch_add(1, Ordering::Relaxed);
+                    false
+                }
+            }
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "freebsd")))]
+        {
+            let _ = path;
+            false
+        }
+    }
+
     pub async fn data_extents(
         &self,
         path: &Path,
@@ -2944,7 +2989,7 @@ enum PageCacheAdvice {
 }
 
 fn advise_page_cache(file: &File, offset: u64, len: usize, advice: PageCacheAdvice) -> bool {
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "freebsd"))]
     {
         use std::os::fd::AsRawFd;
 
@@ -2959,7 +3004,7 @@ fn advise_page_cache(file: &File, offset: u64, len: usize, advice: PageCacheAdvi
         unsafe { libc::posix_fadvise(fd, offset, len, advice) == 0 }
     }
 
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(not(any(target_os = "linux", target_os = "freebsd")))]
     {
         let _ = (file, offset, len, advice);
         true
@@ -3050,17 +3095,29 @@ fn effective_file_pool_size(configured: usize, process_budget: usize) -> usize {
     configured.min(process_budget)
 }
 
+/// Reserve `len` bytes of real storage for `file`.
+///
+/// This calls `fallocate(2)` directly instead of `posix_fallocate(3)` on
+/// purpose. When the filesystem has no native preallocation, glibc's
+/// `posix_fallocate` *emulates* it by writing zero bytes into every block.
+/// Those blocks are indistinguishable from written payload, so after a host
+/// crash a never-written region would look like valid, fully allocated data
+/// and defeat the allocation audit (`alloc_audit`). A native `fallocate`
+/// instead leaves unwritten extents the filesystem can report, and on a
+/// filesystem without support it fails with `EOPNOTSUPP`; the caller then
+/// falls back to a sparse length, which is honest about holes.
 fn full_preallocate(file: &File, len: u64) -> Result<(), StorageError> {
     #[cfg(target_os = "linux")]
     {
         use std::os::fd::AsRawFd;
-        let rc = unsafe { libc::posix_fallocate(file.as_raw_fd(), 0, len as libc::off_t) };
+        // SAFETY: `file` owns a live descriptor for the duration of the call.
+        let rc = unsafe { libc::fallocate(file.as_raw_fd(), 0, 0, len as libc::off_t) };
         if rc == 0 {
             return Ok(());
         }
         Err(StorageError::Io {
             path: "<preallocate>".to_owned(),
-            source: std::io::Error::from_raw_os_error(rc),
+            source: std::io::Error::last_os_error(),
         })
     }
     #[cfg(not(target_os = "linux"))]
@@ -3896,6 +3953,51 @@ mod tests {
                 on_disk, original,
                 "file bytes must be untouched after a refused shrink for {mode:?}"
             );
+        }
+    }
+
+    /// The reason `full_preallocate` uses raw `fallocate(2)`: preallocated
+    /// but never-written space must stay *visibly* unwritten to the
+    /// filesystem, so the allocation audit can flag it after a crash. If this
+    /// ever regressed to zero-filling (glibc's `posix_fallocate` emulation),
+    /// the audit would see ordinary data blocks and the guarantee would be
+    /// silently gone.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn full_preallocation_leaves_unwritten_extents_not_zero_blocks() {
+        use crate::alloc_audit::{audit_file_allocation, AllocationAudit, AuditMethod};
+
+        let len = 8u64 << 20;
+        // Use the working directory's filesystem: /tmp is often tmpfs, which
+        // cannot report unwritten extents.
+        let dir = tempfile::Builder::new()
+            .prefix("prealloc-audit-")
+            .tempdir_in(std::env::current_dir().unwrap())
+            .unwrap();
+        let path = dir.path().join("prealloc.bin");
+        let sched = hdd_scheduler();
+        sched
+            .prepare_file(&path, len, PreallocationMode::Full)
+            .await
+            .unwrap();
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), len);
+
+        let fs_type = crate::device::detect_storage_topology(&path).fs_type;
+        let extent_fs = matches!(fs_type.as_deref(), Some("ext4" | "xfs" | "btrfs"));
+        let stats = sched.stats();
+        match audit_file_allocation(&path, len).unwrap() {
+            AllocationAudit::Gaps {
+                gaps,
+                method: AuditMethod::Fiemap,
+            } if extent_fs => {
+                assert_eq!(stats.preallocation_fallbacks, 0);
+                assert_eq!(
+                    gaps.merged(),
+                    vec![(0, len)],
+                    "full preallocation on {fs_type:?} must remain unwritten, not zero-filled"
+                );
+            }
+            other => eprintln!("fs {fs_type:?} exposes no unwritten extents ({other:?}); skipping"),
         }
     }
 

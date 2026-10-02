@@ -1,7 +1,9 @@
 use anyhow::{anyhow, bail, Context, Result};
 use bytes::{BufMut, BytesMut};
 use quick_xml::{events::Event, name::QName, Reader};
+use serde::de::{self, DeserializeSeed, Deserializer, IgnoredAny, MapAccess, SeqAccess, Visitor};
 use serde_json::{json, Value};
+use std::fmt;
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -20,7 +22,13 @@ const MAX_SCGI_RESPONSE_BYTES: usize = 64 * 1024 * 1024;
 const MAX_XMLRPC_REQUEST_BYTES: usize = 128 * 1024 * 1024;
 const MAX_XMLRPC_COLLECTION_ITEMS: usize = 16_384;
 const MAX_XMLRPC_VALUE_DEPTH: usize = 64;
+const MAX_XMLRPC_NODES: usize = 65_536;
+const MAX_XMLRPC_DEPTH: usize = 64;
 const MAX_XMLRPC_TEXT_BYTES: usize = 16 * 1024 * 1024;
+const MAX_JSONRPC_NODES: usize = 65_536;
+const MAX_JSONRPC_DEPTH: usize = 64;
+const MAX_JSONRPC_TEXT_BYTES: usize = 8 * 1024 * 1024;
+const MAX_JSONRPC_COLLECTION_ITEMS: usize = 16_384;
 
 #[derive(Debug, Clone)]
 pub enum Transport {
@@ -466,6 +474,7 @@ fn json_to_xml_at_depth(value: Value, depth: usize) -> Result<XmlValue> {
 }
 
 fn parse_jsonrpc_response(body: &[u8]) -> Result<XmlValue> {
+    validate_jsonrpc_bytes(body)?;
     let value: Value =
         serde_json::from_slice(body).context("JSON-RPC response is not valid JSON")?;
     let response = value
@@ -486,6 +495,283 @@ fn parse_jsonrpc_response(body: &[u8]) -> Result<XmlValue> {
         .cloned()
         .ok_or_else(|| anyhow!("JSON-RPC response has no result"))?;
     json_to_xml(result)
+}
+
+/// Validate JSON-RPC structure before `serde_json::from_slice` materializes a
+/// `Value` tree. The SCGI byte ceiling alone still permits a response with
+/// millions of small values to allocate a much larger in-memory tree.
+fn validate_jsonrpc_bytes(body: &[u8]) -> Result<()> {
+    let mut state = JsonShapeState { nodes: 0 };
+    let mut deserializer = serde_json::Deserializer::from_slice(body);
+    deserializer
+        .deserialize_any(JsonShapeVisitor {
+            depth: 0,
+            state: &mut state,
+        })
+        .context("JSON-RPC response shape is invalid")?;
+    deserializer
+        .end()
+        .context("JSON-RPC response contains trailing data")?;
+    Ok(())
+}
+
+struct JsonShapeState {
+    nodes: usize,
+}
+
+impl JsonShapeState {
+    fn visit_node<E: de::Error>(&mut self, depth: usize) -> Result<(), E> {
+        self.nodes = self
+            .nodes
+            .checked_add(1)
+            .ok_or_else(|| E::custom("JSON-RPC response node count overflowed"))?;
+        if self.nodes > MAX_JSONRPC_NODES {
+            return Err(E::custom(format!(
+                "JSON-RPC response exceeds {MAX_JSONRPC_NODES} value limit"
+            )));
+        }
+        if depth > MAX_JSONRPC_DEPTH {
+            return Err(E::custom(format!(
+                "JSON-RPC response exceeds {MAX_JSONRPC_DEPTH} nesting depth"
+            )));
+        }
+        Ok(())
+    }
+}
+
+struct JsonShapeSeed<'a> {
+    depth: usize,
+    state: &'a mut JsonShapeState,
+}
+
+impl<'de, 'a> DeserializeSeed<'de> for JsonShapeSeed<'a> {
+    type Value = ();
+
+    fn deserialize<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        deserializer.deserialize_any(JsonShapeVisitor {
+            depth: self.depth,
+            state: self.state,
+        })
+    }
+}
+
+struct RejectJsonValueSeed;
+
+impl<'de> DeserializeSeed<'de> for RejectJsonValueSeed {
+    type Value = ();
+
+    fn deserialize<D>(self, _deserializer: D) -> Result<Self::Value, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        Err(de::Error::custom(
+            "JSON-RPC collection exceeds its item limit",
+        ))
+    }
+}
+
+struct JsonShapeVisitor<'a> {
+    depth: usize,
+    state: &'a mut JsonShapeState,
+}
+
+impl<'de, 'a> Visitor<'de> for JsonShapeVisitor<'a> {
+    type Value = ();
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("a JSON value")
+    }
+
+    fn visit_unit<E>(self) -> Result<Self::Value, E>
+    where
+        E: de::Error,
+    {
+        self.state.visit_node(self.depth)
+    }
+
+    fn visit_bool<E>(self, _value: bool) -> Result<Self::Value, E>
+    where
+        E: de::Error,
+    {
+        self.state.visit_node(self.depth)
+    }
+
+    fn visit_i64<E>(self, _value: i64) -> Result<Self::Value, E>
+    where
+        E: de::Error,
+    {
+        self.state.visit_node(self.depth)
+    }
+
+    fn visit_u64<E>(self, _value: u64) -> Result<Self::Value, E>
+    where
+        E: de::Error,
+    {
+        self.state.visit_node(self.depth)
+    }
+
+    fn visit_f64<E>(self, _value: f64) -> Result<Self::Value, E>
+    where
+        E: de::Error,
+    {
+        self.state.visit_node(self.depth)
+    }
+
+    fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
+    where
+        E: de::Error,
+    {
+        if value.len() > MAX_JSONRPC_TEXT_BYTES {
+            return Err(E::custom(format!(
+                "JSON-RPC string exceeds {MAX_JSONRPC_TEXT_BYTES} bytes"
+            )));
+        }
+        self.state.visit_node(self.depth)
+    }
+
+    fn visit_borrowed_str<E>(self, value: &'de str) -> Result<Self::Value, E>
+    where
+        E: de::Error,
+    {
+        if value.len() > MAX_JSONRPC_TEXT_BYTES {
+            return Err(E::custom(format!(
+                "JSON-RPC string exceeds {MAX_JSONRPC_TEXT_BYTES} bytes"
+            )));
+        }
+        self.state.visit_node(self.depth)
+    }
+
+    fn visit_string<E>(self, value: String) -> Result<Self::Value, E>
+    where
+        E: de::Error,
+    {
+        if value.len() > MAX_JSONRPC_TEXT_BYTES {
+            return Err(E::custom(format!(
+                "JSON-RPC string exceeds {MAX_JSONRPC_TEXT_BYTES} bytes"
+            )));
+        }
+        self.state.visit_node(self.depth)
+    }
+
+    fn visit_none<E>(self) -> Result<Self::Value, E>
+    where
+        E: de::Error,
+    {
+        self.state.visit_node(self.depth)
+    }
+
+    fn visit_some<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        deserializer.deserialize_any(JsonShapeVisitor {
+            depth: self.depth,
+            state: self.state,
+        })
+    }
+
+    fn visit_seq<A>(self, mut sequence: A) -> Result<Self::Value, A::Error>
+    where
+        A: SeqAccess<'de>,
+    {
+        self.state.visit_node(self.depth)?;
+        let mut items = 0;
+        loop {
+            if items >= MAX_JSONRPC_COLLECTION_ITEMS {
+                let _ = sequence.next_element_seed(RejectJsonValueSeed)?;
+                break;
+            }
+            match sequence.next_element_seed(JsonShapeSeed {
+                depth: self.depth + 1,
+                state: self.state,
+            })? {
+                Some(()) => items += 1,
+                None => break,
+            }
+        }
+        Ok(())
+    }
+
+    fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+    where
+        A: MapAccess<'de>,
+    {
+        self.state.visit_node(self.depth)?;
+        let mut fields = 0;
+        loop {
+            if fields >= MAX_JSONRPC_COLLECTION_ITEMS {
+                if map.next_key::<IgnoredAny>()?.is_some() {
+                    return Err(de::Error::custom(format!(
+                        "JSON-RPC object contains more than {MAX_JSONRPC_COLLECTION_ITEMS} members"
+                    )));
+                }
+                break;
+            }
+            match map.next_key_seed(JsonKeySeed)? {
+                Some(_) => {
+                    map.next_value_seed(JsonShapeSeed {
+                        depth: self.depth + 1,
+                        state: self.state,
+                    })?;
+                    fields += 1;
+                }
+                None => break,
+            }
+        }
+        Ok(())
+    }
+}
+
+struct JsonKeySeed;
+
+impl<'de> DeserializeSeed<'de> for JsonKeySeed {
+    type Value = ();
+
+    fn deserialize<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        deserializer.deserialize_str(JsonKeyVisitor)
+    }
+}
+
+struct JsonKeyVisitor;
+
+impl<'de> Visitor<'de> for JsonKeyVisitor {
+    type Value = ();
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("a bounded JSON object key")
+    }
+
+    fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
+    where
+        E: de::Error,
+    {
+        if value.len() > MAX_JSONRPC_TEXT_BYTES {
+            return Err(E::custom(format!(
+                "JSON-RPC object key exceeds {MAX_JSONRPC_TEXT_BYTES} bytes"
+            )));
+        }
+        Ok(())
+    }
+
+    fn visit_borrowed_str<E>(self, value: &'de str) -> Result<Self::Value, E>
+    where
+        E: de::Error,
+    {
+        self.visit_str(value)
+    }
+
+    fn visit_string<E>(self, value: String) -> Result<Self::Value, E>
+    where
+        E: de::Error,
+    {
+        self.visit_str(&value)
+    }
 }
 
 fn is_jsonrpc_unavailable(error: &anyhow::Error) -> bool {
@@ -662,6 +948,11 @@ fn parse_multicall_response(
     method: &str,
 ) -> Result<Vec<Result<XmlValue, String>>> {
     let items = response.try_into_array()?;
+    if items.len() > MAX_XMLRPC_COLLECTION_ITEMS {
+        bail!(
+            "system.multicall({method}) returned more than {MAX_XMLRPC_COLLECTION_ITEMS} results"
+        );
+    }
     if items.len() != expected_count {
         bail!(
             "system.multicall({method}) returned {} results for {} calls",
@@ -690,6 +981,7 @@ fn parse_multicall_response(
 
 fn parse_xmlrpc_response(xml: &[u8]) -> Result<XmlValue> {
     let xml_str = std::str::from_utf8(xml).context("XMLRPC response not UTF-8")?;
+    validate_xmlrpc_shape(xml_str)?;
     let mut reader = Reader::from_str(xml_str);
     reader.config_mut().trim_text(true);
 
@@ -722,6 +1014,56 @@ fn parse_xmlrpc_response(xml: &[u8]) -> Result<XmlValue> {
     }
 
     parse_value(&mut reader)
+}
+
+/// Validate the structural complexity before the recursive XML-RPC projection
+/// runs. The SCGI byte ceiling alone still permits a deeply nested document or
+/// millions of empty elements to exhaust parser stack/CPU resources.
+fn validate_xmlrpc_shape(xml: &str) -> Result<()> {
+    let mut reader = Reader::from_str(xml);
+    let mut depth = 0usize;
+    let mut nodes = 0usize;
+    loop {
+        match reader.read_event()? {
+            Event::Start(_) => {
+                nodes = nodes.saturating_add(1);
+                if nodes > MAX_XMLRPC_NODES {
+                    bail!("XML-RPC response exceeds {MAX_XMLRPC_NODES} element limit");
+                }
+                depth = depth.saturating_add(1);
+                if depth > MAX_XMLRPC_DEPTH {
+                    bail!("XML-RPC response exceeds {MAX_XMLRPC_DEPTH} nesting depth");
+                }
+            }
+            Event::Empty(_) => {
+                nodes = nodes.saturating_add(1);
+                if nodes > MAX_XMLRPC_NODES {
+                    bail!("XML-RPC response exceeds {MAX_XMLRPC_NODES} element limit");
+                }
+            }
+            Event::Text(text) => {
+                if text.as_ref().len() > MAX_XMLRPC_TEXT_BYTES {
+                    bail!("XML-RPC text exceeds {MAX_XMLRPC_TEXT_BYTES} byte limit");
+                }
+            }
+            Event::CData(text) => {
+                if text.as_ref().len() > MAX_XMLRPC_TEXT_BYTES {
+                    bail!("XML-RPC text exceeds {MAX_XMLRPC_TEXT_BYTES} byte limit");
+                }
+            }
+            Event::End(_) => {
+                depth = depth
+                    .checked_sub(1)
+                    .ok_or_else(|| anyhow!("XML-RPC response has an unmatched closing element"))?;
+            }
+            Event::Eof => break,
+            _ => {}
+        }
+    }
+    if depth != 0 {
+        bail!("XML-RPC response has an unterminated element");
+    }
+    Ok(())
 }
 
 fn parse_value(reader: &mut Reader<&[u8]>) -> Result<XmlValue> {
@@ -824,6 +1166,11 @@ fn parse_struct(reader: &mut Reader<&[u8]>, depth: usize) -> Result<XmlValue> {
         match reader.read_event()? {
             Event::Start(e) => match e.name().into_inner() {
                 "name" => {
+                    if fields.len() >= MAX_XMLRPC_COLLECTION_ITEMS {
+                        bail!(
+                            "XML-RPC struct contains more than {MAX_XMLRPC_COLLECTION_ITEMS} members"
+                        );
+                    }
                     current_name = read_text_string(reader, e.name())?;
                 }
                 "value" => {
@@ -947,7 +1294,7 @@ mod multicall_tests {
         let error = parse_xmlrpc_response(xml.as_bytes()).unwrap_err();
         assert!(error
             .to_string()
-            .contains("XML-RPC value nesting exceeds 64 levels"));
+            .contains("XML-RPC response exceeds 64 nesting depth"));
     }
 
     #[test]

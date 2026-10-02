@@ -88,7 +88,8 @@ if [[ ! -f "$config_path" ]]; then
 fi
 mark "Proton config" "PASS" "$LABEL"
 
-set +e
+# The script is intentionally evaluated inside the Proton network namespace.
+# shellcheck disable=SC2016
 "$SLSKR_ROOT/scripts/run-in-proton-wg-netns.sh" "$NAMESPACE" "$config_path" \
   bash -lc '
     set -euo pipefail
@@ -112,17 +113,25 @@ fi
 
 proton_ip="$(sed -n 's/^egress=//p' "$TMP_OUTPUT" | tail -1)"
 [[ -n "$proton_ip" ]] || proton_ip="$(sed -n 's/^Public IP address : //p' "$TMP_OUTPUT" | tail -1)"
-[[ -n "$proton_ip" ]] && mark "Proton egress IP" "PASS" "$proton_ip" || mark "Proton egress IP" "FAIL" "missing"
+if [[ -n "$proton_ip" ]]; then
+  mark "Proton egress IP" "PASS" "$proton_ip"
+else
+  mark "Proton egress IP" "FAIL" "missing"
+fi
 
 tcp_mapping="$(awk '/Mapped public port/ && /protocol TCP/ {for (i=1; i<=NF; i++) if ($i=="port") {print $(i+1); exit}}' "$TMP_OUTPUT")"
 udp_mapping="$(awk '/Mapped public port/ && /protocol UDP/ {for (i=1; i<=NF; i++) if ($i=="port") {print $(i+1); exit}}' "$TMP_OUTPUT")"
 
-[[ -n "$tcp_mapping" ]] \
-  && mark "TCP Proton NAT-PMP mapping" "PASS" "public=$tcp_mapping private=$PRIVATE_PORT" \
-  || mark "TCP Proton NAT-PMP mapping" "FAIL" "missing"
-[[ -n "$udp_mapping" ]] \
-  && mark "UDP Proton NAT-PMP mapping" "PASS" "public=$udp_mapping private=$PRIVATE_PORT" \
-  || mark "UDP Proton NAT-PMP mapping" "FAIL" "missing"
+if [[ -n "$tcp_mapping" ]]; then
+  mark "TCP Proton NAT-PMP mapping" "PASS" "public=$tcp_mapping private=$PRIVATE_PORT"
+else
+  mark "TCP Proton NAT-PMP mapping" "FAIL" "missing"
+fi
+if [[ -n "$udp_mapping" ]]; then
+  mark "UDP Proton NAT-PMP mapping" "PASS" "public=$udp_mapping private=$PRIVATE_PORT"
+else
+  mark "UDP Proton NAT-PMP mapping" "FAIL" "missing"
+fi
 
 container_ip="$(docker exec "$TNG_CONTAINER" sh -lc 'wget -qO- https://api.ipify.org 2>/dev/null || true' 2>/dev/null | tr -d '\r\n')"
 if [[ -n "$container_ip" && -n "$proton_ip" && "$container_ip" == "$proton_ip" ]]; then

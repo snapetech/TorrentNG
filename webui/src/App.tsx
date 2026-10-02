@@ -26,6 +26,7 @@ import { PALETTES, applyTheme, findPalette, THEME_MODE_STORAGE_KEY, THEME_STORAG
 const EnginePanel = lazy(() => import('./components/EnginePanel').then(module => ({ default: module.EnginePanel })))
 const StoragePanel = lazy(() => import('./components/StoragePanel').then(module => ({ default: module.StoragePanel })))
 const UserAgentPanel = lazy(() => import('./components/UserAgentPanel').then(module => ({ default: module.UserAgentPanel })))
+const CrashSafetyPanel = lazy(() => import('./components/CrashSafetyPanel').then(module => ({ default: module.CrashSafetyPanel })))
 const RatioGroupsPanel = lazy(() => import('./components/RatioGroupsPanel').then(module => ({ default: module.RatioGroupsPanel })))
 const WorkflowsPanel = lazy(() => import('./components/WorkflowsPanel').then(module => ({ default: module.WorkflowsPanel })))
 const RssRulesPanel = lazy(() => import('./components/RssRulesPanel').then(module => ({ default: module.RssRulesPanel })))
@@ -108,6 +109,7 @@ const preloadSettingsPanels = {
   engine: () => {
     void import('./components/EnginePanel')
     void import('./components/UserAgentPanel')
+    void import('./components/CrashSafetyPanel')
     void import('./components/LogsPanel')
   },
   automation: () => {
@@ -1268,6 +1270,7 @@ function SettingsView({ section, onSection, mediaInference, onMediaInference, th
           <PanelTitle title="Backend" subtitle="Runtime diagnostics, settings, and capability checks" />
           <PanelFrame><EnginePanel /></PanelFrame>
           <PanelFrame><UserAgentPanel /></PanelFrame>
+          <PanelFrame><CrashSafetyPanel /></PanelFrame>
           <PanelFrame><LogsPanel /></PanelFrame>
         </section>)}
         {section === 'automation' && (<section id="settings-panel-automation" role="tabpanel" aria-labelledby="settings-tab-automation" tabIndex={0}>
@@ -1500,7 +1503,7 @@ function LoginScreen({ message, onLogin }: {
             <h1 style={{ margin: 0, fontWeight: 800, fontSize: 18 }}>TorrentNG</h1>
           </div>
           <div style={{ color: 'var(--faint)', fontSize: 12, marginTop: 4, lineHeight: 1.5 }}>
-            Fresh loopback installs use <strong>torrentng / torrentng</strong>. An API token also works in either field. On Unraid, find it in the native template’s <strong>API Token</strong> setting or the WebUI template’s <strong>API Tokens</strong> setting. Native config uses <code>[auth].api_tokens</code> or <code>[auth].api_tokens_file</code>; the WebUI service also accepts <code>TNG_API_TOKENS</code> or <code>RTNG_API_TOKENS</code>.
+            Fresh installs generate a unique WebUI password. Run <code>torrentngd auth-token</code> for the native daemon or <code>torrentng auth-token</code> for the WebUI service in its console to retrieve it. An API token also works in either field. On Unraid, find it in the native template’s <strong>API Token</strong> setting or the WebUI template’s <strong>API Tokens</strong> setting. Native config uses <code>[auth].api_tokens</code> or <code>[auth].api_tokens_file</code>; the WebUI service also accepts <code>TNG_API_TOKENS</code> or <code>RTNG_API_TOKENS</code>.
           </div>
         </div>
         <label className="tng-form-card" style={{ display: 'flex', flexDirection: 'column', gap: 5, fontSize: 12, color: 'var(--muted)' }}>

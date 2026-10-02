@@ -11,6 +11,11 @@ use crate::error::DbError;
 pub const MAX_SESSION_EVENT_PAYLOAD_BYTES: usize = 256 * 1024;
 pub const MAX_JOB_EVENT_PAYLOAD_BYTES: usize = 1024 * 1024;
 pub const MAX_SESSION_EVENT_RESULT_ITEMS: usize = 1_000;
+/// Bound the aggregate strings retained by one session-event query. Per-row
+/// validation prevents a single corrupt value, while this cap prevents a
+/// valid set of near-limit rows from multiplying into an oversized API
+/// snapshot.
+pub const MAX_SESSION_EVENT_RESULT_BYTES: usize = 64 * 1024 * 1024;
 pub const MAX_JOB_EVENT_RESULT_ITEMS: usize = 1_024;
 const MAX_EVENT_INFO_HASH_BYTES: usize = 64;
 const MAX_EVENT_JOB_ID_BYTES: usize = 256;
@@ -363,10 +368,37 @@ pub fn list_session_events_filtered(
     values.push(Value::Integer(limit));
 
     let mut stmt = conn.prepare(&sql)?;
-    let rows = stmt
-        .query_map(params_from_iter(values), SessionEventRow::from_row)?
-        .collect::<rusqlite::Result<Vec<_>>>()?;
-    Ok(rows)
+    let mut rows = stmt.query(params_from_iter(values))?;
+    let mut result = Vec::new();
+    let mut result_bytes = 0usize;
+    while let Some(row) = rows.next()? {
+        let event = SessionEventRow::from_row(row)?;
+        result_bytes = checked_session_event_result_bytes(result_bytes, &event)?;
+        result.push(event);
+    }
+    Ok(result)
+}
+
+fn checked_session_event_result_bytes(
+    current: usize,
+    event: &SessionEventRow,
+) -> Result<usize, DbError> {
+    let event_bytes = event
+        .info_hash
+        .as_ref()
+        .map_or(0, String::len)
+        .saturating_add(event.kind.len())
+        .saturating_add(event.message.as_ref().map_or(0, String::len))
+        .saturating_add(event.payload.len());
+    let total = current.saturating_add(event_bytes);
+    if total > MAX_SESSION_EVENT_RESULT_BYTES {
+        return Err(DbError::ValueTooLarge {
+            field: "session event result",
+            len: total as u64,
+            max: MAX_SESSION_EVENT_RESULT_BYTES as u64,
+        });
+    }
+    Ok(total)
 }
 
 fn session_event_level(row: &SessionEventRow) -> &'static str {
@@ -693,6 +725,22 @@ mod tests {
         let events = list_session_events_filtered(&conn, None, None, &[], Some(1), 10).unwrap();
         assert_eq!(events.len(), 1);
         assert!(events[0].event_id.unwrap_or_default() > 1);
+    }
+
+    #[test]
+    fn session_event_result_bound_rejects_aggregate_overflow() {
+        let event = SessionEventRow {
+            event_id: Some(1),
+            occurred_at: 0,
+            info_hash: None,
+            kind: "test".into(),
+            message: None,
+            payload: "{}".into(),
+        };
+        assert!(checked_session_event_result_bytes(0, &event).is_ok());
+        assert!(
+            checked_session_event_result_bytes(MAX_SESSION_EVENT_RESULT_BYTES, &event).is_err()
+        );
     }
 
     #[test]

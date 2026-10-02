@@ -10,7 +10,7 @@ status="PASS"
 started_at="$(date +%s)"
 
 {
-  echo "# TorrentNG Release-Optimized Backend Scale Evidence"
+  echo "# TorrentNG Release-Optimized Backend Performance Diagnostic"
   echo
   echo "- Date UTC: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
   echo "- Host: $(hostname)"
@@ -24,9 +24,9 @@ started_at="$(date +%s)"
     echo "- Worktree: dirty"
   fi
   echo
-  echo "This is the release-optimized synthetic scale suite. It exercises the"
-  echo "API projection and storage seams in optimized test binaries; it is not"
-  echo "a claim that the production daemon has been certified at 100k torrents."
+  echo "This is an opt-in release-optimized diagnostic suite. It exercises the"
+  echo "API projection and storage seams in optimized test binaries; it is not a"
+  echo "release gate or a numeric torrent-capacity certification."
   echo
   echo "## Command"
   echo

@@ -6,7 +6,8 @@ use serde_json::{json, Value};
 use std::{collections::BTreeMap, net::SocketAddr};
 
 use super::{
-    map_qbit_piece_state, parse_qbit_peer_response, response_bytes_bounded, response_json_bounded,
+    ensure_backend_collection_bound, map_qbit_piece_state, parse_backend_url,
+    parse_qbit_peer_response, response_bytes_bounded, response_json_bounded,
     validate_qbit_mutation_body, BackendCapabilities, BackendPeer, BackendPieceState,
     BackendStatus, BackendTransferLimits, BackendType, QueueMove, TorrentBackend,
     MAX_BACKEND_JSON_BYTES,
@@ -30,11 +31,15 @@ impl TorrentngBackend {
         let client = super::backend_client_builder()
             .timeout(std::time::Duration::from_secs(cfg.timeout_secs.max(1)))
             .danger_accept_invalid_certs(cfg.accept_invalid_certs)
+            // Backend URLs are explicit operator configuration. Do not let
+            // ambient proxy variables silently redirect API credentials or
+            // control traffic to another intermediary.
+            .no_proxy()
             .build()
             .context("create TorrentNG API client")?;
         Ok(Self {
             client,
-            base_url: Url::parse(cfg.url.trim()).context("parse torrentng.url")?,
+            base_url: parse_backend_url(&cfg.url, "torrentng.url")?,
             api_token: cfg.api_token.clone(),
         })
     }
@@ -185,6 +190,10 @@ impl TorrentBackend for TorrentngBackend {
                 .get("torrents")
                 .and_then(Value::as_array)
                 .ok_or_else(|| anyhow::anyhow!("TorrentNG list response missing torrents array"))?;
+            ensure_backend_collection_bound(page.len(), "TorrentNG torrent page")?;
+            if page.len() > TORRENT_PAGE_SIZE {
+                bail!("TorrentNG torrent page exceeded requested page size {TORRENT_PAGE_SIZE}");
+            }
             let page_snapshot = body
                 .get("snapshot")
                 .and_then(Value::as_u64)
@@ -222,8 +231,12 @@ impl TorrentBackend for TorrentngBackend {
                 ));
             }
             result.extend(page.iter().map(map_summary).collect::<Result<Vec<_>>>()?);
-            if result.len() >= total {
-                result.truncate(total);
+            if result.len() > total {
+                return Err(anyhow::anyhow!(
+                    "TorrentNG list response returned more torrents than its declared total"
+                ));
+            }
+            if result.len() == total {
                 return Ok(result);
             }
             let next_offset = offset.saturating_add(page.len());
@@ -277,6 +290,7 @@ impl TorrentBackend for TorrentngBackend {
             .get("torrents")
             .and_then(Value::as_array)
             .ok_or_else(|| anyhow::anyhow!("TorrentNG range response missing torrents array"))?;
+        ensure_backend_collection_bound(torrents.len(), "TorrentNG torrent page")?;
         if torrents.len() > limit {
             bail!("TorrentNG range response exceeded requested page size {limit}");
         }
@@ -406,6 +420,7 @@ impl TorrentBackend for TorrentngBackend {
 
     async fn list_trackers(&self, hash: &str) -> Result<Vec<RawTracker>> {
         let trackers: Vec<Value> = self.get_json(&Self::torrent_path(hash, "trackers")).await?;
+        ensure_backend_collection_bound(trackers.len(), "TorrentNG trackers")?;
         let mut out = Vec::with_capacity(trackers.len());
         for (index, tracker) in trackers.iter().enumerate() {
             let url = tracker
@@ -467,36 +482,25 @@ impl TorrentBackend for TorrentngBackend {
     }
 
     async fn list_files(&self, hash: &str) -> Result<Vec<RawFile>> {
-        let files: Vec<Value> = self.get_json(&Self::torrent_path(hash, "files")).await?;
-        let mut out = Vec::with_capacity(files.len());
-        for file in &files {
-            let index = required_nonnegative_usize(file, "file_index")?;
-            let path = required_string(file, "path")?;
-            let length = required_nonnegative_i64(file, "length")?;
-            let priority = required_i64(file, "priority")?;
-            if !(0..=2).contains(&priority) {
-                bail!("TorrentNG file {index} returned invalid priority {priority}");
-            }
-            out.push(RawFile {
-                index,
-                path,
-                size_bytes: length,
-                size_chunks: length,
-                completed_chunks: 0,
-                priority,
-                is_created: true,
-                is_open: true,
-            });
-        }
-        Ok(out)
+        let files: Vec<Value> = self
+            .get_json(&format!(
+                "api/qb/v2/torrents/files?hash={}",
+                urlencoding::encode(hash)
+            ))
+            .await?;
+        ensure_backend_collection_bound(files.len(), "TorrentNG files")?;
+        files.iter().map(map_torrentng_file).collect()
     }
 
     async fn list_webseeds(&self, hash: &str) -> Result<Vec<String>> {
-        self.get_json(&format!(
-            "api/qb/v2/torrents/webseeds?hash={}",
-            urlencoding::encode(hash)
-        ))
-        .await
+        let webseeds: Vec<String> = self
+            .get_json(&format!(
+                "api/qb/v2/torrents/webseeds?hash={}",
+                urlencoding::encode(hash)
+            ))
+            .await?;
+        ensure_backend_collection_bound(webseeds.len(), "TorrentNG webseeds")?;
+        Ok(webseeds)
     }
 
     async fn piece_states(&self, hash: &str) -> Result<Vec<BackendPieceState>> {
@@ -506,15 +510,19 @@ impl TorrentBackend for TorrentngBackend {
                 urlencoding::encode(hash)
             ))
             .await?;
+        ensure_backend_collection_bound(states.len(), "TorrentNG piece states")?;
         states.into_iter().map(map_qbit_piece_state).collect()
     }
 
     async fn piece_hashes(&self, hash: &str) -> Result<Vec<String>> {
-        self.get_json(&format!(
-            "api/qb/v2/torrents/pieceHashes?hash={}",
-            urlencoding::encode(hash)
-        ))
-        .await
+        let hashes: Vec<String> = self
+            .get_json(&format!(
+                "api/qb/v2/torrents/pieceHashes?hash={}",
+                urlencoding::encode(hash)
+            ))
+            .await?;
+        ensure_backend_collection_bound(hashes.len(), "TorrentNG piece hashes")?;
+        Ok(hashes)
     }
 
     async fn list_peers(&self, hash: &str) -> Result<Vec<BackendPeer>> {
@@ -814,6 +822,7 @@ impl TorrentBackend for TorrentngBackend {
             .get("tags")
             .and_then(Value::as_array)
             .ok_or_else(|| anyhow::anyhow!("TorrentNG torrent response omitted tags array"))?;
+        ensure_backend_collection_bound(current_tags.len(), "TorrentNG torrent tags")?;
         let current_tags = current_tags
             .iter()
             .map(|tag| {
@@ -914,16 +923,18 @@ fn map_summary(t: &Value) -> Result<RawTorrent> {
             bail!("TorrentNG torrent reports {amount_left} bytes left for size {size}");
         }
     }
-    let bytes_done = if state == "seeding" {
-        // TorrentNG-client seeding is the upload-side lifecycle state and therefore
-        // proves the payload is complete, even on older servers that did not
-        // expose the optional live `amount_left` field.
-        size
-    } else {
-        amount_left.map_or(downloaded.min(size), |amount_left| {
-            size.saturating_sub(amount_left)
-        })
-    };
+    let bytes_done = amount_left.map_or_else(
+        || {
+            // Older native servers did not expose `amount_left`; on that wire
+            // shape the lifecycle state is the only completion signal.
+            if state == "seeding" {
+                size
+            } else {
+                downloaded.min(size)
+            }
+        },
+        |amount_left| size.saturating_sub(amount_left),
+    );
     let uploaded = required_nonnegative_i64(t, "uploaded")?;
     let ratio = t
         .get("ratio")
@@ -940,7 +951,9 @@ fn map_summary(t: &Value) -> Result<RawTorrent> {
     let tags = t
         .get("tags")
         .and_then(Value::as_array)
-        .ok_or_else(|| anyhow::anyhow!("TorrentNG response omitted tags array"))?
+        .ok_or_else(|| anyhow::anyhow!("TorrentNG response omitted tags array"))?;
+    ensure_backend_collection_bound(tags.len(), "TorrentNG torrent tags")?;
+    let tags = tags
         .iter()
         .map(|tag| {
             tag.as_str()
@@ -984,7 +997,7 @@ fn map_summary(t: &Value) -> Result<RawTorrent> {
         // and cannot prove that the current payload is complete. Only the
         // lifecycle projection can establish completion on that wire shape.
         complete: amount_left.map_or(state == "seeding", |amount_left| {
-            state == "seeding" || (size > 0 && amount_left == 0)
+            size > 0 && amount_left == 0
         }),
         state: state_code,
         priority: 0,
@@ -1030,6 +1043,13 @@ fn required_i64(value: &Value, field: &str) -> Result<i64> {
         .ok_or_else(|| anyhow::anyhow!("TorrentNG response omitted valid {field}"))
 }
 
+fn required_f64(value: &Value, field: &str) -> Result<f64> {
+    value
+        .get(field)
+        .and_then(Value::as_f64)
+        .ok_or_else(|| anyhow::anyhow!("TorrentNG response omitted valid {field}"))
+}
+
 fn required_nonnegative_i64_value(value: &Value, field: &str) -> Result<i64> {
     let number = value
         .as_i64()
@@ -1051,6 +1071,32 @@ fn required_nonnegative_i64(value: &Value, field: &str) -> Result<i64> {
 fn required_nonnegative_usize(value: &Value, field: &str) -> Result<usize> {
     usize::try_from(required_nonnegative_i64(value, field)?)
         .with_context(|| format!("TorrentNG response {field} exceeds usize"))
+}
+
+fn map_torrentng_file(file: &Value) -> Result<RawFile> {
+    let index = required_nonnegative_usize(file, "index")?;
+    let path = required_string(file, "name")?;
+    let length = required_nonnegative_i64(file, "size")?;
+    let progress = required_f64(file, "progress")?;
+    if !progress.is_finite() || !(0.0..=1.0).contains(&progress) {
+        bail!("TorrentNG file {index} returned invalid progress");
+    }
+    let priority = match required_i64(file, "priority")? {
+        0 => 0,
+        1 => 1,
+        6 | 7 => 2,
+        other => bail!("TorrentNG file {index} returned invalid priority {other}"),
+    };
+    Ok(RawFile {
+        index,
+        path,
+        size_bytes: length,
+        size_chunks: length,
+        completed_chunks: (length as f64 * progress).round() as i64,
+        priority,
+        is_created: true,
+        is_open: true,
+    })
 }
 
 fn torrentng_status_for_view(view: &str) -> Result<Option<String>> {
@@ -1214,6 +1260,32 @@ mod tests {
 
         assert_eq!(mapped.bytes_done, 50);
         assert_eq!(mapped.down_total, 100);
+        assert!(!mapped.complete);
+    }
+
+    #[test]
+    fn native_summary_does_not_trust_stale_seeding_with_live_remaining_bytes() {
+        let raw = json!({
+            "info_hash": "abc",
+            "name": "stale-seeding",
+            "state": "seeding",
+            "total_length": 100,
+            "downloaded": 100,
+            "amount_left": 50,
+            "uploaded": 0,
+            "ratio": 0.0,
+            "save_path": "/data",
+            "category": null,
+            "tags": [],
+            "added_at": 10,
+            "completed_at": 20,
+            "num_peers": 0,
+            "num_seeds": 0
+        });
+
+        let mapped = map_summary(&raw).unwrap();
+
+        assert_eq!(mapped.bytes_done, 50);
         assert!(!mapped.complete);
     }
 

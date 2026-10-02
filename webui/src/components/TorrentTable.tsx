@@ -1,6 +1,6 @@
 import { useRef, useEffect, useMemo, useState } from 'react'
 import { useVirtualizer } from '@tanstack/react-virtual'
-import type { TorrentSummary, ListParams } from '../api/client'
+import { isFinalizing, type TorrentSummary, type ListParams } from '../api/client'
 import { useLiveTorrentStats, useSmoothedLiveRates, type SmoothedLiveRate } from '../hooks/useTorrents'
 import type { MediaInferenceMode } from './AppearancePanel'
 import { maskAnnounceUrl } from '../lib/maskUrl'
@@ -134,6 +134,7 @@ function statusLabel(t: TorrentSummary): { label: string; accessibleLabel: strin
   if (t.state === 4) return { label: 'Metadata', accessibleLabel: 'Waiting for metadata', color: 'var(--muted)' }
   if (t.state === 5) return { label: 'Queued', accessibleLabel: 'Queued', color: 'var(--muted)' }
   if (t.complete && t.is_active) return { label: 'Seeding', accessibleLabel: 'Seeding', color: 'var(--success)' }
+  if (isFinalizing(t)) return { label: 'Sync', accessibleLabel: 'Finalizing: waiting for storage to confirm the data is on disk', color: 'var(--warning)' }
   if (!t.complete && t.is_active) return { label: 'DL', accessibleLabel: 'Downloading', color: 'var(--accent)' }
   if (t.is_open) return { label: 'Stalled', accessibleLabel: 'Stalled', color: 'var(--warning)' }
   return { label: 'Queued', accessibleLabel: 'Queued', color: 'var(--muted)' }

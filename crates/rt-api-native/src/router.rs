@@ -14,12 +14,13 @@ use crate::{
     handlers::{
         add_torrent, add_torrent_peers, add_torrent_tags, apply_rss_rules, auth_login, auth_logout,
         auth_settings, bulk_action, cancel_job, categories, create_tag, cross_seed,
-        delete_category, delete_saved_json, delete_tag, delete_torrent, diagnose_torrent,
-        engine_commands, engine_diagnostics, get_torrent, get_user_agent, health, list_json_map,
-        list_session_events, list_torrent_files, list_torrent_trackers, list_torrents,
-        list_workflow_runs, live_torrent_stats, logs, metrics, patch_torrent_files,
-        patch_torrent_trackers, pause_job, pause_torrent, reannounce_torrent, recheck_torrent,
-        remove_torrent_tags, reset_auth_settings, restart_engine, resume_job, resume_torrent,
+        delete_category, delete_saved_json, delete_tag, delete_torrent, describe_crash_safety_path,
+        diagnose_torrent, engine_commands, engine_diagnostics, get_crash_safety, get_torrent,
+        get_user_agent, health, list_json_map, list_session_events, list_torrent_files,
+        list_torrent_trackers, list_torrents, list_workflow_runs, live_torrent_stats, logs,
+        metrics, patch_torrent_files, patch_torrent_trackers, pause_job, pause_torrent,
+        put_crash_safety, reannounce_torrent, recheck_torrent, remove_torrent_tags,
+        reset_auth_settings, reset_crash_safety, restart_engine, resume_job, resume_torrent,
         rtorrent_settings, run_json_workflow, save_rtorrent_settings, session_features,
         session_settings, set_torrent_category, set_user_agent, sidebar_facets, storage,
         storage_execute_plan, storage_preview_plan, stream_events, tags, test_rss_rules,
@@ -30,9 +31,10 @@ use crate::{
     state::AppState,
 };
 use rt_api_model::{
-    api_token_allowed, bearer_token, csrf_request_allowed, has_browser_request_headers,
-    has_session_cookie, request_fingerprint, valid_idempotency_key, CachedResponse,
-    IdempotencyClaim, MAX_IDEMPOTENCY_BODY_BYTES,
+    api_token_allowed, api_uri_is_bounded, bearer_token, cached_response_headers,
+    csrf_request_allowed, has_browser_request_headers, has_session_cookie,
+    is_replayable_response_header, request_fingerprint, single_header_value, valid_idempotency_key,
+    CachedResponse, IdempotencyClaim, MAX_IDEMPOTENCY_BODY_BYTES,
 };
 use tower::limit::GlobalConcurrencyLimitLayer;
 
@@ -186,6 +188,16 @@ pub fn build_router(state: AppState) -> Router {
             get(get_user_agent).put(set_user_agent),
         )
         .route(
+            "/api/v1/settings/crash-safety",
+            get(get_crash_safety)
+                .put(put_crash_safety)
+                .delete(reset_crash_safety),
+        )
+        .route(
+            "/api/v1/settings/crash-safety/path",
+            get(describe_crash_safety_path),
+        )
+        .route(
             "/api/v1/torrents/:hash/files",
             get(list_torrent_files).patch(patch_torrent_files),
         )
@@ -212,7 +224,46 @@ pub fn build_router(state: AppState) -> Router {
         // The route-local limit above is the only path that needs the larger
         // TorrentNG JSON/base64 envelope.
         .layer(DefaultBodyLimit::max(MAX_NATIVE_DEFAULT_BODY_BYTES))
+        .layer(middleware::from_fn(native_request_uri_guard))
         .with_state(state)
+}
+
+async fn native_request_uri_guard(req: Request<Body>, next: Next) -> Response {
+    if !api_uri_is_bounded(req.uri()) {
+        return (
+            StatusCode::URI_TOO_LONG,
+            "request URI exceeds the maximum length",
+        )
+            .into_response();
+    }
+    next.run(req).await
+}
+
+fn cookie_component_decode(input: &str) -> Option<String> {
+    let bytes = input.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] != b'%' {
+            decoded.push(bytes[index]);
+            index += 1;
+            continue;
+        }
+        let high = *bytes.get(index + 1)?;
+        let low = *bytes.get(index + 2)?;
+        decoded.push((hex_value(high)? << 4) | hex_value(low)?);
+        index += 3;
+    }
+    String::from_utf8(decoded).ok()
+}
+
+fn hex_value(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
 }
 
 /// Coalesce retries of successful TorrentNG HTTP mutations. Durable engine jobs
@@ -231,16 +282,22 @@ async fn torrentng_idempotency_guard(
             | &axum::http::Method::DELETE
     ) || torrentng_auth_path(req.uri().path())
     {
+        // Multipart torrent uploads have a larger route-local limit and a
+        // separate concurrency budget. Do not buffer them in this small
+        // idempotency middleware before those guards can run.
         return next.run(req).await;
     }
 
-    let Some(key) = req
-        .headers()
-        .get("idempotency-key")
-        .and_then(|value| value.to_str().ok())
-        .map(str::to_owned)
-    else {
-        return next.run(req).await;
+    let key = match single_header_value(req.headers(), "idempotency-key") {
+        Ok(Some(value)) => value.to_owned(),
+        Ok(None) => return next.run(req).await,
+        Err(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                "duplicate Idempotency-Key headers are not accepted",
+            )
+                .into_response();
+        }
     };
     if !valid_idempotency_key(&key) {
         return (StatusCode::BAD_REQUEST, "invalid Idempotency-Key").into_response();
@@ -295,11 +352,7 @@ async fn torrentng_idempotency_guard(
     };
     let response = Response::from_parts(parts.clone(), Body::from(body.clone()));
     if parts.status.is_success() {
-        let headers = parts
-            .headers
-            .iter()
-            .map(|(name, value)| (name.to_string(), value.as_bytes().to_vec()))
-            .collect();
+        let headers = cached_response_headers(&parts.headers);
         execution.complete(CachedResponse {
             status: parts.status.as_u16(),
             headers,
@@ -324,8 +377,18 @@ fn replay_response(cached: CachedResponse) -> Response {
             .into_response();
     }
     let mut response = Response::new(Body::from(cached.body));
-    *response.status_mut() = StatusCode::from_u16(cached.status).unwrap_or(StatusCode::OK);
+    let Ok(status) = StatusCode::from_u16(cached.status) else {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "cached idempotency response had an invalid status",
+        )
+            .into_response();
+    };
+    *response.status_mut() = status;
     for (name, value) in cached.headers {
+        if !is_replayable_response_header(&name) {
+            continue;
+        }
         let Ok(name) = axum::http::HeaderName::from_bytes(name.as_bytes()) else {
             continue;
         };
@@ -470,36 +533,6 @@ fn torrentng_session_cookie(cookie: &str) -> Option<String> {
     })
 }
 
-fn cookie_component_decode(input: &str) -> Option<String> {
-    let bytes = input.as_bytes();
-    let mut output = Vec::with_capacity(bytes.len());
-    let mut index = 0;
-    while index < bytes.len() {
-        if bytes[index] != b'%' {
-            output.push(bytes[index]);
-            index += 1;
-            continue;
-        }
-        if index + 2 >= bytes.len() {
-            return None;
-        }
-        let high = hex_value(bytes[index + 1])?;
-        let low = hex_value(bytes[index + 2])?;
-        output.push((high << 4) | low);
-        index += 3;
-    }
-    String::from_utf8(output).ok()
-}
-
-fn hex_value(byte: u8) -> Option<u8> {
-    match byte {
-        b'0'..=b'9' => Some(byte - b'0'),
-        b'a'..=b'f' => Some(byte - b'a' + 10),
-        b'A'..=b'F' => Some(byte - b'A' + 10),
-        _ => None,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::{build_router, torrentng_auth_path, torrentng_public_path};
@@ -507,6 +540,24 @@ mod tests {
     use axum::{body::Body, http::Request};
     use std::sync::Arc;
     use tower::ServiceExt;
+
+    #[tokio::test]
+    async fn auth_routes_reject_oversized_bodies_before_handler_execution() {
+        let response = build_router(AppState::new())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/auth/login")
+                    .body(Body::from(vec![
+                        b'x';
+                        super::MAX_NATIVE_AUTH_BODY_BYTES + 1
+                    ]))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), axum::http::StatusCode::PAYLOAD_TOO_LARGE);
+    }
 
     #[test]
     fn native_auth_paths_are_exact() {

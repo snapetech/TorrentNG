@@ -2,7 +2,47 @@ use anyhow::{anyhow, bail, Result};
 use rusqlite::{params, params_from_iter, OptionalExtension, Transaction};
 use std::{collections::BTreeSet, error::Error, fmt};
 
-use super::db::{allocate_revision, canonical_hash, prune_removed_tombstones, Db};
+use super::db::{
+    allocate_revision, canonical_hash, prune_removed_tombstones, sql_limit_with_sentinel,
+    validate_torrent_tag_bytes, Db, MAX_TORRENT_TAGS,
+};
+
+pub const MAX_CATEGORY_ENTRIES: usize = 5_000;
+pub const MAX_TAG_ENTRIES: usize = 5_000;
+/// Keep category and save-path values bounded before they reach SQLite,
+/// backend adapters, or compatibility responses.  The cache is a trust
+/// boundary because callers include backend projections as well as HTTP input.
+pub const MAX_CATEGORY_TEXT_BYTES: usize = 64 * 1024;
+pub const MAX_TAG_TEXT_BYTES: usize = 16 * 1024;
+pub const MAX_TORRENT_LOCATION_TEXT_BYTES: usize = 64 * 1024;
+
+pub(crate) fn bounded_text_from_sql(
+    row: &rusqlite::Row<'_>,
+    length_index: usize,
+    value_index: usize,
+    maximum: usize,
+    field: &'static str,
+) -> rusqlite::Result<String> {
+    let bytes = row.get::<_, i64>(length_index)?;
+    if bytes < 0 || bytes as u64 > maximum as u64 {
+        return Err(rusqlite::Error::FromSqlConversionFailure(
+            length_index,
+            rusqlite::types::Type::Integer,
+            Box::new(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("{field} exceeds configured size limit"),
+            )),
+        ));
+    }
+    row.get(value_index)
+}
+
+pub(crate) fn validate_bounded_text(label: &str, value: &str, maximum: usize) -> Result<()> {
+    if value.len() > maximum {
+        bail!("{label} exceeds the maximum of {maximum} bytes");
+    }
+    Ok(())
+}
 
 pub(crate) const MAX_CACHED_LABEL_DICTIONARY_ITEMS: usize = 16_384;
 pub(crate) const MAX_CACHED_LABEL_DICTIONARY_BYTES: usize = 4 * 1024 * 1024;
@@ -474,11 +514,11 @@ impl Db {
                 WHERE category != ''
                 GROUP BY category
              )
-             SELECT names.name,
+             SELECT length(CAST(names.name AS BLOB)),
+                    length(CAST(COALESCE(categories.save_path, '') AS BLOB)),
+                    names.name,
                     COALESCE(categories.save_path, '') AS save_path,
-                    COALESCE(counts.torrent_count, 0) AS torrent_count,
-                    length(CAST(names.name AS BLOB)),
-                    length(CAST(COALESCE(categories.save_path, '') AS BLOB))
+                    COALESCE(counts.torrent_count, 0) AS torrent_count
              FROM names
              LEFT JOIN categories ON categories.name = names.name
              LEFT JOIN counts ON counts.name = names.name
@@ -492,8 +532,8 @@ impl Db {
             if categories.len() >= MAX_CACHED_LABEL_DICTIONARY_ITEMS {
                 return Err(anyhow!(CategoryTagCapacityError::new("category")));
             }
-            let name_bytes: i64 = row.get(3)?;
-            let path_bytes: i64 = row.get(4)?;
+            let name_bytes: i64 = row.get(0)?;
+            let path_bytes: i64 = row.get(1)?;
             if name_bytes < 0
                 || name_bytes as usize > MAX_CACHED_LABEL_NAME_BYTES
                 || path_bytes < 0
@@ -502,9 +542,9 @@ impl Db {
                 return Err(anyhow!(CategoryTagCapacityError::new("category")));
             }
             let category = Category {
-                name: row.get(0)?,
-                save_path: row.get(1)?,
-                torrent_count: row.get(2)?,
+                name: row.get(2)?,
+                save_path: row.get(3)?,
+                torrent_count: row.get(4)?,
             };
             let row_bytes = category.name.len().saturating_add(category.save_path.len());
             total_bytes = total_bytes.saturating_add(row_bytes);
@@ -662,6 +702,29 @@ impl Db {
         Ok(tags)
     }
 
+    /// Validate an additive tag mutation against the current cache before a
+    /// backend is changed. The write method remains authoritative and repeats
+    /// the check inside its transaction; this preflight prevents a known
+    /// cache-limit failure from leaving the remote backend ahead of the cache.
+    pub fn validate_add_torrent_tags(&self, hash: &str, tags: &[&str]) -> Result<()> {
+        if tags.len() > MAX_TORRENT_TAGS {
+            bail!("torrent tags exceed the maximum of {MAX_TORRENT_TAGS}");
+        }
+        for tag in tags {
+            validate_bounded_text("torrent tag", tag, MAX_TAG_TEXT_BYTES)?;
+        }
+        let mut combined = self.get_torrent_tags(hash)?;
+        for tag in tags {
+            if !combined.iter().any(|existing| existing == tag) {
+                combined.push((*tag).to_owned());
+            }
+        }
+        if combined.len() > MAX_TORRENT_TAGS {
+            bail!("torrent tags exceed the maximum of {MAX_TORRENT_TAGS}");
+        }
+        validate_torrent_tag_bytes(combined.iter().map(String::as_str))
+    }
+
     pub fn add_torrent_tag(&self, hash: &str, tag: &str) -> Result<()> {
         let mut conn = self.conn()?;
         let tx = conn.transaction()?;
@@ -673,6 +736,22 @@ impl Db {
             "INSERT OR IGNORE INTO torrent_tags(hash, tag) VALUES(?1,?2)",
             params![hash, tag],
         )?;
+        let stored_tags = tx
+            .prepare(
+                "SELECT length(CAST(tag AS BLOB)), tag FROM torrent_tags
+                 WHERE hash=?1 COLLATE NOCASE
+                 ORDER BY tag
+                 LIMIT ?2",
+            )?
+            .query_map(
+                params![hash.as_str(), sql_limit_with_sentinel(MAX_TORRENT_TAGS)],
+                |row| bounded_text_from_sql(row, 0, 1, MAX_TAG_TEXT_BYTES, "torrent tag"),
+            )?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        if stored_tags.len() > MAX_TORRENT_TAGS {
+            bail!("torrent tags exceed the maximum of {MAX_TORRENT_TAGS}");
+        }
+        validate_torrent_tag_bytes(stored_tags.iter().map(String::as_str))?;
         touch_torrent(&tx, &hash)?;
         tx.commit()?;
         Ok(())
@@ -694,6 +773,33 @@ impl Db {
                 params![hash, tag],
             )?;
         }
+        let count: i64 = tx.query_row(
+            "SELECT COUNT(*) FROM torrent_tags WHERE hash=?1 COLLATE NOCASE",
+            params![hash.as_str()],
+            |row| row.get(0),
+        )?;
+        if count < 0 {
+            bail!("torrent tag count is invalid");
+        }
+        if count as usize > MAX_TORRENT_TAGS {
+            bail!("torrent tags exceed the maximum of {MAX_TORRENT_TAGS}");
+        }
+        let stored_tags = tx
+            .prepare(
+                "SELECT length(CAST(tag AS BLOB)), tag FROM torrent_tags
+                 WHERE hash=?1 COLLATE NOCASE
+                 ORDER BY tag
+                 LIMIT ?2",
+            )?
+            .query_map(
+                params![hash.as_str(), sql_limit_with_sentinel(MAX_TORRENT_TAGS)],
+                |row| bounded_text_from_sql(row, 0, 1, MAX_TAG_TEXT_BYTES, "torrent tag"),
+            )?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        if stored_tags.len() > MAX_TORRENT_TAGS {
+            bail!("torrent tags exceed the maximum of {MAX_TORRENT_TAGS}");
+        }
+        validate_torrent_tag_bytes(stored_tags.iter().map(String::as_str))?;
         touch_torrent(&tx, &hash)?;
         tx.commit()?;
         Ok(())
@@ -744,6 +850,22 @@ impl Db {
                 params![hash, tag],
             )?;
         }
+        let stored_tags = tx
+            .prepare(
+                "SELECT length(CAST(tag AS BLOB)), tag FROM torrent_tags
+                 WHERE hash=?1 COLLATE NOCASE
+                 ORDER BY tag
+                 LIMIT ?2",
+            )?
+            .query_map(
+                params![hash.as_str(), sql_limit_with_sentinel(MAX_TORRENT_TAGS)],
+                |row| bounded_text_from_sql(row, 0, 1, MAX_TAG_TEXT_BYTES, "torrent tag"),
+            )?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        if stored_tags.len() > MAX_TORRENT_TAGS {
+            bail!("torrent tags exceed the maximum of {MAX_TORRENT_TAGS}");
+        }
+        validate_torrent_tag_bytes(stored_tags.iter().map(String::as_str))?;
         touch_torrent(&tx, &hash)?;
         tx.commit()?;
         Ok(())

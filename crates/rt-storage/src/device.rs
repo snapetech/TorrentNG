@@ -3,7 +3,12 @@ use std::fs::File;
 #[cfg(target_os = "linux")]
 use std::io::Read;
 use std::path::Path;
-#[cfg(target_os = "linux")]
+#[cfg(any(
+    target_os = "linux",
+    target_os = "macos",
+    target_os = "freebsd",
+    windows
+))]
 use std::path::PathBuf;
 
 use rt_path::StorageProfile;
@@ -25,6 +30,10 @@ struct MountInfo {
     major_minor: String,
     fs_type: String,
     source: String,
+    /// Per-mount options (`rw,relatime,...`).
+    options: String,
+    /// Per-superblock options (`rw,errors=remount-ro,...`).
+    super_options: String,
 }
 
 #[cfg(target_os = "linux")]
@@ -37,6 +46,118 @@ const MAX_MOUNTINFO_BYTES: u64 = 8 * 1024 * 1024;
 /// `Unknown` and keep the conservative HDD-shaped scheduler defaults.
 pub fn detect_storage_profile(path: &Path) -> StorageProfile {
     detect_storage_topology(path).profile
+}
+
+/// Filesystem type and mount options for the mount containing `path`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MountDetails {
+    pub fs_type: String,
+    /// Mount and superblock options, split on commas.
+    pub options: Vec<String>,
+}
+
+/// Best-effort lookup of the filesystem type and options under `path`.
+/// `None` on platforms without `/proc/self/mountinfo` or when it cannot be
+/// read.
+pub fn detect_mount_details(path: &Path) -> Option<MountDetails> {
+    #[cfg(target_os = "linux")]
+    {
+        detect_mount_details_from(path, Path::new("/proc/self/mountinfo"))
+    }
+    #[cfg(any(target_os = "macos", target_os = "freebsd"))]
+    {
+        statfs_mount_details(path)
+    }
+    #[cfg(windows)]
+    {
+        windows_mount_details(path)
+    }
+    #[cfg(not(any(
+        target_os = "linux",
+        target_os = "macos",
+        target_os = "freebsd",
+        windows
+    )))]
+    {
+        let _ = path;
+        None
+    }
+}
+
+/// The nearest ancestor of `path` (or `path` itself) that exists, so a save
+/// path that has not been created yet can still be classified.
+#[cfg(any(target_os = "macos", target_os = "freebsd", windows))]
+fn existing_ancestor(path: &Path) -> Option<PathBuf> {
+    let mut current = path.to_path_buf();
+    loop {
+        if current.exists() {
+            return Some(current);
+        }
+        if !current.pop() {
+            return None;
+        }
+    }
+}
+
+/// macOS and FreeBSD: filesystem type name from `statfs(2)`.
+#[cfg(any(target_os = "macos", target_os = "freebsd"))]
+fn statfs_mount_details(path: &Path) -> Option<MountDetails> {
+    use std::ffi::{CStr, CString};
+    use std::os::unix::ffi::OsStrExt;
+
+    let target = existing_ancestor(path)?;
+    let c_path = CString::new(target.as_os_str().as_bytes()).ok()?;
+    // SAFETY: `statfs` is plain old data; zero is a valid bit pattern.
+    let mut stats: libc::statfs = unsafe { std::mem::zeroed() };
+    // SAFETY: `c_path` is NUL terminated and `stats` is a live statfs buffer.
+    if unsafe { libc::statfs(c_path.as_ptr(), &mut stats) } != 0 {
+        return None;
+    }
+    // SAFETY: the kernel NUL-terminates `f_fstypename`.
+    let name = unsafe { CStr::from_ptr(stats.f_fstypename.as_ptr()) }
+        .to_string_lossy()
+        .into_owned();
+    (!name.is_empty()).then_some(MountDetails {
+        fs_type: name,
+        options: Vec::new(),
+    })
+}
+
+/// Windows: volume filesystem name and drive type. A remote drive is reported
+/// as `network` whatever the server's filesystem is, since durability then
+/// depends on the server.
+#[cfg(windows)]
+fn windows_mount_details(path: &Path) -> Option<MountDetails> {
+    use crate::win32::{drive_kind, filesystem_name, volume_root, DriveKind};
+
+    let target = existing_ancestor(path)?;
+    let root = volume_root(&target)?;
+    let name = filesystem_name(&root)?.to_ascii_lowercase();
+    let (fs_type, options) = match drive_kind(&root) {
+        DriveKind::Remote => ("network".to_owned(), vec![format!("fs={name}")]),
+        DriveKind::RamDisk => ("ramfs".to_owned(), Vec::new()),
+        DriveKind::Other => (name, Vec::new()),
+    };
+    Some(MountDetails { fs_type, options })
+}
+
+#[cfg(target_os = "linux")]
+fn detect_mount_details_from(path: &Path, mountinfo_path: &Path) -> Option<MountDetails> {
+    let target = canonical_existing_path(path)?;
+    let mountinfo = read_mountinfo(mountinfo_path)?;
+    let mounts = parse_mountinfo(&mountinfo)?;
+    let mount = find_best_mount(&target, &mounts)?;
+    let options = mount
+        .options
+        .split(',')
+        .chain(mount.super_options.split(','))
+        .filter(|option| !option.is_empty())
+        .map(str::to_owned)
+        .collect();
+    Some(MountDetails {
+        fs_type: mount.fs_type.clone(),
+        options,
+    })
 }
 
 pub fn detect_storage_topology(path: &Path) -> StorageTopology {
@@ -137,6 +258,8 @@ fn parse_mountinfo(input: &str) -> Option<Vec<MountInfo>> {
             major_minor: left_fields[2].to_owned(),
             fs_type: right_fields[0].to_owned(),
             source: right_fields.get(1).copied().unwrap_or("").to_owned(),
+            options: left_fields.get(5).copied().unwrap_or("").to_owned(),
+            super_options: right_fields.get(2).copied().unwrap_or("").to_owned(),
         });
     }
     Some(mounts)
@@ -286,6 +409,23 @@ mod tests {
         assert_eq!(remote.major_minor, "0:42");
         assert_eq!(remote.fs_type, "nfs");
         assert!(is_network_fs(&remote.fs_type));
+    }
+
+    #[test]
+    fn mount_details_include_mount_and_superblock_options() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("data")).unwrap();
+        let mountinfo = format!(
+            "24 0 8:1 / {} rw,relatime,nobarrier - ext4 /dev/sda1 rw,errors=remount-ro\n",
+            dir.path().join("data").display()
+        );
+        let mountinfo_path = dir.path().join("mountinfo");
+        std::fs::write(&mountinfo_path, mountinfo).unwrap();
+        let details =
+            detect_mount_details_from(&dir.path().join("data/x.bin"), &mountinfo_path).unwrap();
+        assert_eq!(details.fs_type, "ext4");
+        assert!(details.options.iter().any(|o| o == "nobarrier"));
+        assert!(details.options.iter().any(|o| o == "errors=remount-ro"));
     }
 
     #[test]

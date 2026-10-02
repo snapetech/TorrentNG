@@ -61,6 +61,9 @@ pub(super) struct EngineSubsystems {
     pub(super) network_budget: GlobalNetworkBudget,
     pub(super) storage_jobs: StorageJobDispatcher,
     pub(super) stats_cache: Option<EngineStatsCache>,
+    /// Crash-safety settings and run verdict shared with every torrent task.
+    /// Starts inert; `Engine::start` installs the real runtime.
+    pub(super) crash_safety: std::sync::Arc<crate::crash_safety::CrashSafetyRuntime>,
 }
 
 pub(super) struct EngineStatsCache {
@@ -86,6 +89,7 @@ impl EngineSubsystems {
             network_budget,
             storage_jobs,
             stats_cache: None,
+            crash_safety: crate::crash_safety::CrashSafetyRuntime::inert(),
         }
     }
 }

@@ -86,6 +86,42 @@ peer sockets and restarts DHT on its corresponding port; an explicit
 | `peer_read_cache_entries` | `64` | Bounded per-scheduler peer-read readahead cache entries; set to `0` to disable cached readahead reuse |
 | `peer_read_elevator_budget_ms` | `25` | HDD/network peer-read elevator batching window; ignored when `device_elevator_enabled = false` |
 
+### `[crash_safety]`
+
+Protection against power loss and crashes; see
+[CRASH_SAFETY.md](CRASH_SAFETY.md) for what each option does and when to
+change it. Every key is also editable at runtime (WebUI **Settings → Backend →
+Crash safety**, or `PUT /api/v1/settings/crash-safety`); a runtime change is
+persisted and **overrides this file** until reset. Unknown keys are rejected so
+a typo cannot silently leave a safety setting at its default.
+
+| Key | Default | Description |
+|---|---|---|
+| `completion_gate` | `true` | Hold a finished download at "1 byte left" until its data is synced; only then report it complete |
+| `host_crash_detection` | `true` | Keep a durable run marker (`run_marker.json` in `session_dir`) so a host crash can be told apart from a process crash |
+| `host_crash_recovery` | `"recent"` | After a host crash: `"watermark"` (trust saved state, recheck only unsynced pieces), `"recent"` (also recheck torrents written inside the window), `"full"` (recheck everything) |
+| `recent_write_window_secs` | `86400` | Look-back for `"recent"`; `1` to `31536000` |
+| `structural_audit` | `"on_unclean"` | Metadata-only check for unwritten/hole extents behind valid pieces: `"off"`, `"on_unclean"`, `"always"`; Linux, macOS, FreeBSD and Windows (see the platform table in CRASH_SAFETY.md) |
+| `mount_probe` | `true` | Rate each save location's `fsync` trust from its filesystem (and, on Linux, mount options); Linux, macOS, FreeBSD and Windows |
+| `weak_mount_escalation` | `true` | Recheck weak mounts fully after a host crash (and sample read-back on completion); raise unknown mounts to at least `"recent"` |
+| `weak_mount_paths` | `[]` | Absolute path prefixes always treated as weak (longest prefix wins over the probe) |
+| `strong_mount_paths` | `[]` | Absolute path prefixes always treated as strong |
+| `completion_verify` | `"off"` | Re-read finished downloads from disk before releasing them: `"off"`, `"sample"`, `"full"` |
+| `completion_verify_sample_percent` | `5` | Percent of pieces re-read for `"sample"` (file first and last pieces are always included); `1` to `100` |
+| `path_policies` | `[]` | Per-location overrides: an array of `[[crash_safety.path_policies]]` tables, each with an absolute `path` and any of `completion_gate`, `host_crash_recovery`, `structural_audit`, `completion_verify`, `completion_verify_sample_percent`. The longest matching path prefix of a torrent's save path wins; unset keys use the global value. At most 64, no duplicate paths |
+
+```toml
+[[crash_safety.path_policies]]
+path = "/mnt/nas"
+host_crash_recovery = "full"
+completion_verify = "sample"
+```
+
+`[storage] durability_mode = "fast"` skips the payload fsync between saves;
+since the crash-safety work, a record saved that way is discarded after a host
+crash instead of trusted, and the final save when a torrent exits always syncs. `[storage] preallocation_mode = "full"` uses
+`fallocate(2)` and falls back to a sparse length where it is unsupported.
+
 ### `[memory]`
 
 | Key | Default | Description |
@@ -162,7 +198,7 @@ external endpoint.
 | Key | Default | Description |
 |---|---|---|
 | `username` | `torrentng` | WebUI login username |
-| `password` | `torrentng` | WebUI login password; must be at least 8 characters |
+| `password` | unset | WebUI login password; unset generates a unique private password on first startup; configured values must be 8-1024 bytes |
 | `api_tokens` | `[]` | Pre-shared bearer/session tokens accepted by the TorrentNG API |
 | `api_tokens_file` | unset | Optional newline-delimited token file; loaded in addition to `api_tokens` |
 | `metrics.include_torrent_ids` | `false` | Include raw infohashes in hot-torrent Prometheus labels; disabled by default because labels are high-cardinality identifiers |
@@ -171,12 +207,16 @@ An empty token list is valid only when `[daemon].api_bind` is loopback. A
 non-loopback bind requires at least one real token of 16 or more characters;
 placeholder values such as `change-me` and `REPLACE_WITH_*` are rejected at
 startup. Prefer `api_tokens_file` or a deployment secret over inline tokens.
-For a public bind, the default WebUI password `torrentng` is not accepted,
-even if the configured username differs; use an API token to sign in and set a
-unique password. An API token works in either WebUI login field. Settings ->
-Security can update the username/password at runtime; those values persist in
-`<session_dir>/auth-settings.json` with mode `0600` and take precedence over
-the config file until reset from the WebUI.
+An unset password is generated once and stored in
+`<session_dir>/bootstrap-password` with mode `0600`. Run `torrentngd auth-token`
+from an interactive terminal to display the active WebUI login. The command
+writes directly to the controlling terminal and refuses to run without one, so
+redirected stdout and pipelines do not capture credentials. A public bind
+requires an API token and a WebUI password of at least 16 bytes. API tokens
+work in either login field.
+Settings -> Security can update the username/password at runtime; those values
+persist in `<session_dir>/auth-settings.json` with mode `0600` and take
+precedence over the config file until reset from the WebUI.
 
 ### `[logging]`
 
@@ -207,7 +247,6 @@ download_dir = "/data"
 
 [auth]
 username = "torrentng"
-password = "torrentng"
 # Loopback-only TorrentNG-client development mode. Public binds require real tokens.
 api_tokens = []
 # Production alternative: api_tokens_file = "/run/secrets/torrentngd_api_token"
@@ -234,6 +273,17 @@ preallocation_mode = "auto"
 durability_mode = "checkpoint"
 peer_read_cache_entries = 64
 
+[crash_safety]
+# Defaults shown; see docs/CRASH_SAFETY.md.
+completion_gate = true
+host_crash_detection = true
+host_crash_recovery = "recent"
+recent_write_window_secs = 86400
+structural_audit = "on_unclean"
+mount_probe = true
+weak_mount_escalation = true
+completion_verify = "off"
+
 [tracker]
 http_timeout_secs = 30
 udp_timeout_secs = 15
@@ -254,7 +304,6 @@ wal_checkpoint_pages = 1000
 
 [auth]
 username = "torrentng"
-password = "torrentng"
 api_tokens = ["your-automation-token"]
 
 [logging]
@@ -350,6 +399,10 @@ while qBittorrent owns torrent execution.
 | `timeout_secs` | `10` | - | Timeout for qBittorrent Web API requests |
 | `no_auth` | `false` | `TNG_QBITTORRENT_NO_AUTH=1` | Skip login for trusted no-auth local WebUI deployments |
 | `accept_invalid_certs` | `false` | - | Accept invalid TLS certificates for lab deployments |
+
+Configured external backend URLs must use `http` or `https` and must not
+embed userinfo; keep credentials in the dedicated username/password or token
+fields. Backend API clients do not follow redirects.
 
 ```toml
 [backend]
@@ -540,7 +593,7 @@ Use these only for lab compatibility testing. Tracker-facing identity is still c
 | Key | Default | Env override | Description |
 |---|---|---|---|
 | `username` | `torrentng` | `TNG_USERNAME` / `RTNG_USERNAME` | WebUI login username |
-| `password` | `torrentng` | `TNG_PASSWORD` / `RTNG_PASSWORD` | WebUI login password; 8-1024 bytes |
+| `password` | unset | `TNG_PASSWORD` / `RTNG_PASSWORD` | WebUI login password; unset generates a private per-install value; configured values must be 8-1024 bytes |
 | `secret_key` | - | `TNG_SECRET_KEY` | Secret for signing expiring compatibility session cookies. Required for public binds. |
 | `api_tokens` | `[]` | `TNG_API_TOKENS` | Comma-separated pre-shared bearer tokens for automation tools and WebUI login; enter a token in either login field. Public binds require tokens of at least 16 characters |
 | `trust_proxy_header` | `false` | - | Trust a non-empty `X-Remote-User` only on a loopback listener; the proxy must authenticate the request and discard client-supplied copies before setting its own identity (the bundled Nginx config clears this header) |
@@ -550,11 +603,12 @@ Requests authenticated by `X-Remote-User` require same-origin evidence for
 browser mutations and WebSocket handshakes. Automation clients should use an
 API-token Bearer credential instead.
 
-Fresh loopback installs accept `torrentng` / `torrentng` on both the native
-and existing-client profiles. Change credentials in **Settings -> Security**
-or in the service `[auth]` config. Runtime changes persist in
-`auth-settings.json` under the service data directory with mode `0600`. Public
-binds require API tokens and reject the default password.
+Fresh installs generate a unique WebUI password in the service data directory.
+Run `torrentng auth-token [config.toml]` to print the active login. Change
+credentials in **Settings -> Security** or in the service `[auth]` config.
+Runtime changes persist in `auth-settings.json` under the service data directory
+with mode `0600`. Public binds require API tokens and a WebUI password of at
+least 16 bytes. API tokens can be entered in either login field.
 
 When API tokens are configured, unauthenticated login submissions are limited
 to 10 per TCP peer per 60 seconds. Further attempts receive `429 Too Many

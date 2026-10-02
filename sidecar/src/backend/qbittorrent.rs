@@ -5,7 +5,8 @@ use std::{collections::BTreeMap, net::SocketAddr};
 use tokio::sync::Mutex;
 
 use super::{
-    map_qbit_piece_state, parse_qbit_peer_response, response_bytes_bounded, response_json_bounded,
+    download_remote_torrent, ensure_backend_collection_bound, is_magnet_url, map_qbit_piece_state,
+    parse_backend_url, parse_qbit_peer_response, response_bytes_bounded, response_json_bounded,
     validate_qbit_mutation_body, BackendCapabilities, BackendPeer, BackendPieceState,
     BackendStatus, BackendTransferLimits, BackendType, QueueMove, TorrentBackend,
     MAX_BACKEND_JSON_BYTES,
@@ -28,11 +29,16 @@ impl QbittorrentBackend {
     pub fn new(cfg: &QbittorrentConfig) -> Result<Self> {
         let client = super::backend_client_builder()
             .cookie_store(true)
+            .redirect(reqwest::redirect::Policy::none())
             .timeout(std::time::Duration::from_secs(cfg.timeout_secs.max(1)))
             .danger_accept_invalid_certs(cfg.accept_invalid_certs)
+            // qBittorrent is an explicit configured backend, not a generic
+            // outbound fetch target. Ignore ambient proxy variables so its
+            // credentials and mutations cannot be rerouted unexpectedly.
+            .no_proxy()
             .build()
             .context("create qBittorrent Web API client")?;
-        let base_url = Url::parse(cfg.url.trim()).context("parse qbittorrent.url")?;
+        let base_url = parse_backend_url(&cfg.url, "qbittorrent.url")?;
         Ok(Self {
             client,
             base_url,
@@ -289,6 +295,7 @@ impl TorrentBackend for QbittorrentBackend {
 
     async fn list_torrents(&self) -> Result<Vec<RawTorrent>> {
         let torrents: Vec<QbitTorrent> = self.get_json("api/v2/torrents/info").await?;
+        ensure_backend_collection_bound(torrents.len(), "qBittorrent torrents/info")?;
         torrents.into_iter().map(map_torrent).collect()
     }
 
@@ -325,6 +332,7 @@ impl TorrentBackend for QbittorrentBackend {
             "qBittorrent paged torrents/info",
         )
         .await?;
+        ensure_backend_collection_bound(torrents.len(), "qBittorrent paged torrents/info")?;
         if torrents.len() > limit.clamp(1, 5_000) as usize {
             bail!("qBittorrent paged torrents/info exceeded requested page size");
         }
@@ -398,7 +406,11 @@ impl TorrentBackend for QbittorrentBackend {
     }
 
     async fn add_url(&self, url: &str, save_path: &str, category: &str, start: bool) -> Result<()> {
-        self.add_magnet(url, save_path, category, start).await
+        if is_magnet_url(url) {
+            return self.add_magnet(url, save_path, category, start).await;
+        }
+        let data = download_remote_torrent(url).await?;
+        self.add_torrent(&data, save_path, category, start).await
     }
 
     async fn remove(&self, hash: &str, delete_data: bool) -> Result<()> {
@@ -439,6 +451,7 @@ impl TorrentBackend for QbittorrentBackend {
                 urlencoding::encode(hash)
             ))
             .await?;
+        ensure_backend_collection_bound(trackers.len(), "qBittorrent trackers")?;
         trackers.into_iter().enumerate().map(map_tracker).collect()
     }
 
@@ -477,15 +490,19 @@ impl TorrentBackend for QbittorrentBackend {
                 urlencoding::encode(hash)
             ))
             .await?;
+        ensure_backend_collection_bound(files.len(), "qBittorrent files")?;
         files.into_iter().enumerate().map(map_file).collect()
     }
 
     async fn list_webseeds(&self, hash: &str) -> Result<Vec<String>> {
-        self.get_json(&format!(
-            "api/v2/torrents/webseeds?hash={}",
-            urlencoding::encode(hash)
-        ))
-        .await
+        let webseeds: Vec<String> = self
+            .get_json(&format!(
+                "api/v2/torrents/webseeds?hash={}",
+                urlencoding::encode(hash)
+            ))
+            .await?;
+        ensure_backend_collection_bound(webseeds.len(), "qBittorrent webseeds")?;
+        Ok(webseeds)
     }
 
     async fn piece_states(&self, hash: &str) -> Result<Vec<BackendPieceState>> {
@@ -495,15 +512,19 @@ impl TorrentBackend for QbittorrentBackend {
                 urlencoding::encode(hash)
             ))
             .await?;
+        ensure_backend_collection_bound(states.len(), "qBittorrent piece states")?;
         states.into_iter().map(map_qbit_piece_state).collect()
     }
 
     async fn piece_hashes(&self, hash: &str) -> Result<Vec<String>> {
-        self.get_json(&format!(
-            "api/v2/torrents/pieceHashes?hash={}",
-            urlencoding::encode(hash)
-        ))
-        .await
+        let hashes: Vec<String> = self
+            .get_json(&format!(
+                "api/v2/torrents/pieceHashes?hash={}",
+                urlencoding::encode(hash)
+            ))
+            .await?;
+        ensure_backend_collection_bound(hashes.len(), "qBittorrent piece hashes")?;
+        Ok(hashes)
     }
 
     async fn list_peers(&self, hash: &str) -> Result<Vec<BackendPeer>> {
@@ -771,6 +792,7 @@ impl TorrentBackend for QbittorrentBackend {
             "qBittorrent torrent tag lookup",
         )
         .await?;
+        ensure_backend_collection_bound(torrents.len(), "qBittorrent torrent tag lookup")?;
         let current = torrents
             .into_iter()
             .find(|torrent| torrent.hash.eq_ignore_ascii_case(hash))
@@ -1170,6 +1192,10 @@ mod tests {
         .is_err());
         assert!(parse_qbit_peer_response(&serde_json::json!({
             "peers": { "127.0.0.1:6881": { "progress": 2.0 } }
+        }))
+        .is_err());
+        assert!(parse_qbit_peer_response(&serde_json::json!({
+            "peers": { "127.0.0.1:0": {} }
         }))
         .is_err());
     }

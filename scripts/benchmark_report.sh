@@ -3,7 +3,7 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 OUT="${1:-$ROOT/benchmarks/report-$(date -u +%Y%m%dT%H%M%SZ).md}"
-BENCH_COUNTS="${TNG_BENCH_COUNTS:-1000 10000 15000 50000}"
+BENCH_TORRENTS="${TNG_BENCH_TORRENTS:-}"
 
 mkdir -p "$(dirname "$OUT")"
 
@@ -16,36 +16,29 @@ mkdir -p "$(dirname "$OUT")"
   echo "- Rust: $(rustc --version 2>/dev/null || echo unavailable)"
   echo "- Cargo: $(cargo --version 2>/dev/null || echo unavailable)"
   echo
-  echo "## Synthetic Benchmarks"
+  echo "## Informational deterministic performance checks"
   echo
-  echo "- Torrent counts: $BENCH_COUNTS"
+  echo "- This report is diagnostic only; it is not a release gate or torrent-count capacity certification."
   echo
   echo '```text'
 } > "$OUT"
 
-for count in $BENCH_COUNTS; do
-  {
-    echo
-    echo "### TNG_BENCH_TORRENTS=$count"
-  } | tee -a "$OUT"
-
-  (
-    cd "$ROOT/sidecar"
-    TNG_BENCH_TORRENTS="$count" cargo test --release --test benchmarks -- --ignored --nocapture
-  ) 2>&1 | tee -a "$OUT"
-done
+if [[ -n "$BENCH_TORRENTS" ]]; then
+  echo "- An explicit bounded fixture size was supplied through TNG_BENCH_TORRENTS." >> "$OUT"
+  (cd "$ROOT/sidecar" && TNG_BENCH_TORRENTS="$BENCH_TORRENTS" \
+    cargo test --release --test benchmarks -- --ignored --nocapture) 2>&1 | tee -a "$OUT"
+else
+  (cd "$ROOT/sidecar" && cargo test --release --test benchmarks -- --ignored --nocapture) \
+    2>&1 | tee -a "$OUT"
+fi
 
 {
   echo '```'
   echo
-  echo "## Release Targets"
+  echo "## Interpretation"
   echo
-  echo "| Scenario | Target |"
-  echo "|---|---|"
-  echo "| 50k synthetic qBit torrents/info | < 500ms |"
-  echo "| qBit sync/maindata delta | < 50ms |"
-  echo "| 15k memory soak | < 500MB after 24h |"
-  echo "| Cold start first list | < 5s |"
+  echo "- Use the output to diagnose deterministic API regressions."
+  echo "- Keep numeric capacity qualification and long-duration stability testing out of this report; those are intentionally deferred from the current release scope."
 } >> "$OUT"
 
 echo "$OUT"

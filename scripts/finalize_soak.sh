@@ -5,7 +5,6 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 REPORT="${1:-}"
 OUT="${2:-$ROOT/certification/reports/soak-final-$(date -u +%Y%m%dT%H%M%SZ).md}"
 MIN_SAMPLES="${SOAK_MIN_SAMPLES:-1200}"
-MIN_TORRENTS="${SOAK_MIN_TORRENTS:-15000}"
 MAX_RSS_MB="${SOAK_MAX_RSS_MB:-500}"
 MAX_FDS="${SOAK_MAX_FDS:-4096}"
 MAX_THREADS="${SOAK_MAX_THREADS:-512}"
@@ -14,7 +13,9 @@ RESTORE_NORMAL="${RESTORE_NORMAL:-0}"
 ALLOW_INCOMPLETE="${SOAK_ALLOW_INCOMPLETE:-0}"
 
 if [[ -z "$REPORT" ]]; then
-  REPORT="$(find "$ROOT/certification/reports" -maxdepth 1 -type f -name 'soak-24h-*.md' -printf '%T@ %p\n' 2>/dev/null | sort -nr | awk 'NR==1 {print $2}')"
+  REPORT="$(find "$ROOT/certification/reports" -maxdepth 1 -type f -name 'soak-24h-*.md' -printf '%T@\t%p\n' 2>/dev/null \
+    | sort -t $'\t' -k1,1nr \
+    | awk 'NR == 1 { print substr($0, index($0, "\t") + 1) }')"
 fi
 
 mkdir -p "$(dirname "$OUT")"
@@ -36,7 +37,6 @@ mark() {
   echo "- Date UTC: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
   echo "- Source report: ${REPORT:-missing}"
   echo "- Minimum samples: $MIN_SAMPLES"
-  echo "- Minimum torrents: $MIN_TORRENTS"
   echo "- Max RSS MB: $MAX_RSS_MB"
   echo "- Max file descriptors: $MAX_FDS"
   echo "- Max threads: $MAX_THREADS"
@@ -58,13 +58,6 @@ else
     mark "sample count" "PASS" "$sample_count >= $MIN_SAMPLES"
   else
     mark "sample count" "FAIL" "$sample_count < $MIN_SAMPLES"
-  fi
-
-  min_torrents="$(awk -F'|' '/^\| 20[0-9][0-9]-/ {gsub(/ /, "", $4); if (min == "" || $4 < min) min=$4} END {print min == "" ? 0 : min}' "$REPORT")"
-  if (( min_torrents >= MIN_TORRENTS )); then
-    mark "torrent floor" "PASS" "$min_torrents >= $MIN_TORRENTS"
-  else
-    mark "torrent floor" "FAIL" "$min_torrents < $MIN_TORRENTS"
   fi
 
   max_rss="$(awk -F'|' '/^\| 20[0-9][0-9]-/ {gsub(/ /, "", $5); if ($5+0 > max) max=$5+0} END {printf "%.1f", max}' "$REPORT")"
@@ -123,21 +116,35 @@ else
     mark "extended process telemetry" "INFO" "legacy report has no FD/thread/disk/metrics columns"
   fi
 
-  if grep -q '^Overall status: PASS' "$REPORT"; then
-    mark "source completion" "PASS" "source report completed PASS"
-  elif [[ "$ALLOW_INCOMPLETE" == "1" ]]; then
-    mark "source completion" "INFO" "source report still running"
-  else
-    mark "source completion" "FAIL" "source report has not completed PASS"
-  fi
+  source_status="$(sed -nE 's/^Overall status: ([A-Z_]+)$/\1/p' "$REPORT" | tail -n1)"
+  case "$source_status" in
+    PASS)
+      mark "source completion" "PASS" "source report completed PASS"
+      ;;
+    IN_PROGRESS|RUNNING|RUNNING_UNKNOWN)
+      if [[ "$ALLOW_INCOMPLETE" == "1" ]]; then
+        mark "source completion" "INFO" "source report is still in progress"
+      else
+        mark "source completion" "FAIL" "source report has not completed PASS"
+      fi
+      ;;
+    FAIL)
+      mark "source completion" "FAIL" "source report completed FAIL"
+      ;;
+    *)
+      mark "source completion" "FAIL" "source report has no recognized completion status"
+      ;;
+  esac
 fi
 
 if [[ "$RESTORE_NORMAL" == "1" ]]; then
-  if "$ROOT/scripts/restore_certification_normal.sh" >/tmp/tng-restore-normal.log 2>&1; then
+  restore_log="$(mktemp "${TMPDIR:-/tmp}/torrentng-restore-normal.XXXXXX")"
+  if "$ROOT/scripts/restore_certification_normal.sh" >"$restore_log" 2>&1; then
     mark "restore normal sync" "PASS" "TNG_SYNC_INTERVAL_SECS=2"
   else
-    mark "restore normal sync" "FAIL" "$(tr '\n' ' ' </tmp/tng-restore-normal.log)"
+    mark "restore normal sync" "FAIL" "$(tr '\n' ' ' <"$restore_log")"
   fi
+  rm -f "$restore_log"
 else
   mark "restore normal sync" "INFO" "set RESTORE_NORMAL=1 to restore certification service"
 fi

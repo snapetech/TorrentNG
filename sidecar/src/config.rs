@@ -5,6 +5,9 @@ use std::{io::Read, net::SocketAddr, path::PathBuf, time::Duration};
 use crate::safe_file::open_regular_read;
 
 const MAX_CONFIG_BYTES: u64 = 1024 * 1024;
+const MAX_AUTH_TOKENS: usize = 256;
+const MAX_AUTH_TOKEN_BYTES: usize = 4096;
+const MAX_AUTH_SECRET_BYTES: usize = 4096;
 
 /// Keep tracker-facing user-agent mutations bounded independently of the
 /// ordinary JSON request limit. A user-agent is carried through XML-RPC and
@@ -196,7 +199,9 @@ impl Default for AuthConfig {
     fn default() -> Self {
         Self {
             username: "torrentng".to_owned(),
-            password: "torrentng".to_owned(),
+            // Empty selects a private per-install bootstrap password created
+            // by the service in its data directory at startup.
+            password: String::new(),
             secret_key: None,
             api_tokens: Vec::new(),
             trust_proxy_header: false,
@@ -648,6 +653,10 @@ impl Config {
             .parse()
             .with_context(|| format!("parse listen_addr {}", self.listen_addr))?;
 
+        if self.sync_interval_secs == 0 {
+            bail!("sync_interval_secs must be greater than zero");
+        }
+
         match self.backend.backend_type {
             BackendKind::Rtorrent => match (&self.rtorrent.scgi_socket, &self.rtorrent.scgi_addr) {
                 (None, None) => bail!("rtorrent: one of scgi_socket or scgi_addr must be set"),
@@ -689,12 +698,20 @@ impl Config {
         if self.auth.username.trim().is_empty() || self.auth.username.len() > 256 {
             bail!("auth.username must contain 1-256 bytes");
         }
-        if self.auth.password.trim().len() < 8 || self.auth.password.len() > 1024 {
-            bail!("auth.password must contain at least 8 and at most 1024 bytes");
+        if !self.auth.password.is_empty()
+            && (self.auth.password.trim().len() < 8 || self.auth.password.len() > 1024)
+        {
+            bail!("auth.password must be empty for a generated password or contain 8-1024 bytes");
+        }
+        if self.auth.api_tokens.len() > MAX_AUTH_TOKENS {
+            bail!("auth.api_tokens must contain at most {MAX_AUTH_TOKENS} tokens");
         }
         for token in &self.auth.api_tokens {
             if token.trim().is_empty() {
                 bail!("auth.api_tokens must not contain empty tokens");
+            }
+            if token.len() > MAX_AUTH_TOKEN_BYTES {
+                bail!("auth.api_tokens entries must be <= {MAX_AUTH_TOKEN_BYTES} bytes");
             }
             if is_placeholder_secret(token) {
                 bail!("auth.api_tokens must not contain an example token");
@@ -702,6 +719,9 @@ impl Config {
         }
         if !self.auth.api_tokens.is_empty() {
             if let Some(secret) = self.auth.secret_key.as_deref() {
+                if secret.len() > MAX_AUTH_SECRET_BYTES {
+                    bail!("auth.secret_key must be <= {MAX_AUTH_SECRET_BYTES} bytes");
+                }
                 if is_placeholder_secret(secret) {
                     bail!("auth.secret_key must not contain an example secret");
                 }
@@ -750,7 +770,10 @@ impl Config {
     }
 
     pub fn sync_interval(&self) -> Duration {
-        Duration::from_secs(self.sync_interval_secs)
+        // Config::validate rejects zero for normal startup. Keep the accessor
+        // defensive as well because tests and embedding callers can construct
+        // Config values without going through Config::load.
+        Duration::from_secs(self.sync_interval_secs.max(1))
     }
 
     pub fn rtorrent_timeout(&self) -> Duration {
@@ -987,6 +1010,35 @@ mod tests {
     }
 
     #[test]
+    fn auth_material_limits_bound_comparison_work() {
+        let mut cfg = Config::test_default();
+        cfg.auth.api_tokens = vec!["x".repeat(MAX_AUTH_TOKEN_BYTES + 1)];
+        assert!(cfg
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("4096 bytes"));
+
+        cfg.auth.api_tokens = vec!["sidecar-api-token-20260904".to_owned()];
+        cfg.auth.secret_key = Some("x".repeat(MAX_AUTH_SECRET_BYTES + 1));
+        assert!(cfg
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("auth.secret_key"));
+
+        cfg.auth.secret_key = None;
+        cfg.auth.api_tokens = (0..=MAX_AUTH_TOKENS)
+            .map(|index| format!("token-{index:03}-long-enough"))
+            .collect();
+        assert!(cfg
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("256 tokens"));
+    }
+
+    #[test]
     fn proxy_header_auth_requires_a_loopback_listener() {
         let mut cfg = Config::test_default();
         cfg.auth.trust_proxy_header = true;
@@ -1119,6 +1171,18 @@ mod tests {
         assert_eq!(cfg.rtorrent_log_poll_interval(), Duration::from_secs(1));
     }
 
+    #[test]
+    fn sync_interval_rejects_zero_and_accessor_has_a_floor() {
+        let mut cfg = Config::test_default();
+        cfg.sync_interval_secs = 0;
+        assert!(cfg
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("greater than zero"));
+        assert_eq!(cfg.sync_interval(), Duration::from_secs(1));
+    }
+
     fn restore_env(key: &str, value: Option<String>) {
         if let Some(value) = value {
             std::env::set_var(key, value);
@@ -1202,7 +1266,7 @@ scgi_socket = "/tmp/rtorrent.sock"
         assert_eq!(cfg.auth.secret_key.as_deref(), Some("legacy-secret"));
         assert_eq!(cfg.auth.api_tokens, ["legacy-one", "legacy-two"]);
         assert_eq!(cfg.auth.username, "torrentng");
-        assert_eq!(cfg.auth.password, "torrentng");
+        assert!(cfg.auth.password.is_empty());
         assert_eq!(cfg.rtorrent.user_agent, "legacy-agent");
         assert_eq!(cfg.identity.qbittorrent_version, "legacy-qbit");
 

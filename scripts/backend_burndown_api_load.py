@@ -91,6 +91,18 @@ def open_direct(request: Request, timeout: float):
     return HTTP.open(request, timeout=timeout)
 
 
+def validate_base_url(raw: str) -> str:
+    raw = raw.strip()
+    parsed = urlsplit(raw)
+    if parsed.scheme.lower() not in {"http", "https"} or not parsed.netloc:
+        raise ValueError("base URL must use http or https and include a host")
+    if parsed.username is not None or parsed.password is not None:
+        raise ValueError("base URL must not contain userinfo")
+    if parsed.query or parsed.fragment:
+        raise ValueError("base URL must not contain a query or fragment")
+    return urlunsplit((parsed.scheme.lower(), parsed.netloc, parsed.path.rstrip("/"), "", ""))
+
+
 class LoadStats:
     def __init__(self) -> None:
         self.lock = threading.Lock()
@@ -376,23 +388,67 @@ def main() -> int:
     raw = os.environ.get("TNG_LOAD_RAW", report.removesuffix(".md") + ".json")
     requested_base = os.environ.get("TNG_BASE_URL", "http://127.0.0.1:28080")
     token = os.environ.get("TNG_API_TOKEN", os.environ.get("TNG_RELEASE_TOKEN", ""))
+    pid = os.environ.get("TNG_LOAD_PID", "")
+    commit = os.environ.get("TNG_LOAD_COMMIT", "unknown (set TNG_LOAD_COMMIT)")
+    binary = os.environ.get("TNG_LOAD_BINARY", "")
+    binary_digest = binary_sha256(binary)
+    started = time.time()
     try:
         base = validate_protected_target(requested_base)
+    except ValueError as error:
+        print(f"invalid API load configuration: {error}", file=sys.stderr)
+        write_report(
+            report,
+            raw,
+            "<invalid base URL>",
+            0,
+            0,
+            0,
+            0,
+            LoadStats(),
+            None,
+            {},
+            "",
+            started,
+            time.time(),
+            commit,
+            binary,
+            binary_digest,
+            "invalid base URL",
+        )
+        print(report)
+        return 2
+    try:
         duration = env_float("TNG_LOAD_DURATION_SECONDS", 30.0, 0.1, 1200.0)
         clients = env_int("TNG_LOAD_CLIENTS", 32, 1, 64)
         sse_clients = env_int("TNG_LOAD_SSE_CLIENTS", 8, 0, 32)
         slow_delay_ms = env_int("TNG_LOAD_SLOW_DELAY_MS", 250, 0, 10000)
         if clients + sse_clients > MAX_LOAD_WORKERS:
             raise ValueError(f"combined API/SSE clients must not exceed {MAX_LOAD_WORKERS}")
-    except ValueError as error:
-        print(f"invalid API load configuration: {error}", file=sys.stderr)
+    except ValueError:
+        print("invalid API load configuration: one or more load settings are invalid", file=sys.stderr)
+        write_report(
+            report,
+            raw,
+            base,
+            0,
+            0,
+            0,
+            0,
+            LoadStats(),
+            None,
+            {},
+            pid,
+            started,
+            time.time(),
+            commit,
+            binary,
+            binary_digest,
+            "invalid load configuration",
+        )
+        print(report)
         return 2
-    pid = os.environ.get("TNG_LOAD_PID", "")
-    commit = os.environ.get("TNG_LOAD_COMMIT", "unknown (set TNG_LOAD_COMMIT)")
-    binary = os.environ.get("TNG_LOAD_BINARY", "")
-    binary_digest = binary_sha256(binary)
 
-    started = time.time()
     preflight_error: str | None = None
     try:
         request = Request(base + "/health", headers={"Authorization": f"Bearer {token}"} if token else {})

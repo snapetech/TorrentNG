@@ -27,14 +27,33 @@ awk -F'|' '
 ' "$tmp_status" >"$tmp_rows"
 
 json_escape() {
-  sed \
-    -e 's/\\/\\\\/g' \
-    -e 's/"/\\"/g' \
-    -e 's/	/\\t/g'
+  local LC_ALL=C
+  local value="${1-}"
+  local char code index
+  for ((index = 0; index < ${#value}; index++)); do
+    char="${value:index:1}"
+    case "$char" in
+      \\) printf "\\\\" ;;
+      '"') printf '\\"' ;;
+      $'\b') printf '\\b' ;;
+      $'\f') printf '\\f' ;;
+      $'\n') printf '\\n' ;;
+      $'\r') printf '\\r' ;;
+      $'\t') printf '\\t' ;;
+      *)
+        printf -v code '%d' "'$char"
+        if ((code < 0x20)); then
+          printf '\\u%04x' "$code"
+        else
+          printf '%s' "$char"
+        fi
+        ;;
+    esac
+  done
 }
 
 json_value() {
-  printf '%s' "$1" | json_escape
+  json_escape "$1"
 }
 
 pass=0

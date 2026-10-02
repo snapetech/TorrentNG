@@ -14,7 +14,7 @@ trackers, jobs, metrics, and compatibility API projections.
 
 ## Product shape
 
-**Target persona:** private tracker users, seedbox operators, homelab media automation, large archive seeders, 10k–100k torrent operators, multi-hundred-TB libraries, *arr/autobrr/cross-seed power users, and operators migrating between rTorrent, qBittorrent, Transmission, Deluge, uTorrent/BitTorrent Classic, BiglyBT/Vuze, Tixati, and generic torrent libraries.
+**Target persona:** private tracker users, seedbox operators, homelab media automation, large archive seeders, multi-hundred-TB libraries, *arr/autobrr/cross-seed power users, and operators migrating between rTorrent, qBittorrent, Transmission, Deluge, uTorrent/BitTorrent Classic, BiglyBT/Vuze, Tixati, and generic torrent libraries. No numeric torrent-capacity guarantee is part of the current release scope.
 
 **Not the primary target:** casual desktop torrenting, search-engine plugin users, "download one magnet and watch immediately" users.
 
@@ -68,7 +68,7 @@ crates/
   rt-api-deluge/      — Deluge compatibility facade over TorrentNG-client state
   rt-jobs/            — in-memory job model/queue for library users and tests;
                        daemon persistence is in rt-engine's StorageJobDispatcher
-  rt-metrics/         — Prometheus metrics definitions and scale certification tests
+  rt-metrics/         — Prometheus metrics definitions and resource regression tests
   rt-config/          — TOML config, env override, validation
   rt-migrate/         — import from rTorrent / qBit / Transmission / Deluge / uTorrent / BiglyBT / Tixati / generic libraries
   rt-testkit/         — test fixtures, synthetic torrent generators, interop helpers
@@ -137,7 +137,7 @@ remains a proxy contract, not a capacity certificate. The registry now stores
 taskless torrents as compact `DormantTorrent` records; `DormantTorrentSnapshot`
 is the separate tier-policy record used for deadline and activity decisions.
 The current release-binary smoke proves startup and basic API behavior, not a
-100k capacity claim or simultaneous-hot peer/tracker workload.
+numeric capacity claim or simultaneous-hot peer/tracker workload.
 
 The engine's first structural ownership boundary is explicit in code. The
 `rt-engine::storage_control` module owns storage-plan validation,
@@ -184,6 +184,9 @@ metadata_only           — no file I/O (metadata/announce only)
   completed storage barrier. Clean saves advance the barrier after sync;
   unclean saves with a watermark downgrade only those dirty pieces on restart,
   bounding post-crash recheck instead of forcing full-library verification.
+  See [CRASH_SAFETY.md](CRASH_SAFETY.md) for the completion gate, run marker,
+  host-crash recovery policy, allocation audit and read-back verification that
+  sit on top of this watermark.
 - Peer-read locality through internal readahead/coalescing while returning exact requested bytes
 - Page-cache stewardship: large peer reads issue `SEQUENTIAL`/`WILLNEED`
   hints, and large recheck reads issue `SEQUENTIAL` before I/O and `DONTNEED`
@@ -515,10 +518,14 @@ Every torrent answers these questions through the API:
 - Mount disappears
 - Network outage / DNS failure
 
-### Scale tests (synthetic)
+### Scale tests (synthetic diagnostics)
+
+These fixtures exercise tiering, serialization, and storage behavior for
+regression diagnosis. They are not release gates and do not establish a
+numeric torrent-capacity claim.
 
 ```
-1k / 5k / 10k / 15k / 50k / 100k torrents
+bounded synthetic torrent fixtures selected for the host
 Large single-file torrents
 Large multi-file deep directory trees
 Many small files

@@ -28,12 +28,81 @@ const SESSION_TTL_SECS: u64 = 24 * 60 * 60;
 const MAX_LOGIN_ATTEMPTS: u8 = 10;
 const LOGIN_ATTEMPT_WINDOW: Duration = Duration::from_secs(60);
 const MAX_TRACKED_LOGIN_CLIENTS: usize = 4_096;
+const MAX_BOOTSTRAP_PASSWORD_BYTES: usize = 128;
 
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AuthCredentials {
     pub username: String,
     pub password: String,
+}
+
+fn read_bootstrap_password(path: &Path) -> std::io::Result<String> {
+    let mut file = crate::safe_file::open_regular_read_no_follow(path)?;
+    let mut bytes = Vec::with_capacity(64);
+    file.by_ref()
+        .take((MAX_BOOTSTRAP_PASSWORD_BYTES + 1) as u64)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() > MAX_BOOTSTRAP_PASSWORD_BYTES {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "bootstrap password file is too large",
+        ));
+    }
+    let password = String::from_utf8(bytes).map_err(|_| {
+        std::io::Error::new(std::io::ErrorKind::InvalidData, "invalid password file")
+    })?;
+    let password = password.trim().to_owned();
+    if password.len() < 16 || password.len() > MAX_BOOTSTRAP_PASSWORD_BYTES {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "bootstrap password file has an invalid length",
+        ));
+    }
+    Ok(password)
+}
+
+/// Load or atomically create this installation's random first-login password.
+/// The file is private to the service account and never appears in logs.
+pub fn load_or_create_bootstrap_password(path: &Path) -> anyhow::Result<String> {
+    match read_bootstrap_password(path) {
+        Ok(password) => return Ok(password),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("reading bootstrap password from {}", path.display()))
+        }
+    }
+
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("creating auth state directory {}", parent.display()))?;
+    }
+    let password = uuid::Uuid::new_v4().simple().to_string();
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    match options.open(path) {
+        Ok(mut file) => {
+            use std::io::Write as _;
+            file.write_all(password.as_bytes())?;
+            file.write_all(b"\n")?;
+            file.sync_all()?;
+            Ok(password)
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            read_bootstrap_password(path)
+                .map_err(anyhow::Error::from)
+                .with_context(|| format!("reading bootstrap password from {}", path.display()))
+        }
+        Err(error) => {
+            Err(error).with_context(|| format!("creating bootstrap password at {}", path.display()))
+        }
+    }
 }
 
 pub fn load_auth_credentials(
@@ -355,9 +424,9 @@ fn bearer_token(req: &Request<Body>) -> Option<String> {
 }
 
 fn trusted_proxy_user(req: &Request<Body>) -> bool {
-    req.headers()
-        .get("X-Remote-User")
-        .and_then(|value| value.to_str().ok())
+    single_header_value(req.headers(), "x-remote-user")
+        .ok()
+        .flatten()
         .is_some_and(|value| {
             let value = value.trim();
             !value.is_empty() && value.len() <= 256 && !value.chars().any(char::is_control)
@@ -420,6 +489,15 @@ fn local_session_cookie_valid(state: &AppState, req: &Request<Body>) -> bool {
 }
 
 fn verify_signed_session(secret: &str, tokens: &[String], value: &str) -> Option<String> {
+    verify_signed_session_at(secret, tokens, value, unix_now())
+}
+
+fn verify_signed_session_at(
+    secret: &str,
+    tokens: &[String],
+    value: &str,
+    now: u64,
+) -> Option<String> {
     let mut parts = value.split('.');
     let version = parts.next()?;
     let expires = parts.next()?.parse::<u64>().ok()?;
@@ -427,7 +505,7 @@ fn verify_signed_session(secret: &str, tokens: &[String], value: &str) -> Option
     let signature = parts.next()?;
     if version != "tng1"
         || parts.next().is_some()
-        || expires < unix_now()
+        || expires <= now
         || nonce.len() != 32
         || signature.len() != 64
         || !nonce.bytes().all(|byte| byte.is_ascii_hexdigit())
@@ -484,11 +562,15 @@ fn csrf_request_allowed(headers: &axum::http::HeaderMap) -> bool {
     // Origin/Referer-free request that Sec-Fetch-Site also didn't label, is
     // not proof of same-origin — it's simply a client that omitted the
     // headers this check relies on.
-    let Some(host) = headers.get("Host").and_then(|value| value.to_str().ok()) else {
+    let Ok(Some(host)) = single_header_value(headers, "host") else {
         return false;
     };
-    let origin = headers.get("Origin").and_then(|value| value.to_str().ok());
-    let referer = headers.get("Referer").and_then(|value| value.to_str().ok());
+    let Ok(origin) = single_header_value(headers, "origin") else {
+        return false;
+    };
+    let Ok(referer) = single_header_value(headers, "referer") else {
+        return false;
+    };
     if origin.is_none() && referer.is_none() {
         return false;
     }
@@ -499,6 +581,22 @@ fn csrf_request_allowed(headers: &axum::http::HeaderMap) -> bool {
         }
     }
     true
+}
+
+/// Security-sensitive headers are single-valued. Reject duplicates instead
+/// of letting a proxy and the application select different values.
+fn single_header_value<'a>(
+    headers: &'a axum::http::HeaderMap,
+    name: &str,
+) -> Result<Option<&'a str>, ()> {
+    let mut values = headers.get_all(name).iter();
+    let Some(value) = values.next() else {
+        return Ok(None);
+    };
+    if values.next().is_some() {
+        return Err(());
+    }
+    value.to_str().map(Some).map_err(|_| ())
 }
 
 fn same_origin_authority(value: &str, host: &str, required: bool) -> bool {
@@ -520,6 +618,9 @@ fn same_origin_authority(value: &str, host: &str, required: bool) -> bool {
         return false;
     }
     let scheme = value[..scheme_end].to_ascii_lowercase();
+    if !matches!(scheme.as_str(), "http" | "https") {
+        return false;
+    }
     normalize_authority(authority, &scheme) == normalize_authority(host.trim(), &scheme)
 }
 
@@ -585,6 +686,33 @@ mod tests {
             );
         }
         map
+    }
+
+    #[test]
+    fn bootstrap_password_is_unique_persistent_and_private() {
+        let dir = tempfile::tempdir().unwrap();
+        let first_path = dir.path().join("first").join("bootstrap-password");
+        let second_path = dir.path().join("second").join("bootstrap-password");
+
+        let first = load_or_create_bootstrap_password(&first_path).unwrap();
+        assert_eq!(first.len(), 32);
+        assert!(first.bytes().all(|byte| byte.is_ascii_hexdigit()));
+        assert_eq!(
+            load_or_create_bootstrap_password(&first_path).unwrap(),
+            first
+        );
+
+        let second = load_or_create_bootstrap_password(&second_path).unwrap();
+        assert_ne!(first, second);
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(&first_path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
     }
 
     #[test]

@@ -78,6 +78,16 @@ export function HelpDialog({ onClose }: Props) {
           </section>
 
           <section className="tng-card" style={sectionCard}>
+            <h3 style={headingStyle}>Finalizing</h3>
+            <p style={textStyle}>
+              A torrent shown as Finalizing has downloaded every piece but is being held until its data is
+              confirmed on disk, so a power cut cannot leave a half-written file marked complete for
+              Sonarr, Radarr or a tracker. It normally clears within a second. If it stays, storage cannot be
+              synced; see Settings, Backend, Crash safety.
+            </p>
+          </section>
+
+          <section className="tng-card" style={sectionCard}>
             <h3 style={headingStyle}>Links</h3>
             <div style={{ display: 'grid', gap: 7 }}>
               {LINKS.map(([label, href]) => (

@@ -5,7 +5,7 @@ use url::Url;
 
 use crate::{error::MetainfoError, types::MagnetLink};
 
-const MAX_MAGNET_BYTES: usize = 4 * 1024 * 1024;
+pub const MAX_MAGNET_BYTES: usize = 4 * 1024 * 1024;
 const MAX_MAGNET_NAME_BYTES: usize = 4096;
 const MAX_MAGNET_TRACKERS: usize = 4096;
 const MAX_MAGNET_TRACKER_BYTES: usize = 8192;

@@ -72,6 +72,13 @@ pub struct TorrentEntry {
     /// announce completes; cleared on the next successful announce.
     #[serde(default)]
     pub tracker_message: Option<String>,
+    /// The download has finished but is being held until its data is durable
+    /// (and any read-back verification has passed). Runtime-only: it is not
+    /// persisted, so a restart never resumes a hold. Reported alongside
+    /// `amount_left == 1` so clients that only read the byte count still see
+    /// an unfinished torrent.
+    #[serde(default)]
+    pub finalizing: bool,
 }
 
 /// The durable projection retained for a torrent that has no live runtime
@@ -144,6 +151,8 @@ impl DormantTorrent {
             tags: self.tags.as_ref().to_vec(),
             error_message: self.error_message.as_ref().map(|value| value.to_string()),
             tracker_message: self.tracker_message.as_ref().map(|value| value.to_string()),
+            // A dormant torrent has no live task, so nothing is being held.
+            finalizing: false,
         }
     }
 
@@ -178,6 +187,7 @@ impl TorrentEntry {
             tags: Vec::new(),
             error_message: None,
             tracker_message: None,
+            finalizing: false,
         }
     }
 

@@ -1558,6 +1558,7 @@ version = "0.1.0"
 dependencies = [
  "rt-logging",
  "serde",
+ "serde_json",
  "thiserror 2.0.20",
  "toml",
 ]
@@ -1705,6 +1706,7 @@ dependencies = [
 name = "rt-migrate"
 version = "0.1.0"
 dependencies = [
+ "libc",
  "rt-bencode",
  "rt-db",
  "rt-fastresume",
@@ -2356,6 +2358,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "axum",
+ "libc",
  "rt-api-deluge",
  "rt-api-model",
  "rt-api-native",

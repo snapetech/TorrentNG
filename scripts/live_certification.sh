@@ -45,6 +45,13 @@ trap cleanup EXIT
 tng_write_qbit_login_body "$TNG_API_TOKEN" "$AUTH_BODY_FILE"
 
 mkdir -p "$(dirname "$OUT")"
+TMP_DIR="$(mktemp -d "${TMPDIR:-/tmp}/torrentng-live-cert.XXXXXX")"
+BODY="$TMP_DIR/body"
+COOKIE_JAR="$TMP_DIR/cookies"
+cleanup() {
+  rm -rf "$TMP_DIR"
+}
+trap cleanup EXIT
 
 if [[ "${CERT_START_STACK:-0}" == "1" ]]; then
   docker compose --env-file "$ENV_FILE" -f "$COMPOSE_FILE" up -d --build

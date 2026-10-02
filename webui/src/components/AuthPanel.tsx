@@ -48,7 +48,7 @@ export function AuthPanel() {
         Login credentials
       </h2>
       <p style={{ margin: '0 0 14px', color: 'var(--faint)', fontSize: 12, lineHeight: 1.55 }}>
-        Choose a WebUI username and password. API tokens stay enabled for automation and can also be entered in either login field.
+        Choose a WebUI username and password. Public binds require a password of at least 16 characters. API tokens stay enabled for automation and can also be entered in either login field.
       </p>
 
       {isLoading && <div role="status">Loading authentication settings…</div>}
@@ -58,11 +58,6 @@ export function AuthPanel() {
           <div style={{ marginBottom: 14, fontSize: 12, color: 'var(--muted)', lineHeight: 1.55 }}>
             <div>Current username: <strong>{data.username}</strong></div>
             <div>API-token login: <strong>{data.api_token_login_enabled ? 'enabled' : 'not configured'}</strong></div>
-            {data.password_is_default && !data.default_credentials_allowed && (
-              <div style={{ color: 'var(--danger)', marginTop: 4 }}>
-                The default password is disabled on this public bind. Sign in with the API token, then choose a password here.
-              </div>
-            )}
           </div>
 
           <form onSubmit={submit} style={{ display: 'grid', gap: 10, maxWidth: 440 }}>

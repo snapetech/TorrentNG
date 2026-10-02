@@ -149,6 +149,8 @@ pub(crate) fn file_matches_path(file: &File, path: &Path) -> io::Result<bool> {
         )
     }
 
+    // `MetadataExt::{volume_serial_number, file_index}` are still unstable
+    // std API, so identity comes from the handle directly.
     #[cfg(windows)]
     {
         let current = open_path_no_follow_windows(path, false, false)?;

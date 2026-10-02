@@ -56,6 +56,11 @@ torrentngd migrate --source <SRC> --from <DIR> [OPTIONS]
 - `--policy` — fast-resume trust: `verify`, `trust-hints` (default), or
   `trust-all`. `trust-hints` only trusts complete state when the data files
   are present at the expected sizes; anything else falls back to verification.
+  If the source client looks like it crashed, the policy is lowered to `verify`
+  automatically (see [Crash detection](#crash-detection)).
+- `--trust-unclean-source` — keep `--policy` even when the source looks crashed
+- `--allow-running-source` — import even though the source client appears to be
+  running (its state may be mid-write; refused by default)
 - `--remap OLD=NEW` — rewrite a save-path prefix (repeatable), e.g.
   `--remap /downloads=/data` when data moved into a container
 - `--default-save-path DIR` — fallback save path when the source recorded none
@@ -63,6 +68,36 @@ torrentngd migrate --source <SRC> --from <DIR> [OPTIONS]
 - `--config FILE` — config file (else `TORRENTNGD_CONFIG` / defaults); this
   determines the TorrentNG-client DB and fast-resume target locations
 - `--yes` — skip the confirmation prompt with `--apply`
+
+### Crash detection
+
+A resume bitfield saved just before a crash can claim data that never reached
+disk; importing it under a trusting policy reproduces the failure described in
+[CRASH_SAFETY.md](CRASH_SAFETY.md). Before applying, `torrentngd migrate` checks
+the source's shutdown state:
+
+| Source | Signal | Result |
+|---|---|---|
+| rTorrent | `rtorrent.lock` (`host:+pid`) in the session directory | no lock: clean. Lock and a live `rtorrent` process: **running**, refused unless `--allow-running-source`. Lock but no such process (or another host, or unreadable): **crashed** |
+| qBittorrent | `lockfile` (Qt `QLockFile`: pid, app, host) in the state directory or up to two parents | lock found: same rules as rTorrent. Not found: **unknown**, not clean |
+| Deluge | `deluged.pid` (`pid;port`) in the state directory or its parent | same as qBittorrent |
+| any other source, or a non-standard location | `--source-lock FILE` | a lock or pid file you name: found and stale is a crash, found and live is running, **missing means the client exited cleanly** |
+| every other source without `--source-lock` | none TorrentNG can read | unknown; nothing is assumed |
+
+The qBittorrent and Deluge file names, formats and locations come from those
+clients' documented behavior and were not verified against the real programs; if
+yours keeps its lock elsewhere, pass it with `--source-lock`.
+
+A lock is judged by its process: gone means the last run did not finish; alive
+and named like the client means it is running now; alive but named like an
+unrelated program means the pid was reused (crash); a scripting-language host
+such as `python` counts as possibly the client. Process checks use `/proc` on
+Linux, `kill` and `ps` on macOS and FreeBSD, and `OpenProcess` on Windows.
+
+For a crashed source the policy becomes `verify`, so every imported torrent is
+hash-checked before it is trusted; the dry-run prints this, and
+`--trust-unclean-source` overrides it. For sources with no signal, after any
+crash of that client pass `--policy verify` yourself.
 
 The dry-run report and the post-apply summary both break torrents down into
 trusted / hints / metadata-only / none so you can see how much state will

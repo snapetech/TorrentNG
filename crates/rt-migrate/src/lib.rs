@@ -1,4 +1,10 @@
 pub mod export;
+pub mod source_state;
+
+pub use source_state::{
+    detect_source_shutdown, detect_source_shutdown_with, parse_lock, process_state, LockInfo,
+    ProcessState, SourceShutdown,
+};
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::File;
@@ -1108,6 +1114,7 @@ fn migration_torrent_from_path(
 
     apply_file_resume_state(
         &mut files,
+        &migration_padding_file_indices(&meta),
         &resume.file_priorities,
         &resume.file_wanted,
         &resume.file_completed_bytes,
@@ -1280,8 +1287,32 @@ fn migration_files(meta: &TorrentMeta) -> Vec<MigrationFile> {
     }
 }
 
+fn migration_padding_file_indices(meta: &TorrentMeta) -> BTreeSet<u32> {
+    match meta {
+        TorrentMeta::V1(meta) => meta
+            .files
+            .iter()
+            .filter(|file| file.pad)
+            .map(|file| file.index)
+            .collect(),
+        TorrentMeta::Hybrid(meta, _) => meta
+            .files
+            .iter()
+            .filter(|file| file.pad)
+            .map(|file| file.index)
+            .collect(),
+        TorrentMeta::V2(meta) => meta
+            .files
+            .iter()
+            .filter(|file| file.pad)
+            .map(|file| file.index)
+            .collect(),
+    }
+}
+
 fn apply_file_resume_state(
     files: &mut [MigrationFile],
+    padding_file_indices: &BTreeSet<u32>,
     priorities: &[i32],
     wanted: &[bool],
     completed_bytes: &[u64],
@@ -1301,6 +1332,14 @@ fn apply_file_resume_state(
         }
         if let Some(bytes) = completed_bytes.get(file.index as usize).copied() {
             file.completed_bytes = Some(bytes.min(file.length));
+        }
+        if padding_file_indices.contains(&file.index) {
+            // Resume sidecars often carry a uniform priority/wanted array.
+            // A BEP 47 padding entry must remain disabled even when that
+            // array claims every file is wanted; real clients do not create
+            // the synthetic path on disk.
+            file.priority = 0;
+            file.wanted = false;
         }
     }
 }
@@ -2812,6 +2851,16 @@ mod tests {
              never write it to disk, so requiring it forces a needless recheck"
         );
         assert_eq!(files[1].priority, 0);
+
+        let raw = std::fs::read(dir.path().join(format!("{info_hash_hex}.torrent"))).unwrap();
+        let parsed = parse_torrent(&raw).unwrap();
+        let mut resumed_files = migration_files(&parsed);
+        let padding = migration_padding_file_indices(&parsed);
+        apply_file_resume_state(&mut resumed_files, &padding, &[1, 1], &[true, true], &[]);
+        assert!(resumed_files[0].wanted);
+        assert_eq!(resumed_files[0].priority, 1);
+        assert!(!resumed_files[1].wanted);
+        assert_eq!(resumed_files[1].priority, 0);
     }
 
     #[test]

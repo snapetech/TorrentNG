@@ -32,8 +32,9 @@ run_gate() {
 
 latest() {
   local pattern="$1"
-  find "$REPORT_DIR" -maxdepth 1 -type f -name "$pattern" -printf '%T@ %p\n' 2>/dev/null \
-    | sort -nr | awk 'NR==1 {print $2}'
+  find "$REPORT_DIR" -maxdepth 1 -type f -name "$pattern" -printf '%T@\t%p\n' 2>/dev/null \
+    | sort -t $'\t' -k1,1nr \
+    | awk 'NR == 1 { print substr($0, index($0, "\t") + 1) }'
 }
 
 active_long_soak() {

@@ -38,7 +38,20 @@ REQUIRED:
 OPTIONS:
     --apply            perform the import (default: dry-run report only)
     --policy <P>       fast-resume trust policy: verify | trust-hints |
-                       trust-all (default: trust-hints)
+                       trust-all (default: trust-hints). If the source
+                       client did not shut down cleanly (see below) the
+                       policy is lowered to `verify` automatically.
+    --trust-unclean-source
+                       keep --policy even when the source looks crashed
+    --allow-running-source
+                       import even though the source client appears to be
+                       running (its state may be mid-write)
+    --source-lock <FILE>
+                       lock or pid file the source client keeps while it runs
+                       (for example transmission-daemon --pid-file); used for
+                       crash detection when the client has no built-in
+                       detection. A missing file means the client exited
+                       cleanly
     --remap <OLD=NEW>  rewrite a save-path prefix; repeatable
                        (e.g. --remap /downloads=/data)
     --default-save-path <DIR>
@@ -54,7 +67,14 @@ OPTIONS:
 
 Dry-run is read-only. With --apply, TorrentNG-client DB rows and compatible
 fast-resume state are written together; complete torrents whose data is
-present resume without a full recheck.";
+present resume without a full recheck.
+
+Crash detection: a resume bitfield written just before a crash can claim data
+that never reached disk. For rTorrent, a leftover rtorrent.lock whose process
+is gone marks the session as crashed. qBittorrent (lockfile) and Deluge
+(deluged.pid) are searched for near the state directory, best effort. For any
+other client pass --source-lock; without a signal, after any crash of that
+client pass --policy verify.";
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum Command {
@@ -76,6 +96,9 @@ pub struct MigrateArgs {
     pub report_json: Option<PathBuf>,
     pub config: Option<PathBuf>,
     pub assume_yes: bool,
+    pub trust_unclean_source: bool,
+    pub allow_running_source: bool,
+    pub source_lock: Option<PathBuf>,
 }
 
 pub fn parse_source(value: &str) -> Option<MigrationSource> {
@@ -126,6 +149,9 @@ pub fn parse_args(args: &[String]) -> Result<Command, String> {
     let mut report_json = None;
     let mut config = None;
     let mut assume_yes = false;
+    let mut trust_unclean_source = false;
+    let mut allow_running_source = false;
+    let mut source_lock = None;
 
     let mut iter = args.iter();
     while let Some(arg) = iter.next() {
@@ -144,6 +170,9 @@ pub fn parse_args(args: &[String]) -> Result<Command, String> {
             "--from" => from = Some(PathBuf::from(value("--from")?)),
             "--apply" => apply = true,
             "--yes" | "-y" => assume_yes = true,
+            "--trust-unclean-source" => trust_unclean_source = true,
+            "--allow-running-source" => allow_running_source = true,
+            "--source-lock" => source_lock = Some(PathBuf::from(value("--source-lock")?)),
             "--policy" => {
                 let raw = value("--policy")?;
                 policy = parse_policy(&raw).ok_or_else(|| format!("unknown --policy `{raw}`"))?;
@@ -176,7 +205,80 @@ pub fn parse_args(args: &[String]) -> Result<Command, String> {
         report_json,
         config,
         assume_yes,
+        trust_unclean_source,
+        allow_running_source,
+        source_lock,
     }))
+}
+
+/// What to do about the source client's shutdown state.
+#[derive(Debug, PartialEq, Eq)]
+pub struct SourceSafety {
+    /// Policy to apply for this import.
+    pub policy: ImportPolicy,
+    /// Lines to show the operator.
+    pub notices: Vec<String>,
+    /// The import must not proceed.
+    pub refuse: Option<String>,
+}
+
+/// Turn the source's shutdown state and the operator's flags into the policy
+/// actually used. A crashed source never keeps a trusting policy unless the
+/// operator explicitly says so, and a running source is refused outright.
+pub fn plan_source_safety(
+    shutdown: &rt_migrate::SourceShutdown,
+    requested: ImportPolicy,
+    trust_unclean_source: bool,
+    allow_running_source: bool,
+) -> SourceSafety {
+    use rt_migrate::SourceShutdown as S;
+    match shutdown {
+        S::Clean | S::Unknown => SourceSafety {
+            policy: requested,
+            notices: Vec::new(),
+            refuse: None,
+        },
+        S::Running { pid } => SourceSafety {
+            policy: requested,
+            notices: vec![format!(
+                "warning: the source client appears to be running (pid {pid}); its state may be mid-write"
+            )],
+            refuse: (!allow_running_source).then(|| {
+                format!(
+                    "the source client is running (pid {pid}); stop it first, or pass \
+                     --allow-running-source to import anyway"
+                )
+            }),
+        },
+        S::Crashed { reason } => {
+            let downgrade = requested != ImportPolicy::RequireVerification && !trust_unclean_source;
+            let mut notices = vec![format!(
+                "warning: the source client did not shut down cleanly: {reason}"
+            )];
+            if downgrade {
+                notices.push(
+                    "the fast-resume policy is lowered to `verify`, so every imported torrent is \
+                     hash-checked before it is trusted (override with --trust-unclean-source)"
+                        .to_owned(),
+                );
+            } else if trust_unclean_source && requested != ImportPolicy::RequireVerification {
+                notices.push(
+                    "--trust-unclean-source: keeping the requested policy; data written just \
+                     before the crash may be missing"
+                        .to_owned(),
+                );
+            }
+            SourceSafety {
+                policy: if downgrade {
+                    ImportPolicy::RequireVerification
+                } else {
+                    requested
+                },
+                notices,
+                refuse: None,
+            }
+        }
+    }
 }
 
 fn now_unix() -> i64 {
@@ -411,11 +513,28 @@ pub fn run(args: &[String]) -> anyhow::Result<()> {
         plan.warning_count(),
     );
 
+    let safety = plan_source_safety(
+        &rt_migrate::detect_source_shutdown_with(
+            args.source,
+            &args.from,
+            args.source_lock.as_deref(),
+        ),
+        args.policy,
+        args.trust_unclean_source,
+        args.allow_running_source,
+    );
+    for notice in &safety.notices {
+        println!("\n{notice}");
+    }
+
     if !args.apply {
         println!("\nDry-run only. Re-run with --apply to write TorrentNG-client state.");
         return Ok(());
     }
 
+    if let Some(reason) = &safety.refuse {
+        bail!("{reason}");
+    }
     if plan.torrent_count() == 0 {
         println!("\nNothing to import.");
         return Ok(());
@@ -429,7 +548,7 @@ pub fn run(args: &[String]) -> anyhow::Result<()> {
         "\nApply target:\n  database:   {}\n  fastresume: {}\n  policy:     {:?}",
         db_path.display(),
         fastresume_dir.display(),
-        args.policy,
+        safety.policy,
     );
 
     if !args.assume_yes {
@@ -447,10 +566,10 @@ pub fn run(args: &[String]) -> anyhow::Result<()> {
     }
 
     if let Some(parent) = db_path.parent() {
-        std::fs::create_dir_all(parent)
+        rt_storage::create_dir_all_no_follow(parent)
             .with_context(|| format!("creating {}", parent.display()))?;
     }
-    std::fs::create_dir_all(&fastresume_dir)
+    rt_storage::create_dir_all_no_follow(&fastresume_dir)
         .with_context(|| format!("creating {}", fastresume_dir.display()))?;
 
     let mut conn = rusqlite::Connection::open(&db_path)
@@ -465,7 +584,7 @@ pub fn run(args: &[String]) -> anyhow::Result<()> {
     let blobs = persist_torrent_blobs(&plan, &blob_dir)?;
 
     let result = plan
-        .apply_native_import(&mut conn, &fastresume_dir, &options, args.policy)
+        .apply_native_import(&mut conn, &fastresume_dir, &options, safety.policy)
         .map_err(|e| anyhow!("TorrentNG-client import failed: {e}"))?;
 
     println!(
@@ -561,6 +680,96 @@ mod tests {
         assert!(parse_args(&args(&["--source", "nope", "--from", "/x"])).is_err());
         assert!(parse_args(&args(&["--bogus"])).is_err());
         assert!(parse_args(&args(&["--source"])).is_err());
+    }
+
+    #[test]
+    fn crash_related_flags_parse_and_default_off() {
+        let Command::Migrate(a) =
+            parse_args(&args(&["--source", "rtorrent", "--from", "/s"])).unwrap()
+        else {
+            panic!("expected migrate");
+        };
+        assert!(!a.trust_unclean_source);
+        assert!(!a.allow_running_source);
+        assert_eq!(a.source_lock, None);
+
+        let Command::Migrate(a) = parse_args(&args(&[
+            "--source",
+            "transmission",
+            "--from",
+            "/s",
+            "--trust-unclean-source",
+            "--allow-running-source",
+            "--source-lock",
+            "/run/transmission.pid",
+        ]))
+        .unwrap() else {
+            panic!("expected migrate");
+        };
+        assert!(a.trust_unclean_source);
+        assert!(a.allow_running_source);
+        assert_eq!(a.source_lock, Some(PathBuf::from("/run/transmission.pid")));
+    }
+
+    #[test]
+    fn a_crashed_source_lowers_trusting_policies_to_verify() {
+        use rt_migrate::SourceShutdown as S;
+        let crashed = S::Crashed {
+            reason: "stale lock".to_owned(),
+        };
+        for requested in [ImportPolicy::TrustHints, ImportPolicy::TrustAll] {
+            let safety = plan_source_safety(&crashed, requested, false, false);
+            assert_eq!(
+                safety.policy,
+                ImportPolicy::RequireVerification,
+                "{requested:?}"
+            );
+            assert!(safety.refuse.is_none());
+            assert!(safety
+                .notices
+                .iter()
+                .any(|n| n.contains("lowered to `verify`")));
+        }
+        // Already the strictest: nothing to lower, but still reported.
+        let safety = plan_source_safety(&crashed, ImportPolicy::RequireVerification, false, false);
+        assert_eq!(safety.policy, ImportPolicy::RequireVerification);
+        assert!(!safety.notices.is_empty());
+    }
+
+    #[test]
+    fn the_operator_can_explicitly_keep_a_trusting_policy_for_a_crashed_source() {
+        use rt_migrate::SourceShutdown as S;
+        let crashed = S::Crashed {
+            reason: "stale lock".to_owned(),
+        };
+        let safety = plan_source_safety(&crashed, ImportPolicy::TrustHints, true, false);
+        assert_eq!(safety.policy, ImportPolicy::TrustHints);
+        assert!(safety
+            .notices
+            .iter()
+            .any(|n| n.contains("--trust-unclean-source")));
+    }
+
+    #[test]
+    fn a_running_source_is_refused_unless_explicitly_allowed() {
+        use rt_migrate::SourceShutdown as S;
+        let running = S::Running { pid: 77 };
+        let refused = plan_source_safety(&running, ImportPolicy::TrustHints, false, false);
+        assert!(refused.refuse.as_deref().unwrap().contains("77"));
+        let allowed = plan_source_safety(&running, ImportPolicy::TrustHints, false, true);
+        assert!(allowed.refuse.is_none());
+        assert_eq!(allowed.policy, ImportPolicy::TrustHints);
+    }
+
+    #[test]
+    fn clean_and_unknown_sources_keep_the_requested_policy_silently() {
+        use rt_migrate::SourceShutdown as S;
+        for shutdown in [S::Clean, S::Unknown] {
+            let safety = plan_source_safety(&shutdown, ImportPolicy::TrustAll, false, false);
+            assert_eq!(safety.policy, ImportPolicy::TrustAll);
+            assert!(safety.notices.is_empty());
+            assert!(safety.refuse.is_none());
+        }
     }
 
     #[test]

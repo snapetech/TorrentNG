@@ -195,6 +195,13 @@ pub struct EngineTorrentFile {
     pub index: u32,
     pub path: String,
     pub length: u64,
+    /// Byte offset in the concatenated payload stream. This is the coordinate
+    /// used by `amount_left` and per-file completion accounting.
+    pub offset: u64,
+    /// Logical BEP 52 piece-space offset. Pure-v2 torrents may leave
+    /// alignment gaps between adjacent files, so callers that project piece
+    /// ranges must not reconstruct this from payload lengths.
+    pub piece_offset: u64,
     pub priority: i64,
     pub wanted: bool,
 }
@@ -1657,6 +1664,22 @@ pub(crate) enum EngineCmd {
     SetUserAgent {
         user_agent: String,
         reply: oneshot::Sender<CmdResult<()>>,
+    },
+    /// Read the crash-safety settings, run verdict, mount trust and counters.
+    GetCrashSafety {
+        reply: oneshot::Sender<CmdResult<crate::crash_safety::CrashSafetyView>>,
+    },
+    /// Persist and apply new crash-safety settings. `None` removes the runtime
+    /// override and returns to the config-file values.
+    SetCrashSafety {
+        settings: Option<rt_config::CrashSafetyConfig>,
+        reply: oneshot::Sender<CmdResult<crate::crash_safety::CrashSafetyView>>,
+    },
+    /// What crash-safety settings, mount rating and recovery a save location
+    /// would get, without adding it to the tracked mounts.
+    DescribeCrashSafetyPath {
+        path: std::path::PathBuf,
+        reply: oneshot::Sender<CmdResult<crate::crash_safety::PathReport>>,
     },
     GetQueuePriority {
         info_hash: String,

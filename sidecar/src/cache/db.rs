@@ -1,11 +1,12 @@
 use super::categories::{
-    check_category_capacity, check_tag_capacity, check_torrent_tag_capacity,
-    MAX_CACHED_LABEL_NAME_BYTES, MAX_CACHED_TAGS_PER_MUTATION, MAX_CACHED_TAG_MUTATION_BYTES,
+    bounded_text_from_sql, check_category_capacity, check_tag_capacity, check_torrent_tag_capacity,
+    validate_bounded_text, MAX_CACHED_LABEL_NAME_BYTES, MAX_CACHED_TAGS_PER_MUTATION,
+    MAX_CACHED_TAG_MUTATION_BYTES,
 };
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use rusqlite::{params, Connection, OptionalExtension};
 use std::{
-    collections::{BTreeMap, HashSet},
+    collections::BTreeMap,
     path::Path,
     sync::{
         atomic::{AtomicBool, AtomicUsize, Ordering},
@@ -15,12 +16,32 @@ use std::{
 };
 use tokio::sync::Semaphore;
 
+use super::categories::{MAX_CATEGORY_TEXT_BYTES, MAX_TORRENT_LOCATION_TEXT_BYTES};
+
 /// qBittorrent's `sync/maindata.rid` is a logical change cursor, not a wall
 /// clock.  Keep it in the cache database so it survives service restarts and
 /// cannot miss two updates made in the same second.
 pub(crate) const CACHE_REVISION_KEY: &str = "cache_revision";
 pub(crate) const CACHE_REVISION_FLOOR_KEY: &str = "cache_revision_floor";
 pub(crate) const MAX_REMOVED_TORRENT_TOMBSTONES: i64 = 100_000;
+pub(crate) const MAX_TORRENT_TAGS: usize = 1_024;
+pub const MAX_TORRENT_TAG_BYTES: usize = 256 * 1024;
+pub(crate) const MAX_TORRENT_HASH_BYTES: usize = 128;
+pub(crate) const MAX_TORRENT_NAME_BYTES: usize = 64 * 1024;
+pub(crate) const MAX_TORRENT_MESSAGE_BYTES: usize = 64 * 1024;
+pub(crate) const MAX_TORRENT_TRACKER_URL_BYTES: usize = 64 * 1024;
+pub(crate) const MAX_KV_KEY_BYTES: usize = 256;
+pub(crate) const MAX_KV_VALUE_BYTES: usize = 16 * 1024 * 1024;
+// rTorrent log ingestion deliberately preserves one bounded log line, whose
+// existing per-poll budget is 1 MiB. Keep the database boundary at that same
+// ceiling while still preventing an unbounded event record from any caller.
+const MAX_APP_EVENT_TEXT_BYTES: usize = 1024 * 1024;
+const MAX_APP_EVENT_PAYLOAD_BYTES: usize = 256 * 1024;
+/// Bound the aggregate strings retained by one log query. Individual event
+/// writes and reads are bounded too, but 1,000 valid near-limit rows would
+/// otherwise create a multi-hundred-megabyte compatibility snapshot.
+const MAX_APP_EVENT_RESULT_BYTES: usize = 64 * 1024 * 1024;
+const MAX_APP_EVENT_RESULT_ITEMS: usize = 10_000;
 const MAX_BLOCKING_DB_READS: usize = 8;
 /// Number of standing read-only connections kept open beside the single
 /// writer connection. SQLite's WAL mode lets any number of reader
@@ -280,6 +301,25 @@ impl Db {
     /// `TorrentRow::tags` in that case means "not exposed", not "remove every
     /// cached tag".
     pub fn upsert_with_tags(&self, t: &TorrentRow, sync_tags: bool) -> Result<bool> {
+        validate_bounded_text("torrent hash", &t.hash, MAX_TORRENT_HASH_BYTES)?;
+        validate_bounded_text("torrent name", &t.name, MAX_TORRENT_NAME_BYTES)?;
+        validate_bounded_text("torrent message", &t.message, MAX_TORRENT_MESSAGE_BYTES)?;
+        validate_bounded_text(
+            "torrent tracker URL",
+            &t.tracker_url,
+            MAX_TORRENT_TRACKER_URL_BYTES,
+        )?;
+        validate_bounded_text("torrent category", &t.category, MAX_CATEGORY_TEXT_BYTES)?;
+        validate_bounded_text(
+            "torrent base path",
+            &t.base_path,
+            MAX_TORRENT_LOCATION_TEXT_BYTES,
+        )?;
+        validate_bounded_text(
+            "torrent directory",
+            &t.directory,
+            MAX_TORRENT_LOCATION_TEXT_BYTES,
+        )?;
         if t.category.len() > MAX_CACHED_LABEL_NAME_BYTES {
             anyhow::bail!("category name exceeds the {MAX_CACHED_LABEL_NAME_BYTES}-byte limit");
         }
@@ -522,6 +562,18 @@ impl Db {
     }
 
     pub fn append_app_event(&self, event: &AppEventRow, retention: usize) -> Result<i64> {
+        for (label, value) in [
+            ("app event level", event.level.as_str()),
+            ("app event kind", event.kind.as_str()),
+            ("app event message", event.message.as_str()),
+        ] {
+            if value.len() > MAX_APP_EVENT_TEXT_BYTES {
+                bail!("{label} exceeds the maximum of {MAX_APP_EVENT_TEXT_BYTES} bytes");
+            }
+        }
+        if event.payload.len() > MAX_APP_EVENT_PAYLOAD_BYTES {
+            bail!("app event payload exceeds the maximum of {MAX_APP_EVENT_PAYLOAD_BYTES} bytes");
+        }
         serde_json::from_str::<serde_json::Value>(&event.payload)
             .with_context(|| "validate app event payload JSON")?;
         let message = crate::url_redaction::redact_sensitive_text(&event.message);
@@ -549,8 +601,10 @@ impl Db {
         last_known_id: Option<i64>,
     ) -> Result<Vec<AppEventRow>> {
         let conn = self.read()?;
-        let limit = limit.max(1) as i64;
-        let mut sql = "SELECT event_id, occurred_at, level, kind, message, payload
+        let limit = limit.clamp(1, MAX_APP_EVENT_RESULT_ITEMS) as i64;
+        let mut sql = "SELECT event_id, occurred_at, level, kind,
+                    length(CAST(message AS BLOB)), message,
+                    length(CAST(payload AS BLOB)), payload
              FROM app_events"
             .to_owned();
         let mut clauses = Vec::new();
@@ -591,33 +645,44 @@ impl Db {
         values.push(rusqlite::types::Value::Integer(limit));
 
         let mut stmt = conn.prepare(&sql)?;
-        let rows = stmt
-            .query_map(rusqlite::params_from_iter(values), |row| {
-                let message: String = row.get(4)?;
-                let payload: String = row.get(5)?;
-                Ok(AppEventRow {
-                    event_id: Some(row.get(0)?),
-                    occurred_at: row.get(1)?,
-                    level: row.get(2)?,
-                    kind: row.get(3)?,
-                    message: crate::url_redaction::redact_sensitive_text(&message),
-                    payload: crate::url_redaction::redact_sensitive_json(&payload),
-                })
-            })?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
-        Ok(rows)
+        let rows = stmt.query_map(rusqlite::params_from_iter(values), |row| {
+            let message =
+                bounded_text_from_sql(row, 4, 5, MAX_APP_EVENT_TEXT_BYTES, "app event message")?;
+            let payload =
+                bounded_text_from_sql(row, 6, 7, MAX_APP_EVENT_PAYLOAD_BYTES, "app event payload")?;
+            Ok(AppEventRow {
+                event_id: Some(row.get(0)?),
+                occurred_at: row.get(1)?,
+                level: row.get(2)?,
+                kind: row.get(3)?,
+                message: crate::url_redaction::redact_sensitive_text(&message),
+                payload: crate::url_redaction::redact_sensitive_json(&payload),
+            })
+        })?;
+        let mut result = Vec::with_capacity(limit as usize);
+        let mut result_bytes = 0usize;
+        for event in rows {
+            let event = event?;
+            result_bytes = result_bytes
+                .saturating_add(event.level.len())
+                .saturating_add(event.kind.len())
+                .saturating_add(event.message.len())
+                .saturating_add(event.payload.len());
+            if result_bytes > MAX_APP_EVENT_RESULT_BYTES {
+                bail!("app event result exceeds the maximum of {MAX_APP_EVENT_RESULT_BYTES} bytes");
+            }
+            result.push(event);
+        }
+        Ok(result)
     }
 
     pub fn get_kv(&self, key: &str) -> Result<Option<String>> {
-        Ok(self
-            .read()?
-            .query_row("SELECT value FROM kv WHERE key=?1", params![key], |r| {
-                r.get(0)
-            })
-            .optional()?)
+        let connection = self.read()?;
+        kv_value_bounded(&connection, key, MAX_KV_VALUE_BYTES, "cache value")
     }
 
     pub fn set_kv(&self, key: &str, value: &str) -> Result<()> {
+        validate_kv_text(key, value)?;
         self.conn()?.execute(
             "INSERT INTO kv(key, value) VALUES(?1,?2)
              ON CONFLICT(key) DO UPDATE SET value=excluded.value",
@@ -697,15 +762,6 @@ impl Db {
         )?)
     }
 
-    pub fn all_hashes(&self) -> Result<HashSet<String>> {
-        let conn = self.read()?;
-        let mut stmt = conn.prepare("SELECT hash FROM torrents")?;
-        let hashes = stmt
-            .query_map([], |r| r.get(0))?
-            .collect::<rusqlite::Result<HashSet<String>>>()?;
-        Ok(hashes)
-    }
-
     /// Read no more than `limit` torrent hashes. Callers that need to reject
     /// over-limit selections can request `max + 1` rows without materializing
     /// the entire cache first.
@@ -720,6 +776,69 @@ impl Db {
     }
 }
 
+pub(crate) fn kv_value_bounded(
+    conn: &Connection,
+    key: &str,
+    maximum: usize,
+    field: &'static str,
+) -> Result<Option<String>> {
+    validate_kv_key(key)?;
+    Ok(conn
+        .query_row(
+            "SELECT length(CAST(value AS BLOB)), value FROM kv WHERE key=?1",
+            params![key],
+            |row| bounded_text_from_sql(row, 0, 1, maximum, field),
+        )
+        .optional()?)
+}
+
+fn validate_kv_text(key: &str, value: &str) -> Result<()> {
+    validate_kv_key(key)?;
+    if value.len() > MAX_KV_VALUE_BYTES {
+        bail!("cache value exceeds the maximum of {MAX_KV_VALUE_BYTES} bytes");
+    }
+    Ok(())
+}
+
+fn validate_kv_key(key: &str) -> Result<()> {
+    if key.len() > MAX_KV_KEY_BYTES {
+        bail!("cache key exceeds the maximum of {MAX_KV_KEY_BYTES} bytes");
+    }
+    Ok(())
+}
+
+pub(crate) fn sql_limit_with_sentinel(maximum: usize) -> i64 {
+    i64::try_from(maximum)
+        .unwrap_or(i64::MAX - 1)
+        .saturating_add(1)
+}
+
+pub(crate) fn validate_torrent_tag_bytes<'a, I>(tags: I) -> Result<()>
+where
+    I: IntoIterator<Item = &'a str>,
+{
+    let mut total = 0usize;
+    let mut count = 0usize;
+    for tag in tags {
+        total = total
+            .saturating_add(tag.len())
+            .saturating_add(usize::from(count != 0));
+        if total > MAX_TORRENT_TAG_BYTES {
+            bail!("torrent tags exceed the maximum of {MAX_TORRENT_TAG_BYTES} bytes");
+        }
+        count = count.saturating_add(1);
+    }
+    ensure_torrent_tag_count(count)?;
+    Ok(())
+}
+
+fn ensure_torrent_tag_count(count: usize) -> Result<()> {
+    if count > MAX_TORRENT_TAGS {
+        bail!("torrent tags exceed the maximum of {MAX_TORRENT_TAGS}");
+    }
+    Ok(())
+}
+
 /// Return the hash spelling stored in the cache for a logical torrent.
 /// Protocols such as qBittorrent accept hash values case-insensitively, while
 /// the original cache schema uses a binary primary key.  Callers performing a
@@ -727,21 +846,16 @@ impl Db {
 pub(crate) fn canonical_hash(conn: &rusqlite::Connection, hash: &str) -> Result<Option<String>> {
     Ok(conn
         .query_row(
-            "SELECT hash FROM torrents WHERE hash=?1 COLLATE NOCASE",
+            "SELECT length(CAST(hash AS BLOB)), hash
+             FROM torrents WHERE hash=?1 COLLATE NOCASE",
             params![hash],
-            |row| row.get(0),
+            |row| bounded_text_from_sql(row, 0, 1, MAX_TORRENT_HASH_BYTES, "torrent hash"),
         )
         .optional()?)
 }
 
 pub(crate) fn current_revision_locked(conn: &Connection) -> Result<i64> {
-    let value: Option<String> = conn
-        .query_row(
-            "SELECT value FROM kv WHERE key=?1",
-            params![CACHE_REVISION_KEY],
-            |row| row.get(0),
-        )
-        .optional()?;
+    let value = kv_value_bounded(conn, CACHE_REVISION_KEY, 64, "cache revision")?;
     value
         .unwrap_or_else(|| "0".to_owned())
         .parse::<i64>()
@@ -768,13 +882,7 @@ pub(crate) fn prune_removed_tombstones(conn: &Connection, current_revision: i64)
         params![cutoff],
     )?;
 
-    let floor = conn
-        .query_row(
-            "SELECT value FROM kv WHERE key=?1",
-            params![CACHE_REVISION_FLOOR_KEY],
-            |row| row.get::<_, String>(0),
-        )
-        .optional()?
+    let floor = kv_value_bounded(conn, CACHE_REVISION_FLOOR_KEY, 64, "cache revision floor")?
         .map(|value| value.parse::<i64>())
         .transpose()
         .context("parse cache revision floor")?
@@ -940,13 +1048,7 @@ fn migrate(conn: &mut Connection) -> Result<()> {
         .unwrap_or_default()
         .as_secs()
         .min(i64::MAX as u64) as i64;
-    let revision = conn
-        .query_row(
-            "SELECT value FROM kv WHERE key=?1",
-            params![CACHE_REVISION_KEY],
-            |row| row.get::<_, String>(0),
-        )
-        .optional()?
+    let revision = kv_value_bounded(conn, CACHE_REVISION_KEY, 64, "cache revision")?
         .map(|value| value.parse::<i64>())
         .transpose()
         .context("parse persisted cache revision")?
@@ -1059,9 +1161,14 @@ fn collapse_case_duplicate_hashes(conn: &mut Connection) -> Result<()> {
     let tx = conn.transaction()?;
 
     let torrent_hashes = {
-        let mut stmt = tx.prepare("SELECT hash FROM torrents ORDER BY lower(hash), hash")?;
+        let mut stmt = tx.prepare(
+            "SELECT length(CAST(hash AS BLOB)), hash
+             FROM torrents ORDER BY lower(hash), hash",
+        )?;
         let rows = stmt
-            .query_map([], |row| row.get::<_, String>(0))?
+            .query_map([], |row| {
+                bounded_text_from_sql(row, 0, 1, MAX_TORRENT_HASH_BYTES, "torrent hash")
+            })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         rows
     };
@@ -1094,11 +1201,16 @@ fn collapse_case_duplicate_hashes(conn: &mut Connection) -> Result<()> {
     }
 
     let removed_rows = {
-        let mut stmt =
-            tx.prepare("SELECT hash, revision FROM removed_torrents ORDER BY lower(hash), hash")?;
+        let mut stmt = tx.prepare(
+            "SELECT length(CAST(hash AS BLOB)), hash, revision
+                 FROM removed_torrents ORDER BY lower(hash), hash",
+        )?;
         let rows = stmt
             .query_map([], |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+                Ok((
+                    bounded_text_from_sql(row, 0, 1, MAX_TORRENT_HASH_BYTES, "tombstone hash")?,
+                    row.get::<_, i64>(2)?,
+                ))
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         rows

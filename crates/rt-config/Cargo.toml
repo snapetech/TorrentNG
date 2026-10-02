@@ -11,3 +11,6 @@ thiserror.workspace = true
 serde.workspace = true
 toml.workspace = true
 rt-logging = { path = "../rt-logging" }
+
+[dev-dependencies]
+serde_json.workspace = true

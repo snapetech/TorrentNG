@@ -9,7 +9,7 @@ use tokio::sync::{Mutex, Notify, RwLock};
 
 use rt_api_model::{ApiRuntimeMetrics, ChunkedBitSet, ChunkedVec, IdempotencyStore};
 use rt_engine::{EngineGlobalLimits, EngineHandle, OutboundEgressPolicy};
-use rt_session::{RegistryChange, SessionRegistry, TorrentEntry, TorrentState};
+use rt_session::{RegistryChange, SessionRegistry, TorrentEntry};
 
 pub type JsonMap = serde_json::Map<String, serde_json::Value>;
 
@@ -205,8 +205,7 @@ pub(crate) fn canonical_sort_key(requested_sort: Option<&str>) -> &'static str {
 /// `completed_at` records history and can remain populated after a recheck
 /// discovers missing pieces.
 pub(crate) fn torrent_is_complete(entry: &TorrentEntry) -> bool {
-    matches!(entry.state, TorrentState::Seeding)
-        || (entry.total_length > 0 && entry.amount_left == 0)
+    entry.total_length > 0 && entry.amount_left == 0
 }
 
 fn build_filter_index(entries: &ChunkedVec<TorrentEntry>) -> TorrentFilterIndex {
@@ -816,5 +815,10 @@ mod tests {
         new.amount_left = 0;
         update_filter_index(&mut filters, 0, &old, &new, entries.len());
         assert_eq!(filters.completed.indices(), vec![0]);
+
+        let mut stale_seeding = old;
+        stale_seeding.state = rt_session::TorrentState::Seeding;
+        stale_seeding.amount_left = 25;
+        assert!(!torrent_is_complete(&stale_seeding));
     }
 }

@@ -15,6 +15,34 @@ use std::{
 use sha2::{Digest, Sha256};
 use tokio::sync::Notify;
 
+/// Response headers that cannot safely be replayed after the original body
+/// has been detached from its response. Transport framing belongs to the new
+/// response, not to the cached response.
+pub fn is_replayable_response_header(name: &str) -> bool {
+    !matches!(
+        name.to_ascii_lowercase().as_str(),
+        "connection"
+            | "content-length"
+            | "idempotency-replayed"
+            | "keep-alive"
+            | "proxy-authenticate"
+            | "proxy-authorization"
+            | "te"
+            | "trailer"
+            | "transfer-encoding"
+            | "upgrade"
+    )
+}
+
+/// Copy only end-to-end response headers into an idempotency cache entry.
+pub fn cached_response_headers(headers: &http::HeaderMap) -> Vec<(String, Vec<u8>)> {
+    headers
+        .iter()
+        .filter(|(name, _)| is_replayable_response_header(name.as_str()))
+        .map(|(name, value)| (name.to_string(), value.as_bytes().to_vec()))
+        .collect()
+}
+
 pub const MAX_IDEMPOTENCY_KEY_BYTES: usize = 128;
 pub const MAX_IDEMPOTENCY_ENTRIES: usize = 1_024;
 pub const IDEMPOTENCY_TTL: Duration = Duration::from_secs(24 * 60 * 60);

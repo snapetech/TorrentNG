@@ -116,6 +116,8 @@ else
 fi
 
 if [[ "$RUN_REAL_DEVICE" == "1" ]]; then
+  # The child shell must expand STORAGE_PHASE_B_REAL_DEVICE and its positional path.
+  # shellcheck disable=SC2016
   run_gate "real-device storage matrix" bash -c 'STORAGE_PHASE_B_REAL_DEVICE=1 "$1"' _ "$ROOT/scripts/storage_phase_b_matrix.sh"
 else
   skip_gate "real-device storage matrix" "set UNIVERSAL_LIVE_REAL_DEVICE=1 and configure TNG_STORAGE_BENCH_DIR for target hardware"

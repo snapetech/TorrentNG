@@ -586,11 +586,68 @@ fn persist_normalized_labels_values_in_tx(
 }
 
 pub fn list_torrent_tags(conn: &Connection, info_hash: &str) -> Result<Vec<String>, DbError> {
-    let mut stmt =
-        conn.prepare("SELECT tag FROM torrent_tags WHERE info_hash = ?1 ORDER BY tag ASC")?;
-    let tags = stmt
-        .query_map(params![info_hash], |row| row.get(0))?
-        .collect::<rusqlite::Result<Vec<String>>>()?;
+    let (count, total_bytes): (i64, i64) = conn.query_row(
+        "SELECT COUNT(*), COALESCE(SUM(length(CAST(tag AS BLOB))), 0)
+         FROM torrent_tags
+         WHERE info_hash = ?1",
+        params![info_hash],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+    if count < 0 || count as u64 > MAX_TORRENT_LABEL_RESULT_ITEMS as u64 {
+        return Err(DbError::ValueTooLarge {
+            field: "torrent tag result",
+            len: count.max(0) as u64,
+            max: MAX_TORRENT_LABEL_RESULT_ITEMS as u64,
+        });
+    }
+    if total_bytes < 0 || total_bytes as u64 > MAX_TORRENT_LABEL_RESULT_BYTES as u64 {
+        return Err(DbError::ValueTooLarge {
+            field: "torrent tag result",
+            len: total_bytes.max(0) as u64,
+            max: MAX_TORRENT_LABEL_RESULT_BYTES as u64,
+        });
+    }
+
+    // Keep the query itself bounded as well. The preflight aggregate protects
+    // the initial allocation, while the sentinel catches a concurrent insert
+    // between the aggregate and the row scan.
+    let sentinel_limit = (MAX_TORRENT_LABEL_RESULT_ITEMS as i64).saturating_add(1);
+    let mut stmt = conn.prepare(
+        "SELECT length(CAST(tag AS BLOB)), tag
+         FROM torrent_tags
+         WHERE info_hash = ?1
+         ORDER BY tag ASC
+         LIMIT ?2",
+    )?;
+    let mut rows = stmt.query(params![info_hash, sentinel_limit])?;
+    let mut tags = Vec::with_capacity(count as usize);
+    let mut observed_bytes = 0usize;
+    while let Some(row) = rows.next()? {
+        if tags.len() >= MAX_TORRENT_LABEL_RESULT_ITEMS {
+            return Err(DbError::ValueTooLarge {
+                field: "torrent tag result",
+                len: (tags.len() + 1) as u64,
+                max: MAX_TORRENT_LABEL_RESULT_ITEMS as u64,
+            });
+        }
+        let tag_bytes = row.get::<_, i64>(0)?.max(0) as u64;
+        if tag_bytes > MAX_TORRENT_LABEL_ROW_BYTES as u64 {
+            return Err(DbError::ValueTooLarge {
+                field: "torrent tag",
+                len: tag_bytes,
+                max: MAX_TORRENT_LABEL_ROW_BYTES as u64,
+            });
+        }
+        observed_bytes = observed_bytes.saturating_add(tag_bytes as usize);
+        if observed_bytes > MAX_TORRENT_LABEL_RESULT_BYTES {
+            return Err(DbError::ValueTooLarge {
+                field: "torrent tag result",
+                len: observed_bytes as u64,
+                max: MAX_TORRENT_LABEL_RESULT_BYTES as u64,
+            });
+        }
+        tags.push(row.get(1)?);
+    }
     Ok(tags)
 }
 
@@ -709,6 +766,7 @@ pub fn list_torrent_labels_page(
 /// predate the normalized tag projection.
 pub fn list_all_torrent_labels(conn: &Connection) -> Result<Vec<TorrentLabelsRow>, DbError> {
     let mut all = Vec::new();
+    let mut total_bytes = 0usize;
     let mut after_rowid = 0i64;
     loop {
         let page = list_torrent_labels_page(conn, after_rowid, TORRENT_LABEL_PAGE_SIZE)?;
@@ -716,7 +774,34 @@ pub fn list_all_torrent_labels(conn: &Connection) -> Result<Vec<TorrentLabelsRow
             break;
         };
         after_rowid = *last_rowid;
-        all.extend(page.into_iter().map(|(_, row)| row));
+        for (_, row) in page {
+            if all.len() >= MAX_TORRENT_RESULT_ITEMS {
+                return Err(DbError::ValueTooLarge {
+                    field: "torrent label result items",
+                    len: (all.len() + 1) as u64,
+                    max: MAX_TORRENT_RESULT_ITEMS as u64,
+                });
+            }
+            let row_bytes = row
+                .info_hash
+                .len()
+                .saturating_add(row.category.as_deref().map_or(0, str::len))
+                .saturating_add(
+                    row.tags
+                        .iter()
+                        .map(String::len)
+                        .fold(0usize, usize::saturating_add),
+                );
+            total_bytes = total_bytes.saturating_add(row_bytes);
+            if total_bytes > MAX_TORRENT_RESULT_BYTES {
+                return Err(DbError::ValueTooLarge {
+                    field: "torrent label result bytes",
+                    len: total_bytes as u64,
+                    max: MAX_TORRENT_RESULT_BYTES as u64,
+                });
+            }
+            all.push(row);
+        }
     }
     Ok(all)
 }
@@ -1406,6 +1491,60 @@ mod tests {
                 added_at: row.added_at,
             }]
         );
+    }
+
+    #[test]
+    fn normalized_tag_reads_reject_too_many_items_before_collecting_them() {
+        let conn = setup();
+        let row = sample();
+        upsert(&conn, &row).unwrap();
+        conn.execute(
+            "DELETE FROM torrent_tags WHERE info_hash = ?1",
+            params![row.info_hash],
+        )
+        .unwrap();
+        for index in 0..=MAX_TORRENT_LABEL_RESULT_ITEMS {
+            conn.execute(
+                "INSERT INTO torrent_tags (info_hash, tag) VALUES (?1, ?2)",
+                params![row.info_hash, format!("tag-{index}")],
+            )
+            .unwrap();
+        }
+
+        assert!(matches!(
+            list_torrent_tags(&conn, &row.info_hash),
+            Err(DbError::ValueTooLarge {
+                field: "torrent tag result",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn normalized_tag_reads_reject_oversized_result_bytes() {
+        let conn = setup();
+        let row = sample();
+        upsert(&conn, &row).unwrap();
+        conn.execute(
+            "DELETE FROM torrent_tags WHERE info_hash = ?1",
+            params![row.info_hash],
+        )
+        .unwrap();
+        for index in 0..=MAX_TORRENT_LABEL_RESULT_BYTES / 16_384 {
+            conn.execute(
+                "INSERT INTO torrent_tags (info_hash, tag) VALUES (?1, ?2)",
+                params![row.info_hash, format!("{index}-{}", "x".repeat(16_384))],
+            )
+            .unwrap();
+        }
+
+        assert!(matches!(
+            list_torrent_tags(&conn, &row.info_hash),
+            Err(DbError::ValueTooLarge {
+                field: "torrent tag result",
+                ..
+            })
+        ));
     }
 
     #[test]

@@ -18,8 +18,6 @@ export class AuthError extends Error {
 
 export interface AuthSettings {
   username: string
-  password_is_default: boolean
-  default_credentials_allowed: boolean
   api_token_login_enabled: boolean
 }
 
@@ -50,6 +48,11 @@ export interface TorrentSummary {
   tracker_url: string
   tags: string
   updated_at: number
+  /**
+   * The download finished but the daemon is holding it until its data is
+   * confirmed on disk (docs/CRASH_SAFETY.md). Set only by the TorrentNG client.
+   */
+  finalizing?: boolean
 }
 
 export interface TorrentListResponse {
@@ -116,6 +119,7 @@ interface TorrentNgTorrentSummary {
   num_peers: number
   num_seeds: number
   tracker_message?: string | null
+  finalizing?: boolean
 }
 
 interface TorrentNgTorrentListResponse {
@@ -194,7 +198,13 @@ function normalizeTorrentNgTorrent(t: TorrentNgTorrentSummary): TorrentSummary {
     ? Math.min(size, rawAmountLeft)
     : Math.min(size, Math.max(0, downloaded))
   const done = size > 0 ? size - amountLeft : 0
-  const complete = t.state === 'seeding' || (size > 0 && amountLeft === 0)
+  // `amount_left` is the live picker invariant. A persisted lifecycle string
+  // can remain `seeding` after a recheck discovers missing pieces, so only
+  // legacy payloads without that field may use the state as a completion
+  // fallback.
+  const complete = hasLiveAmountLeft
+    ? size > 0 && amountLeft === 0
+    : t.state === 'seeding' || (size > 0 && amountLeft === 0)
   const active = t.state === 'checking' || t.state === 'seeding' || t.state === 'downloading'
   const open = t.state === 'metadata_pending' || active
   return {
@@ -221,10 +231,20 @@ function normalizeTorrentNgTorrent(t: TorrentNgTorrentSummary): TorrentSummary {
     peers_connected: finiteNonNegative(t.num_peers),
     peers_complete: finiteNonNegative(t.num_seeds),
     message: t.tracker_message ?? '',
+    finalizing: t.finalizing === true,
     tracker_url: '',
     tags: Array.isArray(t.tags) ? t.tags.join(', ') : '',
     updated_at: Date.now(),
   }
+}
+
+/**
+ * A finished download the daemon is holding back until storage confirms the
+ * data is on disk (see docs/CRASH_SAFETY.md). The daemon publishes this
+ * explicitly and reports one byte remaining alongside it.
+ */
+export function isFinalizing(t: Pick<TorrentSummary, 'finalizing' | 'complete'>): boolean {
+  return t.finalizing === true && !t.complete
 }
 
 function isTorrentNgTorrentSummary(item: TorrentSummary | TorrentNgTorrentSummary): item is TorrentNgTorrentSummary {
@@ -556,8 +576,118 @@ export interface BackendCapabilities {
   supports_torrent_rename: boolean
   supports_file_rename: boolean
   supports_runtime_user_agent: boolean
+  /** Present only when TorrentNG runs its own client (torrentngd). */
+  supports_crash_safety?: boolean
   supports_config_overlay: boolean
   supports_restart: boolean
+}
+
+export type HostCrashRecovery = 'watermark' | 'recent' | 'full'
+export type StructuralAuditMode = 'off' | 'on_unclean' | 'always'
+export type CompletionVerifyMode = 'off' | 'sample' | 'full'
+
+/**
+ * A per-location override (`[[crash_safety.path_policies]]`). `null` means the
+ * key is unset and inherits the global value.
+ */
+export interface CrashSafetyPathPolicy {
+  path: string
+  completion_gate: boolean | null
+  host_crash_recovery: HostCrashRecovery | null
+  structural_audit: StructuralAuditMode | null
+  completion_verify: CompletionVerifyMode | null
+  completion_verify_sample_percent: number | null
+}
+
+/** Mirrors `[crash_safety]` in the daemon config; see docs/CRASH_SAFETY.md. */
+export interface CrashSafetySettings {
+  completion_gate: boolean
+  host_crash_detection: boolean
+  host_crash_recovery: HostCrashRecovery
+  recent_write_window_secs: number
+  structural_audit: StructuralAuditMode
+  mount_probe: boolean
+  weak_mount_escalation: boolean
+  weak_mount_paths: string[]
+  strong_mount_paths: string[]
+  completion_verify: CompletionVerifyMode
+  completion_verify_sample_percent: number
+  /** Absent from servers that predate per-location policies. */
+  path_policies?: CrashSafetyPathPolicy[]
+}
+
+export type PreviousRunVerdict =
+  | 'no_record'
+  | 'clean'
+  | 'process_crash'
+  | 'host_crash'
+  | 'unclean_unknown_cause'
+
+export type DurabilityTrust = 'strong' | 'unknown' | 'weak'
+
+export interface CrashSafetyReport {
+  run_started_unix: number
+  detection_active: boolean
+  previous_run: {
+    verdict: PreviousRunVerdict
+    crash_reference_unix: number | null
+    previous_boot_id: string | null
+    current_boot_id: string | null
+  }
+  counters: {
+    recovery_rechecks: number
+    rechecks_unsynced_state: number
+    rechecks_full_policy: number
+    rechecks_recent_write: number
+    rechecks_weak_mount: number
+    rechecks_unknown_mount: number
+    audit_torrents: number
+    audit_files_unsupported: number
+    audit_pieces_downgraded: number
+    completions_gated: number
+    completions_released: number
+    completion_gate_retries: number
+    completion_sync_unsupported: number
+    completion_verify_pieces: number
+    completion_verify_failures: number
+    integrity_regressions: number
+    completions_pending: number
+  }
+  mounts: { path: string; trust: DurabilityTrust; fs_type: string | null; reasons: string[] }[]
+  platform: {
+    boot_identity: boolean
+    allocation_audit: boolean
+    mount_probe: boolean
+    page_cache_drop: boolean
+  }
+}
+
+/** What one save location would get; from `GET /settings/crash-safety/path`. */
+export interface CrashSafetyPathReport {
+  path: string
+  /** The `path_policies` entry that matched, or null when only global settings apply. */
+  matched_policy: string | null
+  completion_gate: boolean
+  host_crash_recovery: HostCrashRecovery
+  /** The recovery actually applied after weak/unknown-mount escalation. */
+  host_crash_recovery_effective: HostCrashRecovery
+  /** `weak_mount` or `unknown_mount_recent_write` when escalation raised it. */
+  recovery_escalated_by: string | null
+  structural_audit: StructuralAuditMode
+  completion_verify: CompletionVerifyMode
+  /** The read-back mode actually applied after weak-mount escalation. */
+  completion_verify_effective: CompletionVerifyMode
+  completion_verify_sample_percent: number
+  mount: { path: string; trust: DurabilityTrust; fs_type: string | null; reasons: string[] }
+}
+
+export interface CrashSafetyView {
+  settings: CrashSafetySettings
+  /** What the config file specifies: the target of "reset". */
+  defaults: CrashSafetySettings
+  /** True when `settings` come from a runtime change, not the config file. */
+  overridden: boolean
+  report: CrashSafetyReport
 }
 
 export interface BackendInfo {
@@ -938,6 +1068,14 @@ export const api = {
   settings: {
     getUserAgent: (): Promise<{ user_agent: string }> => get('/settings/user-agent'),
     setUserAgent: (user_agent: string) => put('/settings/user-agent', { user_agent }),
+    getCrashSafety: (): Promise<CrashSafetyView> => get('/settings/crash-safety'),
+    putCrashSafety: (settings: CrashSafetySettings): Promise<CrashSafetyView> =>
+      put('/settings/crash-safety', settings),
+    /** Drop the runtime override and return to the config-file values. */
+    resetCrashSafety: (): Promise<CrashSafetyView> => delJson('/settings/crash-safety'),
+    /** What settings, mount rating and recovery an absolute directory would get. */
+    describeCrashSafetyPath: (path: string): Promise<CrashSafetyPathReport> =>
+      get('/settings/crash-safety/path', { path }),
   },
 
   storage: (): Promise<StorageResponse> => get('/storage'),

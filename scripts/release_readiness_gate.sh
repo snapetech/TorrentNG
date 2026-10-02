@@ -56,6 +56,9 @@ nonclean="$(
   if [[ "$RELEASE_SCOPE" == "local" ]]; then
     echo "- Scope policy: external opt-in evidence rows are documented but not release-blocking for this local readiness run"
   fi
+  if [[ "${TNG_DEFER_24H_SOAK:-0}" == "1" ]]; then
+    echo "- Soak policy: 24h soak explicitly deferred for this qualification run; no stability claim is made"
+  fi
   echo
   echo "## Non-Clean Certification Rows"
   echo

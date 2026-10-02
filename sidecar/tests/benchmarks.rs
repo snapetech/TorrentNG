@@ -55,6 +55,9 @@ async fn spawn_server_with_db() -> (SocketAddr, Client, Arc<Db>) {
         local_webui_session_token: Some(format!("tng-benchmark-{}", uuid::Uuid::new_v4().simple())),
         public_bind: false,
         control_plane_write: Arc::new(tokio::sync::Mutex::new(())),
+        request_concurrency: Arc::new(tokio::sync::Semaphore::new(256)),
+        large_uploads: Arc::new(tokio::sync::Semaphore::new(4)),
+        ws_clients: Arc::new(tokio::sync::Semaphore::new(256)),
     };
     let app: Router = torrentng::api::server::build_router(state);
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();

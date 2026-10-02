@@ -39,7 +39,8 @@ TNG_SYNC_INTERVAL_SECS=2
 EOF
 
 set -a
-# shellcheck disable=SC1090
+# The env file is generated in a temporary directory immediately above.
+# shellcheck disable=SC1090,SC1091
 source "$WORK_DIR/env"
 set +a
 

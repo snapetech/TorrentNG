@@ -47,7 +47,7 @@ services:
 
   qbittorrent:
     <<: *interop-dns
-    image: lscr.io/linuxserver/qbittorrent:latest
+    image: lscr.io/linuxserver/qbittorrent@sha256:2be038f3421f60f62e8e4bf201f66f385b68e4fbc9ed3ab79051069ea22e2650
     restart: unless-stopped
     ports:
       - "127.0.0.1:${INTEROP_QBIT_HOST_PORT:-28181}:8080"
@@ -68,7 +68,7 @@ services:
 
   transmission:
     <<: *interop-dns
-    image: lscr.io/linuxserver/transmission:latest
+    image: lscr.io/linuxserver/transmission@sha256:1a12fef3c89eca48b7be9e7d36b17b4eb4e1bcf5e1ee7fbf372e3a38b562939d
     restart: unless-stopped
     ports:
       - "127.0.0.1:${INTEROP_TRANSMISSION_HOST_PORT:-28191}:9091"
@@ -89,7 +89,7 @@ services:
 
   deluge:
     <<: *interop-dns
-    image: lscr.io/linuxserver/deluge:latest
+    image: lscr.io/linuxserver/deluge@sha256:9505c64720afa9e5f0ac1576e660dd6d1e9d4a6733b791f4821e8f496f19f41f
     restart: unless-stopped
     ports:
       - "127.0.0.1:${INTEROP_DELUGE_HOST_PORT:-28212}:8112"
@@ -109,12 +109,12 @@ services:
 
   rtorrent:
     <<: *interop-dns
-    image: jesec/rtorrent:latest
+    image: jesec/rtorrent@sha256:994728c59953e5f19c643827024dd06e9ffaf62b8d903a3f1468794415e72e03
     restart: unless-stopped
     command: ["-o", "system.daemon.set=true", "-o", "import=/config/rtorrent.rc"]
     ports:
-      - "${INTEROP_RTORRENT_PEER_PORT:-29185}:6885"
-      - "${INTEROP_RTORRENT_PEER_PORT:-29185}:6885/udp"
+      - "${INTEROP_BIND_ADDR:-127.0.0.1}:${INTEROP_RTORRENT_PEER_PORT:-29185}:6885"
+      - "${INTEROP_BIND_ADDR:-127.0.0.1}:${INTEROP_RTORRENT_PEER_PORT:-29185}:6885/udp"
     volumes:
       - ./rtorrent.rc:/config/rtorrent.rc:ro
       - ${INTEROP_WORKDIR:-../../certification/interop}/config/rtorrent:/config
@@ -126,7 +126,7 @@ services:
     networks: [interop]
 
   opentracker:
-    image: lednerb/opentracker-docker:latest
+    image: lednerb/opentracker-docker@sha256:a055447e44450036b7b2a923618b12d4ecf1eff3c894e969cc2c42f466b2c6f6
     restart: unless-stopped
     command: ["opentracker", "-p", "6969", "-P", "6969"]
     ports:
@@ -135,7 +135,7 @@ services:
     networks: [interop]
 
   fixture-http:
-    image: nginx:alpine
+    image: nginx@sha256:62ff2089abf5a9ed33bd232895bef5e22f7bb4b200675cec49a5ebc48e3d4ac8
     restart: unless-stopped
     ports:
       - "127.0.0.1:${INTEROP_FIXTURE_HTTP_PORT:-28188}:80"

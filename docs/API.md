@@ -47,11 +47,13 @@ and the WebUI/static paths. `/metrics` is protected when API tokens are
 configured; it is not a public exception.
 
 Native loopback installs without API tokens require the configured username
-and password for browser WebUI requests; the fresh-install pair is
-`torrentng` / `torrentng`. Non-browser machine clients retain the existing
-loopback no-token behavior. Configure an API token when automation clients
-need authenticated access. Public binds always require real API tokens and do
-not accept the default WebUI password.
+and password for browser WebUI requests. Fresh installs generate a unique
+password retrievable with `torrentngd auth-token` (or `torrentng auth-token`
+for the compatible-client service). Non-browser machine clients retain the
+existing loopback no-token behavior. Configure an API token when automation
+clients need authenticated access; tokens work in either login field. Public
+binds require API tokens for initial access and enforce a WebUI password of at
+least 16 bytes.
 
 ## Request Correlation
 
@@ -115,10 +117,10 @@ required for the TorrentNG client.
 
 | Method | Path | Description |
 |---|---|---|
-| `POST` | `/api/v1/auth/login` | WebUI login with configured username/password or API token. Fresh loopback installs on both profiles default to `torrentng` / `torrentng`; an API token can be supplied in either form field. Public binds refuse the default password. Success returns `Ok.` and a `tng_session` cookie. Login allows 10 attempts per TCP peer per 60 seconds, then returns `429` with `Retry-After`. |
+| `POST` | `/api/v1/auth/login` | WebUI login with configured username/password or API token. Fresh installs generate a unique password retrievable with `torrentngd auth-token` or `torrentng auth-token`; an API token can be supplied in either form field. Public binds require an API token and a WebUI password of at least 16 bytes. Success returns `Ok.` and a `tng_session` cookie. Login allows 10 attempts per TCP peer per 60 seconds, then returns `429` with `Retry-After`. |
 | `POST` | `/api/v1/auth/logout` | WebUI logout probe; expires the `tng_session` cookie. |
-| `GET` | `/api/v1/auth/settings` | Read safe WebUI auth settings (username and status flags only; never returns the password). |
-| `PUT` | `/api/v1/auth/settings` | Set `{ "username": "...", "password": "..." }`; authenticated. Passwords must be at least 8 characters. |
+| `GET` | `/api/v1/auth/settings` | Read safe WebUI auth settings (username and whether API-token login is enabled; never returns the password). |
+| `PUT` | `/api/v1/auth/settings` | Set `{ "username": "...", "password": "..." }`; authenticated. Passwords must be at least 8 bytes, or 16 bytes on public binds. |
 | `DELETE` | `/api/v1/auth/settings` | Remove the runtime credential override and restore `[auth].username` and `[auth].password` from config.toml. |
 
 Runtime changes persist in `auth-settings.json` under native `daemon.session_dir`
@@ -474,6 +476,45 @@ Pass `dry_run: true` to preview what would be affected without making changes.
 |--------|------|-------------|
 | `GET`  | `/api/v1/settings/user-agent` | Get current runtime user-agent string when supported by the selected backend |
 | `PUT`  | `/api/v1/settings/user-agent` | Set user-agent (`{ user_agent: "..." }`) when supported; the TorrentNG client persists and applies it through its engine, while rTorrent behavior depends on its packaged build |
+| `GET`  | `/api/v1/settings/crash-safety` | TorrentNG client only. Effective crash-safety settings, the config-file defaults, whether a runtime override is active, how the previous run ended, per-mount durability ratings, counters and platform support |
+| `PUT`  | `/api/v1/settings/crash-safety` | Replace the settings. Body is the full settings object; omitted fields take built-in defaults and unknown keys are rejected (`400`/`422`). Validated, persisted, applied immediately, and kept across restarts until reset. Returns the same view as `GET` |
+| `DELETE` | `/api/v1/settings/crash-safety` | Drop the runtime override and return to the config-file values. Returns the same view as `GET` |
+| `GET`  | `/api/v1/settings/crash-safety/path?path=/abs/dir` | TorrentNG client only. What a save location would get: the longest-matching `path_policies` entry, the effective per-location settings, the mount's durability rating and why, and the recovery and read-back mode that would apply after weak/unknown-mount escalation. The path must be absolute and at most 4096 bytes (`400` otherwise); it need not exist and is not added to the tracked mounts |
+
+Crash-safety settings object (all fields optional on `PUT`; see
+[CRASH_SAFETY.md](CRASH_SAFETY.md) for meanings):
+
+```json
+{
+  "completion_gate": true,
+  "host_crash_detection": true,
+  "host_crash_recovery": "recent",
+  "recent_write_window_secs": 86400,
+  "structural_audit": "on_unclean",
+  "mount_probe": true,
+  "weak_mount_escalation": true,
+  "weak_mount_paths": [],
+  "strong_mount_paths": [],
+  "completion_verify": "off",
+  "completion_verify_sample_percent": 5
+}
+```
+
+`GET` returns `{ "settings": {...}, "defaults": {...}, "overridden": bool,
+"report": {...} }`. `report.previous_run.verdict` is one of `no_record`,
+`clean`, `process_crash`, `host_crash`, `unclean_unknown_cause`;
+`report.counters` are per-run counts; `report.mounts[]` lists each save location
+with `trust` (`strong`, `unknown`, `weak`), `fs_type` and `reasons`;
+`report.platform` says which checks this OS supports. `supports_crash_safety` in
+the capability manifest is `true` only when TorrentNG runs its own client.
+
+**A finished download that is still being made durable** (the completion gate)
+is reported by every API surface as `downloading` with exactly **1 byte left**,
+so automation that keys off 100% or `seeding` does not import it early. The
+TorrentNG torrent objects also carry `"finalizing": true` while this holds (the
+field is omitted otherwise). It
+becomes `seeding`, gets `completed_at`, and the tracker gets `completed` only
+after storage confirms the data is on disk.
 
 ### Infrastructure
 
@@ -764,6 +805,16 @@ sync-loop counters because it polls the selected client adapter.
 | `torrentng_dormant_runtime_heap_bytes` | gauge | Heap retained by compact dormant runtime projections; this does not certify total process RSS |
 | `torrentng_torrent_tasks_active` | gauge | Active per-torrent runtime tasks |
 | `torrentng_fastresume_dirty_pieces` | gauge | Pieces validated since the last completed durability barrier |
+| `torrentng_crash_safety_previous_run_unclean{verdict=...}` | gauge | `1` when the previous daemon run did not shut down cleanly |
+| `torrentng_crash_recovery_rechecks_total{reason=...}` | counter | Torrents whose resume state was discarded after a possible host crash (`unsynced_state`, `full_policy`, `recent_write`, `weak_mount`, `unknown_mount`) |
+| `torrentng_allocation_audit_pieces_downgraded_total` | counter | Valid pieces sent back for re-verification because they overlapped an unwritten or hole extent |
+| `torrentng_completions_gated_total` / `_released_total` | counter | Finished downloads held by the completion gate / released after the barrier |
+| `torrentng_completions_pending` | gauge | Finished downloads currently held (alert if it stays above zero) |
+| `torrentng_completion_gate_retries_total` | counter | Completion-gate barrier attempts that had to be retried |
+| `torrentng_completion_verify_{pieces,failures}_total` | counter | Pieces re-read by completion read-back verification / pieces that did not match |
+| `torrentng_integrity_regressions_total` | counter | Torrents already reported complete whose pieces later failed verification |
+| `torrentng_fsync_unsupported_total` | counter | Times a filesystem reported that `fsync` is unsupported |
+| `torrentng_storage_mounts{trust=...}` | gauge | Save-path mounts seen by the durability probe, by rating |
 | `torrentng_completed_piece_verify_from_{memory,disk}_total` | counter | Completed-piece verification source; memory verifies avoid read-after-write disk rereads |
 | `torrentng_{download,upload}_rate_bytes_per_second` | gauge | Aggregate current peer transfer rates; served from the cached TorrentNG-client stats snapshot |
 | `torrentng_peers_connected` | gauge | Connected peers across all torrents |

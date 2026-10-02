@@ -69,7 +69,7 @@ The final source tail is available for audit:
 
 ```sh
 tail -n 20 .run/soak-24h-public-debian-20260905-v3.md
-SOAK_MIN_TORRENTS=1 scripts/soak_status.sh .run/soak-24h-public-debian-20260905-v3.md
+scripts/soak_status.sh .run/soak-24h-public-debian-20260905-v3.md
 ```
 
 The first background-launch attempt was terminated after its first sample by

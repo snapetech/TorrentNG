@@ -41,6 +41,10 @@ capabilities; compatible does not mean every client exposes identical features.
 - [DEPLOYMENT.md](DEPLOYMENT.md) - compatible-client WebUI/API deployment.
 - [CONFIGURATION.md](CONFIGURATION.md) - TorrentNG client and compatible-client
   WebUI/API service configuration.
+- [CRASH_SAFETY.md](CRASH_SAFETY.md) - how the TorrentNG client survives power
+  loss and crashes: the durability barrier, completion gate, host-crash
+  recovery, allocation audit, read-back verification, storage trust ratings,
+  every option, and what the WebUI and API show.
 - [TRACKER-IDENTITY.md](TRACKER-IDENTITY.md) - rTorrent/libtorrent tracker
   identity policy for the compatible-client integration and TorrentNG client.
 - [BACKUP_RESTORE.md](BACKUP_RESTORE.md) - TorrentNG-client state backup, restore, and

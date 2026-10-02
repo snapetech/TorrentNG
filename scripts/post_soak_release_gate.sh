@@ -9,8 +9,9 @@ mkdir -p "$(dirname "$OUT")"
 
 latest() {
   local pattern="$1"
-  find "$REPORT_DIR" -maxdepth 1 -type f -name "$pattern" -printf '%T@ %p\n' 2>/dev/null \
-    | sort -nr | awk 'NR==1 {print $2}'
+  find "$REPORT_DIR" -maxdepth 1 -type f -name "$pattern" -printf '%T@\t%p\n' 2>/dev/null \
+    | sort -t $'\t' -k1,1nr \
+    | awk 'NR == 1 { print substr($0, index($0, "\t") + 1) }'
 }
 
 overall() {
@@ -21,7 +22,7 @@ overall() {
   fi
   awk -F': ' '
     /^Overall status:/ {status=$2}
-    /test result: ok/ {ok=1}
+    /^[[:space:]]*test result: ok([.[:space:]]|$)/ {ok=1}
     END {
       if (status) print status;
       else if (ok) print "PASS";
@@ -191,7 +192,11 @@ certification_status_gate() {
   echo "|---|---|---|"
 } >"$OUT"
 
-gate "soak finalization" 'soak-final-*.md'
+if [[ "${TNG_DEFER_24H_SOAK:-0}" == "1" ]]; then
+  mark "soak finalization" "INFO" "deferred by TNG_DEFER_24H_SOAK=1; post-soak evidence is not claimed"
+else
+  gate "soak finalization" 'soak-final-*.md'
+fi
 gate "local release gate" 'local-release-*.md'
 gate "storage release certification" 'storage-release-certification-*.md'
 memory_gate

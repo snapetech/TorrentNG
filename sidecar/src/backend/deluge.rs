@@ -5,8 +5,9 @@ use reqwest::Url;
 use serde_json::{json, Value};
 
 use super::{
-    checked_backend_file_index, response_json_bounded, BackendCapabilities, BackendStatus,
-    BackendType, TorrentBackend, MAX_BACKEND_JSON_BYTES,
+    checked_backend_file_index, ensure_backend_collection_bound, parse_backend_url,
+    response_json_bounded, BackendCapabilities, BackendStatus, BackendType, TorrentBackend,
+    MAX_BACKEND_JSON_BYTES,
 };
 use crate::{
     config::DelugeConfig,
@@ -23,13 +24,17 @@ impl DelugeBackend {
     pub fn new(cfg: &DelugeConfig) -> Result<Self> {
         let client = super::backend_client_builder()
             .cookie_store(true)
+            .redirect(reqwest::redirect::Policy::none())
             .timeout(std::time::Duration::from_secs(cfg.timeout_secs.max(1)))
             .danger_accept_invalid_certs(cfg.accept_invalid_certs)
+            // Deluge RPC is an explicit configured backend. Do not inherit a
+            // process proxy that can observe or alter its authenticated RPC.
+            .no_proxy()
             .build()
             .context("create Deluge Web client")?;
         Ok(Self {
             client,
-            url: Url::parse(cfg.url.trim()).context("parse deluge.url")?,
+            url: parse_backend_url(&cfg.url, "deluge.url")?,
             password: cfg.password.clone(),
         })
     }
@@ -161,6 +166,7 @@ impl TorrentBackend for DelugeBackend {
         let items = value.as_object().ok_or_else(|| {
             anyhow::anyhow!("Deluge core.get_torrents_status returned a non-object result")
         })?;
+        ensure_backend_collection_bound(items.len(), "Deluge torrent status")?;
         items
             .iter()
             .map(|(hash, torrent)| map_torrent(hash, torrent))
@@ -535,12 +541,13 @@ fn require_torrent_id(value: Value, method: &str) -> Result<()> {
 }
 
 fn required_array<'a>(value: &'a Value, key: &str, method: &str) -> Result<&'a [Value]> {
-    value
+    let array = value
         .as_object()
         .and_then(|object| object.get(key))
         .and_then(Value::as_array)
-        .map(Vec::as_slice)
-        .ok_or_else(|| anyhow::anyhow!("Deluge RPC {method} result has no array field {key:?}"))
+        .ok_or_else(|| anyhow::anyhow!("Deluge RPC {method} result has no array field {key:?}"))?;
+    ensure_backend_collection_bound(array.len(), &format!("Deluge {method} field {key}"))?;
+    Ok(array)
 }
 
 impl DelugeBackend {
@@ -635,7 +642,7 @@ fn map_tracker((index, tracker): (usize, &Value)) -> Result<RawTracker> {
     Ok(RawTracker {
         url: required_nonempty_string(tracker, "url")?,
         id: index as i64,
-        group: required_i64(tracker, "tier")?,
+        group: required_nonnegative_i64(tracker, "tier")?,
         group_index: index as i64,
         is_enabled: true,
         is_open: false,
@@ -797,5 +804,11 @@ mod tests {
 
         assert!(mapped.complete);
         assert_eq!(mapped.bytes_done, 100);
+    }
+
+    #[test]
+    fn deluge_tracker_tier_must_be_nonnegative() {
+        let tracker = json!({"url": "https://tracker.example/announce", "tier": -1});
+        assert!(map_tracker((0, &tracker)).is_err());
     }
 }

@@ -232,6 +232,39 @@ impl PieceMap {
         Ok(ranges)
     }
 
+    /// Half-open piece range `[first, last)` touched by bytes `[start, end)`
+    /// of one file. The byte range is clamped to the file's length. Returns
+    /// `None` when the file is unknown or the clamped range is empty.
+    ///
+    /// Used to translate filesystem allocation gaps (holes, unwritten
+    /// extents), which are reported per file, into the pieces they poison.
+    pub fn piece_range_for_file_bytes(
+        &self,
+        file_index: u32,
+        start: u64,
+        end: u64,
+    ) -> Option<(u32, u32)> {
+        let file = self
+            .files
+            .get(file_index as usize)
+            .filter(|file| file.file_index == file_index)
+            .or_else(|| self.files.iter().find(|file| file.file_index == file_index))?;
+        let end = end.min(file.length);
+        if start >= end {
+            return None;
+        }
+        let content_start = file.content_offset.checked_add(start)?;
+        let content_end = file.content_offset.checked_add(end)?;
+        let first = u32::try_from(content_start / self.piece_length).ok()?;
+        let last = u32::try_from(
+            content_end
+                .div_ceil(self.piece_length)
+                .min(u64::from(self.piece_count)),
+        )
+        .ok()?;
+        (first < last).then_some((first, last))
+    }
+
     /// Validate a peer block request (BEP 3) and return file regions to read.
     ///
     /// Rejects requests where length > 16 KiB.
@@ -316,6 +349,34 @@ mod tests {
                 span
             })
             .collect()
+    }
+
+    #[test]
+    fn file_byte_range_maps_to_the_pieces_it_touches() {
+        // Two files: a.bin = 100 bytes, b.bin = 250 bytes; piece length 64.
+        // b.bin starts at content offset 100, i.e. inside piece 1.
+        let files = make_files(&[(&["a.bin"], 100), (&["b.bin"], 250)]);
+        let pm = PieceMap::new(64, files).unwrap();
+        assert_eq!(pm.piece_count, 6);
+
+        // First byte of b.bin (content 100) is in piece 1.
+        assert_eq!(pm.piece_range_for_file_bytes(1, 0, 1), Some((1, 2)));
+        // b.bin bytes [0, 28) end exactly at content 128, the end of piece 1.
+        assert_eq!(pm.piece_range_for_file_bytes(1, 0, 28), Some((1, 2)));
+        // One byte further spills into piece 2.
+        assert_eq!(pm.piece_range_for_file_bytes(1, 0, 29), Some((1, 3)));
+        // The whole of a.bin covers pieces 0 and 1.
+        assert_eq!(pm.piece_range_for_file_bytes(0, 0, 100), Some((0, 2)));
+    }
+
+    #[test]
+    fn file_byte_range_is_clamped_and_rejects_empty_or_unknown() {
+        let files = make_files(&[(&["a.bin"], 100)]);
+        let pm = PieceMap::new(64, files).unwrap();
+        assert_eq!(pm.piece_range_for_file_bytes(0, 0, u64::MAX), Some((0, 2)));
+        assert_eq!(pm.piece_range_for_file_bytes(0, 50, 50), None);
+        assert_eq!(pm.piece_range_for_file_bytes(0, 100, 200), None);
+        assert_eq!(pm.piece_range_for_file_bytes(7, 0, 10), None);
     }
 
     #[test]

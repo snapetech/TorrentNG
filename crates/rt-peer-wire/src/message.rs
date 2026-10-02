@@ -39,6 +39,9 @@ pub enum Message {
     Cancel { piece: u32, begin: u32, length: u32 },
     /// id=16: BEP 6 Fast extension — reject a request that cannot be served.
     Reject { piece: u32, begin: u32, length: u32 },
+    /// id=17: BEP 6 Fast extension — a piece the receiver may request
+    /// without first being unchoked.
+    AllowedFast(u32),
     /// id=14 (0x0E): BEP 6 Fast extension — sender has every piece. Sent in
     /// place of a full `Bitfield` when the local peer is complete and the
     /// remote negotiated the Fast extension in the handshake.
@@ -89,7 +92,7 @@ impl Message {
             | Message::NotInterested
             | Message::HaveAll
             | Message::HaveNone => 1,
-            Message::Have(_) => 5,
+            Message::Have(_) | Message::AllowedFast(_) => 5,
             Message::Bitfield(bits) => 1usize.checked_add(bits.len())?,
             Message::Request { .. } | Message::Cancel { .. } | Message::Reject { .. } => 13,
             Message::Piece { data, .. } => 9usize.checked_add(data.len())?,
@@ -154,6 +157,7 @@ impl Message {
             Message::Interested => put_fixed(dst, 2, &[]),
             Message::NotInterested => put_fixed(dst, 3, &[]),
             Message::Have(idx) => put_fixed(dst, 4, &idx.to_be_bytes()),
+            Message::AllowedFast(idx) => put_fixed(dst, 17, &idx.to_be_bytes()),
             Message::Bitfield(bits) => {
                 dst.put_u32((1 + bits.len()) as u32);
                 dst.put_u8(5);
@@ -325,6 +329,12 @@ impl Message {
                     begin,
                     length,
                 })
+            }
+            17 => {
+                expect_len(body, 4, "AllowedFast")?;
+                Ok(Message::AllowedFast(u32::from_be_bytes(
+                    body[..4].try_into().unwrap(),
+                )))
             }
             14 => {
                 expect_len(body, 0, "HaveAll")?;
@@ -667,6 +677,14 @@ mod tests {
         let mut payload = vec![16u8];
         payload.extend_from_slice(&encode_3u32(0, 0, MAX_BLOCK_SIZE + 1));
         assert!(Message::parse(&payload).is_err());
+    }
+
+    #[test]
+    fn allowed_fast_roundtrip() {
+        let message = Message::AllowedFast(42);
+        assert_eq!(roundtrip(message.clone()), message);
+        assert_eq!(&message.encode()[4..5], &[17]);
+        assert_eq!(message.encoded_len(), Some(9));
     }
 
     #[test]

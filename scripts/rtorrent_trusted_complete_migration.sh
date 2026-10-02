@@ -193,6 +193,21 @@ start_if_was_running() {
   fi
 }
 
+services_restored=0
+
+restore_services() {
+  [[ "$services_restored" == "1" ]] && return 0
+  start_if_was_running "$TORRENTNGD_SERVICE" "$TORRENTNGD_WAS_RUNNING"
+  start_if_was_running "$RTORRENT_SERVICE" "$RTORRENT_WAS_RUNNING"
+  services_restored=1
+}
+
+restore_services_on_exit() {
+  local exit_status="$?"
+  restore_services || true
+  exit "$exit_status"
+}
+
 log() {
   printf '[rtorrent-migrate] %s\n' "$*" >&2
 }
@@ -355,6 +370,7 @@ MIGRATION_APPLY_ATTEMPTED=0
 MIGRATION_COMMITTED=0
 service_running "$RTORRENT_SERVICE" && RTORRENT_WAS_RUNNING=1
 service_running "$TORRENTNGD_SERVICE" && TORRENTNGD_WAS_RUNNING=1
+trap restore_services_on_exit EXIT
 
 restore_archived_rtorrent_entries() {
   local archived_path relative destination destination_parent resolved_parent
@@ -443,8 +459,7 @@ jq -r '.torrents[].info_hash' "$REPORT_JSON" >"$HASHES"
 SELECTED_COUNT="$(wc -l <"$HASHES" | tr -d ' ')"
 if [[ "$SELECTED_COUNT" == "0" ]]; then
   log "no trusted completed rTorrent torrents selected; restoring service state"
-  start_if_was_running "$TORRENTNGD_SERVICE" "$TORRENTNGD_WAS_RUNNING"
-  start_if_was_running "$RTORRENT_SERVICE" "$RTORRENT_WAS_RUNNING"
+  restore_services
   exit 0
 fi
 
@@ -454,8 +469,7 @@ python3 "$SCRIPT_DIR/stage_rtorrent_migration.py" \
 
 if [[ "$DRY_RUN" == "1" ]]; then
   log "dry-run complete; restoring service state without changing active session"
-  start_if_was_running "$TORRENTNGD_SERVICE" "$TORRENTNGD_WAS_RUNNING"
-  start_if_was_running "$RTORRENT_SERVICE" "$RTORRENT_WAS_RUNNING"
+  restore_services
   log "selected hashes: $HASHES"
   exit 0
 fi

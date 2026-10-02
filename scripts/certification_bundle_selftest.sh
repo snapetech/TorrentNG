@@ -36,6 +36,7 @@ for report in \
   universal-compat-selftest.md \
   universal-live-selftest.md \
   migration-corpus-selftest.md \
+  external-evidence-preflight-selftest.md \
   soak-20260517-selftest.md \
   transfer-churn-selftest.md \
   soak-24h-selftest.md \
@@ -61,20 +62,43 @@ for report in \
 done
 write_report "$benchmark_dir/report-selftest.md"
 
+if grep -Fq "http://\$TNG_API_TOKEN:\$TNG_API_TOKEN@" "$ROOT/scripts/live_certification.sh"; then
+  echo "live certification script would disclose TNG_API_TOKEN in its report" >&2
+  exit 1
+fi
+grep -q 'http://<token>:<token>@torrentng:8080' "$ROOT/scripts/live_certification.sh"
+if grep -Eq '/tmp/tng-cert-(body|cookies)' "$ROOT/scripts/live_certification.sh"; then
+  echo "live certification script retained a predictable credential artifact path" >&2
+  exit 1
+fi
+
 REPORT_DIR="$report_dir" BENCHMARK_DIR="$benchmark_dir" CERTIFICATION_BUNDLE_DIR="$bundle_dir" \
   "$ROOT/scripts/certification_bundle.sh" "$bundle_dir/pass.tar.gz" >/dev/null
 grep -q '^Overall status: PASS$' "$report_dir/certification-bundle-"*.md
 grep -q 'Missing referenced reports: 0' "$report_dir/certification-bundle-"*.md
 tar -tzf "$bundle_dir/pass.tar.gz" >"$tmpdir/pass-list.txt"
-grep -q 'benchmarks/report-selftest.md' "$tmpdir/pass-list.txt"
+if grep -q 'benchmarks/report-selftest.md' "$tmpdir/pass-list.txt"; then
+  echo "non-certifying benchmark report was included in the release bundle" >&2
+  exit 1
+fi
+
+REPORT_DIR="$report_dir" BENCHMARK_DIR="$benchmark_dir" CERTIFICATION_BUNDLE_DIR="$bundle_dir" \
+  TNG_DEFER_24H_SOAK=1 \
+  "$ROOT/scripts/certification_bundle.sh" "$bundle_dir/deferred.tar.gz" >/dev/null
+latest="$(find "$report_dir" -maxdepth 1 -type f -name 'certification-bundle-*.md' -printf '%T@\t%p\n' | sort -nr | head -1 | cut -f2-)"
+grep -q '^Overall status: PASS$' "$latest"
+grep -q 'Missing referenced reports: 0' "$latest"
+deferred_manifest_path="$(tar -tzf "$bundle_dir/deferred.tar.gz" | awk '/\/MANIFEST\.md$/ {path=$0} END {print path}')"
+tar -xOzf "$bundle_dir/deferred.tar.gz" "$deferred_manifest_path" >"$tmpdir/deferred-manifest.md"
+grep -q '24h soak | INFO | deferred by TNG_DEFER_24H_SOAK=1 | intentionally deferred' "$tmpdir/deferred-manifest.md"
 
 rm -f "$report_dir/universal-live-selftest.md"
 write_report "$report_dir/universal-live-selftest.md"
 sleep 1
 REPORT_DIR="$report_dir" BENCHMARK_DIR="$benchmark_dir" CERTIFICATION_BUNDLE_DIR="$bundle_dir" \
-  TNG_CERT_BUNDLE_TEST_REMOVE_REPORT=universal-live-selftest.md \
+TNG_CERT_BUNDLE_TEST_REMOVE_REPORT=universal-live-selftest.md \
   "$ROOT/scripts/certification_bundle.sh" "$bundle_dir/warn.tar.gz" >/dev/null || true
-latest="$(ls -t "$report_dir"/certification-bundle-*.md | head -1)"
+latest="$(find "$report_dir" -maxdepth 1 -type f -name 'certification-bundle-*.md' -printf '%T@\t%p\n' | sort -nr | head -1 | cut -f2-)"
 grep -q 'Overall status: PASS_WITH_WARNINGS' "$latest"
 grep -q 'Missing referenced reports: 1' "$latest"
 manifest_path="$(tar -tzf "$bundle_dir/warn.tar.gz" | awk '/\/MANIFEST\.md$/ {path=$0} END {print path}')"

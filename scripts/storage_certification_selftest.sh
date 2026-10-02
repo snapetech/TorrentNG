@@ -91,6 +91,36 @@ grep -q 'storage-uring-graduation-selftest.md' "$index"
 grep -q '| uring | frame_pool_slots |' "$index"
 grep -q '| yes | PASS |' "$index"
 
+empty_index_dir="$tmpdir/empty-index"
+mkdir -p "$empty_index_dir"
+TNG_STORAGE_REPORT_DIR="$empty_index_dir" \
+  TNG_STORAGE_REPORT_INDEX="$empty_index_dir/storage-certification-index.md" \
+  "$ROOT/scripts/storage_certification_index.sh" >/dev/null
+awk -F'|' '/_none_/ { if (NF != 12) exit 1; found = 1 } END { exit found ? 0 : 1 }' \
+  "$empty_index_dir/storage-certification-index.md"
+
+warning_index_dir="$tmpdir/warning-index"
+mkdir -p "$warning_index_dir"
+cat >"$warning_index_dir/storage-hardware-warning-selftest.md" <<'REPORT'
+# TorrentNG Storage Hardware Matrix
+
+| Gate | Result |
+| --- | --- |
+| bounded local probe | PASS |
+
+Overall status: PASS_WITH_WARNINGS
+REPORT
+TNG_STORAGE_REPORT_DIR="$warning_index_dir" \
+  TNG_STORAGE_REPORT_INDEX="$warning_index_dir/storage-certification-index.md" \
+  "$ROOT/scripts/storage_certification_index.sh" >/dev/null
+awk -F'|' '
+  /storage-hardware-warning-selftest\.md/ {
+    gsub(/^[[:space:]]+|[[:space:]]+$/, "", $(NF - 1));
+    found = ($(NF - 1) == "INFO")
+  }
+  END { exit found ? 0 : 1 }
+' "$warning_index_dir/storage-certification-index.md"
+
 write_passing_report() {
   local path="$1"
   {
