@@ -237,9 +237,9 @@ layouts.
 
 Fresh installs generate a unique WebUI password in the service state directory.
 Run `torrentngd auth-token` for the native client or `torrentng auth-token`
-for the compatible-client service to retrieve the active login. The native
-command writes credentials only to the controlling terminal and requires an
-interactive terminal, so shell redirection and pipelines cannot capture them.
+for the compatible-client service to retrieve the active login. Both commands
+write credentials only to the controlling terminal and require an interactive
+terminal, so shell redirection and pipelines cannot capture them.
 API tokens remain available for automation and also work in either login field.
 Unraid stores API tokens in each template's token setting; public binds require
 an API token and a WebUI password of at least 16 characters.

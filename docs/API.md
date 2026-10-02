@@ -49,11 +49,12 @@ configured; it is not a public exception.
 Native loopback installs without API tokens require the configured username
 and password for browser WebUI requests. Fresh installs generate a unique
 password retrievable with `torrentngd auth-token` (or `torrentng auth-token`
-for the compatible-client service). Non-browser machine clients retain the
-existing loopback no-token behavior. Configure an API token when automation
-clients need authenticated access; tokens work in either login field. Public
-binds require API tokens for initial access and enforce a WebUI password of at
-least 16 bytes.
+for the compatible-client service); both commands require an interactive
+terminal and do not write credentials to stdout. Non-browser machine clients
+retain the existing loopback no-token behavior. Configure an API token when
+automation clients need authenticated access; tokens work in either login
+field. Public binds require API tokens for initial access and enforce a WebUI
+password of at least 16 bytes.
 
 ## Request Correlation
 

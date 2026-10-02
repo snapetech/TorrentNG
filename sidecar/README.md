@@ -25,8 +25,10 @@ When API-token authentication is enabled, use the configured token in either
 the WebUI username or password field. Tokens come from `[auth].api_tokens` in
 the service config or `TNG_API_TOKENS` / `RTNG_API_TOKENS` in the environment.
 Fresh installs generate a unique WebUI password in the service data directory;
-run `torrentng auth-token [config.toml]` to retrieve the active login. Configure
-a custom username/password in `[auth]`, `TNG_USERNAME` / `TNG_PASSWORD`, or
+run `torrentng auth-token [config.toml]` from an interactive terminal to
+retrieve the active login. It writes credentials only to the controlling
+terminal, never stdout, and refuses non-interactive use. Configure a custom
+username/password in `[auth]`, `TNG_USERNAME` / `TNG_PASSWORD`, or
 **Settings -> Security**. Public binds require an API token and a WebUI password
 of at least 16 characters. Runtime changes persist in the service data
 directory; API tokens remain enabled for automation.
