@@ -209,8 +209,11 @@ placeholder values such as `change-me` and `REPLACE_WITH_*` are rejected at
 startup. Prefer `api_tokens_file` or a deployment secret over inline tokens.
 An unset password is generated once and stored in
 `<session_dir>/bootstrap-password` with mode `0600`. Run `torrentngd auth-token`
-to print the active WebUI login. A public bind requires an API token and a
-WebUI password of at least 16 bytes. API tokens work in either login field.
+from an interactive terminal to display the active WebUI login. The command
+writes directly to the controlling terminal and refuses to run without one, so
+redirected stdout and pipelines do not capture credentials. A public bind
+requires an API token and a WebUI password of at least 16 bytes. API tokens
+work in either login field.
 Settings -> Security can update the username/password at runtime; those values
 persist in `<session_dir>/auth-settings.json` with mode `0600` and take
 precedence over the config file until reset from the WebUI.

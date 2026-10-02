@@ -23,6 +23,7 @@ Required production policy:
 Runtime behavior:
 
 - Fresh installs generate a unique WebUI password in a private state file; `torrentngd auth-token` and `torrentng auth-token` retrieve the active login. Public binds require an API token and a WebUI password of at least 16 bytes.
+- The native `torrentngd auth-token` command writes credentials directly to the controlling terminal and requires an interactive terminal; it does not send credentials through stdout, shell redirection, or pipelines.
 - WebUI credentials can be configured in `[auth].username` / `[auth].password` or changed through the authenticated auth-settings API. Generated bootstrap passwords and runtime credential files use mode `0600`; the API never returns a password.
 - API tokens remain valid for bearer authentication and can be entered in either WebUI login field. The UI identifies the token source for Unraid and config-file deployments without returning the secret through an API read.
 - Native and compatible-client WebUI login attempts are limited to 10 per TCP peer per 60 seconds; successful login clears that peer's bucket.

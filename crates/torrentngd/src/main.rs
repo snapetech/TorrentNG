@@ -110,9 +110,7 @@ async fn main() -> anyhow::Result<()> {
         Some("auth-token") => {
             let config = load_config()?;
             let (_, credentials, _) = resolve_auth_credentials(&config)?;
-            println!("WebUI username: {}", credentials.username);
-            println!("WebUI password: {}", credentials.password);
-            println!("Configured API tokens can also be used in either login field.");
+            write_auth_credentials_to_terminal(&credentials)?;
             return Ok(());
         }
         _ => {}
@@ -335,6 +333,40 @@ async fn main() -> anyhow::Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(any(unix, windows))]
+fn write_auth_credentials_to_terminal(credentials: &AuthCredentials) -> anyhow::Result<()> {
+    use std::io::Write as _;
+
+    #[cfg(unix)]
+    let mut terminal = std::fs::OpenOptions::new()
+        .write(true)
+        .open("/dev/tty")
+        .context(
+            "auth-token requires an interactive terminal; credentials were not written to stdout",
+        )?;
+
+    #[cfg(windows)]
+    let mut terminal = std::fs::OpenOptions::new()
+        .write(true)
+        .open("CONOUT$")
+        .context(
+            "auth-token requires an interactive terminal; credentials were not written to stdout",
+        )?;
+
+    writeln!(terminal, "WebUI username: {}", credentials.username)?;
+    writeln!(terminal, "WebUI password: {}", credentials.password)?;
+    writeln!(
+        terminal,
+        "Configured API tokens can also be used in either login field."
+    )?;
+    Ok(())
+}
+
+#[cfg(not(any(unix, windows)))]
+fn write_auth_credentials_to_terminal(_credentials: &AuthCredentials) -> anyhow::Result<()> {
+    anyhow::bail!("auth-token requires an interactive terminal on this platform")
 }
 
 async fn shutdown_signal(

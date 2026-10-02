@@ -26,7 +26,9 @@ real-device, or long-soak certificate.
 - Put payload data on mounted storage roots with stable paths.
 - An unset `[auth].password` generates a unique value in
   `<session_dir>/bootstrap-password` with mode `0600`. Retrieve the active
-  WebUI login with `torrentngd auth-token`; change it in Settings -> Security
+  WebUI login with `torrentngd auth-token` from an interactive terminal; the
+  command writes to the controlling terminal and refuses non-interactive use.
+  Change it in Settings -> Security
   or set `[auth].username` and `[auth].password` in `config.toml`.
 - Set TorrentNG API tokens in `[auth].api_tokens` or a protected
   `[auth].api_tokens_file`; public binds reject missing, short, or placeholder

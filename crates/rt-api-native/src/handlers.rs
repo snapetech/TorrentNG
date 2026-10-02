@@ -11897,13 +11897,20 @@ mod tests {
                 )
                 .await
                 .unwrap();
-            assert_eq!(response.status(), StatusCode::OK, "{body}");
+            assert_eq!(
+                response.status(),
+                StatusCode::OK,
+                "valid login was rejected"
+            );
             let cookie = response
                 .headers()
                 .get(header::SET_COOKIE)
                 .and_then(|value| value.to_str().ok())
                 .unwrap();
-            assert!(cookie.starts_with("tng_session=secret-token;"), "{body}");
+            assert!(
+                cookie.starts_with("tng_session=secret-token;"),
+                "valid login did not set the expected session cookie"
+            );
         }
     }
 
