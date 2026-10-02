@@ -3,7 +3,7 @@ set -euo pipefail
 
 readonly REPO="snapetech/TorrentNG"
 readonly WORKFLOW="release-ppa.yml"
-readonly EXPECTED_FINGERPRINT="07E2531E1F470F8008ACCFC996A07606FE65392F"
+readonly EXPECTED_FINGERPRINT="605676EA8D1633352357044A4DF9BA816E46C024"
 readonly ADDITIONAL_KEY_UID="slskdn (TorrentNG additional Launchpad key) <slskdn@proton.me>"
 readonly ADDITIONAL_KEY_SECRET_SERVICE="torrentng-launchpad-ppa"
 readonly LAUNCHPAD_KEY_PAGE="https://launchpad.net/~keefshape/+editpgpkeys"

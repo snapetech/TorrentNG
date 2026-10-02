@@ -47,7 +47,7 @@ if [[ ! "$run_id" =~ ^[0-9]+$ || ! "$run_attempt" =~ ^[0-9]+$ ]]; then
   exit 1
 fi
 
-expected_key="07E2531E1F470F8008ACCFC996A07606FE65392F"
+expected_key="605676EA8D1633352357044A4DF9BA816E46C024"
 signing_key="${LAUNCHPAD_GPG_FINGERPRINT:-$expected_key}"
 if [[ "$signing_key" != "$expected_key" ]]; then
   echo "Launchpad signing key does not match the account key configured for this PPA." >&2
