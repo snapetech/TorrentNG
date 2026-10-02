@@ -126,14 +126,27 @@ class WorkflowSecurityTests(unittest.TestCase):
 
     def test_native_release_packaging_uses_declared_matrix_environment(self) -> None:
         release = (WORKFLOWS / "release.yml").read_text(encoding="utf-8")
+        native_job = release.split("  native-binaries:\n", 1)[1].split(
+            "  linux-release-assets:\n", 1
+        )[0]
         package_step = release.split("- name: Package TorrentNG client assets", 1)[1].split(
             "- name: Upload TorrentNG client artifacts", 1
         )[0]
+        self.assertIn("RELEASE_TAG: ${{ needs.validate-release-tag.outputs.tag }}", native_job)
         self.assertIn("RELEASE_BINARY: ${{ matrix.binary }}", package_step)
         self.assertIn("RELEASE_SUFFIX: ${{ matrix.suffix }}", package_step)
         self.assertIn('binary="${RELEASE_BINARY:?RELEASE_BINARY must be set}"', package_step)
         self.assertIn('suffix="${RELEASE_SUFFIX:?RELEASE_SUFFIX must be set}"', package_step)
         self.assertIn('if [[ "$binary" == "torrentngd.exe" ]]', package_step)
+        self.assertNotIn("steps.tag.outputs.tag", package_step)
+
+        publish_job = release.split("  publish:\n", 1)[1]
+        checksum_step = publish_job.split("- name: Generate checksums", 1)[1].split(
+            "- name: Create GitHub release", 1
+        )[0]
+        self.assertIn("RELEASE_TAG: ${{ needs.validate-release-tag.outputs.tag }}", publish_job)
+        self.assertNotIn("steps.tag.outputs.tag", checksum_step)
+        self.assertEqual(release.count("${{ steps.tag.outputs.tag }}"), 1)
 
     def test_bearer_targets_and_soak_transport_fail_closed(self) -> None:
         api_load = (ROOT / "scripts" / "backend_burndown_api_load.py").read_text(encoding="utf-8")

@@ -340,7 +340,6 @@ jobs:
         env:
           RELEASE_ARCHIVE: ${{ matrix.archive }}
           RELEASE_BINARY: ${{ matrix.binary }}
-          RELEASE_TAG: ${{ steps.tag.outputs.tag }}
           RELEASE_SUFFIX: ${{ matrix.suffix }}
         shell: bash
         run: |
@@ -662,8 +661,6 @@ jobs:
           merge-multiple: true
 
       - name: Generate checksums
-        env:
-          RELEASE_TAG: ${{ steps.tag.outputs.tag }}
         shell: bash
         run: |
           set -euo pipefail
