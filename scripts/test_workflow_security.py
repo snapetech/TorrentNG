@@ -124,6 +124,17 @@ class WorkflowSecurityTests(unittest.TestCase):
         self.assertIn("git merge-base --is-ancestor", release)
         self.assertIn("needs: validate-release-tag", release)
 
+    def test_native_release_packaging_uses_declared_matrix_environment(self) -> None:
+        release = (WORKFLOWS / "release.yml").read_text(encoding="utf-8")
+        package_step = release.split("- name: Package TorrentNG client assets", 1)[1].split(
+            "- name: Upload TorrentNG client artifacts", 1
+        )[0]
+        self.assertIn("RELEASE_BINARY: ${{ matrix.binary }}", package_step)
+        self.assertIn("RELEASE_SUFFIX: ${{ matrix.suffix }}", package_step)
+        self.assertIn('binary="${RELEASE_BINARY:?RELEASE_BINARY must be set}"', package_step)
+        self.assertIn('suffix="${RELEASE_SUFFIX:?RELEASE_SUFFIX must be set}"', package_step)
+        self.assertIn('if [[ "$binary" == "torrentngd.exe" ]]', package_step)
+
     def test_bearer_targets_and_soak_transport_fail_closed(self) -> None:
         api_load = (ROOT / "scripts" / "backend_burndown_api_load.py").read_text(encoding="utf-8")
         self.assertIn("NoProxyHandler", api_load)

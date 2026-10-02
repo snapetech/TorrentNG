@@ -345,11 +345,14 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          tag="$RELEASE_TAG"
-          suffix="${{ matrix.suffix }}"
+          tag="${RELEASE_TAG:?RELEASE_TAG must be set}"
+          suffix="${RELEASE_SUFFIX:?RELEASE_SUFFIX must be set}"
+          binary="${RELEASE_BINARY:?RELEASE_BINARY must be set}"
           mkdir -p dist native/usr/bin native/usr/share/torrentng/webui
           artifact_suffix=""
-          [[ "$binary" == "torrentngd.exe" ]] && artifact_suffix=".exe"
+          if [[ "$binary" == "torrentngd.exe" ]]; then
+            artifact_suffix=".exe"
+          fi
           cp "target/release/$binary" "dist/torrentngd-${suffix}${artifact_suffix}"
           cp "target/release/$binary" "native/usr/bin/$binary"
           cp -a webui/dist/. native/usr/share/torrentng/webui/
