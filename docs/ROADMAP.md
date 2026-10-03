@@ -359,13 +359,13 @@ operator-facing polish.
 | Criterion | Status | Evidence |
 |---|---|---|
 | Large-library rows remain manageable under bounded rendering | Done | `rt-metrics` regression tests and virtualized WebUI |
-| 200+ TB library imported without forced global recheck | Done | `rt-migrate` dry-run/import planning and durable DB import tests |
+| Imports do not force a global recheck | Done | `rt-migrate` planning and durable DB import tests cover the implemented behavior; 200+ TB capacity remains a design target without a matching measured run |
 | qBit-compatible API works with Sonarr/Radarr/Prowlarr/autobrr | Done | Compatible-client live certification plus TorrentNG-client qBit projection tests |
 | Cold restart does not announce-storm trackers | Done | tracker restart storm scale test |
 | Rechecks are queued, resumable, cancellable, and visible | Done | durable job queue, recheck job, and engine recovery tests |
 | Bulk path/category/tracker edits have dry-run previews | Done | TorrentNG-client bulk preview and storage planning tests |
 | Storage engine has per-mount queueing and backpressure | Done | `rt-storage` scheduler and starvation tests |
-| UI can filter/sort without unbounded browser rendering | Done | virtualized WebUI and TorrentNG API regression tests |
+| UI can filter/sort without unbounded browser rendering and jump into large result sets | Done | virtualized WebUI, snapshot pagination, and direct row-range navigation |
 | Crash during move/check/import is recoverable | Done | job recovery, move planning, and migration atomicity tests |
 | Private tracker mode disables DHT/PEX/LSD unless explicitly enabled | Done | tracker policy tests |
 | Metrics and event logs explain failures without log spelunking | Done | TorrentNG metrics, diagnostics, and append-only event log |

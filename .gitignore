@@ -15,7 +15,15 @@ webui/playwright-report/
 .claude/settings.local.json
 .claude/worktrees/
 benchmarks/report-*.md
-certification/reports/
+certification/reports/*
+!certification/reports/storage-hardware-local-nvme-20261002.md
+!certification/reports/soak-24h-tng145-current-20261002.md
+!certification/reports/soak-final-tng145-current-20261003.md
+!certification/reports/webui-certification-tng147-local-20261002.md
+!certification/reports/storage-release-certification-local-ssd-20261002.md
+!certification/reports/storage-hardware-release-20261002T211623Z.md
+!certification/reports/storage-uring-graduation-release-20261002T211623Z.md
+!certification/reports/storage-move-import-release-20261002T211623Z.md
 certification/bundles/
 certification/interop/
 

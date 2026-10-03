@@ -18,6 +18,8 @@ interface Props {
   onContextMenu: (torrent: TorrentSummary, x: number, y: number) => void
   onSort: (sort: string) => void
   onLoadMore: () => void
+  onJumpTo: (offset: number) => void
+  pageOffset: number
   hasMore: boolean
   isFetchingMore: boolean
   detailHash: string | null
@@ -360,7 +362,7 @@ function loadWidths(): Partial<Record<ColKey, number>> {
 
 export function TorrentTable({
   torrents, total, selected, params, onSelect, onSelectAll, onSelectAllMatching, isSelectingAllMatching,
-  onDetail, onContextMenu, onSort, onLoadMore, hasMore, isFetchingMore, detailHash, mediaInference,
+  onDetail, onContextMenu, onSort, onLoadMore, onJumpTo, pageOffset, hasMore, isFetchingMore, detailHash, mediaInference,
 }: Props) {
   const parentRef = useRef<HTMLDivElement>(null)
   const columnsRef = useRef<HTMLDivElement>(null)
@@ -371,6 +373,7 @@ export function TorrentTable({
   const [widths, setWidths] = useState<Partial<Record<ColKey, number>>>(loadWidths)
   const [dragKey, setDragKey] = useState<ColKey | null>(null)
   const [focusedHash, setFocusedHash] = useState<string | null>(null)
+  const [jumpRow, setJumpRow] = useState(String(pageOffset + 1))
   const rowRefs = useRef(new Map<string, HTMLDivElement>())
   const columnsButtonRef = useRef<HTMLButtonElement>(null)
   const columnsWereOpen = useRef(false)
@@ -506,6 +509,11 @@ export function TorrentTable({
   }, [focusedHash, torrents])
 
   useEffect(() => {
+    setJumpRow(String(pageOffset + 1))
+    if (parentRef.current) parentRef.current.scrollTop = 0
+  }, [pageOffset])
+
+  useEffect(() => {
     if (columnsOpen) {
       columnsWereOpen.current = true
       window.requestAnimationFrame(() => {
@@ -631,6 +639,49 @@ export function TorrentTable({
       <span id="torrent-selection-help" className="tng-visually-hidden">
         Click a row to select it. Hold Control or Command to add or remove rows. Hold Shift to select a range. Use Arrow keys to move and Space to select.
       </span>
+      <div className="tng-list-jump" style={{
+        display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 12,
+        minHeight: 42, padding: '5px 12px', borderBottom: '1px solid var(--border)',
+        background: 'var(--panel)', color: 'var(--muted)', fontSize: 12,
+      }}>
+        <form aria-label="Jump to torrent row" onSubmit={event => {
+          event.preventDefault()
+          const row = Number.parseInt(jumpRow, 10)
+          if (!Number.isFinite(row) || row < 1 || row > total) return
+          onJumpTo(row - 1)
+        }} style={{ display: 'flex', alignItems: 'center', gap: 7 }}>
+          <label htmlFor="torrent-row-jump" style={{ whiteSpace: 'nowrap' }}>Jump to row</label>
+          <input
+            id="torrent-row-jump"
+            aria-label="Torrent row number"
+            type="number"
+            inputMode="numeric"
+            min={1}
+            max={Math.max(1, total)}
+            step={1}
+            value={jumpRow}
+            disabled={total === 0}
+            onChange={event => setJumpRow(event.target.value)}
+            onBlur={() => {
+              const row = Number.parseInt(jumpRow, 10)
+              if (!Number.isFinite(row)) setJumpRow(String(Math.min(total, pageOffset + 1) || 1))
+            }}
+            style={{
+              width: 92, minHeight: 30, padding: '3px 7px', color: 'var(--text)',
+              background: 'var(--surface)', border: '1px solid var(--border-strong)',
+              borderRadius: 4, fontSize: 12, fontVariantNumeric: 'tabular-nums',
+            }}
+          />
+          <button type="submit" disabled={total === 0} style={{
+            minHeight: 30, padding: '3px 10px', color: 'var(--accent-text)',
+            background: 'var(--surface-2)', border: '1px solid var(--border-strong)',
+            borderRadius: 4, fontSize: 12,
+          }}>Jump</button>
+        </form>
+        <span aria-live="polite" style={{ color: 'var(--faint)', fontVariantNumeric: 'tabular-nums', textAlign: 'right' }}>
+          {total === 0 ? 'No rows' : `Rows ${(pageOffset + 1).toLocaleString()}–${Math.min(total, pageOffset + torrents.length).toLocaleString()} of ${total.toLocaleString()}`}
+        </span>
+      </div>
       <div
         ref={parentRef}
         role="grid"
@@ -968,7 +1019,7 @@ export function TorrentTable({
                 key={t.hash}
                 className="torrent-row"
                 role="row"
-                aria-rowindex={item.index + 2}
+                aria-rowindex={pageOffset + item.index + 2}
                 aria-selected={isSelected}
                 aria-label={`${t.name}, ${accessibleLabel}${t.message ? `, ${t.message}` : ''}`}
                 tabIndex={focusedHash === t.hash || (!focusedHash && item.index === 0) ? 0 : -1}

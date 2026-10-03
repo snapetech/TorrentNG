@@ -5,6 +5,15 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 REPORT_DIR="${TNG_WEBUI_REPORT_DIR:-$ROOT/certification/reports}"
 OUT="${1:-${TNG_WEBUI_REPORT:-$REPORT_DIR/webui-certification-$(date -u +%Y%m%dT%H%M%SZ).md}}"
 
+worktree_state() {
+  if git -C "$ROOT" diff --quiet && git -C "$ROOT" diff --cached --quiet &&
+    [[ -z "$(git -C "$ROOT" ls-files --others --exclude-standard)" ]]; then
+    printf 'clean\n'
+  else
+    printf 'dirty\n'
+  fi
+}
+
 mkdir -p "$REPORT_DIR"
 tmpdir="$(mktemp -d)"
 trap 'rm -rf "$tmpdir"' EXIT
@@ -43,6 +52,7 @@ dependencies_ready() {
   echo
   echo "- Generated: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
   echo "- Commit: $(git -C "$ROOT" rev-parse --short HEAD 2>/dev/null || echo unknown)"
+  echo "- Worktree state: $(worktree_state)"
   echo "- 15k first-visible threshold: ${TNG_WEBUI_FIRST_VISIBLE_MS:-8000}ms"
   echo
   echo "| Gate | Result |"

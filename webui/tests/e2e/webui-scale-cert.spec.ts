@@ -3,6 +3,7 @@ import { expect, test, type Page } from '@playwright/test'
 const SCALE_TOTAL = 15_000
 const DEFAULT_LIMIT = 200
 const FIRST_VISIBLE_THRESHOLD_MS = Number(process.env.TNG_WEBUI_FIRST_VISIBLE_MS ?? 8000)
+const requestedPages: Array<{ offset: number; snapshot: number | null }> = []
 
 function makeTorrent(index: number) {
   const n = index + 1
@@ -99,8 +100,9 @@ async function installScaleApiMock(page: Page) {
     if (path === '/api/v1/torrents') {
       const offset = Number(url.searchParams.get('offset') ?? 0)
       const limit = Number(url.searchParams.get('limit') ?? DEFAULT_LIMIT)
+      requestedPages.push({ offset, snapshot: url.searchParams.get('snapshot') ? Number(url.searchParams.get('snapshot')) : null })
       const count = Math.max(0, Math.min(limit, SCALE_TOTAL - offset))
-      return json({ total: SCALE_TOTAL, torrents: Array.from({ length: count }, (_, i) => makeTorrent(offset + i)) })
+      return json({ snapshot: 77, total: SCALE_TOTAL, torrents: Array.from({ length: count }, (_, i) => makeTorrent(offset + i)) })
     }
     if (path === '/api/v1/categories') {
       return json([
@@ -181,6 +183,7 @@ async function installScaleApiMock(page: Page) {
 }
 
 test.beforeEach(async ({ page }) => {
+  requestedPages.length = 0
   const errors: string[] = []
   page.on('pageerror', err => errors.push(err.message))
   page.on('console', msg => {
@@ -207,6 +210,24 @@ test('desktop handles 15k torrents without rendering every row', async ({ page, 
   await expect(page.getByRole('button', { name: /200 \/ 15,000/ })).toBeVisible()
   await page.getByRole('button', { name: /200 \/ 15,000/ }).click()
   await expect(page.getByRole('button', { name: /400 \/ 15,000/ })).toBeVisible()
+})
+
+test('jumps directly to a distant row and continues within the same snapshot', async ({ page, isMobile }) => {
+  const rowJump = page.getByRole('spinbutton', { name: 'Torrent row number' })
+  await rowJump.fill('10001')
+  await page.getByRole('form', { name: 'Jump to torrent row' }).getByRole('button', { name: 'Jump' }).click()
+
+  await expect(page.getByText('TorrentNG scale fixture 10001')).toBeVisible()
+  await expect(page.getByText('Rows 10,001–10,200 of 15,000')).toBeVisible()
+  expect(requestedPages.some(request => request.offset === 10_000 && request.snapshot === null)).toBe(true)
+
+  const grid = page.getByRole('grid', { name: 'Torrent list' })
+  await grid.evaluate(element => {
+    element.scrollTop = element.scrollHeight
+    element.dispatchEvent(new Event('scroll'))
+  })
+  await expect.poll(() => requestedPages.some(request => request.offset === 10_200)).toBe(true)
+  expect(requestedPages.find(request => request.offset === 10_200)?.snapshot).toBe(77)
 })
 
 test('core workspace controls expose accessible names', async ({ page }) => {

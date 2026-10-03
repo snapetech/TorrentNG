@@ -1,16 +1,18 @@
 # TorrentNG Project Gap Audit
 
-Status as of 2026-09-10 on clean `main` at `50e0fc3`; runtime product evidence
-and kspls0 LVM reports are tied to `b393eb0` where stated below, and the clean
-release smoke identifies its own build commit. The 2026-10-01 audit addendum
-invalidates the public soak's daemon RSS/FD/thread figures; see TNG-145 below.
+Historical baseline: 2026-09-10 on `50e0fc3`; runtime product evidence and
+kspls0 LVM reports are tied to `b393eb0` where stated below, and the clean
+release smoke identifies its own build commit. The current source disposition
+is updated here as of 2026-10-02; dated evidence below remains tied to its
+recorded artifact and host.
 
 This audit separates local implementation gaps from external evidence gates.
 It is based on the roadmap docs, compatibility matrices, certification status,
 and the local checks listed at the end.
 
-The dated audit narrative below is retained for traceability. The current
-repository disposition is the 2026-09-04 reconciliation in
+**Historical status note (2026-09-04; superseded by the 2026-10-02 update below):**
+The dated audit narrative below is retained for traceability. The 2026-09-04
+repository disposition in
 [`BACKEND_AUDIT_BURN_DOWN.md`](BACKEND_AUDIT_BURN_DOWN.md): all repository-
 actionable implementation, contract, security, CI, and local evidence work is
 closed for its declared scope. Hosted CI is now green. Remaining rows require
@@ -18,7 +20,25 @@ broader public clients/networks, additional physical targets,
 branch-protection settings, or optional scale/profiling work and are not hidden
 implementation backlog.
 
-## Current qualification update — 2026-09-16
+## Current implementation update — 2026-10-02
+
+TNG-145/146 source safeguards and TNG-147 documentation/navigation changes are
+implemented locally. A fresh physical SSD release suite passes on `/dev/sdb`
+and is recorded in [`storage-release-certification-local-ssd-20261002.md`](../certification/reports/storage-release-certification-local-ssd-20261002.md). The current-tree 24-hour idle-daemon qualification completed PASS (1439 samples; 2026-10-02T21:11:04Z through 2026-10-03T21:17:37Z) under the recorded daemon resource and service-health thresholds. This remains idle-daemon evidence, not loaded-swarm or public-network evidence.
+
+- Soak resource sampling rejects wrapper-only or ambiguous process identity
+  and records the daemon PID/executable plus container and image IDs.
+- Storage certification labels unknown, pseudo-filesystem, and network targets
+  as smoke-only; a release hardware PASS requires an eligible block-backed
+  filesystem target.
+- The WebUI supports direct row-range navigation on top of snapshot pagination
+  and virtualized rendering. The current dirty-worktree build/lint/browser
+  report passes (28 passed, 10 skipped). This improves reachability without
+  claiming a 100,000-row production-capacity result.
+- Performance and memory wording separates measured workloads, design targets,
+  frame-pool limits, and total process RSS.
+
+## Qualification snapshot — 2026-09-16 (historical)
 
 The current local implementation and fault gates are green. The 28-row local
 Docker matrix passes, the official Debian public transfer passes, and the live
@@ -190,6 +210,9 @@ Remaining WebUI gaps are now product/certification depth:
 - the browser-driven 15k-row benchmark now verifies bounded DOM rendering,
   load-more responsiveness, and a configurable first-visible threshold through
   `TNG_WEBUI_FIRST_VISIBLE_MS` in `scripts/webui_certification.sh`;
+- direct row-range navigation now starts at a requested server-side offset and
+  pins subsequent pages to the returned snapshot; browser certification should
+  cover the interaction on desktop and mobile;
 - some plugin panels intentionally show compatibility-state surfaces until
   TorrentNG owns first-party plugin workflows such as blocklist, execute, extractor,
   scheduler, or auto-add behavior.

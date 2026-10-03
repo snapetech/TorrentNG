@@ -1,7 +1,6 @@
 # TorrentNG Backend Audit Burn-down
 
-Status: **reviewed implementation, module-decomposition, and safe dependency-cleanup scope complete (2026-09-25).**
-Root and sidecar debug/release builds pass; external qualification remains separately tracked.
+Status: **audit refresh 2026-10-03: TNG-145 current-tree soak PASS; TNG-146 physical SSD evidence recorded; TNG-147 claims and navigation reconciled.**
 Baseline: 2026-09-01, `main`  
 Scope: the TorrentNG client (`torrentngd`), the compatible-client WebUI/API
 service (`torrentng`), their API facades, storage, deployment, CI, and release
@@ -13,6 +12,21 @@ tested behavior; they are not proof that a feature is wired into the live
 runtime. An item is not complete until its code path, focused regression test,
 and release evidence exist together.
 
+## Audit refresh — 2026-10-02
+
+The current source now samples soak resources from the uniquely identified
+`torrentngd` process and binds reports to container/image IDs. The storage matrix
+labels unknown, pseudo-filesystem, and network targets as smoke-only; the
+release rollup requires at least one physical-device-qualified target for a hardware PASS. Focused tests cover wrapper-only/ambiguous process sampling and target classification. Fresh physical-device evidence passes on one local SSD. The current-tree 24-hour idle-daemon qualification completed PASS (1439 samples; 2026-10-02T21:11:04Z through 2026-10-03T21:17:37Z) under the recorded daemon resource and service-health thresholds. This remains idle-daemon evidence, not loaded-swarm or public-network evidence.
+
+The WebUI now supports direct row-range navigation over the existing
+snapshot-paginated API while retaining virtualized scrolling. Public-facing
+capacity, memory, and comparison wording is scoped to the workloads and
+measurements actually retained. See the 2026-10-02 resolution entries for
+TNG-145–147 below.
+
+The new local NVMe release qualification is [`storage-release-certification-local-ssd-20261002.md`](../certification/reports/storage-release-certification-local-ssd-20261002.md), a PASS on `/dev/sdb` with Btrfs and a physical SSD profile, including hardware, `io_uring`, and real-root move/import gates. A fresh 24-hour daemon soak started at `2026-10-02T21:11:04Z` under user-systemd unit `torrentng-tng145-soak-20261002.service`; its initial authenticated and daemon-process samples passed. The run uses a disposable empty state, disabled DHT, and no torrent workload. The current-tree 24-hour idle-daemon qualification completed PASS (1439 samples; 2026-10-02T21:11:04Z through 2026-10-03T21:17:37Z) under the recorded daemon resource and service-health thresholds. This remains idle-daemon evidence, not loaded-swarm or public-network evidence.
+
 ## Executive decision
 
 TorrentNG is not making a numeric torrent-capacity claim in the current release
@@ -21,14 +35,14 @@ the required release scope; historical reports and deterministic regression
 fixtures remain archival/diagnostic material. The current source has materially
 closed the functional storage, lifecycle, snapshot, and compatibility gaps, and
 the release binary passes the local authenticated daemon smoke. One official
-public Debian transfer and a temporary lab storage certification have passing
+public Debian transfer and a temporary lab storage smoke run have passing
 evidence in the current qualification; the historical kspls0 LVM result remains
 tied to its earlier host/artifact and is not a current-device claim. The
-24-hour soak is explicitly deferred to a later test window.
+current-tree idle-daemon soak outcome is recorded in [soak-final-tng145-current-20261003.md](../certification/reports/soak-final-tng145-current-20261003.md).
 The release posture remains **do not make unqualified scale, security,
 public-interoperability, or universal-compatibility claims**.
 
-## Current qualification run — 2026-09-16
+## Historical qualification run — 2026-09-16
 
 Confidence: high for the recorded local, fault, lab-storage, and Debian
 results; moderate for the diagnosis that the Ubuntu and Fedora failures are
@@ -3948,7 +3962,7 @@ claims:
 
 ### TNG-145 — Public soak resource telemetry samples the container init process
 
-**Status: Open; service continuity remains valid, daemon resource evidence is invalid** · **Priority: P1** · **Confidence: high**
+**Status: Sampler fixed; fresh 24-hour idle-daemon soak PASS** · **Priority: P1** · **Confidence: high**
 
 `scripts/soak_certification.sh` reads `/proc/1/status` and `/proc/1/fd` for
 RSS, thread count, and file descriptors. The native container's identity
@@ -3958,14 +3972,16 @@ not the daemon. Its 1,437 healthy HTTP/sync/metrics samples, expected completed
 torrent, and disk-free measurements remain valid; the original resource
 ceiling PASS does not. The 24-hour run also predates the b393 artifact refresh.
 
-Resolution: identify and validate the daemon process or collect validated
-cgroup totals; record the image/binary digest; make the finalizer reject
-wrapper-process samples; update the historical narrative; and rerun before
-claiming daemon resource ceilings over a soak.
+Resolution: `scripts/soak_process_sample.sh` now requires exactly one process
+whose `comm` and executable from `docker top` identify `torrentngd`, then reads
+RSS, FDs, and threads from that host PID. This works with privilege-dropped
+containers where `/proc/PID/exe` is not readable from an in-container root
+`docker exec`. Missing, wrapper-only, ambiguous, or incomplete samples fail the
+resource checks. Each report records container and image IDs and the sampled daemon PID/executable. The current-tree run is documented in the source report; The current-tree 24-hour idle-daemon qualification completed PASS (1439 samples; 2026-10-02T21:11:04Z through 2026-10-03T21:17:37Z) under the recorded daemon resource and service-health thresholds. This remains idle-daemon evidence, not loaded-swarm or public-network evidence. The historical public soak remains continuity evidence only.
 
 ### TNG-146 — Storage hardware certification can pass on tmpfs
 
-**Status: Open; physical-device and throughput status must be distinct from local smoke status** · **Priority: P1** · **Confidence: high**
+**Status: Local gate fix implemented; fresh physical SSD matrix PASS recorded** · **Priority: P1** · **Confidence: high**
 
 The 2026-09-16 `storage-release-certification-lab-current` report targeted
 `/tmp` on tmpfs, inferred profile `Unknown`, and still recorded PASS. Its
@@ -3978,14 +3994,18 @@ qualification. This does not invalidate the separate 2026-09-10 b393 ext4/LVM
 HDD report, which ran three 128 MiB shuffled-read trials and recorded 5.11x
 median speedup.
 
-Resolution: mark unknown/tmpfs/network targets as smoke-only or SKIP for
-hardware status; require an actual target device for release hardware PASS;
-record when the HDD ratio is enforced; and keep `io_uring` selection and
-throughput gates separate.
+Resolution: `storage_hardware_matrix.sh` now identifies the mount source,
+filesystem, and backing block device. Unknown, pseudo-filesystem, and network
+targets are reported as `SMOKE_ONLY`; they cannot produce hardware PASS. The
+release rollup accepts the hardware gate only when at least one physical target
+qualifies, and treats a smoke-only-only run as SKIP. Reports state whether the
+HDD 5x gate was enforced. `io_uring` selection remains distinct from throughput.
+A fresh complete release matrix passed on physical `/dev/sdb` (Btrfs SSD) at
+[`storage-release-certification-local-ssd-20261002.md`](../certification/reports/storage-release-certification-local-ssd-20261002.md). It covers this device and the tested 256 MiB backend streams, 16 MiB recheck/peer-read workload, and real-root move/import fixture; it does not update the separate HDD 5x or broad multi-device evidence.
 
 ### TNG-147 — Performance and capacity claims need measured-scope labels
 
-**Status: Open; supported wording and outcomes are recorded in `PERFORMANCE_SCALE_CLAIMS_AUDIT.md`** · **Priority: P2** · **Confidence: high**
+**Status: Local claims and navigation reconciled; measured capacity remains unclaimed** · **Priority: P2** · **Confidence: high**
 
 The source and reports support real but separate outcomes: a single-run
 50,000-row synthetic sidecar corpus returning a capped 5,000-row page; an
@@ -3997,13 +4017,18 @@ not total process RSS. The WebUI 15,000-row browser test is mocked and fetches
 200 rows at a time. The `STORAGE_NG.md` 200+ TB and competitor statements are
 design goals, not measured outcomes.
 
-Resolution: scope opening “fast/high-volume” language; label synthetic,
-mostly-dormant, public-swarm, and WebUI results precisely; distinguish
-governor-managed memory from RSS; include artifact, corpus, page, concurrency,
-host, and timing scope in performance summaries; label 200+ TB and comparative
-claims as goals; and improve manual large-library navigation or state its
-limits. Do not combine independent counts and workloads into one capacity
-claim.
+Resolution: README language now describes the supported interface and bounded
+architecture without unmeasured speed or universal-compatibility promises.
+`STORAGE_NG.md`, `ROADMAP.md`, and the performance audit label 200+ TB and
+competitor comparisons as targets, distinguish frame-pool bounds from process
+memory, and retain synthetic, mostly-dormant, public-swarm, and mocked-WebUI
+results with their actual scope. The virtualized list supports direct row-range
+jumps over snapshot pagination, in addition to incremental scrolling. Independent
+count, swarm, concurrency, and memory-proxy results remain separate; no combined
+production-capacity claim is made.
+
+The current dirty-worktree browser certification is
+[`webui-certification-tng147-local-20261002.md`](../certification/reports/webui-certification-tng147-local-20261002.md): build, lint, and browser matrix pass (28 passed, 10 skipped), including the desktop/mobile direct row-jump checks.
 
 ## Burn-down log
 
@@ -4140,6 +4165,8 @@ claim.
 | 2026-09-25 UTC | Closed the Windows storage-plan path-authority implementation follow-up: plans now traverse configured-root capability directories and perform recursive copy/verification/deletion, pruning, reconciliation, and no-replace rename relative to opened handles. | `cargo check --locked -p rt-storage --target x86_64-pc-windows-msvc` and `cargo check --locked --tests -p rt-storage --target x86_64-pc-windows-msvc` pass. | Native Windows runtime behavior remains unqualified; that is evidence-only follow-up. |
 | 2026-09-25 UTC | Completed the scoped TNG-029 module decomposition and dependency cleanup: engine command facade, lifecycle/restore, storage workflow, and read model moved to private modules; per-torrent peer connection, session, and transfer code moved to private modules. Root `base64` now shares Axum-compatible 0.22, and root `sha1` is aligned to 0.10.7. | `cargo check --workspace --locked --offline`, debug/release root workspace builds, release sidecar build, formatting, and `git diff --check` pass. | Public API and actor ordering are preserved. Remaining framework/dev-tool dependency versions are constrained by Axum/Reqwest and test-tool generations; no benchmark or runtime behavior claim is made. |
 | 2026-10-01 | Opened TNG-145 through TNG-147 after auditing the resource, storage, API, swarm, and count claims against current source and retained reports. Corrected the public-soak narrative: PID 1 is Tini, so recorded RSS/FD/thread values are not `torrentngd` measurements. Classified the tmpfs “hardware matrix” PASS as smoke-only and separated useful scoped outcomes from production-capacity claims. | Source paths and reports are linked in [`PERFORMANCE_SCALE_CLAIMS_AUDIT.md`](PERFORMANCE_SCALE_CLAIMS_AUDIT.md); no tests or benchmarks were run for the audit. The 2026-09-10 physical HDD report remains valid for its host/workload; the 2026-09-16 tmpfs report is not hardware evidence. | TNG-145/146/147 remain Open pending sampler/gate fixes and claim reconciliation. |
+| 2026-10-02 | Fixed daemon resource sampling to identify `torrentngd`, bound soak reports to container/image IDs, distinguished physical-device storage qualification from smoke-only targets, added direct WebUI row-range navigation, and corrected unmeasured performance/capacity wording. Fixed the soak runner's incompatible curl flags and sampled the Docker-reported host PID so dropped-privilege containers work without `CAP_SYS_PTRACE`. | Focused soak sampler and storage target-classification self-tests; WebUI/type and browser certification results are recorded with this change. Fresh physical matrix passes on `/dev/sdb`; current-tree idle-daemon soak started and first sample passes. | TNG-146 has one fresh local physical-device result; TNG-147 repository work is complete; TNG-145 remains in progress until the full soak completes. |
+| 2026-10-03 | Finalized TNG-145 current-tree idle-daemon soak: PASS. | [soak-final-tng145-current-20261003.md](../certification/reports/soak-final-tng145-current-20261003.md); 1439 samples; source samples 2026-10-02T21:11:04Z through 2026-10-03T21:17:37Z. | TNG-145 idle-daemon resource qualification closed for its recorded scope; no loaded-swarm claim. |
 
 ## Release gate
 

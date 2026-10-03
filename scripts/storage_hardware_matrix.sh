@@ -2,6 +2,7 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+source "$ROOT/scripts/storage_target_qualification.sh"
 OUT="${TNG_STORAGE_MATRIX_REPORT:-$ROOT/certification/reports/storage-hardware-$(date -u +%Y%m%dT%H%M%SZ).md}"
 
 usage() {
@@ -45,6 +46,15 @@ source_for_path() {
 
 fstype_for_path() {
   findmnt -n -T "$1" -o FSTYPE 2>/dev/null || true
+}
+
+worktree_state() {
+  if git -C "$ROOT" diff --quiet && git -C "$ROOT" diff --cached --quiet &&
+    [[ -z "$(git -C "$ROOT" ls-files --others --exclude-standard)" ]]; then
+    printf 'clean\n'
+  else
+    printf 'dirty\n'
+  fi
 }
 
 root_block_for_source() {
@@ -209,6 +219,7 @@ append_summary() {
   echo "- Generated: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
   echo "- Host: $(hostname)"
   echo "- Commit: $(git -C "$ROOT" rev-parse --short HEAD 2>/dev/null || echo unknown)"
+  echo "- Worktree state: $(worktree_state)"
   echo "- Blocks: ${TNG_STORAGE_BENCH_BLOCKS:-4096}"
   echo "- Hot reads: ${TNG_STORAGE_BENCH_READS:-10000}"
   echo "- Syscall counts: ${TNG_STORAGE_SYSCALLS:-0}"
@@ -216,14 +227,29 @@ append_summary() {
 } >"$OUT"
 
 overall=0
-
+hardware_passes=0
+smoke_only=0
 for target in "$@"; do
   mkdir -p "$target"
   source="$(source_for_path "$target")"
   fstype="$(fstype_for_path "$target")"
   root_block="$(root_block_for_source "$source")"
+  hardware_device_type="unknown"
+  if [[ -n "$root_block" ]]; then
+    hardware_device_type="$(lsblk -s -nro TYPE "$root_block" 2>/dev/null | awk '$1 == "disk" || $1 == "part" {print; exit}')"
+    hardware_device_type="${hardware_device_type:-unknown}"
+  fi
   rota="$(rotational_for_block "$root_block")"
   profile="$(profile_for_rota "$rota")"
+  if storage_target_is_hardware_qualified "$root_block" "$fstype" "$hardware_device_type"; then
+    hardware_qualified=1
+    qualification_status="PASS"
+    qualification_detail="block device and filesystem identified"
+  else
+    hardware_qualified=0
+    qualification_status="SKIP"
+    qualification_detail="target is unknown, pseudo-filesystem, or network-backed; benchmark is smoke evidence only"
+  fi
   log="$tmpdir/$(basename "$target" | tr -c 'A-Za-z0-9_.-' '_').log"
 
   {
@@ -234,8 +260,12 @@ for target in "$@"; do
     echo "| mount source | ${source:-unknown} |"
     echo "| filesystem | ${fstype:-unknown} |"
     echo "| root block | ${root_block:-unknown} |"
+    echo "| physical device type | $hardware_device_type |"
     echo "| rotational | ${rota:-unknown} |"
     echo "| inferred profile | $profile |"
+    echo "| hardware qualification | $qualification_status |"
+    echo "| qualification detail | $qualification_detail |"
+    echo "| HDD 5x gate | $([[ "$rota" == "1" && "${TNG_STORAGE_REQUIRE_HDD_5X:-0}" == "1" ]] && echo enforced || echo not enforced) |"
     append_lvm_extent_probe "$target" "$source" "$root_block"
     echo
   } >>"$OUT"
@@ -254,7 +284,13 @@ for target in "$@"; do
     TNG_STORAGE_REQUIRE_5X="$require_5x" \
     TNG_STORAGE_SYSCALLS="${TNG_STORAGE_SYSCALLS:-0}" \
     "$ROOT/scripts/storage_real_device_benchmark.sh" "$target" 2>&1 | tee "$log"; then
-    echo "- Result: PASS" >>"$OUT"
+    if [[ "$hardware_qualified" == "1" ]]; then
+      echo "- Result: PASS" >>"$OUT"
+      hardware_passes=$((hardware_passes + 1))
+    else
+      echo "- Result: SMOKE_ONLY" >>"$OUT"
+      smoke_only=$((smoke_only + 1))
+    fi
   else
     echo "- Result: FAIL" >>"$OUT"
     overall=1
@@ -274,14 +310,22 @@ done
 {
   echo "## Gate"
   echo
-  if [[ "$overall" -eq 0 ]]; then
-    echo "PASS"
-    echo
-    echo "Overall status: PASS"
-  else
+  if [[ "$overall" -ne 0 ]]; then
     echo "FAIL"
     echo
     echo "Overall status: FAIL"
+  elif [[ "$hardware_passes" -eq 0 ]]; then
+    echo "SMOKE_ONLY: no physical-device qualification"
+    echo
+    echo "Overall status: PASS_WITH_SKIPS"
+  elif [[ "$smoke_only" -gt 0 ]]; then
+    echo "PASS: physical-device targets qualified; smoke-only targets are labeled"
+    echo
+    echo "Overall status: PASS_WITH_WARNINGS"
+  else
+    echo "PASS"
+    echo
+    echo "Overall status: PASS"
   fi
 } >>"$OUT"
 

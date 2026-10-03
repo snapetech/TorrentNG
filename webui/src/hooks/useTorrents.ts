@@ -6,9 +6,9 @@ const PAGE_SIZE = 200
 const LIVE_STATS_INTERVAL_MS = 2500
 const MAX_VISIBLE_LIVE_TORRENTS = 128
 
-export function useTorrentsInfinite(params: Omit<ListParams, 'limit' | 'offset'>, enabled = true) {
+export function useTorrentsInfinite(params: Omit<ListParams, 'limit' | 'offset'>, enabled = true, startOffset = 0) {
   return useInfiniteQuery({
-    queryKey: ['torrents', params],
+    queryKey: ['torrents', params, startOffset],
     queryFn: ({ pageParam }) =>
       api.torrents.list({
         ...params,
@@ -17,14 +17,16 @@ export function useTorrentsInfinite(params: Omit<ListParams, 'limit' | 'offset'>
         snapshot: pageParam.snapshot,
       }),
     enabled,
-    initialPageParam: { offset: 0 } as { offset: number; snapshot?: number },
+    initialPageParam: { offset: startOffset } as { offset: number; snapshot?: number },
     getNextPageParam: (lastPage, allPages) => {
       const loaded = allPages.reduce((n, p) => n + p.torrents.length, 0)
-      return loaded < lastPage.total
-        ? { offset: loaded, snapshot: lastPage.snapshot }
+      const nextOffset = startOffset + loaded
+      return nextOffset < lastPage.total
+        ? { offset: nextOffset, snapshot: lastPage.snapshot }
         : undefined
     },
-    placeholderData: (prev) => prev,
+    placeholderData: (prev, previousQuery) =>
+      previousQuery?.queryKey[2] === startOffset ? prev : undefined,
     staleTime: 1000,
     // Real-time updates are pushed over the WebSocket (see useWebSocket),
     // which invalidates this query key on torrent add/remove/update. This

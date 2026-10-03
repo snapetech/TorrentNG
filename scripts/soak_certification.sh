@@ -43,6 +43,8 @@ mapped="$(docker port "$TNG_CONTAINER" 8080/tcp 2>/dev/null | sed -n 's/.*:\([0-
 if [[ -n "$mapped" && "$TNG_HOST_URL" == http://localhost:* ]]; then
   TNG_HOST_URL="http://localhost:$mapped"
 fi
+CONTAINER_ID="$(docker inspect --format '{{.Id}}' "$TNG_CONTAINER" 2>/dev/null || true)"
+CONTAINER_IMAGE_ID="$(docker inspect --format '{{.Image}}' "$TNG_CONTAINER" 2>/dev/null || true)"
 
 python3 "$ROOT/scripts/protected_target.py" "$TNG_HOST_URL"
 if [[ "$TNG_API_TOKEN" == *$'\n'* || "$TNG_API_TOKEN" == *$'\r'* ]]; then
@@ -54,7 +56,7 @@ chmod 0600 "$AUTH_HEADER_FILE"
 
 curl_protected() {
   curl -q --silent --show-error --noproxy '*' \
-    --connect-timeout 5 --max-time 20 --proto '=http,https' "$@"
+    --connect-timeout 5 --max-time 20 "$@"
 }
 
 status="PASS"
@@ -69,19 +71,6 @@ mark() {
   fi
 }
 
-rss_mb() {
-  docker exec "$TNG_CONTAINER" sh -lc "awk '/VmRSS:/ {printf \"%.1f\", \$2 / 1024}' /proc/1/status"
-}
-
-process_field() {
-  local field="$1"
-  docker exec "$TNG_CONTAINER" sh -lc "awk -v field='$field' '\$1 == field {print \$2; exit}' /proc/1/status"
-}
-
-fd_count() {
-  docker exec "$TNG_CONTAINER" sh -lc 'find /proc/1/fd -mindepth 1 -maxdepth 1 -type l 2>/dev/null | wc -l'
-}
-
 disk_free_mb() {
   docker exec "$TNG_CONTAINER" df -Pm -- "$SOAK_DATA_PATH" |
     awk 'NR == 2 {print $4; exit}'
@@ -92,6 +81,8 @@ disk_free_mb() {
   echo
   echo "- Date UTC: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
   echo "- TorrentNG URL: $TNG_HOST_URL"
+  echo "- Container ID: ${CONTAINER_ID:-unavailable}"
+  echo "- Container image ID: ${CONTAINER_IMAGE_ID:-unavailable}"
   echo "- Duration seconds: $SOAK_DURATION_SECONDS"
   echo "- Interval seconds: $SOAK_INTERVAL_SECONDS"
   echo "- Max RSS MB: $SOAK_MAX_RSS_MB"
@@ -126,8 +117,8 @@ fi
   echo
   echo "## Samples"
   echo
-  echo "| UTC | Health | Torrents | RSS MB | sync/maindata HTTP | FDs | Threads | Disk free MB | Metrics HTTP | DB/Cache | Storage |"
-  echo "|---|---:|---:|---:|---:|---:|---:|---:|---:|---|---|"
+  echo "| UTC | Health | Torrents | RSS MB | sync/maindata HTTP | FDs | Threads | Disk free MB | Metrics HTTP | DB/Cache | Storage | Daemon PID | Executable |"
+  echo "|---|---:|---:|---:|---:|---:|---:|---:|---|---|---:|---|---|"
 } >> "$OUT"
 
 deadline=$((SECONDS + SOAK_DURATION_SECONDS))
@@ -136,6 +127,7 @@ max_rss="0"
 bad_health=0
 bad_sync=0
 bad_expected=0
+bad_sampler=0
 while (( SECONDS < deadline || samples == 0 )); do
   now="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
   health="$(curl_protected -o "$HEALTH_BODY" -w '%{http_code}' \
@@ -160,9 +152,32 @@ while (( SECONDS < deadline || samples == 0 )); do
   sync_code="$(curl_protected -o "$BODY" -w '%{http_code}' -b "$COOKIE_JAR" "$TNG_HOST_URL/api/qb/v2/sync/maindata?rid=0" || true)"
   metrics_code="$(curl_protected -o "$METRICS_BODY" -w '%{http_code}' \
     -H "@$AUTH_HEADER_FILE" "$TNG_HOST_URL/metrics" || true)"
-  rss="$(rss_mb)"
-  fds="$(fd_count)"
-  threads="$(process_field Threads:)"
+  daemon_sample=""
+  daemon_pid="unavailable"
+  daemon_exe="unavailable"
+  rss="0"
+  fds="0"
+  threads="0"
+  daemon_candidates="$(docker top "$TNG_CONTAINER" -eo pid,comm,args 2>/dev/null | awk 'NR > 1 && $2 == "torrentngd" && $3 ~ /(^|\/)torrentngd$/ {print $1 "\t" $3}')"
+  daemon_candidate_count="$(printf '%s\n' "$daemon_candidates" | awk 'NF {count++} END {print count + 0}')"
+  daemon_host_pid=""
+  daemon_host_exe=""
+  if [[ "$daemon_candidate_count" == 1 ]]; then
+    IFS=$'\t' read -r daemon_host_pid daemon_host_exe <<< "$daemon_candidates"
+  fi
+  if [[ "$daemon_candidate_count" == 1 && "$daemon_host_pid" =~ ^[0-9]+$ ]] &&
+    daemon_sample="$(SOAK_PROC_ROOT=/proc "$ROOT/scripts/soak_process_sample.sh" --host-process "$daemon_host_pid" "$daemon_host_exe")"; then
+    IFS=$'\t' read -r daemon_pid daemon_exe rss_kib fds threads <<< "$daemon_sample"
+    if [[ "$daemon_pid" =~ ^[0-9]+$ && "$daemon_exe" == */torrentngd && "$rss_kib" =~ ^[0-9]+$ && "$fds" =~ ^[0-9]+$ && "$threads" =~ ^[0-9]+$ ]]; then
+      rss="$(awk -v kib="$rss_kib" 'BEGIN {printf "%.1f", kib / 1024}')"
+    else
+      bad_sampler=$((bad_sampler + 1))
+      daemon_pid="invalid"
+      daemon_exe="invalid sample"
+    fi
+  else
+    bad_sampler=$((bad_sampler + 1))
+  fi
   disk_free="$(disk_free_mb)"
   db_cache="$(jq -r '
     if .engine.subsystems.database_worker.healthy != null then
@@ -179,9 +194,9 @@ while (( SECONDS < deadline || samples == 0 )); do
   if awk -v a="$rss" -v b="$max_rss" 'BEGIN {exit !(a > b)}'; then
     max_rss="$rss"
   fi
-  printf '| %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s |\n' \
+  printf '| %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s |\n' \
     "$now" "$health" "$torrents" "$rss" "$sync_code" "$fds" "$threads" \
-    "$disk_free" "$metrics_code" "$db_cache" "$storage" >> "$OUT"
+    "$disk_free" "$metrics_code" "$db_cache" "$storage" "$daemon_pid" "$daemon_exe" >> "$OUT"
   [[ "$health" == "200" ]] || bad_health=$((bad_health + 1))
   [[ "$sync_code" == "200" ]] || bad_sync=$((bad_sync + 1))
   samples=$((samples + 1))
@@ -191,7 +206,16 @@ while (( SECONDS < deadline || samples == 0 )); do
   sleep "$SOAK_INTERVAL_SECONDS"
 done
 
-if awk -v rss="$max_rss" -v limit="$SOAK_MAX_RSS_MB" 'BEGIN {exit !(rss <= limit)}'; then
+if [[ -n "$CONTAINER_ID" && -n "$CONTAINER_IMAGE_ID" ]]; then
+  mark "artifact identity" "PASS" "container and image IDs recorded"
+else
+  mark "artifact identity" "FAIL" "container or image ID unavailable; resource samples are not bound to an artifact"
+fi
+
+if (( bad_sampler > 0 )); then
+  mark "daemon resource sampler" "FAIL" "$bad_sampler samples did not resolve exactly one torrentngd process; daemon resource ceilings are invalid"
+elif awk -v rss="$max_rss" -v limit="$SOAK_MAX_RSS_MB" 'BEGIN {exit !(rss <= limit)}'; then
+  mark "daemon resource sampler" "PASS" "all $samples samples identified torrentngd by executable; PID and artifact identity recorded"
   mark "memory ceiling" "PASS" "max RSS ${max_rss}MB <= ${SOAK_MAX_RSS_MB}MB"
 else
   mark "memory ceiling" "FAIL" "max RSS ${max_rss}MB > ${SOAK_MAX_RSS_MB}MB"
@@ -202,12 +226,16 @@ max_threads="$(awk -F'|' '/^\| 20[0-9][0-9]-/ {gsub(/[[:space:]]/, "", $8); if (
 min_disk="$(awk -F'|' '/^\| 20[0-9][0-9]-/ {gsub(/[[:space:]]/, "", $9); if (seen == 0 || ($9 + 0) < min) min = $9 + 0; seen = 1} END {print seen ? min : 0}' "$OUT")"
 bad_metrics="$(awk -F'|' '/^\| 20[0-9][0-9]-/ {gsub(/[[:space:]]/, "", $10); if ($10 != "200") bad++} END {print bad + 0}' "$OUT")"
 bad_components="$(awk -F'|' '/^\| 20[0-9][0-9]-/ {for (i = 11; i <= 12; i++) {gsub(/[[:space:]]/, "", $i); if ($i == "unhealthy" || $i == "unknown") bad++}} END {print bad + 0}' "$OUT")"
-if (( max_fds <= SOAK_MAX_FDS )); then
+if (( bad_sampler > 0 )); then
+  mark "file-descriptor ceiling" "FAIL" "daemon FD sampling incomplete; no ceiling can be claimed"
+elif (( max_fds <= SOAK_MAX_FDS )); then
   mark "file-descriptor ceiling" "PASS" "max FDs ${max_fds} <= ${SOAK_MAX_FDS}"
 else
   mark "file-descriptor ceiling" "FAIL" "max FDs ${max_fds} > ${SOAK_MAX_FDS}"
 fi
-if (( max_threads <= SOAK_MAX_THREADS )); then
+if (( bad_sampler > 0 )); then
+  mark "thread ceiling" "FAIL" "daemon thread sampling incomplete; no ceiling can be claimed"
+elif (( max_threads <= SOAK_MAX_THREADS )); then
   mark "thread ceiling" "PASS" "max threads ${max_threads} <= ${SOAK_MAX_THREADS}"
 else
   mark "thread ceiling" "FAIL" "max threads ${max_threads} > ${SOAK_MAX_THREADS}"

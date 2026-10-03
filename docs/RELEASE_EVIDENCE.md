@@ -3,26 +3,46 @@
 This is the operator sequence for turning the current certification state into a
 strict release-ready state.
 
-The current worktree qualification is at `1dea3ea`; older runtime product and
+The previously published worktree qualification snapshot is at `1dea3ea`; older runtime product and
 LVM evidence remains tied to the commit recorded by each report. GitHub
 Actions evidence cited below is historical hosted-run evidence; CI success does
 not configure branch protection or certify broader public-network, target-device,
 or scale behavior.
+
+## Source safeguards update — 2026-10-02
+
+The soak sampler now validates the `torrentngd` process and records its
+container/image identity. Storage hardware rollups now require a block-backed,
+non-pseudo, non-network target; a tmpfs-only run is smoke evidence and yields a
+hardware-gate SKIP. These source changes do not create new soak or physical
+device evidence by themselves. Fresh local qualification evidence is recorded
+below; external and longer-duration claims remain tied to their named reports.
+
+## Fresh local qualification — 2026-10-02
+
+| Gate | Result | Evidence and scope |
+| --- | --- | --- |
+| Physical storage release certification | PASS | [`storage-release-certification-local-ssd-20261002.md`](../certification/reports/storage-release-certification-local-ssd-20261002.md); `/dev/sdb`, Btrfs, physical SSD. Hardware qualification, `io_uring` graduation, real-root move/import, and storage index passed. The matrix exercised 256 MiB backend streams and a 16 MiB recheck; HDD-only elevator evidence is not applicable to this target. |
+| WebUI current-tree certification | PASS | [`webui-certification-tng147-local-20261002.md`](../certification/reports/webui-certification-tng147-local-20261002.md); worktree state is recorded as dirty; production build, lint, and browser matrix pass (28 passed, 10 skipped). |
+| Corrected daemon sampler smoke | PASS | One-sample authenticated smoke against the current-tree daemon recorded `torrentngd` RSS/FD/thread data and healthy API/dependency checks. It is not 24-hour evidence. |
+| Current-tree 24-hour daemon soak | PASS | [soak-24h-tng145-current-20261002.md](../certification/reports/soak-24h-tng145-current-20261002.md) and [soak-final-tng145-current-20261003.md](../certification/reports/soak-final-tng145-current-20261003.md); PASS (1439 samples; 2026-10-02T21:11:04Z through 2026-10-03T21:17:37Z). Empty state, DHT disabled, no torrent workload; qualifies idle-daemon ceilings only, not loaded-swarm or public-network behavior. |
+
+The daemon soak image is built from source revision `db4e333c` plus the current
+WebUI working-tree changes and is identified by its recorded Docker image ID.
+The idle soak can establish idle process ceilings and continuity only; it does
+not replace a loaded public-torrent soak.
 
 ## Current qualification scope — 2026-09-16
 
 Numeric torrent-count capacity proofs, including 10k/100k synthetic or
 hot-set runs, are removed from the required release scope. Existing reports and
 tests remain historical or diagnostic evidence and must not be summarized as a
-capacity certificate. The current qualification also defers the 24-hour soak;
-run the non-soak gates with `TNG_DEFER_24H_SOAK=1` and record the deferral
-explicitly. A later soak must target the then-current artifact before making a
-stability claim.
+capacity certificate. The current-tree soak result is recorded above and in [soak-final-tng145-current-20261003.md](../certification/reports/soak-final-tng145-current-20261003.md). Its scope is limited to an idle daemon; it does not establish loaded-swarm stability.
 
 The concrete failure history and fixes for recent hosted regressions are
 tracked in [`CI_FAILURE_BURN_DOWN.md`](CI_FAILURE_BURN_DOWN.md).
 
-## Current qualification update — 2026-09-16
+## Qualification snapshot — 2026-09-16 (historical)
 
 The current qualification is intentionally narrower than a production-scale
 certificate. Numeric torrent-count proofs are out of scope, and the 24-hour
@@ -35,7 +55,7 @@ soak is explicitly deferred with `TNG_DEFER_24H_SOAK=1`.
 | Public Ubuntu transfer | FAIL/UNQUALIFIED | [`interop-matrix-current-public-ubuntu-bounded-20260916.md`](../certification/reports/interop-matrix-current-public-ubuntu-bounded-20260916.md); official Ubuntu 26.04.1, bounded at 120 seconds, no completed payload |
 | Public Fedora transfer | FAIL/UNQUALIFIED | [`interop-matrix-current-public-fedora-bounded-20260916.md`](../certification/reports/interop-matrix-current-public-fedora-bounded-20260916.md); official Fedora Server 45 Beta, bounded at 120 seconds, no completed payload |
 | Live fault-containment matrix | PASS | [`backend-burndown-fault-matrix-current-20260916.md`](../certification/reports/backend-burndown-fault-matrix-current-20260916.md); live crash/restart, SQLite failure/recovery, cancellation, and filesystem isolation pass |
-| Storage lab certification | PASS | [`storage-release-certification-lab-current-20260916.md`](../certification/reports/storage-release-certification-lab-current-20260916.md); temporary tmpfs root only, not physical-device evidence |
+| Storage lab certification | SMOKE_ONLY | [`storage-release-certification-lab-current-20260916.md`](../certification/reports/storage-release-certification-lab-current-20260916.md); raw child PASS was on tmpfs and does not qualify physical storage |
 | External evidence preflight | PASS_WITH_WARNINGS | [`external-evidence-preflight-current-20260916.md`](../certification/reports/external-evidence-preflight-current-20260916.md); real-device target unavailable, soak informationally deferred |
 | Local release readiness | PASS | [`release-readiness-local-current-20260916.md`](../certification/reports/release-readiness-local-current-20260916.md) |
 | Strict release readiness | FAIL | [`release-readiness-current-20260916.md`](../certification/reports/release-readiness-current-20260916.md); external policy rows remain non-clean |

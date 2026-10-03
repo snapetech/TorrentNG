@@ -4,8 +4,18 @@ set -euo pipefail
 # shellcheck disable=SC2016
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+source "$ROOT/scripts/storage_matrix_release_status.sh"
 REPORT_DIR="${TNG_STORAGE_REPORT_DIR:-$ROOT/certification/reports}"
 OUT="${TNG_STORAGE_RELEASE_REPORT:-$REPORT_DIR/storage-release-certification-$(date -u +%Y%m%dT%H%M%SZ).md}"
+
+worktree_state() {
+  if git -C "$ROOT" diff --quiet && git -C "$ROOT" diff --cached --quiet &&
+    [[ -z "$(git -C "$ROOT" ls-files --others --exclude-standard)" ]]; then
+    printf 'clean\n'
+  else
+    printf 'dirty\n'
+  fi
+}
 
 usage() {
   cat >&2 <<'USAGE'
@@ -115,6 +125,7 @@ storage_child() {
   echo "- Generated: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
   echo "- Host: $(hostname)"
   echo "- Commit: $(git -C "$ROOT" rev-parse --short HEAD 2>/dev/null || echo unknown)"
+  echo "- Worktree state: $(worktree_state)"
   echo "- Targets: $*"
   echo
   echo "| Gate | Status | Detail |"
@@ -125,9 +136,23 @@ uring_target="${TNG_STORAGE_URING_TARGET:-$1}"
 move_root="${TNG_STORAGE_MOVE_IMPORT_ROOT:-$1}"
 stamp="$(date -u +%Y%m%dT%H%M%SZ)"
 
-run_gate "storage hardware matrix" storage_child \
-  TNG_STORAGE_MATRIX_REPORT="${TNG_STORAGE_MATRIX_REPORT:-$REPORT_DIR/storage-hardware-release-$stamp.md}" \
-  -- storage_hardware_matrix "$@"
+matrix_report="${TNG_STORAGE_MATRIX_REPORT:-$REPORT_DIR/storage-hardware-release-$stamp.md}"
+matrix_log="$tmpdir/storage_hardware_matrix.log"
+if storage_child TNG_STORAGE_MATRIX_REPORT="$matrix_report" -- storage_hardware_matrix "$@" >"$matrix_log" 2>&1; then
+  if [[ "${TNG_STORAGE_RELEASE_SELFTEST:-0}" == "1" ]]; then
+    mark "storage hardware matrix" PASS "self-test stub; target classification is covered by storage certification tests"
+  else
+    matrix_status="$(storage_matrix_release_status "$matrix_report")"
+    case "$matrix_status" in
+      PASS) mark "storage hardware matrix" PASS "physical-device qualification passed; smoke-only targets remain labeled" ;;
+      SKIP) mark "storage hardware matrix" SKIP "no physical-device target qualified; local I/O smoke is not hardware evidence" ;;
+      *) mark "storage hardware matrix" FAIL "matrix report did not contain a qualifying hardware PASS" ;;
+    esac
+  fi
+else
+  mark "storage hardware matrix" FAIL "$(tail -1 "$matrix_log")"
+fi
+append_log "storage hardware matrix" "$matrix_log"
 
 if [[ "${TNG_STORAGE_SKIP_URING:-0}" == "1" ]]; then
   mark "io_uring graduation" SKIP "TNG_STORAGE_SKIP_URING=1"

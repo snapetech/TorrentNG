@@ -1,13 +1,13 @@
 # TorrentNG Storage Certification Index
 
-- Generated: 2026-09-16T18:49:55Z
-- Commit: 1dea3ea
+- Generated: 2026-10-02T21:16:32Z
+- Commit: db4e333c
 - Report directory: /home/keith/Documents/code/TorrentNG/certification/reports
 
 | Report | Kind | Generated | Host | Commit | Target | Selected backend | Fixed-buffer strategy | Real-root evidence | Result |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| [storage-hardware-20260517T190812Z.md](../../certification/reports/storage-hardware-20260517T190812Z.md) | hardware matrix | 2026-05-17T19:08:12Z | kspld0 | 8f28b04 | multiple/see report | n/a | n/a | n/a | PASS |
-| [storage-hardware-20260517T190831Z.md](../../certification/reports/storage-hardware-20260517T190831Z.md) | hardware matrix | 2026-05-17T19:08:31Z | kspld0 | 8f28b04 | multiple/see report | n/a | n/a | n/a | PASS |
+| [storage-hardware-20260517T190812Z.md](../../certification/reports/storage-hardware-20260517T190812Z.md) | hardware matrix | 2026-05-17T19:08:12Z | kspld0 | 8f28b04 | multiple/see report | n/a | n/a | n/a | INFO |
+| [storage-hardware-20260517T190831Z.md](../../certification/reports/storage-hardware-20260517T190831Z.md) | hardware matrix | 2026-05-17T19:08:31Z | kspld0 | 8f28b04 | multiple/see report | n/a | n/a | n/a | INFO |
 | [storage-hardware-20260517T191047Z.md](../../certification/reports/storage-hardware-20260517T191047Z.md) | hardware matrix | 2026-05-17T19:10:47Z | kspld0 | 8f28b04 | multiple/see report | n/a | n/a | n/a | PASS |
 | [storage-hardware-20260517T191104Z.md](../../certification/reports/storage-hardware-20260517T191104Z.md) | hardware matrix | 2026-05-17T19:11:04Z | kspld0 | 8f28b04 | multiple/see report | n/a | n/a | n/a | PASS |
 | [storage-hardware-20260517T191744Z.md](../../certification/reports/storage-hardware-20260517T191744Z.md) | hardware matrix | 2026-05-17T19:17:44Z | kspld0 | 12f8bb2 | multiple/see report | n/a | n/a | n/a | PASS |
@@ -23,6 +23,7 @@
 | [storage-hardware-kspls0-lvm-hdd-20260517T201732Z.md](../../certification/reports/storage-hardware-kspls0-lvm-hdd-20260517T201732Z.md) | hardware matrix | 2026-05-17T20:17:32Z | kspls0 | unknown | multiple/see report | n/a | n/a | n/a | PASS |
 | [storage-hardware-kspls0-lvm-pvmap-20260517T202609Z.md](../../certification/reports/storage-hardware-kspls0-lvm-pvmap-20260517T202609Z.md) | hardware matrix | 2026-05-17T20:26:09Z | kspls0 | unknown | multiple/see report | n/a | n/a | n/a | PASS |
 | [storage-hardware-kspls0-nfs-20260910.md](../../certification/reports/storage-hardware-kspls0-nfs-20260910.md) | hardware matrix | 2026-09-10T16:34:19Z | kspld0 | 674b283 | multiple/see report | n/a | n/a | n/a | PASS |
+| [storage-hardware-local-nvme-20261002.md](../../certification/reports/storage-hardware-local-nvme-20261002.md) | hardware matrix | 2026-10-02T21:16:21Z | kspld0 | db4e333c | multiple/see report | n/a | n/a | n/a | PASS |
 | [storage-hardware-release-20260517T230648Z.md](../../certification/reports/storage-hardware-release-20260517T230648Z.md) | hardware matrix | 2026-05-17T23:06:48Z | kspld0 | 35b7b4b | multiple/see report | n/a | n/a | n/a | PASS |
 | [storage-hardware-release-20260518T182416Z.md](../../certification/reports/storage-hardware-release-20260518T182416Z.md) | hardware matrix | 2026-05-18T18:24:16Z | kspld0 | 5360faa | multiple/see report | n/a | n/a | n/a | PASS |
 | [storage-hardware-release-20260518T182527Z.md](../../certification/reports/storage-hardware-release-20260518T182527Z.md) | hardware matrix | 2026-05-18T18:25:27Z | kspld0 | 579c35b | multiple/see report | n/a | n/a | n/a | PASS |
@@ -33,6 +34,8 @@
 | [storage-hardware-release-20260518T191739Z.md](../../certification/reports/storage-hardware-release-20260518T191739Z.md) | hardware matrix | 2026-05-18T19:17:39Z | kspld0 | 84bb3a9 | multiple/see report | n/a | n/a | n/a | PASS |
 | [storage-hardware-release-20260916T182809Z.md](../../certification/reports/storage-hardware-release-20260916T182809Z.md) | hardware matrix | 2026-09-16T18:28:09Z | kspld0 | 1dea3ea | multiple/see report | n/a | n/a | n/a | PASS |
 | [storage-hardware-release-20260916T184949Z.md](../../certification/reports/storage-hardware-release-20260916T184949Z.md) | hardware matrix | 2026-09-16T18:49:49Z | kspld0 | 1dea3ea | multiple/see report | n/a | n/a | n/a | PASS |
+| [storage-hardware-release-20261002T211455Z.md](../../certification/reports/storage-hardware-release-20261002T211455Z.md) | hardware matrix | 2026-10-02T21:14:55Z | kspld0 | db4e333c | multiple/see report | n/a | n/a | n/a | PASS |
+| [storage-hardware-release-20261002T211623Z.md](../../certification/reports/storage-hardware-release-20261002T211623Z.md) | hardware matrix | 2026-10-02T21:16:23Z | kspld0 | db4e333c | multiple/see report | n/a | n/a | n/a | PASS |
 | [storage-uring-graduation-20260517T203720Z.md](../../certification/reports/storage-uring-graduation-20260517T203720Z.md) | io_uring capability/graduation | 2026-05-17T20:37:20Z | kspld0 | dd37bfa | /tmp | uring |  | n/a | PASS |
 | [storage-uring-graduation-20260517T205609Z.md](../../certification/reports/storage-uring-graduation-20260517T205609Z.md) | io_uring capability/graduation | 2026-05-17T20:56:09Z | kspld0 | 2c76711 | /tmp | uring |  | n/a | FAIL |
 | [storage-uring-graduation-20260517T205630Z.md](../../certification/reports/storage-uring-graduation-20260517T205630Z.md) | io_uring capability/graduation | 2026-05-17T20:56:30Z | kspld0 | 2c76711 | /tmp | uring |  | n/a | PASS |
@@ -51,6 +54,8 @@
 | [storage-uring-graduation-release-20260518T191739Z.md](../../certification/reports/storage-uring-graduation-release-20260518T191739Z.md) | io_uring capability/graduation | 2026-05-18T19:17:41Z | kspld0 | 84bb3a9 | certification/storage-release-root | uring | frame_pool_slots | n/a | PASS |
 | [storage-uring-graduation-release-20260916T182809Z.md](../../certification/reports/storage-uring-graduation-release-20260916T182809Z.md) | io_uring capability/graduation | 2026-09-16T18:28:21Z | kspld0 | 1dea3ea | /tmp/torrentng-storage-lab.jQRcw0 | uring | frame_pool_slots | n/a | PASS |
 | [storage-uring-graduation-release-20260916T184949Z.md](../../certification/reports/storage-uring-graduation-release-20260916T184949Z.md) | io_uring capability/graduation | 2026-09-16T18:49:51Z | kspld0 | 1dea3ea | /tmp/torrentng-storage-lab.9He9U6 | uring | frame_pool_slots | n/a | PASS |
+| [storage-uring-graduation-release-20261002T211455Z.md](../../certification/reports/storage-uring-graduation-release-20261002T211455Z.md) | io_uring capability/graduation | 2026-10-02T21:14:56Z | kspld0 | db4e333c | /mnt/disks/gamespool1 | uring | frame_pool_slots | n/a | PASS |
+| [storage-uring-graduation-release-20261002T211623Z.md](../../certification/reports/storage-uring-graduation-release-20261002T211623Z.md) | io_uring capability/graduation | 2026-10-02T21:16:25Z | kspld0 | db4e333c | /mnt/disks/gamespool1 | uring | frame_pool_slots | n/a | PASS |
 | [storage-move-import-20260517T202932Z.md](../../certification/reports/storage-move-import-20260517T202932Z.md) | move/import | 2026-05-17T20:29:32Z | kspld0 | 647145d | multiple/see report | n/a | n/a | no | PASS |
 | [storage-move-import-20260517T203216Z.md](../../certification/reports/storage-move-import-20260517T203216Z.md) | move/import | 2026-05-17T20:32:16Z | kspld0 | a8e6211 | /tmp | n/a | n/a | yes | PASS |
 | [storage-move-import-20260517T203750Z.md](../../certification/reports/storage-move-import-20260517T203750Z.md) | move/import | 2026-05-17T20:37:50Z | kspld0 | dd37bfa | not set | n/a | n/a | no | PASS |
@@ -72,3 +77,5 @@
 | [storage-move-import-release-20260518T191739Z.md](../../certification/reports/storage-move-import-release-20260518T191739Z.md) | move/import | 2026-05-18T19:17:42Z | kspld0 | 84bb3a9 | certification/storage-release-root | n/a | n/a | yes | PASS |
 | [storage-move-import-release-20260916T182809Z.md](../../certification/reports/storage-move-import-release-20260916T182809Z.md) | move/import | 2026-09-16T18:28:22Z | kspld0 | 1dea3ea | /tmp/torrentng-storage-lab.jQRcw0 | n/a | n/a | yes | PASS |
 | [storage-move-import-release-20260916T184949Z.md](../../certification/reports/storage-move-import-release-20260916T184949Z.md) | move/import | 2026-09-16T18:49:51Z | kspld0 | 1dea3ea | /tmp/torrentng-storage-lab.9He9U6 | n/a | n/a | yes | PASS |
+| [storage-move-import-release-20261002T211455Z.md](../../certification/reports/storage-move-import-release-20261002T211455Z.md) | move/import | 2026-10-02T21:14:59Z | kspld0 | db4e333c | /mnt/disks/gamespool1 | n/a | n/a | yes | PASS |
+| [storage-move-import-release-20261002T211623Z.md](../../certification/reports/storage-move-import-release-20261002T211623Z.md) | move/import | 2026-10-02T21:16:27Z | kspld0 | db4e333c | /mnt/disks/gamespool1 | n/a | n/a | yes | PASS |

@@ -156,7 +156,7 @@ maintainability task and is not represented as independent supervision.
 
 Do not use mmap for torrent data as the primary design. Use an explicit userspace disk scheduler with bounded buffers.
 
-Rationale: libtorrent-rasterbar's own maintainer documented why 2.x mmap was a mistake for I/O control. A 200+ TB seedbox needs deliberate storage scheduling, not OS mmap behavior.
+Rationale: libtorrent-rasterbar's own maintainer documented why 2.x mmap was a mistake for I/O control. The prospective 200+ TB deployment target calls for deliberate storage scheduling rather than relying on OS mmap behavior; TorrentNG has not qualified a deployment at that size.
 
 ### Storage modes
 
@@ -233,7 +233,9 @@ Requirements:
 
 ### File movement
 
-Moving 200+ TB is a database migration, not a file copy:
+For the prospective 200+ TB deployment target, a storage-root move is planned
+as a database migration rather than a single file copy; no 200+ TB move has
+been measured:
 
 1. Dry-run: conflict detection, capacity check, path mapping preview
 2. Fast path: same-filesystem rename

@@ -1335,6 +1335,12 @@ summary:hover {
 }
 
 @media (max-width: 720px) {
+  .tng-list-jump {
+    flex-wrap: wrap;
+    justify-content: flex-start !important;
+    gap: 6px 12px !important;
+  }
+
   .tng-topbar {
     height: auto !important;
     min-height: 44px;

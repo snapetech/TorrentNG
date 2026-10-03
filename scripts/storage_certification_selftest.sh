@@ -2,8 +2,45 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+source "$ROOT/scripts/storage_target_qualification.sh"
+source "$ROOT/scripts/storage_matrix_release_status.sh"
 tmpdir="$(mktemp -d)"
 trap 'rm -rf "$tmpdir"' EXIT
+
+"$ROOT/scripts/soak_process_sample_selftest.sh"
+
+storage_target_is_hardware_qualified /dev/mapper/test ext4 disk
+if storage_target_is_hardware_qualified '' ext4 disk; then
+  echo "storage hardware classifier accepted a target without a block device" >&2
+  exit 1
+fi
+if storage_target_is_hardware_qualified /dev/mapper/test tmpfs disk; then
+  echo "storage hardware classifier accepted tmpfs as physical-device evidence" >&2
+  exit 1
+fi
+if storage_target_is_hardware_qualified /dev/mapper/test nfs4 disk; then
+  echo "storage hardware classifier accepted a network filesystem" >&2
+  exit 1
+fi
+if storage_target_is_hardware_qualified /dev/loop0 ext4 loop; then
+  echo "storage hardware classifier accepted a loop device" >&2
+  exit 1
+fi
+cat > "$tmpdir/matrix-smoke-only.md" <<'REPORT'
+| hardware qualification | SKIP |
+Overall status: PASS_WITH_SKIPS
+REPORT
+[[ "$(storage_matrix_release_status "$tmpdir/matrix-smoke-only.md")" == SKIP ]]
+cat > "$tmpdir/matrix-device-pass.md" <<'REPORT'
+| hardware qualification | PASS |
+Overall status: PASS_WITH_WARNINGS
+REPORT
+[[ "$(storage_matrix_release_status "$tmpdir/matrix-device-pass.md")" == PASS ]]
+cat > "$tmpdir/matrix-fail.md" <<'REPORT'
+| hardware qualification | PASS |
+Overall status: FAIL
+REPORT
+[[ "$(storage_matrix_release_status "$tmpdir/matrix-fail.md")" == FAIL ]]
 
 report_dir="$tmpdir/reports"
 benchmark_dir="$tmpdir/benchmarks"

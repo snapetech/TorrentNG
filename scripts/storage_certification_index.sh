@@ -66,6 +66,8 @@ result_for_report() {
     printf 'FAIL'
   elif grep -q '^Overall status: PASS$' "$report"; then
     printf 'PASS'
+  elif grep -q '^Overall status: PASS_WITH_WARNINGS$' "$report"; then
+    printf 'INFO'
   elif grep -q '^Overall status:' "$report"; then
     printf 'INFO'
   elif grep -qE '^Result: PASS$|\|[^|]+\| PASS \|' "$report"; then

@@ -272,6 +272,7 @@ export function App() {
     sort: 'name',
     dir: 'asc',
   })
+  const [pageOffset, setPageOffset] = useState(0)
   const [selected, setSelected] = useState<Set<string>>(new Set())
   const [selectionAnchor, setSelectionAnchor] = useState<string | null>(null)
   const [selectedSnapshots, setSelectedSnapshots] = useState<Map<string, TorrentSummary>>(new Map())
@@ -296,11 +297,12 @@ export function App() {
   const activeTheme = findPalette(themeId)[themeMode]
 
   const updateParams = useCallback((p: Partial<typeof params>) => {
+    setPageOffset(0)
     setParams(prev => ({ ...prev, ...p }))
   }, [])
 
   const isAuthed = activeTab.isActive && authState === 'authenticated'
-  const query = useTorrentsInfinite(params, isAuthed)
+  const query = useTorrentsInfinite(params, isAuthed, pageOffset)
   const { torrents, total } = flattenPages(query.data)
   useEffect(() => {
     const currentByHash = new Map(torrents.map(torrent => [torrent.hash, torrent]))
@@ -478,12 +480,14 @@ export function App() {
   }, [addOpen, bulkEditOpen, contextMenu, detailHash, helpOpen, pendingDelete, propertiesHash, selected, torrents])
 
   function goToTrackerTorrents(tracker: string) {
-    setParams(prev => ({ ...prev, tracker, offset: 0 }))
+    setPageOffset(0)
+    setParams(prev => ({ ...prev, tracker }))
     clearSelection()
     setView('torrents')
   }
 
   function applySavedView(next: typeof params) {
+    setPageOffset(0)
     setParams({
       sort: 'name',
       dir: 'asc',
@@ -627,6 +631,7 @@ export function App() {
   }
 
   function handleSort(sortKey: string) {
+    setPageOffset(0)
     setParams(prev => ({
       ...prev,
       sort: sortKey,
@@ -1040,6 +1045,10 @@ export function App() {
                   }}
                   onSort={handleSort}
                   onLoadMore={() => query.fetchNextPage()}
+                  onJumpTo={offset => {
+                    setPageOffset(Math.max(0, Math.min(Math.floor(offset), Math.max(0, total - 1))))
+                  }}
+                  pageOffset={pageOffset}
                   hasMore={query.hasNextPage ?? false}
                   isFetchingMore={query.isFetchingNextPage}
                   detailHash={selected.size > 1 ? null : detailHash}

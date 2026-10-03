@@ -7,6 +7,16 @@ Confidence: **high** on what each harness measures; **moderate** on how far a
 single host or synthetic corpus generalizes; **unknown** for unmeasured
 production-scale limits.
 
+## Implementation update — 2026-10-02
+
+The repository fixes the actionable findings from this audit: soak telemetry
+now identifies `torrentngd` and records container/image IDs; the storage matrix
+labels non-device targets as smoke-only and the release rollup requires a
+qualified target; the WebUI supports direct row-range navigation; and public
+documentation scopes capacity, memory, and comparative claims to their actual
+evidence. A fresh local physical-device qualification has run, and a current-tree
+idle-daemon soak is in progress; neither changes the scope of historical results.
+
 ## Verdict
 
 TorrentNG has real performance work and several useful measured outcomes. The
@@ -33,11 +43,11 @@ the separate many-client API run, and the single-torrent soak into one
 | 100,000 idle RAM check | `rt-metrics/tests/scale.rs` builds an in-process qBittorrent router with synthetic registry entries. It checks absolute test-process RSS below 2.5 GiB and limits growth to 64 FDs and 8 threads; it does not assert an RSS delta or exercise the native daemon restore path. | A coarse test-process proxy for that API object shape, not a fixed per-torrent RAM budget or engine RSS result. |
 | 1,000 hot memory check | The test builds 1,000 synthetic `TorrentRuntimeStats` rows, then sums only the ten rows retained in `hot_torrent_memory_top` and checks that estimate is below 64 MiB. | A regression for top-ten attribution. It does not measure actual allocations, the governor total, or total memory across 1,000 hot torrents. |
 | “RAM is O(active transfer)” | `STORAGE_NG.md` says the global frame pool makes RAM `O(active transfer)`. That statement describes frame-pool buffers only; registry rows, metadata, piece indexes, runtime tasks, database state, and other allocations also consume memory. | Say that frame-pool memory is capped and follows in-flight I/O. It does not describe the total process memory curve. |
-| Process memory and FD/thread soak | The public 24-hour run completed 1,437 samples and retained the exact completed Debian torrent. However, `soak_certification.sh` reads `/proc/1/status` and `/proc/1/fd`. The native image entrypoint runs Tini as container PID 1, so the reported 1.3 MB RSS, 3 FDs, and 1 thread describe Tini rather than `torrentngd`. | The health, sync, metrics, completed-torrent, and disk-free observations remain useful. The run does not establish daemon RSS, daemon FD/thread ceilings, or a memory-qualified soak. |
+| Process memory and FD/thread soak | The historical public 24-hour run completed 1,437 samples and retained the exact completed Debian torrent, but its sampler read `/proc/1` (Tini), not `torrentngd`. | Continuity, health, sync, metrics, completed-torrent, and disk-free observations remain useful. The run does not establish daemon resource ceilings; the current sampler fix requires a new artifact-bound run. |
 | HDD peer-read elevator | The 2026-09-10 b393 report targets an ext4 filesystem on a rotational LVM device. Across three 128 MiB shuffled-read trials, the median was 5.11x wall-clock improvement; 8,192 peer reads were coalesced to one backend read. | A strong result for this code, host, filesystem, and access pattern. It is not a general torrent throughput claim or deterministic per-drive placement control. |
 | `io_uring` storage | The 2026-09-10 HDD stream measured 209.79 MiB/s read for `pread` and 210.70 MiB/s for `io_uring`; throughput ratios were informational, not a required gate. A later report titled “hardware matrix” ran against tmpfs and inferred `Unknown`; its `io_uring` stream was only 4 MiB and sub-millisecond. | The HDD result shows comparable throughput on one host, not a material `io_uring` speedup. The later tmpfs PASS is capability/smoke evidence only, not hardware or disk-throughput evidence. |
 | Public swarm | The public Debian v1 matrix at b393 completed a 791,674,880-byte torrent and recorded 142 Rust peers in a five-client matrix. The 24-hour run tracked one completed public torrent. | Real public-v1 transfer and continuity evidence. It does not qualify multiple swarms, a large public peer population over time, pure-v2 public interop, or 100,000 torrents. The default global peer connection limit is 200. |
-| WebUI and torrent count | The browser scale test mocks 15,000 rows, checks fewer than 120 rendered rows, and exercises one “Load more” click. The live hook fetches 200 rows per page. | Good evidence for bounded DOM rendering with mocked data. Browsing all 100,000 rows would take 500 page advances; backend pagination does not make that manual interaction efficient. |
+| WebUI and torrent count | The browser scale test mocks 15,000 rows, checks fewer than 120 rendered rows, and exercises page loading. The live hook fetches 200 rows at a time; direct row-range navigation starts from a requested server-side offset. | Good evidence for bounded DOM rendering and direct navigation over mocked data. It does not establish real-library capacity or throughput. |
 | Disk capacity | Storage APIs expose filesystem-reported total, used, and free bytes. The storage design document sets 200+ TB and “beat mainstream clients” as goals; it does not report a 200 TB TorrentNG run or a competitor comparison. | Report those as design targets only. Current real-root move/import fixtures support correctness at their tested fixture sizes, not multi-TB throughput. |
 
 The direct qBittorrent facade also intentionally omits per-torrent transient
@@ -64,40 +74,33 @@ The API documentation already states this tradeoff.
 Keep the build, host, fixture, response size, and date attached to each number.
 These outcomes are valuable; their narrow scope is part of the claim.
 
-## Rectification list
+## Rectification status — 2026-10-02
 
-1. **Fix soak telemetry.** Select the `torrentngd` PID by executable identity
-   or report validated container cgroup totals; record the image or binary
-   digest and fail if the sampler resolves to Tini or another wrapper. Mark the
-   historical RSS/FD/thread values invalid while retaining the service
-   continuity result.
-2. **Make hardware status mean hardware.** Distinguish local I/O smoke tests
-   from physical-device qualification. Unknown, tmpfs, and network targets
-   must not yield a hardware `PASS`; release hardware claims should identify
-   the filesystem/device and apply the HDD performance gate when claiming HDD
-   results. Keep `io_uring` selection separate from a throughput win.
-3. **Scope performance language and benchmark records.** Replace unqualified
-   “fast”/“high-volume” wording with the architecture and tested workload.
-   Label the 50,000 benchmark as a 5,000-row response over a 50,000-row
-   synthetic corpus; report full response-read timing and repeated percentiles
-   for any user-facing latency claim. Include commit, artifact digest, CPU,
-   device, filesystem, corpus shape, request concurrency, response rows, and
-   whether measurements include body transfer.
-4. **Correct RAM-proxy names and extend coverage only where useful.** Qualify
-   “RAM is O(active transfer)” as a frame-pool statement. Rename the 1,000-hot
-   “memory cap” row to top-ten attribution unless it checks all 1,000 rows.
-   Give the 100,000 idle test an explicit RSS delta/per-row bound or call it a
-   permissive test-process ceiling. Keep process RSS and governor-managed
-   bytes as separate measurements.
-5. **Separate count, swarm, and UI claims.** Keep 100,000 mostly-dormant count
-   results separate from active-peer count and concurrent clients. Identify
-   that the 142 peers came from a five-client public Debian matrix. Improve
-   large-library WebUI navigation beyond one manual 200-row page at a time, or
-   avoid implying that API pagination alone makes browsing all 100,000 rows
-   responsive.
-6. **Label the Storage NG document’s 200+ TB and competitor claims as goals.**
-   The current title says “Design,” but the stated numbers and comparison
-   should remain visibly prospective until a matching workload has been run.
+1. **Soak telemetry — implemented; fresh soak PASS.** The sampler uses
+   Docker's process table to identify the `torrentngd` executable and reads the
+   host PID's resource counters, including for privilege-dropped containers.
+   It rejects wrapper-only or ambiguous results and records container/image
+   IDs. The current-tree 24-hour idle-daemon soak completed PASS; see the finalization report for sample-count and daemon RSS/FD/thread ceilings. Historical resource values remain invalid, and a public-torrent loaded soak is not covered.
+2. **Hardware status — implementation and one fresh physical-device run PASS.** Unknown, pseudo-filesystem, and
+   network targets are smoke-only. A release hardware PASS requires at least
+   one eligible block-backed filesystem target. Reports record whether the
+   HDD threshold was enforced and keep `io_uring` selection separate from a
+   throughput win. The 2026-10-02 full storage release suite passes on
+   `/dev/sdb`, Btrfs SSD; this does not add current HDD or multi-device evidence.
+3. **Performance language — reconciled.** README claims now describe the
+   supported interface and bounded architecture without unmeasured speed
+   promises. Historical benchmark claims retain their fixture, response, host,
+   artifact, and timing limits; no new latency claim was added.
+4. **Memory wording — reconciled.** Frame-pool bounds are distinguished from
+   process RSS and governor-managed allocations. The 1,000-hot result is
+   described as top-ten attribution, not total memory across 1,000 torrents.
+5. **Count, swarm, and UI claims — reconciled.** Synthetic mostly-dormant
+   counts, public peers, concurrency, and mocked WebUI results remain separate.
+   Direct row-range navigation is added and covered for offset/snapshot
+   continuity; it does not establish real-library capacity.
+6. **Storage design claims — reconciled.** `STORAGE_NG.md` labels 200+ TB and
+   competitor comparisons as prospective targets until a matching workload
+   has been measured.
 
 The canonical tracked items for these fixes are TNG-145, TNG-146, and TNG-147
 in [`BACKEND_AUDIT_BURN_DOWN.md`](BACKEND_AUDIT_BURN_DOWN.md).

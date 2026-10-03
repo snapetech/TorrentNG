@@ -4,18 +4,19 @@
 
 Support TorrentNG through [Ko-fi](https://ko-fi.com/snapetech).
 
-> The universal torrent client interface.
+> One WebUI for multiple torrent engines.
 
-TorrentNG(d) is a next-generation torrent client written in rust, with high volume efficiency key in mind.
+TorrentNG is a Rust torrent client built around bounded work, durable state, and
+one interface across several torrent engines.
 
-TorrentNG is also a universally compatible WebUI and client interface: one modern
-home for torrents running on the TorrentNG Engine, qBittorrent, rTorrent,
-Transmission, Deluge, and other supported clients.  You can use the WebUI with your existing setups, and benefit from the responsive nature.  You can also replace the backend torrent client with torrentngd, using the migration tools provided.  Migration tools also work in reverse, should the need to revert exist.
+TorrentNG provides one WebUI and API for the TorrentNG Engine and supported
+qBittorrent, rTorrent, Transmission, and Deluge setups. Use it with an existing
+library or run `torrentngd` as the transfer backend. Migration and export tools
+support moving between clients and reversing a migration.
 
 Use TorrentNG to:
 
-- manage torrents through one fast, consistent interface, whatever supported
-  client you choose;
+- manage torrents through one consistent interface across supported clients;
 - connect to an existing qBittorrent, rTorrent, Transmission, or Deluge
   installation without moving its library;
 - run the built-in TorrentNG Engine (`torrentngd`) when you want TorrentNG to

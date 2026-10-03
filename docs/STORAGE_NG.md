@@ -14,11 +14,12 @@ For the implementation/evidence map, see
 
 ## Goal
 
-Service **tens to hundreds of thousands of torrents** and **200+ TB** on
-**low CPU/RAM/fd budgets**, on **rotational disks and pooled filesystems**
-(mergerfs / SnapRAID / ZFS), and beat mainstream clients
-(libtorrent/qBittorrent/Transmission/rTorrent) on exactly that workload —
-not match them.
+The design target is to support **tens to hundreds of thousands of torrents**
+and **200+ TB** on **low CPU/RAM/fd budgets**, including rotational disks and
+pooled filesystems (mergerfs / SnapRAID / ZFS). These are prospective targets,
+not measured TorrentNG capacity or comparative-performance results. No checked-in
+run currently establishes a 200+ TB deployment or a performance win over
+libtorrent, qBittorrent, Transmission, or rTorrent.
 
 ### Workload truths this design is built around
 
@@ -120,8 +121,9 @@ change in phase 1.
 
 A process-wide slab allocator of fixed-size frames in a few size classes
 (16 KiB, 64 KiB, 256 KiB). All read buffers and write-aggregation buffers come
-from it. A hard byte cap means RAM is `O(active transfer)`; when exhausted,
-read/write submission returns `StorageError::QueueFull` and the peer layer
+from it. A hard byte cap bounds this frame pool; it does not cap total process
+memory. When the pool is exhausted, read/write submission returns
+`StorageError::QueueFull` and the peer layer
 applies backpressure (stop sending `unchoke` / defer `request`). 100k idle
 torrents allocate zero frames.
 
