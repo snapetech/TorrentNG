@@ -176,12 +176,6 @@ export function StatusBar({
       <nav className="tng-status-support" aria-label="Support TorrentNG">
         <span>Keep seeding</span>
         <a
-          href="https://www.paypal.com/donate/?business=donations%40snape.tech"
-          target="_blank"
-          rel="noreferrer"
-          title="Support TorrentNG development with PayPal"
-        >PayPal</a>
-        <a
           href="https://ko-fi.com/snapetech"
           target="_blank"
           rel="noreferrer"
