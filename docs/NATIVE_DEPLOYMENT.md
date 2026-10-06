@@ -8,14 +8,14 @@ For the larger product overview and TorrentNG-client versus compatible-client
 comparison, see
 [ENGINE_REWRITE.md](ENGINE_REWRITE.md).
 
-## Current local release evidence
+## Historical local release evidence — 2026-09-03
 
 On 2026-09-03 local time, `cargo build --release --locked -p torrentngd`
 produced `target/release/torrentngd` (21,993,112 bytes,
 SHA-256 `1d5fe1bee668179001dab21ac697aea01bb0f2cb11276f13208c38975cacd28e`).
 The authenticated release-binary smoke started it from an isolated config,
 checked TorrentNG-client and qBittorrent list/transfer endpoints plus Prometheus
-metrics, sent SIGTERM, and observed a clean exit in 474 ms. The current report
+metrics, sent SIGTERM, and observed a clean exit in 474 ms. The named report
 is [`backend-burndown-native-release-smoke-current-20260903.md`](../certification/reports/backend-burndown-native-release-smoke-current-20260903.md).
 This is local deployment evidence, not a capacity, public-compatibility,
 real-device, or long-soak certificate.

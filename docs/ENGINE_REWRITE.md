@@ -1,7 +1,7 @@
 # TorrentNG Client and Compatible-Client Integration Guide
 
 This is the practical guide to the two ways to run TorrentNG: with an existing
-compatible torrent client, or with TorrentNG's own next-generation client. It
+compatible torrent client, or with TorrentNG's own client. It
 explains the ownership boundary, why the first-party client exists, and how to
 test or migrate between arrangements.
 
@@ -15,7 +15,7 @@ transfer stack.
 | Arrangement | TorrentNG service | Transfer owner | Best for |
 |---|---|---|---|
 | Compatible-client integration | `torrentng` (implementation in `sidecar/`) | An existing rTorrent, qBittorrent, Transmission, Deluge, or separate `torrentngd` client | Keep an existing library and client, add TorrentNG's WebUI/API, or migrate gradually |
-| TorrentNG client | `torrentngd` | TorrentNG's first-party Rust client | New deployments and a next-generation client with owned storage, persistence, jobs, rechecks, and protocol control |
+| TorrentNG client | `torrentngd` | TorrentNG's first-party Rust client | New deployments where TorrentNG should own storage, persistence, jobs, rechecks, and protocol control |
 
 The WebUI and compatibility APIs are shared. In a compatible-client
 integration, the selected client owns torrent lifecycle, peer traffic, payload

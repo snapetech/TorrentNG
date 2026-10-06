@@ -1,43 +1,61 @@
 # TorrentNG Release Evidence Runbook
 
-This is the operator sequence for turning the current certification state into a
-strict release-ready state.
+This runbook records older qualification results and the operator sequence for
+establishing release readiness on an exact source revision.
 
 The previously published worktree qualification snapshot is at `1dea3ea`; older runtime product and
-LVM evidence remains tied to the commit recorded by each report. GitHub
-Actions evidence cited below is historical hosted-run evidence; CI success does
-not configure branch protection or certify broader public-network, target-device,
-or scale behavior.
+LVM evidence remains tied to the commit recorded by each report. GitHub Actions
+evidence cited below is historical hosted-run evidence. A `main` ruleset was
+added on 2026-10-06 to require pull requests and named CI checks; it has not yet
+been exercised by a PR from this checkout. Neither CI nor branch protection
+certifies broader public-network, target-device, or scale behavior.
 
-## Source safeguards update — 2026-10-02
+## Current checkout status — 2026-10-06
+
+The changes on `codex/credibility-and-release-prep` have not been tested or
+certified. The reports below are historical records and do not qualify this
+checkout. The 2026-10-02 physical-storage report records source commit
+`db4e333c` and a dirty worktree. The 24-hour soak report records its container
+and image IDs but no source commit; its final report also contains a machine-
+specific absolute path. Treat that soak as a historical idle-service
+observation, not source-bound release evidence. Run the exact-SHA checks in the
+[at-home validation plan](AT_HOME_VALIDATION.md) before considering a release.
+
+## Source safeguards recorded — 2026-10-02
 
 The soak sampler now validates the `torrentngd` process and records its
 container/image identity. Storage hardware rollups now require a block-backed,
 non-pseudo, non-network target; a tmpfs-only run is smoke evidence and yields a
-hardware-gate SKIP. These source changes do not create new soak or physical
-device evidence by themselves. Fresh local qualification evidence is recorded
-below; external and longer-duration claims remain tied to their named reports.
+hardware-gate SKIP. These source changes did not create soak or physical-device
+evidence by themselves. The historical local reports below remain tied to their
+recorded environments; exact-source follow-up is pending.
 
-## Fresh local qualification — 2026-10-02
+## Historical local qualification — 2026-10-02
+
+These results belong to the named reports and their recorded environments. They
+are not evidence for the current checkout.
 
 | Gate | Result | Evidence and scope |
 | --- | --- | --- |
 | Physical storage release certification | PASS | [`storage-release-certification-local-ssd-20261002.md`](../certification/reports/storage-release-certification-local-ssd-20261002.md); `/dev/sdb`, Btrfs, physical SSD. Hardware qualification, `io_uring` graduation, real-root move/import, and storage index passed. The matrix exercised 256 MiB backend streams and a 16 MiB recheck; HDD-only elevator evidence is not applicable to this target. |
-| WebUI current-tree certification | PASS | [`webui-certification-tng147-local-20261002.md`](../certification/reports/webui-certification-tng147-local-20261002.md); worktree state is recorded as dirty; production build, lint, and browser matrix pass (28 passed, 10 skipped). |
-| Corrected daemon sampler smoke | PASS | One-sample authenticated smoke against the current-tree daemon recorded `torrentngd` RSS/FD/thread data and healthy API/dependency checks. It is not 24-hour evidence. |
-| Current-tree 24-hour daemon soak | PASS | [soak-24h-tng145-current-20261002.md](../certification/reports/soak-24h-tng145-current-20261002.md) and [soak-final-tng145-current-20261003.md](../certification/reports/soak-final-tng145-current-20261003.md); PASS (1439 samples; 2026-10-02T21:11:04Z through 2026-10-03T21:17:37Z). Empty state, DHT disabled, no torrent workload; qualifies idle-daemon ceilings only, not loaded-swarm or public-network behavior. |
+| Named WebUI certification | PASS | [`webui-certification-tng147-local-20261002.md`](../certification/reports/webui-certification-tng147-local-20261002.md); worktree state is recorded as dirty; production build, lint, and browser matrix pass (28 passed, 10 skipped). |
+| One-sample daemon sampler smoke | PASS | Authenticated smoke against the daemon recorded `torrentngd` RSS/FD/thread data and healthy API/dependency checks. It is not 24-hour evidence. |
+| Named 24-hour idle-daemon run | PASS | [soak-24h-tng145-current-20261002.md](../certification/reports/soak-24h-tng145-current-20261002.md) and [soak-final-tng145-current-20261003.md](../certification/reports/soak-final-tng145-current-20261003.md); PASS (1439 samples; 2026-10-02T21:11:04Z through 2026-10-03T21:17:37Z). The raw report has no source commit. Empty state, DHT disabled, no torrent workload; idle-daemon observation only, not evidence for this checkout, a loaded swarm, or public-network behavior. |
 
-The daemon soak image is built from source revision `db4e333c` plus the current
-WebUI working-tree changes and is identified by its recorded Docker image ID.
-The idle soak can establish idle process ceilings and continuity only; it does
-not replace a loaded public-torrent soak.
+The daemon image is identified by its recorded Docker image ID, but the raw
+soak report does not record a source revision. The idle soak can establish idle
+process ceilings and continuity only; it does not replace a loaded
+public-torrent soak.
 
-## Current qualification scope — 2026-09-16
+## Qualification scope decision — 2026-09-16
 
 Numeric torrent-count capacity proofs, including 10k/100k synthetic or
 hot-set runs, are removed from the required release scope. Existing reports and
 tests remain historical or diagnostic evidence and must not be summarized as a
-capacity certificate. The current-tree soak result is recorded above and in [soak-final-tng145-current-20261003.md](../certification/reports/soak-final-tng145-current-20261003.md). Its scope is limited to an idle daemon; it does not establish loaded-swarm stability.
+capacity certificate. A later named idle-daemon run is recorded above and in
+[soak-final-tng145-current-20261003.md](../certification/reports/soak-final-tng145-current-20261003.md).
+Its source revision is not recorded, and its scope is limited to an idle daemon;
+it does not establish loaded-swarm stability or qualify this checkout.
 
 The concrete failure history and fixes for recent hosted regressions are
 tracked in [`CI_FAILURE_BURN_DOWN.md`](CI_FAILURE_BURN_DOWN.md).

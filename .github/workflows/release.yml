@@ -24,7 +24,7 @@ jobs:
       tag: ${{ steps.tag.outputs.tag }}
     steps:
       - name: Checkout trusted main history
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           ref: main
           fetch-depth: 0
@@ -67,7 +67,7 @@ jobs:
       RELEASE_TAG: ${{ needs.validate-release-tag.outputs.tag }}
     steps:
       - name: Checkout release tag
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           fetch-depth: 0
           ref: ${{ needs.validate-release-tag.outputs.tag }}
@@ -230,6 +230,7 @@ jobs:
         working-directory: webui
         run: |
           npm ci
+          npm test
           npm audit --audit-level=high
 
   native-release-smoke:
@@ -408,9 +409,10 @@ jobs:
         env:
           RELEASE_TAG: ${{ needs.validate-release-tag.outputs.tag }}
         run: |
-          docker build --pull --network host -f deploy/native/Dockerfile -t "torrentng-native:${RELEASE_TAG}" .
-          docker build --pull --network host -f deploy/docker/Dockerfile -t "torrentng:${RELEASE_TAG}" .
-          docker build --pull --network host -f deploy/docker/Dockerfile.phase1 -t "torrentng-phase1:${RELEASE_TAG}" .
+          source_revision="$(git rev-parse HEAD)"
+          docker build --pull --network host --build-arg "TORRENTNG_SOURCE_REVISION=$source_revision" -f deploy/native/Dockerfile -t "torrentng-native:${RELEASE_TAG}" .
+          docker build --pull --network host --build-arg "TORRENTNG_SOURCE_REVISION=$source_revision" -f deploy/docker/Dockerfile -t "torrentng:${RELEASE_TAG}" .
+          docker build --pull --network host --build-arg "TORRENTNG_SOURCE_REVISION=$source_revision" -f deploy/docker/Dockerfile.phase1 -t "torrentng-phase1:${RELEASE_TAG}" .
 
       - name: Smoke native image with authenticated read-only runtime
         env:
@@ -603,7 +605,7 @@ jobs:
       contents: read
     steps:
       - name: Checkout release tag
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           fetch-depth: 1
           ref: ${{ needs.validate-release-tag.outputs.tag }}
@@ -634,7 +636,7 @@ jobs:
           [[ "$(tar -tvf "$bundle_file" | awk 'NR == 1 { print $1 }')" == "drwxr-xr-x" ]]
 
       - name: Upload YunoHost bundle
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: yunohost-${{ matrix.suffix }}
           path: torrentng-yunohost-${{ needs.validate-release-tag.outputs.tag }}-${{ matrix.suffix }}.tar.gz

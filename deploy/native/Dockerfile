@@ -18,6 +18,7 @@ RUN TNG_WEBUI_OUT_DIR=dist npm run build
 FROM alpine:3.24.2
 ARG TNG_UID=1000
 ARG TNG_GID=1000
+ARG TORRENTNG_SOURCE_REVISION=unknown
 
 RUN apk add --no-cache ca-certificates curl jq tini util-linux \
     && case "$TNG_UID" in ''|*[!0-9]*) echo "TNG_UID must be a nonzero numeric ID" >&2; exit 1;; *[1-9]*) :;; *) echo "TNG_UID must be a nonzero numeric ID" >&2; exit 1;; esac \
@@ -39,7 +40,8 @@ ENV TNG_DEFAULT_UID="${TNG_UID}"
 ENV TNG_DEFAULT_GID="${TNG_GID}"
 
 LABEL org.opencontainers.image.title="TorrentNG Engine" \
-      org.opencontainers.image.description="TorrentNG Engine: native Rust BitTorrent client with the shared WebUI/API, migration tooling, storage, jobs, and recovery."
+      org.opencontainers.image.description="TorrentNG Engine: native Rust BitTorrent client with the shared WebUI/API, migration tooling, storage, jobs, and recovery." \
+      org.opencontainers.image.revision="${TORRENTNG_SOURCE_REVISION}"
 
 USER root
 VOLUME ["/data", "/downloads", "/var/lib/torrentngd", "/config"]

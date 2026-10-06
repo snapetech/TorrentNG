@@ -4,7 +4,12 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 # shellcheck source=scripts/curl_policy.sh
 source "$ROOT/scripts/curl_policy.sh"
+# shellcheck source=scripts/evidence_source.sh
+source "$ROOT/scripts/evidence_source.sh"
 OUT="${1:-$ROOT/certification/reports/soak-$(date -u +%Y%m%dT%H%M%SZ).md}"
+SOURCE_COMMIT="$(evidence_source_commit "$ROOT")"
+SOURCE_BRANCH="$(evidence_source_branch "$ROOT")"
+SOURCE_WORKTREE_STATE="$(evidence_source_worktree_state "$ROOT")"
 TNG_HOST_URL="${TNG_HOST_URL:-http://localhost:${TNG_HOST_PORT:-18080}}"
 TNG_API_TOKEN="${TNG_API_TOKEN:-local-cert-api-token-20260904}"
 TNG_CONTAINER="${TNG_CONTAINER:-certification-torrentng-1}"
@@ -45,6 +50,7 @@ if [[ -n "$mapped" && "$TNG_HOST_URL" == http://localhost:* ]]; then
 fi
 CONTAINER_ID="$(docker inspect --format '{{.Id}}' "$TNG_CONTAINER" 2>/dev/null || true)"
 CONTAINER_IMAGE_ID="$(docker inspect --format '{{.Image}}' "$TNG_CONTAINER" 2>/dev/null || true)"
+CONTAINER_SOURCE_REVISION="$(docker inspect --format '{{ index .Config.Labels "org.opencontainers.image.revision" }}' "$TNG_CONTAINER" 2>/dev/null || true)"
 
 python3 "$ROOT/scripts/protected_target.py" "$TNG_HOST_URL"
 if [[ "$TNG_API_TOKEN" == *$'\n'* || "$TNG_API_TOKEN" == *$'\r'* ]]; then
@@ -80,9 +86,13 @@ disk_free_mb() {
   echo "# TorrentNG Soak Certification"
   echo
   echo "- Date UTC: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  echo "- Source commit: $SOURCE_COMMIT"
+  echo "- Source branch: $SOURCE_BRANCH"
+  echo "- Source worktree state: $SOURCE_WORKTREE_STATE"
   echo "- TorrentNG URL: $TNG_HOST_URL"
   echo "- Container ID: ${CONTAINER_ID:-unavailable}"
   echo "- Container image ID: ${CONTAINER_IMAGE_ID:-unavailable}"
+  echo "- Container source revision: ${CONTAINER_SOURCE_REVISION:-unavailable}"
   echo "- Duration seconds: $SOAK_DURATION_SECONDS"
   echo "- Interval seconds: $SOAK_INTERVAL_SECONDS"
   echo "- Max RSS MB: $SOAK_MAX_RSS_MB"
@@ -99,6 +109,17 @@ disk_free_mb() {
   echo "| Check | Result | Detail |"
   echo "|---|---|---|"
 } > "$OUT"
+
+if [[ "$SOURCE_WORKTREE_STATE" == "clean" && "$SOURCE_COMMIT" =~ ^[0-9a-f]{40}$ &&
+  "$CONTAINER_SOURCE_REVISION" == "$SOURCE_COMMIT" ]]; then
+  mark "source provenance" "PASS" "clean source commit matches the container image revision"
+else
+  mark "source provenance" "FAIL" "clean source commit and matching image revision are required; no soak samples were collected"
+  echo >> "$OUT"
+  echo "Overall status: $status" >> "$OUT"
+  echo "$OUT"
+  exit 1
+fi
 
 auth_payload="$(python3 -c 'import os; from urllib.parse import urlencode; token = os.environ["TNG_API_TOKEN"]; print(urlencode({"username": token, "password": token}))')"
 code="$(printf '%s' "$auth_payload" | curl_protected -o "$BODY" -w '%{http_code}' \
@@ -207,7 +228,7 @@ while (( SECONDS < deadline || samples == 0 )); do
 done
 
 if [[ -n "$CONTAINER_ID" && -n "$CONTAINER_IMAGE_ID" ]]; then
-  mark "artifact identity" "PASS" "container and image IDs recorded"
+  mark "artifact identity" "PASS" "container ID, image ID, and source revision recorded"
 else
   mark "artifact identity" "FAIL" "container or image ID unavailable; resource samples are not bound to an artifact"
 fi

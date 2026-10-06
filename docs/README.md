@@ -2,12 +2,11 @@
 
 Start here when choosing, testing, or operating TorrentNG.
 
-TorrentNG is the universal torrent client interface: one shared WebUI and
-automation API for qBittorrent, rTorrent, Transmission, Deluge, and the
-built-in TorrentNG Engine (`torrentngd`). Use an existing client's library, or
-let the Engine own transfers, storage, persistence, jobs, and recovery. The
-documentation tracks both the common UI/API contract and the backend-specific
-capabilities; compatible does not mean every client exposes identical features.
+TorrentNG provides one WebUI and automation API for its built-in Engine and
+supported connections to qBittorrent, rTorrent, Transmission, and Deluge. With
+an existing client, that client keeps control of transfers and files. With the
+Engine (`torrentngd`), TorrentNG manages transfers, storage, and saved state.
+Supported features vary by client; the compatibility guides list the limits.
 
 ## Product arrangements
 
@@ -31,6 +30,9 @@ capabilities; compatible does not mean every client exposes identical features.
   field coverage, and the remaining cross-client projection gaps.
 - [RELEASE_EVIDENCE.md](RELEASE_EVIDENCE.md) - operator runbook for clearing
   warning rows, enforcing strict readiness, and packaging release evidence.
+- [AT_HOME_VALIDATION.md](AT_HOME_VALIDATION.md) - the exact clean-commit
+  quality, hardware, interoperability, soak, and release sequence for the next
+  qualification run.
 - [Release-note fragments](../release-notes/README.md) - contribution and
   validation rules for the release notes published to GitHub and Discord.
 
