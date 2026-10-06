@@ -1,10 +1,11 @@
 TorrentNG
 Copyright (c) 2026 TorrentNG contributors
 
-This project provides a management interface and compatibility layer for
-rTorrent-based deployments. It is not affiliated with, endorsed by, or sponsored
-by rTorrent, qBittorrent, or any third-party automation project referenced in
-the documentation or source tree.
+TorrentNG provides a native BitTorrent client and a separate WebUI/API service
+that can connect to supported existing clients, including rTorrent,
+qBittorrent, Transmission, and Deluge. It is not affiliated with, endorsed by,
+or sponsored by those clients or by any third-party automation project
+referenced in the documentation or source tree.
 
 All trademarks, service marks, and project names are the property of their
 respective owners and are used only for compatibility, identification, and
@@ -12,4 +13,3 @@ descriptive purposes.
 
 TorrentNG does not condone piracy, copyright infringement, or unauthorized
 distribution of copyrighted works.
-

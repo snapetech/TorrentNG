@@ -2,7 +2,8 @@
 
 storage_target_is_hardware_qualified() {
   local root_block="$1"
-  local fstype="${2,,}"
+  local fstype
+  fstype="$(printf '%s' "${2:-}" | tr '[:upper:]' '[:lower:]')"
   local device_type="${3:-unknown}"
   [[ -n "$root_block" ]] || return 1
   case "$device_type" in

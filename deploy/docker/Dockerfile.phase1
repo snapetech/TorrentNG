@@ -48,6 +48,7 @@ RUN cd rtorrent && autoreconf -fi && \
 FROM base AS runtime
 ARG TNG_UID=1000
 ARG TNG_GID=1000
+ARG TORRENTNG_SOURCE_REVISION=unknown
 
 RUN apk add --no-cache \
     php83 php83-fpm php83-json php83-session php83-curl php83-posix \
@@ -65,7 +66,8 @@ ENV TNG_PACKAGED_LIBTORRENT_VERSION=0.16.11
 ENV TNG_RTORRENT_PATCHES=rtorrent-0.16.11-user-agent-command
 
 LABEL org.opencontainers.image.title="TorrentNG Phase 1" \
-      org.opencontainers.image.description="TorrentNG Phase 1 rTorrent/ruTorrent deployment bundle for compatibility testing."
+      org.opencontainers.image.description="TorrentNG Phase 1 rTorrent/ruTorrent deployment bundle for compatibility testing." \
+      org.opencontainers.image.revision="${TORRENTNG_SOURCE_REVISION}"
 
 # ruTorrent 5.3.1. Verify the archive before unpacking it.
 ARG RUTORRENT_SHA256=338d89c7842381b350e359f63d6595aa36d2472b22d8b6f02294d6ddcfd9ecb1

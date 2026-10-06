@@ -17,6 +17,11 @@ if [[ -z "$REPORT" ]]; then
     | sort -t $'\t' -k1,1nr \
     | awk 'NR == 1 { print substr($0, index($0, "\t") + 1) }')"
 fi
+REPORT_NAME="${REPORT##*/}"
+REPORT_SHA256=""
+if [[ -n "$REPORT" && -f "$REPORT" ]]; then
+  REPORT_SHA256="$(sha256sum "$REPORT" | awk '{print $1}')"
+fi
 
 mkdir -p "$(dirname "$OUT")"
 status="PASS"
@@ -35,7 +40,8 @@ mark() {
   echo "# TorrentNG Soak Finalization"
   echo
   echo "- Date UTC: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
-  echo "- Source report: ${REPORT:-missing}"
+  echo "- Source report: ${REPORT_NAME:-missing}"
+  echo "- Source report SHA-256: ${REPORT_SHA256:-unavailable}"
   echo "- Minimum samples: $MIN_SAMPLES"
   echo "- Max RSS MB: $MAX_RSS_MB"
   echo "- Max file descriptors: $MAX_FDS"
@@ -51,7 +57,18 @@ mark() {
 if [[ -z "$REPORT" || ! -f "$REPORT" ]]; then
   mark "source report" "FAIL" "missing soak report"
 else
-  mark "source report" "PASS" "$REPORT"
+  mark "source report" "PASS" "$REPORT_NAME"
+
+  source_commit="$(sed -nE 's/^- Source commit: ([0-9a-f]{40})$/\1/p' "$REPORT" | head -1)"
+  source_tree_state="$(sed -nE 's/^- Source worktree state: ([a-z]+)$/\1/p' "$REPORT" | head -1)"
+  image_revision="$(sed -nE 's/^- Container source revision: ([^[:space:]]+)$/\1/p' "$REPORT" | head -1)"
+  if [[ "$source_tree_state" == "clean" && -n "$source_commit" &&
+    "$image_revision" == "$source_commit" ]] &&
+    grep -Fq '| source provenance | PASS |' "$REPORT"; then
+    mark "source provenance" "PASS" "clean source commit matches the recorded container image revision"
+  else
+    mark "source provenance" "FAIL" "report must identify a clean source commit matching the container image revision"
+  fi
 
   sample_count="$(awk -F'|' '/^\| 20[0-9][0-9]-/ {count++} END {print count+0}' "$REPORT")"
   if (( sample_count >= MIN_SAMPLES )); then

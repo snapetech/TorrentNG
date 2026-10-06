@@ -6,6 +6,7 @@ services:
       args:
         TNG_UID: "${PUID:-1000}"
         TNG_GID: "${PGID:-1000}"
+        TORRENTNG_SOURCE_REVISION: "${TORRENTNG_SOURCE_REVISION:-unknown}"
     image: torrentng-phase1:latest
     container_name: torrentng-phase1
     restart: unless-stopped

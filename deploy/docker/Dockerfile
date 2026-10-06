@@ -84,6 +84,7 @@ RUN cd rtorrent && autoreconf -fi && \
 FROM alpine:3.20
 ARG TNG_UID=1000
 ARG TNG_GID=1000
+ARG TORRENTNG_SOURCE_REVISION=unknown
 RUN apk add --no-cache ca-certificates curl libcurl ncurses openssl socat tinyxml2 tini tzdata util-linux zlib \
     && case "$TNG_UID" in ''|*[!0-9]*) echo "TNG_UID must be a nonzero numeric ID" >&2; exit 1;; *[1-9]*) :;; *) echo "TNG_UID must be a nonzero numeric ID" >&2; exit 1;; esac \
     && case "$TNG_GID" in ''|*[!0-9]*) echo "TNG_GID must be a nonzero numeric ID" >&2; exit 1;; *[1-9]*) :;; *) echo "TNG_GID must be a nonzero numeric ID" >&2; exit 1;; esac
@@ -112,7 +113,8 @@ ENV TNG_PACKAGED_LIBTORRENT_VERSION=0.16.11
 ENV TNG_RTORRENT_PATCHES=rtorrent-0.16.11-user-agent-command,rtorrent-0.16.11-local-id-command,rtorrent-0.16.11-multicall-range,rtorrent-0.16.11-tracker-identity-gate,rtorrent-0.16.11-unlimited-queue-refill
 
 LABEL org.opencontainers.image.title="TorrentNG Compatible-Client Service" \
-      org.opencontainers.image.description="TorrentNG compatible-client WebUI/API service for existing qBittorrent, rTorrent, Transmission, and Deluge deployments."
+      org.opencontainers.image.description="TorrentNG compatible-client WebUI/API service for existing qBittorrent, rTorrent, Transmission, and Deluge deployments." \
+      org.opencontainers.image.revision="${TORRENTNG_SOURCE_REVISION}"
 
 VOLUME ["/data", "/session", "/config", "/var/lib/torrentng"]
 EXPOSE 8080 50000 50000/udp

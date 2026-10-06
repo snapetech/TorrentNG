@@ -4,6 +4,8 @@ services:
     build:
       context: ../..
       dockerfile: deploy/native/Dockerfile
+      args:
+        TORRENTNG_SOURCE_REVISION: "${TORRENTNG_SOURCE_REVISION:-unknown}"
     restart: unless-stopped
     cap_drop:
       - ALL
@@ -66,7 +68,6 @@ services:
 
 volumes:
   downloads:
-    external: true
     name: certification_downloads
   torrentngd-state:
   grafana-data:

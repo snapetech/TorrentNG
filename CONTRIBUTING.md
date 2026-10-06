@@ -18,5 +18,8 @@ Before submitting changes, run the relevant checks:
 cd sidecar && cargo test  # compatible-client WebUI/API service
 cd ../                   # return to the repository root
 cargo test --workspace --all-targets --locked  # TorrentNG client and libraries
-cd webui && npm run build
+cd webui
+npm run build
+npm test
+npm run lint
 ```
