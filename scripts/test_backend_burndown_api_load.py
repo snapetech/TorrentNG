@@ -3,9 +3,11 @@ from __future__ import annotations
 import contextlib
 import io
 import sys
+import tempfile
 import threading
 import unittest
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 from unittest.mock import patch
 from urllib.error import HTTPError
 from urllib.request import ProxyHandler, Request
@@ -116,12 +118,14 @@ class ApiLoadSecurityTests(unittest.TestCase):
             "TNG_BACKEND_API_ALLOWED_ORIGINS": "",
         }
         stderr = io.StringIO()
-        with (
-            patch.dict("os.environ", environment, clear=False),
-            patch.object(sys, "argv", ["backend_burndown_api_load.py", "unused-report.md"]),
-            contextlib.redirect_stderr(stderr),
-        ):
-            result = load.main()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            report = str(Path(tmpdir) / "unused-report.md")
+            with (
+                patch.dict("os.environ", environment, clear=False),
+                patch.object(sys, "argv", ["backend_burndown_api_load.py", report]),
+                contextlib.redirect_stderr(stderr),
+            ):
+                result = load.main()
         self.assertEqual(result, 2)
         self.assertIn("not listed", stderr.getvalue())
 
