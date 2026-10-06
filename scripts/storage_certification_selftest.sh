@@ -6,7 +6,7 @@ source "$ROOT/scripts/storage_target_qualification.sh"
 source "$ROOT/scripts/storage_matrix_release_status.sh"
 tmpdir="$(mktemp -d)"
 trap 'rm -rf "$tmpdir"' EXIT
-trap 'status=$?; echo "storage certification self-test failed at line ${LINENO} (exit $status)" >&2' ERR
+trap 'status=$?; echo "storage certification self-test failed at line ${LINENO} (exit $status)" >&2; exit "$status"' ERR
 
 "$ROOT/scripts/soak_process_sample_selftest.sh"
 
@@ -304,6 +304,13 @@ fi
 
 release_report="$report_dir/storage-release-certification-run-selftest.md"
 release_log="$tmpdir/storage-release-certification-run-selftest.log"
+source_changes="$(git -C "$ROOT" status --porcelain --untracked-files=all -- . \
+  ':(exclude)certification/reports/**' \
+  ':(exclude)certification/bundles/**' \
+  ':(exclude).run/**')"
+if [[ -n "$source_changes" ]]; then
+  printf 'source changes before storage release self-test:\n%s\n' "$source_changes" >&2
+fi
 if ! TNG_STORAGE_REPORT_DIR="$report_dir" \
   TNG_STORAGE_RELEASE_REPORT="$release_report" \
   TNG_STORAGE_RELEASE_SELFTEST=1 \
