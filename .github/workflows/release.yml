@@ -583,62 +583,6 @@ jobs:
           name: shared-linux-assets
           path: dist/*
 
-  yunohost-bundles:
-    name: YunoHost portable bundle (${{ matrix.suffix }})
-    needs: [validate-release-tag, native-quality, msrv-check, msrv-check-sidecar, security-audit]
-    env:
-      RELEASE_TAG: ${{ needs.validate-release-tag.outputs.tag }}
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - os: ubuntu-24.04
-            platform: linux/amd64
-            suffix: linux-amd64
-          - os: ubuntu-24.04-arm
-            platform: linux/arm64
-            suffix: linux-arm64
-    runs-on: ${{ matrix.os }}
-    permissions:
-      contents: read
-    steps:
-      - name: Checkout release tag
-        uses: actions/checkout@v7
-        with:
-          fetch-depth: 1
-          ref: ${{ needs.validate-release-tag.outputs.tag }}
-          persist-credentials: false
-
-      - name: Build YunoHost portable bundle
-        env:
-          PLATFORM: ${{ matrix.platform }}
-          ASSET_SUFFIX: ${{ matrix.suffix }}
-        shell: bash
-        run: |
-          set -euo pipefail
-          mkdir -p bundle
-          docker buildx build \
-            --pull \
-            --platform "$PLATFORM" \
-            --file packaging/yunohost/Dockerfile.bundle \
-            --target bundle \
-            --output "type=local,dest=bundle" \
-            .
-          chmod -R a+rX bundle
-          chmod 0755 bundle
-          test -x bundle/bin/torrentngd
-          test -x bundle/bin/torrentng
-          test -s bundle/webui/index.html
-          bundle_file="torrentng-yunohost-${RELEASE_TAG}-${ASSET_SUFFIX}.tar.gz"
-          tar -czf "$bundle_file" -C bundle .
-          [[ "$(tar -tvf "$bundle_file" | awk 'NR == 1 { print $1 }')" == "drwxr-xr-x" ]]
-
-      - name: Upload YunoHost bundle
-        uses: actions/upload-artifact@v7
-        with:
-          name: yunohost-${{ matrix.suffix }}
-          path: torrentng-yunohost-${{ needs.validate-release-tag.outputs.tag }}-${{ matrix.suffix }}.tar.gz
-
   publish:
     name: Publish release
     runs-on: [self-hosted, Linux, X64]
@@ -647,7 +591,6 @@ jobs:
       - release-notes
       - native-binaries
       - linux-release-assets
-      - yunohost-bundles
     env:
       RELEASE_TAG: ${{ needs.validate-release-tag.outputs.tag }}
     permissions:

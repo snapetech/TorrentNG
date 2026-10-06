@@ -365,6 +365,14 @@ compatibility responses:
 - Compatibility matrices describe the tested contract, not blanket parity with
   every upstream plugin, preference, or extension.
 
+### YunoHost package status
+
+TorrentNG no longer publishes or updates its YunoHost package. Existing
+installations remain on their last published package; operators should move to
+a supported deployment or maintain package updates independently. The package
+source remains in the repository for reference, but compatibility with future
+TorrentNG releases is not maintained by this project.
+
 ## Testing and development
 
 Build and test the root Rust workspace:
